@@ -5686,35 +5686,20 @@ mod tests {
     #[tokio::test]
     async fn model_migration_prompt_only_shows_for_deprecated_models() {
         let seen = BTreeMap::new();
-        assert!(should_show_model_migration_prompt(
-            "gpt-5",
-            "gpt-5.2-codex",
-            &seen,
-            &all_model_presets()
-        ));
-        assert!(should_show_model_migration_prompt(
-            "gpt-5-codex",
-            "gpt-5.2-codex",
-            &seen,
-            &all_model_presets()
-        ));
-        assert!(should_show_model_migration_prompt(
-            "gpt-5-codex-mini",
-            "gpt-5.2-codex",
-            &seen,
-            &all_model_presets()
-        ));
-        assert!(should_show_model_migration_prompt(
-            "gpt-5.1-codex",
-            "gpt-5.2-codex",
-            &seen,
-            &all_model_presets()
-        ));
+        let available_models = all_model_presets();
+        for model in ["gpt-5", "gpt-5-codex", "gpt-5-codex-mini", "gpt-5.1-codex"] {
+            assert!(should_show_model_migration_prompt(
+                model,
+                "gpt-5.4",
+                &seen,
+                &available_models
+            ));
+        }
         assert!(!should_show_model_migration_prompt(
-            "gpt-5.1-codex",
-            "gpt-5.1-codex",
+            "gpt-5.4",
+            "gpt-5.4",
             &seen,
-            &all_model_presets()
+            &available_models
         ));
     }
 
