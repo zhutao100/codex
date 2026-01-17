@@ -14,7 +14,6 @@ use codex_protocol::openai_models::default_input_modalities;
 use crate::config::Config;
 use crate::features::Feature;
 use crate::truncate::approx_bytes_for_tokens;
-use tracing::warn;
 
 pub const BASE_INSTRUCTIONS: &str = include_str!("../../prompt.md");
 const BASE_INSTRUCTIONS_WITH_APPLY_PATCH: &str =
@@ -34,7 +33,11 @@ const GPT_5_2_CODEX_PERSONALITY_FRIENDLY: &str =
 const GPT_5_2_CODEX_PERSONALITY_PRAGMATIC: &str =
     include_str!("../../templates/personalities/gpt-5.2-codex_pragmatic.md");
 
+const OTHERS_INSTRUCTIONS: &str = include_str!("../../others_prompt.md");
+
 pub(crate) const CONTEXT_WINDOW_272K: i64 = 272_000;
+pub(crate) const CONTEXT_WINDOW_128K: i64 = 131_072;
+pub(crate) const CONTEXT_WINDOW_164K: i64 = 163_840;
 
 macro_rules! model_info {
     (
@@ -312,13 +315,35 @@ pub(crate) fn find_model_info_for_slug(slug: &str) -> ModelInfo {
             truncation_policy: TruncationPolicyConfig::bytes(10_000),
             context_window: Some(CONTEXT_WINDOW_272K),
         )
-    } else {
-        warn!("Unknown model {slug} is used. This will degrade the performance of Codex.");
+    } else if slug.starts_with("mlx-community") {
         model_info!(
             slug,
-            context_window: None,
-            supported_reasoning_levels: Vec::new(),
-            default_reasoning_level: None
+            auto_compact_token_limit: Some(CONTEXT_WINDOW_128K / 3),
+            apply_patch_tool_type: Some(ApplyPatchToolType::Freeform),
+            base_instructions: OTHERS_INSTRUCTIONS.to_string(),
+            context_window: Some(CONTEXT_WINDOW_128K),
+            default_reasoning_level: Some(ReasoningEffort::Medium),
+            default_verbosity: Some(Verbosity::Low),
+            shell_type: ConfigShellToolType::ShellCommand,
+            support_verbosity: true,
+            supports_parallel_tool_calls: true,
+            supports_reasoning_summaries: true,
+            truncation_policy: TruncationPolicyConfig::bytes(10_000),
+        )
+    } else {
+        model_info!(
+            slug,
+            auto_compact_token_limit: Some(CONTEXT_WINDOW_164K / 3),
+            apply_patch_tool_type: Some(ApplyPatchToolType::Freeform),
+            base_instructions: OTHERS_INSTRUCTIONS.to_string(),
+            context_window: Some(CONTEXT_WINDOW_164K),
+            default_reasoning_level: Some(ReasoningEffort::Medium),
+            default_verbosity: Some(Verbosity::Low),
+            shell_type: ConfigShellToolType::ShellCommand,
+            support_verbosity: true,
+            supports_parallel_tool_calls: true,
+            supports_reasoning_summaries: true,
+            truncation_policy: TruncationPolicyConfig::bytes(10_000),
         )
     }
 }
