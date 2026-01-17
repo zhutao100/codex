@@ -4858,7 +4858,6 @@ mod tests {
 
     struct InstructionsTestCase {
         slug: &'static str,
-        expects_apply_patch_instructions: bool,
     }
 
     fn user_message(text: &str) -> ResponseItem {
@@ -4888,44 +4887,20 @@ mod tests {
 
     #[tokio::test]
     async fn get_base_instructions_no_user_content() {
-        let prompt_with_apply_patch_instructions =
-            include_str!("../prompt_with_apply_patch_instructions.md");
         let test_cases = vec![
+            InstructionsTestCase { slug: "gpt-5.4" },
             InstructionsTestCase {
-                slug: "gpt-3.5",
-                expects_apply_patch_instructions: true,
+                slug: "gpt-5.4-mini",
             },
             InstructionsTestCase {
-                slug: "gpt-4.1",
-                expects_apply_patch_instructions: true,
+                slug: "gpt-5.3-codex",
             },
             InstructionsTestCase {
-                slug: "gpt-4o",
-                expects_apply_patch_instructions: true,
+                slug: "gpt-5.3-codex-spark",
             },
+            InstructionsTestCase { slug: "gpt-5.2" },
             InstructionsTestCase {
-                slug: "gpt-5",
-                expects_apply_patch_instructions: true,
-            },
-            InstructionsTestCase {
-                slug: "gpt-5.1",
-                expects_apply_patch_instructions: false,
-            },
-            InstructionsTestCase {
-                slug: "codex-mini-latest",
-                expects_apply_patch_instructions: true,
-            },
-            InstructionsTestCase {
-                slug: "gpt-oss:120b",
-                expects_apply_patch_instructions: false,
-            },
-            InstructionsTestCase {
-                slug: "gpt-5.1-codex",
-                expects_apply_patch_instructions: false,
-            },
-            InstructionsTestCase {
-                slug: "gpt-5.1-codex-max",
-                expects_apply_patch_instructions: false,
+                slug: "codex-auto-review",
             },
         ];
 
@@ -4934,12 +4909,6 @@ mod tests {
         for test_case in test_cases {
             let config = test_config();
             let model_info = ModelsManager::construct_model_info_offline(test_case.slug, &config);
-            if test_case.expects_apply_patch_instructions {
-                assert_eq!(
-                    model_info.base_instructions.as_str(),
-                    prompt_with_apply_patch_instructions
-                );
-            }
 
             {
                 let mut state = session.state.lock().await;

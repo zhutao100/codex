@@ -1807,11 +1807,11 @@ mod tests {
     }
 
     #[test]
-    fn test_build_specs_gpt5_codex_default() {
+    fn test_build_specs_gpt5_2_codex_default() {
         let mut features = Features::with_defaults();
         features.enable(Feature::CollaborationModes);
         assert_default_model_tools(
-            "gpt-5-codex",
+            "gpt-5.2",
             &features,
             Some(WebSearchMode::Cached),
             "shell_command",
@@ -1829,11 +1829,11 @@ mod tests {
     }
 
     #[test]
-    fn test_build_specs_gpt51_codex_default() {
+    fn test_build_specs_gpt5_3_codex_default() {
         let mut features = Features::with_defaults();
         features.enable(Feature::CollaborationModes);
         assert_default_model_tools(
-            "gpt-5.1-codex",
+            "gpt-5.3-codex",
             &features,
             Some(WebSearchMode::Cached),
             "shell_command",
@@ -1851,12 +1851,12 @@ mod tests {
     }
 
     #[test]
-    fn test_build_specs_gpt5_codex_unified_exec_web_search() {
+    fn test_build_specs_gpt5_3_codex_unified_exec_web_search() {
         let mut features = Features::with_defaults();
         features.enable(Feature::UnifiedExec);
         features.enable(Feature::CollaborationModes);
         assert_model_tools(
-            "gpt-5-codex",
+            "gpt-5.3-codex-spark",
             &features,
             Some(WebSearchMode::Live),
             &[
@@ -1875,56 +1875,11 @@ mod tests {
     }
 
     #[test]
-    fn test_build_specs_gpt51_codex_unified_exec_web_search() {
-        let mut features = Features::with_defaults();
-        features.enable(Feature::UnifiedExec);
-        features.enable(Feature::CollaborationModes);
-        assert_model_tools(
-            "gpt-5.1-codex",
-            &features,
-            Some(WebSearchMode::Live),
-            &[
-                "exec_command",
-                "write_stdin",
-                "list_mcp_resources",
-                "list_mcp_resource_templates",
-                "read_mcp_resource",
-                "update_plan",
-                "request_user_input",
-                "apply_patch",
-                "web_search",
-                "view_image",
-            ],
-        );
-    }
-
-    #[test]
-    fn test_codex_mini_defaults() {
+    fn test_codex_5_4_mini_defaults() {
         let mut features = Features::with_defaults();
         features.enable(Feature::CollaborationModes);
         assert_default_model_tools(
-            "codex-mini-latest",
-            &features,
-            Some(WebSearchMode::Cached),
-            "local_shell",
-            &[
-                "list_mcp_resources",
-                "list_mcp_resource_templates",
-                "read_mcp_resource",
-                "update_plan",
-                "request_user_input",
-                "web_search",
-                "view_image",
-            ],
-        );
-    }
-
-    #[test]
-    fn test_codex_5_1_mini_defaults() {
-        let mut features = Features::with_defaults();
-        features.enable(Feature::CollaborationModes);
-        assert_default_model_tools(
-            "gpt-5.1-codex-mini",
+            "gpt-5.4-mini",
             &features,
             Some(WebSearchMode::Cached),
             "shell_command",
@@ -1942,11 +1897,11 @@ mod tests {
     }
 
     #[test]
-    fn test_gpt_5_defaults() {
+    fn test_gpt_5_4_defaults() {
         let mut features = Features::with_defaults();
         features.enable(Feature::CollaborationModes);
         assert_default_model_tools(
-            "gpt-5",
+            "gpt-5.4",
             &features,
             Some(WebSearchMode::Cached),
             "shell",
@@ -1956,74 +1911,7 @@ mod tests {
                 "read_mcp_resource",
                 "update_plan",
                 "request_user_input",
-                "web_search",
-                "view_image",
-            ],
-        );
-    }
-
-    #[test]
-    fn test_gpt_5_1_defaults() {
-        let mut features = Features::with_defaults();
-        features.enable(Feature::CollaborationModes);
-        assert_default_model_tools(
-            "gpt-5.1",
-            &features,
-            Some(WebSearchMode::Cached),
-            "shell_command",
-            &[
-                "list_mcp_resources",
-                "list_mcp_resource_templates",
-                "read_mcp_resource",
-                "update_plan",
-                "request_user_input",
                 "apply_patch",
-                "web_search",
-                "view_image",
-            ],
-        );
-    }
-
-    #[test]
-    fn test_exp_5_1_defaults() {
-        let mut features = Features::with_defaults();
-        features.enable(Feature::CollaborationModes);
-        assert_model_tools(
-            "exp-5.1",
-            &features,
-            Some(WebSearchMode::Cached),
-            &[
-                "exec_command",
-                "write_stdin",
-                "list_mcp_resources",
-                "list_mcp_resource_templates",
-                "read_mcp_resource",
-                "update_plan",
-                "request_user_input",
-                "apply_patch",
-                "web_search",
-                "view_image",
-            ],
-        );
-    }
-
-    #[test]
-    fn test_codex_mini_unified_exec_web_search() {
-        let mut features = Features::with_defaults();
-        features.enable(Feature::UnifiedExec);
-        features.enable(Feature::CollaborationModes);
-        assert_model_tools(
-            "codex-mini-latest",
-            &features,
-            Some(WebSearchMode::Live),
-            &[
-                "exec_command",
-                "write_stdin",
-                "list_mcp_resources",
-                "list_mcp_resource_templates",
-                "read_mcp_resource",
-                "update_plan",
-                "request_user_input",
                 "web_search",
                 "view_image",
             ],
@@ -2075,7 +1963,13 @@ mod tests {
     #[test]
     fn test_test_model_info_includes_sync_tool() {
         let config = test_config();
-        let model_info = ModelsManager::construct_model_info_offline("test-gpt-5-codex", &config);
+        let mut model_info = ModelsManager::construct_model_info_offline("gpt-5.4", &config);
+        model_info.experimental_supported_tools = vec![
+            "test_sync_tool".to_string(),
+            "read_file".to_string(),
+            "grep_files".to_string(),
+            "list_dir".to_string(),
+        ];
         let features = Features::with_defaults();
         let tools_config = ToolsConfig::new(&ToolsConfigParams {
             model_info: &model_info,

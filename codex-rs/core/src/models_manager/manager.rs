@@ -136,17 +136,64 @@ impl ModelsManager {
     // todo(aibrahim): look if we can tighten it to pub(crate)
     /// Look up model metadata, applying remote overrides and config adjustments.
     pub async fn get_model_info(&self, model: &str, config: &Config) -> ModelInfo {
-        let remote = self
-            .get_remote_models(config)
-            .await
-            .into_iter()
-            .find(|m| m.slug == model);
-        let model = if let Some(remote) = remote {
-            remote
+        let remote_models = self.remote_models.read().await;
+        Self::construct_model_info_from_candidates(model, remote_models.as_slice(), config)
+    }
+
+    fn find_model_by_longest_prefix(model: &str, candidates: &[ModelInfo]) -> Option<ModelInfo> {
+        let mut best: Option<ModelInfo> = None;
+        for candidate in candidates {
+            if !model.starts_with(&candidate.slug) {
+                continue;
+            }
+            let is_better_match = if let Some(current) = best.as_ref() {
+                candidate.slug.len() > current.slug.len()
+            } else {
+                true
+            };
+            if is_better_match {
+                best = Some(candidate.clone());
+            }
+        }
+        best
+    }
+
+    /// Retry metadata lookup for a single namespaced slug like `namespace/model-name`.
+    ///
+    /// This only strips one leading namespace segment and only when the namespace is ASCII
+    /// alphanumeric/underscore (`\\w+`) to avoid broadly matching arbitrary aliases.
+    fn find_model_by_namespaced_suffix(model: &str, candidates: &[ModelInfo]) -> Option<ModelInfo> {
+        let (namespace, suffix) = model.split_once('/')?;
+        if suffix.contains('/') {
+            return None;
+        }
+        if !namespace
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            return None;
+        }
+        Self::find_model_by_longest_prefix(suffix, candidates)
+    }
+
+    fn construct_model_info_from_candidates(
+        model: &str,
+        candidates: &[ModelInfo],
+        config: &Config,
+    ) -> ModelInfo {
+        // First use the normal longest-prefix match. If that misses, allow a narrowly scoped
+        // retry for namespaced slugs like `custom/gpt-5.3-codex`.
+        let remote = Self::find_model_by_longest_prefix(model, candidates)
+            .or_else(|| Self::find_model_by_namespaced_suffix(model, candidates));
+        let model_info = if let Some(remote) = remote {
+            ModelInfo {
+                slug: model.to_string(),
+                ..remote
+            }
         } else {
-            model_info::find_model_info_for_slug(model)
+            model_info::model_info_from_slug(model)
         };
-        model_info::with_config_overrides(model, config)
+        model_info::with_config_overrides(model_info, config)
     }
 
     /// Refresh models if the provided ETag differs from the cached ETag.
@@ -346,7 +393,8 @@ impl ModelsManager {
     #[cfg(any(test, feature = "test-support"))]
     /// Build `ModelInfo` without consulting remote state or cache.
     pub fn construct_model_info_offline(model: &str, config: &Config) -> ModelInfo {
-        model_info::with_config_overrides(model_info::find_model_info_for_slug(model), config)
+        let candidates = Self::load_remote_models_from_file().unwrap_or_default();
+        Self::construct_model_info_from_candidates(model, &candidates, config)
     }
 }
 
