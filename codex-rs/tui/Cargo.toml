@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[build-dependencies]
+semver = { workspace = true }
+
 [[bin]]
 name = "codex-tui"
 path = "src/main.rs"
@@ -130,3 +133,4 @@ rand = { workspace = true }
 serial_test = { workspace = true }
 vt100 = { workspace = true }
 uuid = { workspace = true }
+semver = { workspace = true }
