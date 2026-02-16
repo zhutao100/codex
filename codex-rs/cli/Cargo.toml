@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[build-dependencies]
+semver = { workspace = true }
+
 [[bin]]
 name = "codex"
 path = "src/main.rs"
@@ -66,3 +69,4 @@ codex-utils-cargo-bin = { workspace = true }
 predicates = { workspace = true }
 pretty_assertions = { workspace = true }
 sqlx = { workspace = true }
+semver = { workspace = true }
