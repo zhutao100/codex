@@ -17,7 +17,7 @@ use tokio_tungstenite::tungstenite::Message;
 fn runtime_metrics_summary_collects_tool_api_and_streaming_metrics() -> Result<()> {
     let exporter = InMemoryMetricExporter::default();
     let metrics = MetricsClient::new(
-        MetricsConfig::in_memory("test", "codex-cli", env!("CARGO_PKG_VERSION"), exporter)
+        MetricsConfig::in_memory("test", "codex-cli", codex_otel::CODEX_VERSION, exporter)
             .with_runtime_reader(),
     )?;
     let manager = OtelManager::new(

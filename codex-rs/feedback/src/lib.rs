@@ -249,7 +249,7 @@ impl CodexLogSnapshot {
             ..Default::default()
         });
 
-        let cli_version = env!("CARGO_PKG_VERSION");
+        let cli_version = codex_version::CODEX_VERSION;
         let mut tags = BTreeMap::from([
             (String::from("thread_id"), self.thread_id.to_string()),
             (String::from("classification"), classification.to_string()),

@@ -289,7 +289,7 @@ impl RolloutRecorder {
                         timestamp,
                         cwd: config.cwd.clone(),
                         originator: originator().value,
-                        cli_version: env!("CARGO_PKG_VERSION").to_string(),
+                        cli_version: crate::CODEX_VERSION.to_string(),
                         source,
                         model_provider: Some(config.model_provider_id.clone()),
                         base_instructions: Some(base_instructions),

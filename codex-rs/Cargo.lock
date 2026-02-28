@@ -1283,6 +1283,7 @@ dependencies = [
  "clap",
  "codex-app-server-protocol",
  "codex-protocol",
+ "codex-version",
  "serde",
  "serde_json",
  "uuid",
@@ -1545,6 +1546,7 @@ dependencies = [
  "codex-utils-pty",
  "codex-utils-readiness",
  "codex-utils-string",
+ "codex-version",
  "codex-windows-sandbox",
  "core-foundation 0.9.4",
  "core_test_support",
@@ -1619,6 +1621,7 @@ dependencies = [
  "anyhow",
  "clap",
  "codex-app-server-protocol",
+ "codex-version",
  "pretty_assertions",
  "serde",
  "serde_json",
@@ -1736,6 +1739,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "codex-protocol",
+ "codex-version",
  "pretty_assertions",
  "sentry",
  "tracing",
@@ -1921,6 +1925,7 @@ dependencies = [
  "codex-app-server-protocol",
  "codex-protocol",
  "codex-utils-absolute-path",
+ "codex-version",
  "eventsource-stream",
  "http 1.4.0",
  "opentelemetry",
@@ -2245,6 +2250,10 @@ dependencies = [
 
 [[package]]
 name = "codex-utils-string"
+version = "0.0.0"
+
+[[package]]
+name = "codex-version"
 version = "0.0.0"
 
 [[package]]
