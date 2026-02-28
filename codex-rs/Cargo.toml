@@ -11,6 +11,7 @@ members = [
     "apply-patch",
     "arg0",
     "feedback",
+    "version",
     "codex-backend-openapi-models",
     "cloud-requirements",
     "cloud-tasks",
@@ -127,6 +128,7 @@ codex-state = { path = "state" }
 codex-stdio-to-uds = { path = "stdio-to-uds" }
 codex-test-macros = { path = "test-macros" }
 codex-tui = { path = "tui" }
+codex-version = { path = "version" }
 codex-utils-absolute-path = { path = "utils/absolute-path" }
 codex-utils-approval-presets = { path = "utils/approval-presets" }
 codex-utils-cache = { path = "utils/cache" }

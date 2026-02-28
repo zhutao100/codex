@@ -1331,7 +1331,7 @@ async fn start_server_task(
         },
         client_info: Implementation {
             name: "codex-mcp-client".to_owned(),
-            version: env!("CARGO_PKG_VERSION").to_owned(),
+            version: crate::CODEX_VERSION.to_owned(),
             title: Some("Codex".into()),
             description: None,
             icons: None,

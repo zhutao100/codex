@@ -71,7 +71,7 @@ pub async fn run_main(
 
     let otel = codex_core::otel_init::build_provider(
         &config,
-        env!("CARGO_PKG_VERSION"),
+        codex_core::CODEX_VERSION,
         Some(OTEL_SERVICE_NAME),
         DEFAULT_ANALYTICS_ENABLED,
     )

@@ -1511,7 +1511,7 @@ async fn websocket_harness_with_options(
         codex_core::test_support::auth_manager_from_auth(CodexAuth::from_api_key("Test API Key"));
     let exporter = InMemoryMetricExporter::default();
     let metrics = MetricsClient::new(
-        MetricsConfig::in_memory("test", "codex-core", env!("CARGO_PKG_VERSION"), exporter)
+        MetricsConfig::in_memory("test", "codex-core", codex_core::CODEX_VERSION, exporter)
             .with_runtime_reader(),
     )
     .expect("in-memory metrics client");

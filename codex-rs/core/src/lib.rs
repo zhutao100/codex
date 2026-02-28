@@ -5,6 +5,8 @@
 // the TUI or the tracing stack).
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
+pub use codex_version::CODEX_VERSION;
+
 mod analytics_client;
 pub mod api_bridge;
 mod apply_patch;

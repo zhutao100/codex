@@ -402,7 +402,7 @@ impl RolloutRecorder {
                         timestamp,
                         cwd: config.cwd.clone(),
                         originator: originator().value,
-                        cli_version: env!("CARGO_PKG_VERSION").to_string(),
+                        cli_version: crate::CODEX_VERSION.to_string(),
                         agent_nickname: source.get_nickname(),
                         agent_role: source.get_agent_role(),
                         source,

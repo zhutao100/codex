@@ -263,7 +263,7 @@ impl SessionTelemetry {
                 model: model.to_owned(),
                 slug: slug.to_owned(),
                 log_user_prompts,
-                app_version: env!("CARGO_PKG_VERSION"),
+                app_version: crate::CODEX_VERSION,
                 terminal_type,
             },
             metrics: crate::metrics::global(),

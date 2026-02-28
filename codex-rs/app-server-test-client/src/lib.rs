@@ -1538,7 +1538,7 @@ impl CodexClient {
                 client_info: ClientInfo {
                     name: "codex-toy-app-server".to_string(),
                     title: Some("Codex Toy App Server".to_string()),
-                    version: env!("CARGO_PKG_VERSION").to_string(),
+                    version: codex_version::CODEX_VERSION.to_string(),
                 },
                 capabilities: Some(InitializeCapabilities {
                     experimental_api,
@@ -2116,7 +2116,7 @@ impl TestClientTracing {
             .context("error loading config")?;
         let otel_provider = codex_core::otel_init::build_provider(
             &config,
-            env!("CARGO_PKG_VERSION"),
+            codex_core::CODEX_VERSION,
             Some(OTEL_SERVICE_NAME),
             DEFAULT_ANALYTICS_ENABLED,
         )

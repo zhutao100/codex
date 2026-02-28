@@ -19,7 +19,7 @@ fn snapshot_collects_metrics_without_shutdown() -> Result<()> {
     let config = MetricsConfig::in_memory(
         "test",
         "codex-cli",
-        env!("CARGO_PKG_VERSION"),
+        codex_otel::CODEX_VERSION,
         exporter.clone(),
     )
     .with_tag("service", "codex-cli")?
@@ -65,7 +65,7 @@ fn snapshot_collects_metrics_without_shutdown() -> Result<()> {
 #[test]
 fn manager_snapshot_metrics_collects_without_shutdown() -> Result<()> {
     let exporter = InMemoryMetricExporter::default();
-    let config = MetricsConfig::in_memory("test", "codex-cli", env!("CARGO_PKG_VERSION"), exporter)
+    let config = MetricsConfig::in_memory("test", "codex-cli", codex_otel::CODEX_VERSION, exporter)
         .with_tag("service", "codex-cli")?
         .with_runtime_reader();
     let metrics = MetricsClient::new(config)?;
@@ -106,7 +106,7 @@ fn manager_snapshot_metrics_collects_without_shutdown() -> Result<()> {
     let expected = BTreeMap::from([
         (
             "app.version".to_string(),
-            env!("CARGO_PKG_VERSION").to_string(),
+            codex_otel::CODEX_VERSION.to_string(),
         ),
         (
             "auth_mode".to_string(),

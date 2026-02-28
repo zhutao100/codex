@@ -1,3 +1,5 @@
+pub use codex_version::CODEX_VERSION;
+
 pub mod config;
 mod events;
 pub mod metrics;

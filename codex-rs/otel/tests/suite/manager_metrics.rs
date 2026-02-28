@@ -51,7 +51,7 @@ fn manager_attaches_metadata_tags_to_metrics() -> Result<()> {
     let expected = BTreeMap::from([
         (
             "app.version".to_string(),
-            env!("CARGO_PKG_VERSION").to_string(),
+            codex_otel::CODEX_VERSION.to_string(),
         ),
         (
             "auth_mode".to_string(),

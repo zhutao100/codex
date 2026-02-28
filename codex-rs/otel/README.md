@@ -24,7 +24,7 @@ use tracing_subscriber::prelude::*;
 let settings = OtelSettings {
     environment: "dev".to_string(),
     service_name: "codex-cli".to_string(),
-    service_version: env!("CARGO_PKG_VERSION").to_string(),
+    service_version: codex_otel::CODEX_VERSION.to_string(),
     codex_home: std::path::PathBuf::from("/tmp"),
     exporter: OtelExporter::OtlpHttp {
         endpoint: "https://otlp.example.com".to_string(),
@@ -92,7 +92,7 @@ use codex_otel::config::{OtelExporter, OtelHttpProtocol};
 let metrics = MetricsClient::new(MetricsConfig::otlp(
     "dev",
     "codex-cli",
-    env!("CARGO_PKG_VERSION"),
+    codex_otel::CODEX_VERSION,
     OtelExporter::OtlpHttp {
         endpoint: "https://api.statsig.com/otlp".to_string(),
         headers: std::collections::HashMap::from([(
@@ -115,7 +115,7 @@ let exporter = InMemoryMetricExporter::default();
 let metrics = MetricsClient::new(MetricsConfig::in_memory(
     "test",
     "codex-cli",
-    env!("CARGO_PKG_VERSION"),
+    codex_otel::CODEX_VERSION,
     exporter.clone(),
 ))?;
 metrics.counter("codex.turns", 1, &[("model", "gpt-5.1")])?;
