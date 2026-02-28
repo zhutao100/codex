@@ -5695,7 +5695,7 @@ fn build_ephemeral_thread(thread_id: ThreadId, config_snapshot: &ThreadConfigSna
         updated_at: now,
         path: None,
         cwd: config_snapshot.cwd.clone(),
-        cli_version: env!("CARGO_PKG_VERSION").to_string(),
+        cli_version: codex_core::CODEX_VERSION.to_string(),
         source: config_snapshot.session_source.clone().into(),
         git_info: None,
         turns: Vec::new(),

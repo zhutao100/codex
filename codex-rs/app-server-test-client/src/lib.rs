@@ -507,7 +507,7 @@ impl CodexClient {
                 client_info: ClientInfo {
                     name: "codex-toy-app-server".to_string(),
                     title: Some("Codex Toy App Server".to_string()),
-                    version: env!("CARGO_PKG_VERSION").to_string(),
+                    version: codex_version::CODEX_VERSION.to_string(),
                 },
                 capabilities: Some(InitializeCapabilities {
                     experimental_api: true,

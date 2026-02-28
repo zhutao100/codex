@@ -299,7 +299,7 @@ pub async fn run_main_with_transport(
 
     let otel = codex_core::otel_init::build_provider(
         &config,
-        env!("CARGO_PKG_VERSION"),
+        codex_core::CODEX_VERSION,
         Some("codex_app_server"),
         default_analytics_enabled,
     )

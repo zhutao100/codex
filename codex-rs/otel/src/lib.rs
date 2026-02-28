@@ -1,3 +1,5 @@
+pub use codex_version::CODEX_VERSION;
+
 pub mod config;
 pub mod metrics;
 pub mod otel_provider;

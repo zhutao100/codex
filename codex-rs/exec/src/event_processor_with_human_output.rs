@@ -148,11 +148,10 @@ impl EventProcessor for EventProcessorWithHumanOutput {
         prompt: &str,
         session_configured_event: &SessionConfiguredEvent,
     ) {
-        const VERSION: &str = env!("CARGO_PKG_VERSION");
         ts_msg!(
             self,
             "OpenAI Codex v{} (research preview)\n--------",
-            VERSION
+            codex_core::CODEX_VERSION
         );
 
         let mut entries =

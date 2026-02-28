@@ -16,7 +16,7 @@ pub(crate) fn build_metrics_with_defaults(
     let mut config = MetricsConfig::in_memory(
         "test",
         "codex-cli",
-        env!("CARGO_PKG_VERSION"),
+        codex_otel::CODEX_VERSION,
         exporter.clone(),
     );
     for (key, value) in default_tags {

@@ -8,6 +8,7 @@ license.workspace = true
 anyhow.workspace = true
 clap = { workspace = true, features = ["derive"] }
 codex-app-server-protocol.workspace = true
+codex-version.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 

@@ -6,7 +6,7 @@ use opentelemetry_sdk::metrics::InMemoryMetricExporter;
 
 fn build_in_memory_client() -> Result<MetricsClient> {
     let exporter = InMemoryMetricExporter::default();
-    let config = MetricsConfig::in_memory("test", "codex-cli", env!("CARGO_PKG_VERSION"), exporter);
+    let config = MetricsConfig::in_memory("test", "codex-cli", codex_otel::CODEX_VERSION, exporter);
     MetricsClient::new(config)
 }
 
@@ -16,7 +16,7 @@ fn invalid_tag_component_is_rejected() -> Result<()> {
     let err = MetricsConfig::in_memory(
         "test",
         "codex-cli",
-        env!("CARGO_PKG_VERSION"),
+        codex_otel::CODEX_VERSION,
         InMemoryMetricExporter::default(),
     )
     .with_tag("bad key", "value")

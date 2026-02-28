@@ -10,6 +10,7 @@ members = [
     "apply-patch",
     "arg0",
     "feedback",
+    "version",
     "codex-backend-openapi-models",
     "cloud-requirements",
     "cloud-tasks",
@@ -102,6 +103,7 @@ codex-rmcp-client = { path = "rmcp-client" }
 codex-state = { path = "state" }
 codex-stdio-to-uds = { path = "stdio-to-uds" }
 codex-tui = { path = "tui" }
+codex-version = { path = "version" }
 codex-utils-absolute-path = { path = "utils/absolute-path" }
 codex-utils-cache = { path = "utils/cache" }
 codex-utils-cargo-bin = { path = "utils/cargo-bin" }

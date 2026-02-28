@@ -98,7 +98,7 @@ impl AppServerClient {
                 client_info: ClientInfo {
                     name: "debug-client".to_string(),
                     title: Some("Debug Client".to_string()),
-                    version: env!("CARGO_PKG_VERSION").to_string(),
+                    version: codex_version::CODEX_VERSION.to_string(),
                 },
                 capabilities: Some(InitializeCapabilities {
                     experimental_api: true,
