@@ -15,6 +15,8 @@ use crate::agent::agent_status_from_event;
 use crate::analytics_client::AnalyticsEventsClient;
 use crate::analytics_client::build_track_events_context;
 use crate::compact;
+use crate::compact::AUTO_COMPACT_WORK_NOTES_REQUEST_TAG;
+use crate::compact::AUTO_COMPACT_WORK_NOTES_TAG;
 use crate::compact::run_inline_auto_compact_task;
 use crate::compact::should_use_remote_compact_task;
 use crate::compact_remote::run_inline_remote_auto_compact_task;
@@ -190,6 +192,7 @@ use crate::tasks::SessionTask;
 use crate::tasks::SessionTaskContext;
 use crate::tools::ToolRouter;
 use crate::tools::context::SharedTurnDiffTracker;
+use crate::tools::parallel::ToolCallExecutionMode;
 use crate::tools::parallel::ToolCallRuntime;
 use crate::tools::sandboxing::ApprovalStore;
 use crate::tools::spec::ToolsConfig;
@@ -3348,6 +3351,42 @@ fn errors_to_info(errors: &[SkillError]) -> Vec<SkillErrorInfo> {
         .collect()
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+enum PreCompactNotesState {
+    #[default]
+    Idle,
+    AwaitingNotes,
+}
+
+async fn inject_pre_compact_work_notes_request(sess: &Session, turn_context: &TurnContext) {
+    let request = format!(
+        "{AUTO_COMPACT_WORK_NOTES_REQUEST_TAG}\n\
+Token limit is approaching and follow-up work is still needed.\n\
+\n\
+Respond with exactly one assistant message and do not call tools.\n\
+Produce structured SESSION WORK NOTES for the next model after compaction.\n\
+\n\
+Required sections:\n\
+- Objective\n\
+- Current status\n\
+- Validated findings\n\
+- Ruled-out hypotheses / dead ends\n\
+- Open hypotheses / unresolved questions\n\
+- Relevant files / why\n\
+- Irrelevant files / why skip\n\
+- Edits made\n\
+- Edits in progress / intended edits\n\
+- Next best step\n\
+\n\
+Keep it concise but loss-resistant.\n\
+Begin with: {AUTO_COMPACT_WORK_NOTES_TAG}\n\
+</AUTO_COMPACT_WORK_NOTES_REQUEST>"
+    );
+    let message: ResponseItem = DeveloperInstructions::new(request).into();
+    sess.record_conversation_items(turn_context, std::slice::from_ref(&message))
+        .await;
+}
+
 /// Takes a user message as input and runs a loop where, at each sampling request, the model
 /// replies with either:
 ///
@@ -3382,7 +3421,7 @@ pub(crate) async fn run_turn(
     });
     sess.send_event(&turn_context, event).await;
     if total_usage_tokens >= auto_compact_limit {
-        run_auto_compact(&sess, &turn_context).await;
+        run_auto_compact(&sess, &turn_context, None).await;
     }
 
     let skills_outcome = Some(
@@ -3482,6 +3521,8 @@ pub(crate) async fn run_turn(
         .client
         .new_session(Some(turn_context.cwd.clone()));
 
+    let mut pre_compact_notes_state = PreCompactNotesState::Idle;
+
     loop {
         // Note that pending_input would be something like a message the user
         // submitted through the UI while the model was running. Though the UI
@@ -3492,6 +3533,14 @@ pub(crate) async fn run_turn(
             .into_iter()
             .map(ResponseItem::from)
             .collect::<Vec<ResponseItem>>();
+
+        if matches!(pre_compact_notes_state, PreCompactNotesState::AwaitingNotes)
+            && !pending_input.is_empty()
+        {
+            run_auto_compact(&sess, &turn_context, None).await;
+            pre_compact_notes_state = PreCompactNotesState::Idle;
+            continue;
+        }
 
         // Construct the input that we will send to the model.
         let sampling_request_input: Vec<ResponseItem> = {
@@ -3512,6 +3561,12 @@ pub(crate) async fn run_turn(
             explicit_app_paths: &explicit_app_paths,
             skill_name_counts_lower: &skill_name_counts_lower,
         };
+        let tool_execution_mode = match pre_compact_notes_state {
+            PreCompactNotesState::Idle => ToolCallExecutionMode::Normal,
+            PreCompactNotesState::AwaitingNotes => ToolCallExecutionMode::RejectAll {
+                reason: "tool use disabled during auto-compact work-notes capture",
+            },
+        };
         match run_sampling_request(
             Arc::clone(&sess),
             Arc::clone(&turn_context),
@@ -3519,6 +3574,7 @@ pub(crate) async fn run_turn(
             &mut client_session,
             sampling_request_input,
             tool_selection,
+            tool_execution_mode,
             cancellation_token.child_token(),
         )
         .await
@@ -3544,9 +3600,23 @@ pub(crate) async fn run_turn(
                     "post sampling token usage"
                 );
 
-                // as long as compaction works well in getting us way below the token limit, we shouldn't worry about being in an infinite loop.
+                if matches!(pre_compact_notes_state, PreCompactNotesState::AwaitingNotes) {
+                    run_auto_compact(&sess, &turn_context, sampling_request_last_agent_message)
+                        .await;
+                    pre_compact_notes_state = PreCompactNotesState::Idle;
+                    continue;
+                }
+
+                // as long as compaction works well in getting us way below the token limit, we
+                // shouldn't worry about being in an infinite loop.
                 if token_limit_reached && needs_follow_up {
-                    run_auto_compact(&sess, &turn_context).await;
+                    if turn_context.final_output_json_schema.is_some() {
+                        run_auto_compact(&sess, &turn_context, None).await;
+                        continue;
+                    }
+
+                    inject_pre_compact_work_notes_request(&sess, &turn_context).await;
+                    pre_compact_notes_state = PreCompactNotesState::AwaitingNotes;
                     continue;
                 }
 
@@ -3567,6 +3637,12 @@ pub(crate) async fn run_turn(
             Err(CodexErr::TurnAborted) => {
                 // Aborted turn is reported via a different event.
                 break;
+            }
+            Err(e) if matches!(pre_compact_notes_state, PreCompactNotesState::AwaitingNotes) => {
+                info!("Work-notes capture failed; compacting without notes: {e:#}");
+                run_auto_compact(&sess, &turn_context, None).await;
+                pre_compact_notes_state = PreCompactNotesState::Idle;
+                continue;
             }
             Err(CodexErr::InvalidImageRequest()) => {
                 let mut state = sess.state.lock().await;
@@ -3597,11 +3673,25 @@ pub(crate) async fn run_turn(
     last_agent_message
 }
 
-async fn run_auto_compact(sess: &Arc<Session>, turn_context: &Arc<TurnContext>) {
+async fn run_auto_compact(
+    sess: &Arc<Session>,
+    turn_context: &Arc<TurnContext>,
+    preserved_work_notes: Option<String>,
+) {
     if should_use_remote_compact_task(sess.as_ref(), &turn_context.client.get_provider()) {
-        run_inline_remote_auto_compact_task(Arc::clone(sess), Arc::clone(turn_context)).await;
+        run_inline_remote_auto_compact_task(
+            Arc::clone(sess),
+            Arc::clone(turn_context),
+            preserved_work_notes,
+        )
+        .await;
     } else {
-        run_inline_auto_compact_task(Arc::clone(sess), Arc::clone(turn_context)).await;
+        run_inline_auto_compact_task(
+            Arc::clone(sess),
+            Arc::clone(turn_context),
+            preserved_work_notes,
+        )
+        .await;
     }
 }
 
@@ -3703,6 +3793,7 @@ struct SamplingRequestToolSelection<'a> {
     skill_name_counts_lower: &'a HashMap<String, usize>,
 }
 
+#[allow(clippy::too_many_arguments)]
 #[instrument(level = "trace",
     skip_all,
     fields(
@@ -3718,6 +3809,7 @@ async fn run_sampling_request(
     client_session: &mut ModelClientSession,
     input: Vec<ResponseItem>,
     tool_selection: SamplingRequestToolSelection<'_>,
+    tool_execution_mode: ToolCallExecutionMode,
     cancellation_token: CancellationToken,
 ) -> CodexResult<SamplingRequestResult> {
     let mut mcp_tools = sess
@@ -3778,6 +3870,7 @@ async fn run_sampling_request(
             client_session,
             Arc::clone(&turn_diff_tracker),
             &prompt,
+            tool_execution_mode,
             cancellation_token.child_token(),
         )
         .await
@@ -4260,6 +4353,7 @@ async fn try_run_sampling_request(
     client_session: &mut ModelClientSession,
     turn_diff_tracker: SharedTurnDiffTracker,
     prompt: &Prompt,
+    tool_execution_mode: ToolCallExecutionMode,
     cancellation_token: CancellationToken,
 ) -> CodexResult<SamplingRequestResult> {
     let collaboration_mode = sess.current_collaboration_mode().await;
@@ -4299,7 +4393,8 @@ async fn try_run_sampling_request(
         Arc::clone(&sess),
         Arc::clone(&turn_context),
         Arc::clone(&turn_diff_tracker),
-    );
+    )
+    .with_execution_mode(tool_execution_mode);
     let mut in_flight: FuturesOrdered<BoxFuture<'static, CodexResult<ResponseInputItem>>> =
         FuturesOrdered::new();
     let mut needs_follow_up = false;
