@@ -3,6 +3,7 @@ I traced the current path from `core/src/codex.rs:3365-3599` outward, and the cl
 * keep the existing `run_turn` loop and `client_session`
 * add **one extra ordinary sampling round** right before compaction
 * make that round emit **structured work notes**
+* suppress tool execution **at runtime** for that note round (keep the tool list unchanged in the prompt)
 * then compact using the **original session history** as the compaction source
 * inject the work notes **verbatim** into the post-compaction history using existing `replacement_history` support
 
@@ -137,6 +138,10 @@ if matches!(pre_compact_notes_state, PreCompactNotesState::AwaitingNotes) {
 }
 
 if token_limit_reached && needs_follow_up {
+    if turn_context.final_output_json_schema.is_some() {
+        run_auto_compact(&sess, &turn_context, None).await;
+        continue;
+    }
     inject_pre_compact_notes_request(&sess, &turn_context).await;
     pre_compact_notes_state = PreCompactNotesState::AwaitingNotes;
     continue;
@@ -187,6 +192,31 @@ Use a sentinel marker so the code can recognize the transient orchestration suff
 
 I would record this into history and rollout, but not treat it as durable user content.
 
+## 2.5) Suppress tool execution for the note round (without prompt drift)
+
+Even with a “do not call tools” instruction, the safest design is to ensure the note round cannot execute tools at all.
+
+However, you **should not** disable tools at the prompt level (e.g., emptying `tools` in the `Prompt`), because that changes the prompt/tool surface and can defeat prefix caching. Instead:
+
+* keep the tool list in the prompt unchanged
+* suppress tool execution at the runtime layer for this specific sampling request
+
+Concrete shape:
+
+* extend `ToolCallRuntime` (`core/src/tools/parallel.rs`) with a small execution mode:
+
+  ```rust
+  enum ToolCallExecutionMode {
+      Normal,
+      RejectAll { reason: &'static str },
+  }
+  ```
+
+* plumb the mode as a per-sampling-request flag (e.g., an extra `try_run_sampling_request(...)` parameter, or a `ToolCallRuntime::with_execution_mode(...)` helper)
+* when `RejectAll` is active, `handle_tool_call(...)` short-circuits and returns a synthetic tool output payload immediately (for example: “tool use disabled during auto-compact work-notes capture”)
+
+This guarantees “no side effects” during the notes round while preserving the same prompt prefix/tool inventory.
+
 ## 3) Change `run_auto_compact(...)` to accept optional preserved notes
 
 Current signature:
@@ -211,6 +241,17 @@ Only two call sites change:
 * the mid-turn post-note compact passes `Some(notes)` or `None`
 
 That is a very small, low-conflict signature change.
+
+## 3.5) Guardrail: skip the note round when an output schema is active
+
+`run_sampling_request(...)` uses `turn_context.final_output_json_schema.clone()` as `Prompt.output_schema` (`core/src/codex.rs:3769`). If a schema is active, asking the model to emit free-form work notes is likely to:
+
+* produce invalid schema output, or
+* cause the model to fight the schema instead of emitting usable notes
+
+For a minimal, low-conflict patch, add a guard at the note-round trigger:
+
+* if `turn_context.final_output_json_schema.is_some()`, skip the note round and compact immediately (as today)
 
 ## 4) Strip the transient note-request round from the compaction source history
 
@@ -393,6 +434,7 @@ This should degrade cleanly.
 
 If the model calls tools instead of emitting notes:
 
+* tool execution should already be suppressed at runtime for this round
 * do **not** keep looping on the note round
 * compact immediately
 * preferably discard the transient note-request suffix from compaction input
