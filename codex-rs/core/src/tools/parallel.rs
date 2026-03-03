@@ -21,6 +21,15 @@ use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseInputItem;
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) enum ToolCallExecutionMode {
+    #[default]
+    Normal,
+    RejectAll {
+        reason: &'static str,
+    },
+}
+
 #[derive(Clone)]
 pub(crate) struct ToolCallRuntime {
     router: Arc<ToolRouter>,
@@ -28,6 +37,7 @@ pub(crate) struct ToolCallRuntime {
     turn_context: Arc<TurnContext>,
     tracker: SharedTurnDiffTracker,
     parallel_execution: Arc<RwLock<()>>,
+    execution_mode: ToolCallExecutionMode,
 }
 
 impl ToolCallRuntime {
@@ -43,15 +53,25 @@ impl ToolCallRuntime {
             turn_context,
             tracker,
             parallel_execution: Arc::new(RwLock::new(())),
+            execution_mode: ToolCallExecutionMode::Normal,
         }
     }
 
+    pub(crate) fn with_execution_mode(mut self, execution_mode: ToolCallExecutionMode) -> Self {
+        self.execution_mode = execution_mode;
+        self
+    }
+
     #[instrument(level = "trace", skip_all, fields(call = ?call))]
-    pub(crate) fn handle_tool_call(
+    pub(crate) async fn handle_tool_call(
         self,
         call: ToolCall,
         cancellation_token: CancellationToken,
-    ) -> impl std::future::Future<Output = Result<ResponseInputItem, CodexErr>> {
+    ) -> Result<ResponseInputItem, CodexErr> {
+        if let ToolCallExecutionMode::RejectAll { reason } = self.execution_mode {
+            return Ok(Self::rejected_response(&call, reason));
+        }
+
         let supports_parallel = self.router.tool_supports_parallel(&call.tool_name);
 
         let router = Arc::clone(&self.router);
@@ -92,17 +112,14 @@ impl ToolCallRuntime {
                 }
             }));
 
-        async move {
-            match handle.await {
-                Ok(Ok(response)) => Ok(response),
-                Ok(Err(FunctionCallError::Fatal(message))) => Err(CodexErr::Fatal(message)),
-                Ok(Err(other)) => Err(CodexErr::Fatal(other.to_string())),
-                Err(err) => Err(CodexErr::Fatal(format!(
-                    "tool task failed to receive: {err:?}"
-                ))),
-            }
+        match handle.await {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(FunctionCallError::Fatal(message))) => Err(CodexErr::Fatal(message)),
+            Ok(Err(other)) => Err(CodexErr::Fatal(other.to_string())),
+            Err(err) => Err(CodexErr::Fatal(format!(
+                "tool task failed to receive: {err:?}"
+            ))),
         }
-        .in_current_span()
     }
 }
 
@@ -122,6 +139,26 @@ impl ToolCallRuntime {
                 output: FunctionCallOutputPayload {
                     body: FunctionCallOutputBody::Text(Self::abort_message(call, secs)),
                     ..Default::default()
+                },
+            },
+        }
+    }
+
+    fn rejected_response(call: &ToolCall, reason: &str) -> ResponseInputItem {
+        match &call.payload {
+            ToolPayload::Custom { .. } => ResponseInputItem::CustomToolCallOutput {
+                call_id: call.call_id.clone(),
+                output: reason.to_string(),
+            },
+            ToolPayload::Mcp { .. } => ResponseInputItem::McpToolCallOutput {
+                call_id: call.call_id.clone(),
+                result: Err(reason.to_string()),
+            },
+            _ => ResponseInputItem::FunctionCallOutput {
+                call_id: call.call_id.clone(),
+                output: FunctionCallOutputPayload {
+                    body: FunctionCallOutputBody::Text(reason.to_string()),
+                    success: Some(false),
                 },
             },
         }
