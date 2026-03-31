@@ -4,7 +4,10 @@ use crate::Prompt;
 use crate::codex::Session;
 use crate::codex::TurnContext;
 use crate::compact::InitialContextInjection;
+use crate::compact::PreparedCompactionInput;
 use crate::compact::insert_initial_context_before_last_real_user_or_summary;
+use crate::compact::insert_preserved_work_notes;
+use crate::compact::prepare_history_for_compaction;
 use crate::context_manager::ContextManager;
 use crate::context_manager::TotalTokenUsageBreakdown;
 use crate::context_manager::estimate_response_item_model_visible_bytes;
@@ -26,8 +29,15 @@ pub(crate) async fn run_inline_remote_auto_compact_task(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
     initial_context_injection: InitialContextInjection,
+    preserved_work_notes: Option<String>,
 ) -> CodexResult<()> {
-    run_remote_compact_task_inner(&sess, &turn_context, initial_context_injection).await?;
+    run_remote_compact_task_inner(
+        &sess,
+        &turn_context,
+        initial_context_injection,
+        preserved_work_notes,
+    )
+    .await?;
     Ok(())
 }
 
@@ -42,16 +52,28 @@ pub(crate) async fn run_remote_compact_task(
     });
     sess.send_event(&turn_context, start_event).await;
 
-    run_remote_compact_task_inner(&sess, &turn_context, InitialContextInjection::DoNotInject).await
+    run_remote_compact_task_inner(
+        &sess,
+        &turn_context,
+        InitialContextInjection::DoNotInject,
+        None,
+    )
+    .await
 }
 
 async fn run_remote_compact_task_inner(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
     initial_context_injection: InitialContextInjection,
+    preserved_work_notes: Option<String>,
 ) -> CodexResult<()> {
-    if let Err(err) =
-        run_remote_compact_task_inner_impl(sess, turn_context, initial_context_injection).await
+    if let Err(err) = run_remote_compact_task_inner_impl(
+        sess,
+        turn_context,
+        initial_context_injection,
+        preserved_work_notes,
+    )
+    .await
     {
         let event = EventMsg::Error(
             err.to_error_event(Some("Error running remote compact task".to_string())),
@@ -66,14 +88,18 @@ async fn run_remote_compact_task_inner_impl(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
     initial_context_injection: InitialContextInjection,
+    preserved_work_notes: Option<String>,
 ) -> CodexResult<()> {
     let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
     sess.emit_turn_item_started(turn_context, &compaction_item)
         .await;
-    let mut history = sess.clone_history().await;
     let base_instructions = sess.get_base_instructions().await;
+    let PreparedCompactionInput {
+        mut source_history,
+        preserved_work_notes,
+    } = prepare_history_for_compaction(sess.clone_history().await, preserved_work_notes);
     let deleted_items = trim_function_call_history_to_fit_context_window(
-        &mut history,
+        &mut source_history,
         turn_context.as_ref(),
         &base_instructions,
     );
@@ -85,7 +111,7 @@ async fn run_remote_compact_task_inner_impl(
         );
     }
     // Required to keep `/undo` available after compaction
-    let ghost_snapshots: Vec<ResponseItem> = history
+    let ghost_snapshots: Vec<ResponseItem> = source_history
         .raw_items()
         .iter()
         .filter(|item| matches!(item, ResponseItem::GhostSnapshot { .. }))
@@ -93,7 +119,7 @@ async fn run_remote_compact_task_inner_impl(
         .collect();
 
     let prompt = Prompt {
-        input: history.for_prompt(&turn_context.model_info.input_modalities),
+        input: source_history.for_prompt(&turn_context.model_info.input_modalities),
         tools: vec![],
         parallel_tool_calls: false,
         base_instructions,
@@ -130,6 +156,9 @@ async fn run_remote_compact_task_inner_impl(
     )
     .await;
 
+    if let Some(notes) = preserved_work_notes.as_ref() {
+        insert_preserved_work_notes(&mut new_history, notes);
+    }
     if !ghost_snapshots.is_empty() {
         new_history.extend(ghost_snapshots);
     }

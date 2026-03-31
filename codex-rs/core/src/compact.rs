@@ -9,6 +9,7 @@ use crate::codex::PreviousTurnSettings;
 use crate::codex::Session;
 use crate::codex::TurnContext;
 use crate::codex::get_last_assistant_message_from_turn;
+use crate::context_manager::ContextManager;
 use crate::error::CodexErr;
 use crate::error::Result as CodexResult;
 use crate::protocol::CompactedItem;
@@ -30,7 +31,15 @@ use tracing::error;
 
 pub const SUMMARIZATION_PROMPT: &str = include_str!("../templates/compact/prompt.md");
 pub const SUMMARY_PREFIX: &str = include_str!("../templates/compact/summary_prefix.md");
+pub(crate) const AUTO_COMPACT_WORK_NOTES_REQUEST_TAG: &str = "<AUTO_COMPACT_WORK_NOTES_REQUEST>";
+pub(crate) const AUTO_COMPACT_WORK_NOTES_TAG: &str = "<AUTO_COMPACT_WORK_NOTES>";
+const PRESERVED_WORK_NOTES_MESSAGE_PREFIX: &str = "Immediately before compaction, the previous model emitted the following preserved session work notes.\nThese notes are verbatim and are intended to prevent duplicate work and repeated dead ends:\n\n";
 const COMPACT_USER_MESSAGE_MAX_TOKENS: usize = 20_000;
+
+pub(crate) struct PreparedCompactionInput {
+    pub(crate) source_history: ContextManager,
+    pub(crate) preserved_work_notes: Option<String>,
+}
 
 /// Controls whether compaction replacement history must include initial context.
 ///
@@ -55,6 +64,7 @@ pub(crate) async fn run_inline_auto_compact_task(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
     initial_context_injection: InitialContextInjection,
+    preserved_work_notes: Option<String>,
 ) -> CodexResult<()> {
     let prompt = turn_context.compact_prompt().to_string();
     let input = vec![UserInput::Text {
@@ -63,7 +73,14 @@ pub(crate) async fn run_inline_auto_compact_task(
         text_elements: Vec::new(),
     }];
 
-    run_compact_task_inner(sess, turn_context, input, initial_context_injection).await?;
+    run_compact_task_inner(
+        sess,
+        turn_context,
+        input,
+        initial_context_injection,
+        preserved_work_notes,
+    )
+    .await?;
     Ok(())
 }
 
@@ -83,6 +100,7 @@ pub(crate) async fn run_compact_task(
         turn_context,
         input,
         InitialContextInjection::DoNotInject,
+        None,
     )
     .await
 }
@@ -92,13 +110,18 @@ async fn run_compact_task_inner(
     turn_context: Arc<TurnContext>,
     input: Vec<UserInput>,
     initial_context_injection: InitialContextInjection,
+    preserved_work_notes: Option<String>,
 ) -> CodexResult<()> {
     let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
     sess.emit_turn_item_started(&turn_context, &compaction_item)
         .await;
     let initial_input_for_turn: ResponseInputItem = ResponseInputItem::from(input);
 
-    let mut history = sess.clone_history().await;
+    let PreparedCompactionInput {
+        source_history,
+        preserved_work_notes,
+    } = prepare_history_for_compaction(sess.clone_history().await, preserved_work_notes);
+    let mut history = source_history;
     history.record_items(
         &[initial_input_for_turn.into()],
         turn_context.truncation_policy,
@@ -204,6 +227,9 @@ async fn run_compact_task_inner(
         new_history =
             insert_initial_context_before_last_real_user_or_summary(new_history, initial_context);
     }
+    if let Some(notes) = preserved_work_notes.as_ref() {
+        insert_preserved_work_notes(&mut new_history, notes);
+    }
     let ghost_snapshots: Vec<ResponseItem> = history_items
         .iter()
         .filter(|item| matches!(item, ResponseItem::GhostSnapshot { .. }))
@@ -255,7 +281,9 @@ pub(crate) fn collect_user_messages(items: &[ResponseItem]) -> Vec<String> {
         .iter()
         .filter_map(|item| match crate::event_mapping::parse_turn_item(item) {
             Some(TurnItem::UserMessage(user)) => {
-                if is_summary_message(&user.message()) {
+                if is_summary_message(&user.message())
+                    || is_preserved_work_notes_message(&user.message())
+                {
                     None
                 } else {
                     Some(user.message())
@@ -268,6 +296,52 @@ pub(crate) fn collect_user_messages(items: &[ResponseItem]) -> Vec<String> {
 
 pub(crate) fn is_summary_message(message: &str) -> bool {
     message.starts_with(format!("{SUMMARY_PREFIX}\n").as_str())
+}
+
+pub(crate) fn is_preserved_work_notes_message(message: &str) -> bool {
+    message.starts_with(PRESERVED_WORK_NOTES_MESSAGE_PREFIX)
+}
+
+pub(crate) fn preserved_work_notes_message(work_notes: &str) -> ResponseItem {
+    let text = format!("{PRESERVED_WORK_NOTES_MESSAGE_PREFIX}{work_notes}");
+    ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText { text }],
+        end_turn: None,
+        phase: None,
+    }
+}
+
+pub(crate) fn insert_preserved_work_notes(history: &mut Vec<ResponseItem>, work_notes: &str) {
+    if work_notes.trim().is_empty() {
+        return;
+    }
+
+    let insertion_index = history
+        .iter()
+        .rposition(|item| matches!(item, ResponseItem::Compaction { .. }))
+        .or_else(|| history.iter().rposition(is_summary_item));
+
+    let message = preserved_work_notes_message(work_notes);
+    if let Some(index) = insertion_index {
+        history.insert(index, message);
+    } else {
+        history.push(message);
+    }
+}
+
+fn is_summary_item(item: &ResponseItem) -> bool {
+    let ResponseItem::Message { role, content, .. } = item else {
+        return false;
+    };
+    if role != "user" {
+        return false;
+    }
+    let Some(text) = content_items_to_text(content) else {
+        return false;
+    };
+    is_summary_message(&text)
 }
 
 /// Inserts canonical initial context into compacted replacement history at the
@@ -387,6 +461,76 @@ fn build_compacted_history_with_limit(
     });
 
     history
+}
+
+pub(crate) fn prepare_history_for_compaction(
+    mut history: ContextManager,
+    preserved_work_notes: Option<String>,
+) -> PreparedCompactionInput {
+    let mut items = history.raw_items().to_vec();
+
+    // Drop the transient work-notes request suffix if it was injected.
+    if let Some(idx) = items.iter().rposition(is_work_notes_request_item) {
+        items.truncate(idx);
+    }
+
+    let extracted_work_notes = extract_existing_preserved_work_notes(&items);
+    items.retain(|item| !is_preserved_work_notes_item(item));
+    history.replace(items);
+
+    let preserved_work_notes = preserved_work_notes
+        .and_then(|notes| (!notes.trim().is_empty()).then_some(notes))
+        .or(extracted_work_notes);
+
+    PreparedCompactionInput {
+        source_history: history,
+        preserved_work_notes,
+    }
+}
+
+fn is_work_notes_request_item(item: &ResponseItem) -> bool {
+    let ResponseItem::Message { role, content, .. } = item else {
+        return false;
+    };
+    if role != "developer" {
+        return false;
+    }
+
+    let Some(text) = content_items_to_text(content) else {
+        return false;
+    };
+
+    text.contains(AUTO_COMPACT_WORK_NOTES_REQUEST_TAG)
+}
+
+fn is_preserved_work_notes_item(item: &ResponseItem) -> bool {
+    let ResponseItem::Message { role, content, .. } = item else {
+        return false;
+    };
+    if role != "user" {
+        return false;
+    }
+    let Some(text) = content_items_to_text(content) else {
+        return false;
+    };
+    is_preserved_work_notes_message(&text)
+}
+
+fn extract_existing_preserved_work_notes(items: &[ResponseItem]) -> Option<String> {
+    items.iter().rev().find_map(|item| {
+        let ResponseItem::Message { role, content, .. } = item else {
+            return None;
+        };
+        if role != "user" {
+            return None;
+        }
+        let text = content_items_to_text(content)?;
+        if !is_preserved_work_notes_message(&text) {
+            return None;
+        }
+        text.strip_prefix(PRESERVED_WORK_NOTES_MESSAGE_PREFIX)
+            .map(ToString::to_string)
+    })
 }
 
 async fn drain_to_completed(
@@ -561,6 +705,145 @@ do things
         let collected = collect_user_messages(&items);
 
         assert_eq!(vec!["real user message".to_string()], collected);
+    }
+
+    #[test]
+    fn collect_user_messages_filters_preserved_work_notes_messages() {
+        let items = vec![
+            ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "real user message".to_string(),
+                }],
+                end_turn: None,
+                phase: None,
+            },
+            preserved_work_notes_message("notes"),
+        ];
+
+        let collected = collect_user_messages(&items);
+
+        assert_eq!(vec!["real user message".to_string()], collected);
+    }
+
+    #[test]
+    fn insert_preserved_work_notes_inserts_before_summary_message() {
+        let summary_text = format!("{SUMMARY_PREFIX}\nsummary text");
+        let user_messages = vec!["user message".to_string()];
+        let mut history = build_compacted_history(Vec::new(), &user_messages, &summary_text);
+
+        insert_preserved_work_notes(&mut history, "notes");
+
+        let Some(last) = history.last() else {
+            panic!("expected history to have a summary entry");
+        };
+        let last_text = match last {
+            ResponseItem::Message { role, content, .. } if role == "user" => {
+                content_items_to_text(content).unwrap_or_default()
+            }
+            other => panic!("expected summary message, found {other:?}"),
+        };
+        assert!(
+            is_summary_message(&last_text),
+            "expected summary message to remain last in history"
+        );
+
+        let notes_item = &history[history.len().saturating_sub(2)];
+        let notes_text = match notes_item {
+            ResponseItem::Message { role, content, .. } if role == "user" => {
+                content_items_to_text(content).unwrap_or_default()
+            }
+            other => panic!("expected preserved notes message, found {other:?}"),
+        };
+        assert!(
+            is_preserved_work_notes_message(&notes_text),
+            "expected preserved notes message to be inserted immediately before summary"
+        );
+    }
+
+    #[test]
+    fn insert_preserved_work_notes_inserts_before_compaction_item() {
+        let mut history = vec![
+            ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "user message".to_string(),
+                }],
+                end_turn: None,
+                phase: None,
+            },
+            ResponseItem::Compaction {
+                encrypted_content: "encrypted".to_string(),
+            },
+        ];
+
+        insert_preserved_work_notes(&mut history, "notes");
+
+        assert!(
+            matches!(history.last(), Some(ResponseItem::Compaction { .. })),
+            "expected compaction item to remain last in history"
+        );
+
+        let notes_item = &history[history.len().saturating_sub(2)];
+        let notes_text = match notes_item {
+            ResponseItem::Message { role, content, .. } if role == "user" => {
+                content_items_to_text(content).unwrap_or_default()
+            }
+            other => panic!("expected preserved notes message, found {other:?}"),
+        };
+        assert!(
+            is_preserved_work_notes_message(&notes_text),
+            "expected preserved notes message to be inserted immediately before compaction item"
+        );
+    }
+
+    #[test]
+    fn prepare_history_for_compaction_strips_work_notes_request_suffix() {
+        let mut history = ContextManager::new();
+        history.replace(vec![
+            ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "keep".to_string(),
+                }],
+                end_turn: None,
+                phase: None,
+            },
+            preserved_work_notes_message("previous notes"),
+            ResponseItem::Message {
+                id: None,
+                role: "developer".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: format!("{AUTO_COMPACT_WORK_NOTES_REQUEST_TAG}\nrequest"),
+                }],
+                end_turn: None,
+                phase: None,
+            },
+            ResponseItem::Message {
+                id: None,
+                role: "assistant".to_string(),
+                content: vec![ContentItem::OutputText {
+                    text: "transient".to_string(),
+                }],
+                end_turn: None,
+                phase: None,
+            },
+        ]);
+
+        let prepared = prepare_history_for_compaction(history, None);
+
+        assert_eq!(
+            prepared.preserved_work_notes,
+            Some("previous notes".to_string())
+        );
+        assert_eq!(prepared.source_history.raw_items().len(), 1);
+        assert_eq!(
+            collect_user_messages(prepared.source_history.raw_items()),
+            vec!["keep".to_string()]
+        );
     }
 
     #[test]
