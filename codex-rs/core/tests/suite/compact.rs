@@ -61,6 +61,8 @@ const DUMMY_FUNCTION_NAME: &str = "unsupported_tool";
 const DUMMY_CALL_ID: &str = "call-multi-auto";
 const FUNCTION_CALL_LIMIT_MSG: &str = "function call limit push";
 const POST_AUTO_USER_MSG: &str = "post auto follow-up";
+const WORK_NOTES_TEXT: &str =
+    "<AUTO_COMPACT_WORK_NOTES>\nObjective: Preserve work notes.\nCurrent status: Test fixture.";
 
 pub(super) const COMPACT_WARNING_MESSAGE: &str = "Heads up: Long threads and multiple compactions can cause the model to be less accurate. Start a new thread when possible to keep threads small and targeted.";
 
@@ -1082,16 +1084,20 @@ async fn auto_compact_runs_after_token_limit_hit() {
     ]);
 
     let sse3 = sse(vec![
-        ev_assistant_message("m3", AUTO_SUMMARY_TEXT),
-        ev_completed_with_tokens("r3", 200),
+        ev_assistant_message("m3", WORK_NOTES_TEXT),
+        ev_completed_with_tokens("r3", 10),
     ]);
     let sse4 = sse(vec![
-        ev_assistant_message("m4", FINAL_REPLY),
-        ev_completed_with_tokens("r4", 120),
+        ev_assistant_message("m4", AUTO_SUMMARY_TEXT),
+        ev_completed_with_tokens("r4", 200),
+    ]);
+    let sse5 = sse(vec![
+        ev_assistant_message("m5", FINAL_REPLY),
+        ev_completed_with_tokens("r5", 120),
     ]);
     let prefixed_auto_summary = AUTO_SUMMARY_TEXT;
 
-    let request_log = mount_sse_sequence(&server, vec![sse1, sse2, sse3, sse4]).await;
+    let request_log = mount_sse_sequence(&server, vec![sse1, sse2, sse3, sse4, sse5]).await;
 
     let model_provider = non_openai_model_provider(&server);
 
@@ -1148,7 +1154,7 @@ async fn auto_compact_runs_after_token_limit_hit() {
         .collect();
     assert_eq!(
         request_bodies.len(),
-        4,
+        5,
         "expected user turns, a compaction request, and the follow-up turn; got {}",
         request_bodies.len()
     );
@@ -1166,8 +1172,8 @@ async fn auto_compact_runs_after_token_limit_hit() {
         .find_map(|(idx, body)| body_contains_text(body, SUMMARIZATION_PROMPT).then_some(idx))
         .expect("auto compact request missing");
     assert_eq!(
-        auto_compact_index, 2,
-        "auto compact should add a third request"
+        auto_compact_index, 3,
+        "auto compact should add a fourth request"
     );
 
     let follow_up_index = request_bodies
@@ -1179,7 +1185,7 @@ async fn auto_compact_runs_after_token_limit_hit() {
                 .then_some(idx)
         })
         .expect("follow-up request missing");
-    assert_eq!(follow_up_index, 3, "follow-up request should be last");
+    assert_eq!(follow_up_index, 4, "follow-up request should be last");
 
     let body_first = requests[0].body_json();
     let body_auto = requests[auto_compact_index].body_json();
@@ -1273,15 +1279,19 @@ async fn auto_compact_emits_context_compaction_items() {
         ev_completed_with_tokens("r2", 330_000),
     ]);
     let sse3 = sse(vec![
-        ev_assistant_message("m3", AUTO_SUMMARY_TEXT),
-        ev_completed_with_tokens("r3", 200),
+        ev_assistant_message("m3", WORK_NOTES_TEXT),
+        ev_completed_with_tokens("r3", 10),
     ]);
     let sse4 = sse(vec![
-        ev_assistant_message("m4", FINAL_REPLY),
-        ev_completed_with_tokens("r4", 120),
+        ev_assistant_message("m4", AUTO_SUMMARY_TEXT),
+        ev_completed_with_tokens("r4", 200),
+    ]);
+    let sse5 = sse(vec![
+        ev_assistant_message("m5", FINAL_REPLY),
+        ev_completed_with_tokens("r5", 120),
     ]);
 
-    mount_sse_sequence(&server, vec![sse1, sse2, sse3, sse4]).await;
+    mount_sse_sequence(&server, vec![sse1, sse2, sse3, sse4, sse5]).await;
 
     let model_provider = non_openai_model_provider(&server);
     let mut builder = test_codex().with_config(move |config| {
@@ -1356,15 +1366,19 @@ async fn auto_compact_starts_after_turn_started() {
         ev_completed_with_tokens("r2", 330_000),
     ]);
     let sse3 = sse(vec![
-        ev_assistant_message("m3", AUTO_SUMMARY_TEXT),
-        ev_completed_with_tokens("r3", 200),
+        ev_assistant_message("m3", WORK_NOTES_TEXT),
+        ev_completed_with_tokens("r3", 10),
     ]);
     let sse4 = sse(vec![
-        ev_assistant_message("m4", FINAL_REPLY),
-        ev_completed_with_tokens("r4", 120),
+        ev_assistant_message("m4", AUTO_SUMMARY_TEXT),
+        ev_completed_with_tokens("r4", 200),
+    ]);
+    let sse5 = sse(vec![
+        ev_assistant_message("m5", FINAL_REPLY),
+        ev_completed_with_tokens("r5", 120),
     ]);
 
-    mount_sse_sequence(&server, vec![sse1, sse2, sse3, sse4]).await;
+    mount_sse_sequence(&server, vec![sse1, sse2, sse3, sse4, sse5]).await;
 
     let model_provider = non_openai_model_provider(&server);
     let mut builder = test_codex().with_config(move |config| {
@@ -1501,6 +1515,14 @@ async fn auto_compact_runs_after_resume_when_token_usage_is_over_limit() {
         .unwrap();
 
     let follow_up_user = "AFTER_RESUME_USER";
+    mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("work-notes", WORK_NOTES_TEXT),
+            ev_completed("work-notes-response"),
+        ]),
+    )
+    .await;
     let sse_follow_up = sse(vec![
         ev_assistant_message("m2", FINAL_REPLY),
         ev_completed("r2"),
@@ -1570,14 +1592,17 @@ async fn auto_compact_persists_rollout_entries() {
         ev_completed_with_tokens("r2", 330_000),
     ]);
 
-    let auto_summary_payload = auto_summary(AUTO_SUMMARY_TEXT);
     let sse3 = sse(vec![
-        ev_assistant_message("m3", &auto_summary_payload),
-        ev_completed_with_tokens("r3", 200),
+        ev_assistant_message("m3", WORK_NOTES_TEXT),
+        ev_completed_with_tokens("r3", 10),
     ]);
     let sse4 = sse(vec![
-        ev_assistant_message("m4", FINAL_REPLY),
-        ev_completed_with_tokens("r4", 120),
+        ev_assistant_message("m4", &auto_summary(AUTO_SUMMARY_TEXT)),
+        ev_completed_with_tokens("r4", 200),
+    ]);
+    let sse5 = sse(vec![
+        ev_assistant_message("m5", FINAL_REPLY),
+        ev_completed_with_tokens("r5", 120),
     ]);
 
     let first_matcher = |req: &wiremock::Request| {
@@ -1593,20 +1618,27 @@ async fn auto_compact_persists_rollout_entries() {
         body.contains(SECOND_AUTO_MSG)
             && body.contains(FIRST_AUTO_MSG)
             && !body_contains_text(body, SUMMARIZATION_PROMPT)
+            && !body.contains("<AUTO_COMPACT_WORK_NOTES_REQUEST>")
     };
     mount_sse_once_match(&server, second_matcher, sse2).await;
+
+    let notes_matcher = |req: &wiremock::Request| {
+        let body = std::str::from_utf8(&req.body).unwrap_or("");
+        body.contains("<AUTO_COMPACT_WORK_NOTES_REQUEST>")
+    };
+    mount_sse_once_match(&server, notes_matcher, sse3).await;
 
     let third_matcher = |req: &wiremock::Request| {
         let body = std::str::from_utf8(&req.body).unwrap_or("");
         body_contains_text(body, SUMMARIZATION_PROMPT)
     };
-    mount_sse_once_match(&server, third_matcher, sse3).await;
+    mount_sse_once_match(&server, third_matcher, sse4).await;
 
     let fourth_matcher = |req: &wiremock::Request| {
         let body = std::str::from_utf8(&req.body).unwrap_or("");
         body.contains(POST_AUTO_USER_MSG) && !body_contains_text(body, SUMMARIZATION_PROMPT)
     };
-    mount_sse_once_match(&server, fourth_matcher, sse4).await;
+    mount_sse_once_match(&server, fourth_matcher, sse5).await;
 
     let model_provider = non_openai_model_provider(&server);
 
@@ -2024,6 +2056,10 @@ async fn auto_compact_allows_multiple_attempts_when_interleaved_with_other_turn_
         ev_assistant_message("m1", FIRST_REPLY),
         ev_completed_with_tokens("r1", 500),
     ]);
+    let work_notes_1 = sse(vec![
+        ev_assistant_message("work-notes-1", WORK_NOTES_TEXT),
+        ev_completed_with_tokens("work-notes-1-response", 10),
+    ]);
     let first_summary_payload = auto_summary(FIRST_AUTO_SUMMARY);
     let sse2 = sse(vec![
         ev_assistant_message("m2", &first_summary_payload),
@@ -2037,6 +2073,10 @@ async fn auto_compact_allows_multiple_attempts_when_interleaved_with_other_turn_
         ev_assistant_message("m4", SECOND_LARGE_REPLY),
         ev_completed_with_tokens("r4", 450),
     ]);
+    let work_notes_2 = sse(vec![
+        ev_assistant_message("work-notes-2", WORK_NOTES_TEXT),
+        ev_completed_with_tokens("work-notes-2-response", 10),
+    ]);
     let second_summary_payload = auto_summary(SECOND_AUTO_SUMMARY);
     let sse5 = sse(vec![
         ev_assistant_message("m5", &second_summary_payload),
@@ -2049,7 +2089,20 @@ async fn auto_compact_allows_multiple_attempts_when_interleaved_with_other_turn_
     let follow_up_user = "FOLLOW_UP_AUTO_COMPACT";
     let final_user = "FINAL_AUTO_COMPACT";
 
-    let request_log = mount_sse_sequence(&server, vec![sse1, sse2, sse3, sse4, sse5, sse6]).await;
+    let request_log = mount_sse_sequence(
+        &server,
+        vec![
+            sse1,
+            work_notes_1,
+            sse2,
+            sse3,
+            sse4,
+            work_notes_2,
+            sse5,
+            sse6,
+        ],
+    )
+    .await;
 
     let model_provider = non_openai_model_provider(&server);
 
@@ -2104,23 +2157,23 @@ async fn auto_compact_allows_multiple_attempts_when_interleaved_with_other_turn_
         .collect();
     assert_eq!(
         request_bodies.len(),
-        6,
-        "expected six requests including two auto compactions"
+        8,
+        "expected eight requests including two auto compactions"
     );
     assert!(
         request_bodies[0].contains(MULTI_AUTO_MSG),
         "first request should contain the user input"
     );
     assert!(
-        body_contains_text(&request_bodies[1], SUMMARIZATION_PROMPT),
+        body_contains_text(&request_bodies[2], SUMMARIZATION_PROMPT),
         "first auto compact request should include the summarization prompt"
     );
     assert!(
-        request_bodies[3].contains(&format!("unsupported call: {DUMMY_FUNCTION_NAME}")),
+        request_bodies[4].contains(&format!("unsupported call: {DUMMY_FUNCTION_NAME}")),
         "function call output should be sent before the second auto compact"
     );
     assert!(
-        body_contains_text(&request_bodies[4], SUMMARIZATION_PROMPT),
+        body_contains_text(&request_bodies[6], SUMMARIZATION_PROMPT),
         "second auto compact request should include the summarization prompt"
     );
 }
@@ -2144,16 +2197,20 @@ async fn auto_compact_triggers_after_function_call_over_95_percent_usage() {
         ev_assistant_message("m2", FINAL_REPLY),
         ev_completed_with_tokens("r2", over_limit_tokens),
     ]);
-    let auto_summary_payload = auto_summary(AUTO_SUMMARY_TEXT);
-    let auto_compact_turn = sse(vec![
-        ev_assistant_message("m3", &auto_summary_payload),
+    let work_notes_turn = sse(vec![
+        ev_assistant_message("m3", WORK_NOTES_TEXT),
         ev_completed_with_tokens("r3", 10),
     ]);
-    let post_auto_compact_turn = sse(vec![ev_completed_with_tokens("r4", 10)]);
+    let auto_compact_turn = sse(vec![
+        ev_assistant_message("m4", &auto_summary(AUTO_SUMMARY_TEXT)),
+        ev_completed_with_tokens("r4", 10),
+    ]);
+    let post_auto_compact_turn = sse(vec![ev_completed_with_tokens("r5", 10)]);
 
     // Mount responses in order and keep mocks only for the ones we assert on.
     let first_turn_mock = mount_sse_once(&server, first_turn).await;
     let follow_up_mock = mount_sse_once(&server, function_call_follow_up).await;
+    mount_sse_once(&server, work_notes_turn).await;
     let auto_compact_mock = mount_sse_once(&server, auto_compact_turn).await;
     // We don't assert on the post-compact request, so no need to keep its mock.
     mount_sse_once(&server, post_auto_compact_turn).await;
@@ -2250,6 +2307,10 @@ async fn auto_compact_counts_encrypted_reasoning_before_last_user() {
         ev_reasoning_item("post-reasoning", &["post"], &[&post_last_reasoning_content]),
         ev_completed_with_tokens("r2", 80),
     ]);
+    let work_notes_turn = sse(vec![
+        ev_assistant_message("work-notes", WORK_NOTES_TEXT),
+        ev_completed_with_tokens("r3", 10),
+    ]);
     let third_turn = sse(vec![
         ev_assistant_message("m4", FINAL_REPLY),
         ev_completed_with_tokens("r4", 1),
@@ -2262,6 +2323,8 @@ async fn auto_compact_counts_encrypted_reasoning_before_last_user() {
             first_turn,
             // Turn 2: reasoning after last user (should be ignored for compaction).
             second_turn,
+            // Auto-compact: capture work notes before remote compaction.
+            work_notes_turn,
             // Turn 3: next user turn after remote compaction.
             third_turn,
         ],
@@ -2336,15 +2399,15 @@ async fn auto_compact_counts_encrypted_reasoning_before_last_user() {
     let requests = request_log.requests();
     assert_eq!(
         requests.len(),
-        3,
-        "conversation should include three user turns"
+        4,
+        "conversation should include three user turns plus work-notes capture"
     );
     let second_request_body = requests[1].body_json().to_string();
     assert!(
         !second_request_body.contains("REMOTE_COMPACT_SUMMARY"),
         "second turn should not include compacted history"
     );
-    let third_request_body = requests[2].body_json().to_string();
+    let third_request_body = requests[3].body_json().to_string();
     assert!(
         third_request_body.contains("REMOTE_COMPACT_SUMMARY")
             || third_request_body.contains(FINAL_REPLY),
@@ -2377,6 +2440,10 @@ async fn auto_compact_runs_when_reasoning_header_clears_between_turns() {
         ev_reasoning_item("post-reasoning", &["post"], &[&post_last_reasoning_content]),
         ev_completed_with_tokens("r2", 80),
     ]);
+    let work_notes_turn = sse(vec![
+        ev_assistant_message("work-notes", WORK_NOTES_TEXT),
+        ev_completed_with_tokens("r3", 10),
+    ]);
     let third_turn = sse(vec![
         ev_assistant_message("m4", FINAL_REPLY),
         ev_completed_with_tokens("r4", 1),
@@ -2385,6 +2452,7 @@ async fn auto_compact_runs_when_reasoning_header_clears_between_turns() {
     let responses = vec![
         sse_response(first_turn).insert_header("X-Reasoning-Included", "true"),
         sse_response(second_turn),
+        sse_response(work_notes_turn),
         sse_response(third_turn),
     ];
     mount_response_sequence(&server, responses).await;

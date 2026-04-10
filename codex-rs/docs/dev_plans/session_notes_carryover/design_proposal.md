@@ -15,6 +15,7 @@ The goal is to preserve high-value session state across auto-compaction without 
 - Compact from prepared history that excludes the transient work-notes request/response suffix.
 - Inject preserved work notes verbatim after compaction.
 - Reuse the same prepared-history logic for both local and remote compaction.
+- Also capture notes before pre-turn auto-compaction when a turn starts over the limit (unless schema constraints force a safe fallback).
 
 That preserves the original design principles:
 
@@ -96,8 +97,16 @@ Conceptually:
 
 ```rust
 if matches!(pre_compact_notes_state, PreCompactNotesState::AwaitingNotes) {
-    run_auto_compact(&sess, &turn_context, sampling_request_last_agent_message).await;
-    pre_compact_notes_state = PreCompactNotesState::Idle;
+    if let Some(notes) = sampling_request_last_agent_message
+        && notes.trim_start().starts_with("<AUTO_COMPACT_WORK_NOTES>")
+    {
+        run_auto_compact(&sess, &turn_context, Some(notes)).await;
+        pre_compact_notes_state = PreCompactNotesState::Idle;
+        continue;
+    }
+
+    // If we didn't get a valid notes message, retry capture a small number of times,
+    // then compact without notes.
     continue;
 }
 
@@ -191,14 +200,13 @@ This base drains pending input eagerly via `sess.get_pending_input()`.
 
 That creates a subtle edge case:
 
-- if a real user message arrives while the feature is waiting for the note round to complete, the drained input would be lost unless it is requeued before compacting.
+- if a real user message arrives while the feature is waiting for the note round to complete, draining and replaying it into the notes round can perturb ordering and can short-circuit notes capture.
 
-So the note-capture interruption path should:
+The recommended fix is to defer draining pending input while `AwaitingNotes`, so:
 
-1. detect non-empty pending input while `AwaitingNotes`
-2. push the drained items back with `sess.inject_response_items(...)`
-3. compact without notes
-4. continue the turn on the compacted transcript
+- the notes reflect the pre-interruption history
+- the system can still capture fresh notes (replacing stale preserved notes)
+- pending input is preserved and replayed immediately after compaction when the state returns to `Idle`
 
 This behavior is essential on `fe8b474...` and should be preserved during future rebases as long as pending input is still drained rather than merely peeked.
 
@@ -216,7 +224,7 @@ async fn run_auto_compact(
 
 This keeps the control-flow change in `core/src/codex.rs` small:
 
-- pre-turn compaction passes `None`
+- pre-turn compaction captures notes when possible, and passes `None` only when schema constraints are present or capture fails
 - schema-guarded fallback compaction passes `None`
 - successful note capture passes `Some(notes)`
 
@@ -310,8 +318,15 @@ The feature should degrade safely:
 - If `final_output_json_schema` is set, skip the note round and compact immediately.
 - If the note round errors, compact immediately with `preserved_work_notes = None`.
 - If the model tries to call tools during the note round, runtime rejection should prevent side effects and the turn should still compact afterward.
-- If the model returns empty or whitespace-only notes, treat them as absent.
-- If real user input arrives during the note round, requeue that input and compact without notes.
+- If the model returns empty notes or a non-notes message (missing `<AUTO_COMPACT_WORK_NOTES>`), retry capture a small number of times and then compact without notes.
+- If real user input arrives during the note round, defer draining/replaying it until after compaction.
+
+## Rollout learnings (post-implementation)
+
+Real session logs showed two important pitfalls that are easy to miss in a design-only pass:
+
+1. **Pre-turn auto-compaction must also capture notes.** If a turn begins over the limit and compacts without capturing notes, the preserved notes in `replacement_history` can remain stuck on the previous compaction's notes, and the UI may not render a fresh `<AUTO_COMPACT_WORK_NOTES>` section.
+2. **Do not short-circuit notes capture due to pending input.** Compacting without notes when interrupted (instead of deferring pending input) can produce the same stale-notes outcome and hides the notes section at the exact moment it is most valuable.
 
 ## Why This Stays Rebase-Friendly
 

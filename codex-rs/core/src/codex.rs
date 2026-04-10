@@ -3567,6 +3567,16 @@ enum PreCompactNotesState {
     AwaitingNotes,
 }
 
+const AUTO_COMPACT_WORK_NOTES_CAPTURE_MAX_ATTEMPTS: u8 = 2;
+const AUTO_COMPACT_WORK_NOTES_TOOL_REJECT_REASON: &str =
+    "tool use disabled during auto-compact work-notes capture";
+
+fn is_auto_compact_work_notes_message(message: &str) -> bool {
+    message
+        .trim_start()
+        .starts_with(AUTO_COMPACT_WORK_NOTES_TAG)
+}
+
 async fn inject_pre_compact_work_notes_request(sess: &Session, turn_context: &TurnContext) {
     let request = format!(
         "{AUTO_COMPACT_WORK_NOTES_REQUEST_TAG}\n\
@@ -3630,7 +3640,72 @@ pub(crate) async fn run_turn(
     });
     sess.send_event(&turn_context, event).await;
     if total_usage_tokens >= auto_compact_limit {
-        run_auto_compact(&sess, &turn_context, None).await;
+        if turn_context.final_output_json_schema.is_some() {
+            run_auto_compact(&sess, &turn_context, None).await;
+        } else {
+            inject_pre_compact_work_notes_request(&sess, &turn_context).await;
+
+            let mut attempts: u8 = 0;
+            let explicit_app_paths: Vec<String> = Vec::new();
+            let skill_name_counts_lower: HashMap<String, usize> = HashMap::new();
+            let turn_diff_tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+            let turn_metadata_header = turn_context.resolve_turn_metadata_header().await;
+            let mut client_session = sess.services.model_client.new_session();
+
+            loop {
+                let sampling_request_input: Vec<ResponseItem> =
+                    { sess.clone_history().await.for_prompt() };
+                let tool_selection = SamplingRequestToolSelection {
+                    explicit_app_paths: &explicit_app_paths,
+                    skill_name_counts_lower: &skill_name_counts_lower,
+                };
+
+                match run_sampling_request(
+                    Arc::clone(&sess),
+                    Arc::clone(&turn_context),
+                    Arc::clone(&turn_diff_tracker),
+                    &mut client_session,
+                    turn_metadata_header.as_deref(),
+                    sampling_request_input,
+                    tool_selection,
+                    ToolCallExecutionMode::RejectAll {
+                        reason: AUTO_COMPACT_WORK_NOTES_TOOL_REJECT_REASON,
+                    },
+                    cancellation_token.child_token(),
+                )
+                .await
+                {
+                    Ok(output) => {
+                        if let Some(notes) = output.last_agent_message
+                            && is_auto_compact_work_notes_message(&notes)
+                        {
+                            run_auto_compact(&sess, &turn_context, Some(notes)).await;
+                            break;
+                        }
+
+                        attempts += 1;
+                        if attempts >= AUTO_COMPACT_WORK_NOTES_CAPTURE_MAX_ATTEMPTS {
+                            info!(
+                                "Work-notes capture yielded no notes; compacting without notes after {attempts} attempts"
+                            );
+                            run_auto_compact(&sess, &turn_context, None).await;
+                            break;
+                        }
+
+                        info!(
+                            "Work-notes capture yielded no notes; retrying capture ({attempts}/{AUTO_COMPACT_WORK_NOTES_CAPTURE_MAX_ATTEMPTS})"
+                        );
+                    }
+                    Err(e) => {
+                        info!(
+                            "Work-notes capture failed during pre-turn compaction; compacting without notes: {e:#}"
+                        );
+                        run_auto_compact(&sess, &turn_context, None).await;
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     let skills_outcome = Some(
@@ -3732,20 +3807,20 @@ pub(crate) async fn run_turn(
     let mut client_session = sess.services.model_client.new_session();
 
     let mut pre_compact_notes_state = PreCompactNotesState::Idle;
+    let mut pre_compact_notes_attempts: u8 = 0;
 
     loop {
         // Note that pending_input would be something like a message the user
         // submitted through the UI while the model was running. Though the UI
         // may support this, the model might not.
-        let pending_input = sess.get_pending_input().await;
-        if matches!(pre_compact_notes_state, PreCompactNotesState::AwaitingNotes)
-            && !pending_input.is_empty()
-        {
-            let _ = sess.inject_response_items(pending_input).await;
-            run_auto_compact(&sess, &turn_context, None).await;
-            pre_compact_notes_state = PreCompactNotesState::Idle;
-            continue;
-        }
+        //
+        // During pre-compact work-notes capture, defer pending input until after compaction so
+        // the notes reflect the pre-interruption history and ordering is preserved.
+        let pending_input = if matches!(pre_compact_notes_state, PreCompactNotesState::Idle) {
+            sess.get_pending_input().await
+        } else {
+            Vec::new()
+        };
         let pending_response_items = pending_input
             .into_iter()
             .map(ResponseItem::from)
@@ -3789,7 +3864,7 @@ pub(crate) async fn run_turn(
         let tool_execution_mode = match pre_compact_notes_state {
             PreCompactNotesState::Idle => ToolCallExecutionMode::Normal,
             PreCompactNotesState::AwaitingNotes => ToolCallExecutionMode::RejectAll {
-                reason: "tool use disabled during auto-compact work-notes capture",
+                reason: AUTO_COMPACT_WORK_NOTES_TOOL_REJECT_REASON,
             },
         };
         match run_sampling_request(
@@ -3827,9 +3902,29 @@ pub(crate) async fn run_turn(
                 );
 
                 if matches!(pre_compact_notes_state, PreCompactNotesState::AwaitingNotes) {
-                    run_auto_compact(&sess, &turn_context, sampling_request_last_agent_message)
-                        .await;
-                    pre_compact_notes_state = PreCompactNotesState::Idle;
+                    if let Some(notes) = sampling_request_last_agent_message
+                        && is_auto_compact_work_notes_message(&notes)
+                    {
+                        run_auto_compact(&sess, &turn_context, Some(notes)).await;
+                        pre_compact_notes_state = PreCompactNotesState::Idle;
+                        pre_compact_notes_attempts = 0;
+                        continue;
+                    }
+
+                    pre_compact_notes_attempts += 1;
+                    if pre_compact_notes_attempts >= AUTO_COMPACT_WORK_NOTES_CAPTURE_MAX_ATTEMPTS {
+                        info!(
+                            "Work-notes capture yielded no notes; compacting without notes after {pre_compact_notes_attempts} attempts"
+                        );
+                        run_auto_compact(&sess, &turn_context, None).await;
+                        pre_compact_notes_state = PreCompactNotesState::Idle;
+                        pre_compact_notes_attempts = 0;
+                        continue;
+                    }
+
+                    info!(
+                        "Work-notes capture yielded no notes; retrying capture ({pre_compact_notes_attempts}/{AUTO_COMPACT_WORK_NOTES_CAPTURE_MAX_ATTEMPTS})"
+                    );
                     continue;
                 }
 
@@ -3843,6 +3938,7 @@ pub(crate) async fn run_turn(
 
                     inject_pre_compact_work_notes_request(&sess, &turn_context).await;
                     pre_compact_notes_state = PreCompactNotesState::AwaitingNotes;
+                    pre_compact_notes_attempts = 0;
                     continue;
                 }
 
@@ -3875,6 +3971,7 @@ pub(crate) async fn run_turn(
                 info!("Work-notes capture failed; compacting without notes: {e:#}");
                 run_auto_compact(&sess, &turn_context, None).await;
                 pre_compact_notes_state = PreCompactNotesState::Idle;
+                pre_compact_notes_attempts = 0;
                 continue;
             }
             Err(CodexErr::InvalidImageRequest()) => {
