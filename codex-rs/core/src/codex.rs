@@ -5322,7 +5322,17 @@ fn errors_to_info(errors: &[SkillError]) -> Vec<SkillErrorInfo> {
 enum PreCompactNotesState {
     #[default]
     Idle,
-    AwaitingNotes,
+    AwaitingNotes {
+        attempts: u8,
+    },
+}
+
+const PRE_COMPACT_WORK_NOTES_MAX_ATTEMPTS: u8 = 3;
+
+fn is_auto_compact_work_notes_message(message: &str) -> bool {
+    message
+        .trim_start()
+        .starts_with(AUTO_COMPACT_WORK_NOTES_TAG)
 }
 
 async fn inject_pre_compact_work_notes_request(sess: &Session, turn_context: &TurnContext) {
@@ -5392,7 +5402,7 @@ pub(crate) async fn run_turn(
     // new user message are recorded. Estimate pending incoming items (context
     // diffs/full reinjection + user input) and trigger compaction preemptively
     // when they would push the thread over the compaction threshold.
-    if run_pre_sampling_compact(&sess, &turn_context)
+    if run_pre_sampling_compact(&sess, &turn_context, cancellation_token.child_token())
         .await
         .is_err()
     {
@@ -5631,25 +5641,14 @@ pub(crate) async fn run_turn(
         // Note that pending_input would be something like a message the user
         // submitted through the UI while the model was running. Though the UI
         // may support this, the model might not.
-        let pending_input = sess.get_pending_input().await;
-        if matches!(pre_compact_notes_state, PreCompactNotesState::AwaitingNotes)
-            && !pending_input.is_empty()
-        {
-            let _ = sess.inject_response_items(pending_input).await;
-            if run_auto_compact(
-                &sess,
-                &turn_context,
-                InitialContextInjection::BeforeLastUserMessage,
-                None,
-            )
-            .await
-            .is_err()
-            {
-                return None;
-            }
-            pre_compact_notes_state = PreCompactNotesState::Idle;
-            continue;
-        }
+        let pending_input = if matches!(
+            pre_compact_notes_state,
+            PreCompactNotesState::AwaitingNotes { .. }
+        ) {
+            Vec::with_capacity(0)
+        } else {
+            sess.get_pending_input().await
+        };
 
         let pending_response_items = pending_input
             .into_iter()
@@ -5697,7 +5696,7 @@ pub(crate) async fn run_turn(
         let turn_metadata_header = turn_context.turn_metadata_state.current_header_value();
         let tool_execution_mode = match pre_compact_notes_state {
             PreCompactNotesState::Idle => ToolCallExecutionMode::Normal,
-            PreCompactNotesState::AwaitingNotes => ToolCallExecutionMode::RejectAll {
+            PreCompactNotesState::AwaitingNotes { .. } => ToolCallExecutionMode::RejectAll {
                 reason: "tool use disabled during auto-compact work-notes capture",
             },
         };
@@ -5737,19 +5736,48 @@ pub(crate) async fn run_turn(
                     "post sampling token usage"
                 );
 
-                if matches!(pre_compact_notes_state, PreCompactNotesState::AwaitingNotes) {
-                    if run_auto_compact(
-                        &sess,
-                        &turn_context,
-                        InitialContextInjection::BeforeLastUserMessage,
-                        sampling_request_last_agent_message,
-                    )
-                    .await
-                    .is_err()
-                    {
-                        return None;
+                if let PreCompactNotesState::AwaitingNotes { mut attempts } =
+                    pre_compact_notes_state
+                {
+                    let preserved_work_notes = sampling_request_last_agent_message
+                        .filter(|message| is_auto_compact_work_notes_message(message));
+                    if preserved_work_notes.is_some() {
+                        if run_auto_compact(
+                            &sess,
+                            &turn_context,
+                            InitialContextInjection::BeforeLastUserMessage,
+                            preserved_work_notes,
+                        )
+                        .await
+                        .is_err()
+                        {
+                            return None;
+                        }
+                        pre_compact_notes_state = PreCompactNotesState::Idle;
+                        continue;
                     }
-                    pre_compact_notes_state = PreCompactNotesState::Idle;
+
+                    attempts = attempts.saturating_add(1);
+                    if attempts >= PRE_COMPACT_WORK_NOTES_MAX_ATTEMPTS {
+                        info!(
+                            "Work-notes capture did not yield notes after {attempts} attempt(s); compacting without notes."
+                        );
+                        if run_auto_compact(
+                            &sess,
+                            &turn_context,
+                            InitialContextInjection::BeforeLastUserMessage,
+                            None,
+                        )
+                        .await
+                        .is_err()
+                        {
+                            return None;
+                        }
+                        pre_compact_notes_state = PreCompactNotesState::Idle;
+                        continue;
+                    }
+
+                    pre_compact_notes_state = PreCompactNotesState::AwaitingNotes { attempts };
                     continue;
                 }
 
@@ -5771,7 +5799,7 @@ pub(crate) async fn run_turn(
                     }
 
                     inject_pre_compact_work_notes_request(&sess, &turn_context).await;
-                    pre_compact_notes_state = PreCompactNotesState::AwaitingNotes;
+                    pre_compact_notes_state = PreCompactNotesState::AwaitingNotes { attempts: 0 };
                     continue;
                 }
 
@@ -5890,7 +5918,12 @@ pub(crate) async fn run_turn(
                 }
                 continue;
             }
-            Err(e) if matches!(pre_compact_notes_state, PreCompactNotesState::AwaitingNotes) => {
+            Err(e)
+                if matches!(
+                    pre_compact_notes_state,
+                    PreCompactNotesState::AwaitingNotes { .. }
+                ) =>
+            {
                 info!("Work-notes capture failed; compacting without notes: {e:#}");
                 if run_auto_compact(
                     &sess,
@@ -5942,12 +5975,14 @@ pub(crate) async fn run_turn(
 async fn run_pre_sampling_compact(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
+    cancellation_token: CancellationToken,
 ) -> CodexResult<()> {
     let total_usage_tokens_before_compaction = sess.get_total_token_usage().await;
     maybe_run_previous_model_inline_compact(
         sess,
         turn_context,
         total_usage_tokens_before_compaction,
+        cancellation_token.child_token(),
     )
     .await?;
     let total_usage_tokens = sess.get_total_token_usage().await;
@@ -5957,11 +5992,11 @@ async fn run_pre_sampling_compact(
         .unwrap_or(i64::MAX);
     // Compact if the total usage tokens are greater than the auto compact limit
     if total_usage_tokens >= auto_compact_limit {
-        run_auto_compact(
+        run_auto_compact_with_pre_compact_work_notes(
             sess,
             turn_context,
             InitialContextInjection::DoNotInject,
-            None,
+            cancellation_token.child_token(),
         )
         .await?;
     }
@@ -5978,6 +6013,7 @@ async fn maybe_run_previous_model_inline_compact(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
     total_usage_tokens: i64,
+    cancellation_token: CancellationToken,
 ) -> CodexResult<bool> {
     let Some(previous_turn_settings) = sess.previous_turn_settings().await else {
         return Ok(false);
@@ -6002,16 +6038,98 @@ async fn maybe_run_previous_model_inline_compact(
         && previous_model_turn_context.model_info.slug != turn_context.model_info.slug
         && old_context_window > new_context_window;
     if should_run {
-        run_auto_compact(
+        run_auto_compact_with_pre_compact_work_notes(
             sess,
             &previous_model_turn_context,
             InitialContextInjection::DoNotInject,
-            None,
+            cancellation_token,
         )
         .await?;
         return Ok(true);
     }
     Ok(false)
+}
+
+async fn run_auto_compact_with_pre_compact_work_notes(
+    sess: &Arc<Session>,
+    turn_context: &Arc<TurnContext>,
+    initial_context_injection: InitialContextInjection,
+    cancellation_token: CancellationToken,
+) -> CodexResult<()> {
+    if turn_context.final_output_json_schema.is_some() {
+        return run_auto_compact(sess, turn_context, initial_context_injection, None).await;
+    }
+
+    let preserved_work_notes =
+        match capture_pre_compact_work_notes(sess, turn_context, cancellation_token.child_token())
+            .await
+        {
+            Ok(work_notes) => work_notes,
+            Err(e) => {
+                info!("Work-notes capture failed; compacting without notes: {e:#}");
+                None
+            }
+        };
+
+    run_auto_compact(
+        sess,
+        turn_context,
+        initial_context_injection,
+        preserved_work_notes,
+    )
+    .await
+}
+
+async fn capture_pre_compact_work_notes(
+    sess: &Arc<Session>,
+    turn_context: &Arc<TurnContext>,
+    cancellation_token: CancellationToken,
+) -> CodexResult<Option<String>> {
+    inject_pre_compact_work_notes_request(sess, turn_context).await;
+
+    let connectors = HashSet::new();
+    let skills_outcome = Some(turn_context.turn_skills.outcome.as_ref());
+    let turn_diff_tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+    let mut client_session = sess.services.model_client.new_session();
+    let mut server_model_warning_emitted_for_turn = false;
+    let mut attempts: u8 = 0;
+
+    loop {
+        attempts = attempts.saturating_add(1);
+        let sampling_request_input = sess
+            .clone_history()
+            .await
+            .for_prompt(&turn_context.model_info.input_modalities);
+        let turn_metadata_header = turn_context.turn_metadata_state.current_header_value();
+        let SamplingRequestResult {
+            last_agent_message, ..
+        } = run_sampling_request(
+            Arc::clone(sess),
+            Arc::clone(turn_context),
+            Arc::clone(&turn_diff_tracker),
+            &mut client_session,
+            turn_metadata_header.as_deref(),
+            sampling_request_input,
+            &connectors,
+            skills_outcome,
+            &mut server_model_warning_emitted_for_turn,
+            ToolCallExecutionMode::RejectAll {
+                reason: "tool use disabled during auto-compact work-notes capture",
+            },
+            cancellation_token.child_token(),
+        )
+        .await?;
+
+        if let Some(message) = last_agent_message
+            && is_auto_compact_work_notes_message(&message)
+        {
+            return Ok(Some(message));
+        }
+
+        if attempts >= PRE_COMPACT_WORK_NOTES_MAX_ATTEMPTS {
+            return Ok(None);
+        }
+    }
 }
 
 async fn run_auto_compact(

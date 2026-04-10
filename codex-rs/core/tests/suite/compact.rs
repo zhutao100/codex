@@ -44,7 +44,6 @@ use core_test_support::responses::sse_failed;
 use core_test_support::responses::sse_response;
 use core_test_support::responses::start_mock_server;
 use pretty_assertions::assert_eq;
-use serde_json::json;
 use wiremock::MockServer;
 // --- Test helpers -----------------------------------------------------------
 
@@ -66,11 +65,16 @@ const DUMMY_CALL_ID: &str = "call-multi-auto";
 const FUNCTION_CALL_LIMIT_MSG: &str = "function call limit push";
 const POST_AUTO_USER_MSG: &str = "post auto follow-up";
 const PRETURN_CONTEXT_DIFF_CWD: &str = "/tmp/PRETURN_CONTEXT_DIFF_CWD";
+const WORK_NOTES_REQUEST_TAG: &str = "<AUTO_COMPACT_WORK_NOTES_REQUEST>";
 
 pub(super) const COMPACT_WARNING_MESSAGE: &str = "Heads up: Long threads and multiple compactions can cause the model to be less accurate. Start a new thread when possible to keep threads small and targeted.";
 
 fn auto_summary(summary: &str) -> String {
     summary.to_string()
+}
+
+fn work_notes_message(notes: &str) -> String {
+    format!("<AUTO_COMPACT_WORK_NOTES>\n{notes}\n</AUTO_COMPACT_WORK_NOTES>")
 }
 
 fn summary_with_prefix(summary: &str) -> String {
@@ -113,14 +117,22 @@ fn model_info_with_context_window(slug: &str, context_window: i64) -> ModelInfo 
 
 fn assert_pre_sampling_switch_compaction_requests(
     first: &serde_json::Value,
+    work_notes: &serde_json::Value,
     compact: &serde_json::Value,
     follow_up: &serde_json::Value,
     previous_model: &str,
     next_model: &str,
 ) {
     assert_eq!(first["model"].as_str(), Some(previous_model));
+    assert_eq!(work_notes["model"].as_str(), Some(previous_model));
     assert_eq!(compact["model"].as_str(), Some(previous_model));
     assert_eq!(follow_up["model"].as_str(), Some(next_model));
+
+    let work_notes_body = work_notes.to_string();
+    assert!(
+        work_notes_body.contains(WORK_NOTES_REQUEST_TAG),
+        "pre-sampling work-notes request should include work-notes request tag"
+    );
 
     let compact_body = compact.to_string();
     assert!(
@@ -659,19 +671,26 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
     let token_count_used = 270_000;
     // token used count after compaction
     let token_count_used_after_compaction = 80000;
+    // work notes for each compaction
+    let work_notes_1 = work_notes_message("WORK_NOTES_1");
+    let work_notes_2 = work_notes_message("WORK_NOTES_2");
+    let work_notes_3 = work_notes_message("WORK_NOTES_3");
 
     // mock responses from the model
 
     let reasoning_response_1 = ev_reasoning_item("m1", &["I will create a react app"], &[]);
-    let encrypted_content_1 = reasoning_response_1["item"]["encrypted_content"]
-        .as_str()
-        .unwrap();
 
     // first chunk of work
     let model_reasoning_response_1_sse = sse(vec![
         reasoning_response_1.clone(),
         ev_local_shell_call("r1-shell", "completed", vec!["echo", "make-react"]),
         ev_completed_with_tokens("r1", token_count_used),
+    ]);
+
+    // first work-notes capture response
+    let model_work_notes_response_1_sse = sse(vec![
+        ev_assistant_message("m2-notes", &work_notes_1),
+        ev_completed_with_tokens("r2-notes", 100),
     ]);
 
     // first compaction response
@@ -681,15 +700,18 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
     ]);
 
     let reasoning_response_2 = ev_reasoning_item("m3", &["I will create a node app"], &[]);
-    let encrypted_content_2 = reasoning_response_2["item"]["encrypted_content"]
-        .as_str()
-        .unwrap();
 
     // second chunk of work
     let model_reasoning_response_2_sse = sse(vec![
         reasoning_response_2.clone(),
         ev_local_shell_call("r3-shell", "completed", vec!["echo", "make-node"]),
         ev_completed_with_tokens("r3", token_count_used),
+    ]);
+
+    // second work-notes capture response
+    let model_work_notes_response_2_sse = sse(vec![
+        ev_assistant_message("m4-notes", &work_notes_2),
+        ev_completed_with_tokens("r4-notes", 100),
     ]);
 
     // second compaction response
@@ -699,15 +721,18 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
     ]);
 
     let reasoning_response_3 = ev_reasoning_item("m6", &["I will create a python app"], &[]);
-    let encrypted_content_3 = reasoning_response_3["item"]["encrypted_content"]
-        .as_str()
-        .unwrap();
 
     // third chunk of work
     let model_reasoning_response_3_sse = sse(vec![
-        ev_reasoning_item("m6", &["I will create a python app"], &[]),
+        reasoning_response_3.clone(),
         ev_local_shell_call("r6-shell", "completed", vec!["echo", "make-python"]),
         ev_completed_with_tokens("r6", token_count_used),
+    ]);
+
+    // third work-notes capture response
+    let model_work_notes_response_3_sse = sse(vec![
+        ev_assistant_message("m7-notes", &work_notes_3),
+        ev_completed_with_tokens("r7-notes", 100),
     ]);
 
     // third compaction response
@@ -728,10 +753,13 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
     // mount the mock responses from the model
     let bodies = vec![
         model_reasoning_response_1_sse,
+        model_work_notes_response_1_sse,
         model_compact_response_1_sse,
         model_reasoning_response_2_sse,
+        model_work_notes_response_2_sse,
         model_compact_response_2_sse,
         model_reasoning_response_3_sse,
+        model_work_notes_response_3_sse,
         model_compact_response_3_sse,
         model_final_response_sse,
     ];
@@ -752,6 +780,7 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
 
     // collect the requests payloads from the model
     let requests_payloads = request_log.requests();
+    assert_eq!(requests_payloads.len(), 10);
     let body = requests_payloads[0].body_json();
     let input = body.get("input").and_then(|v| v.as_array()).unwrap();
 
@@ -814,388 +843,92 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
             .collect()
     }
 
-    let initial_input = normalize_inputs(input);
-    let environment_message = initial_input[0]["content"][0]["text"].as_str().unwrap();
+    fn input_contains_substring(input: &[serde_json::Value], needle: &str) -> bool {
+        input.iter().any(|value| {
+            value
+                .get("content")
+                .and_then(|content| content.as_array())
+                .is_some_and(|content| {
+                    content.iter().any(|item| {
+                        item.get("text")
+                            .and_then(|text| text.as_str())
+                            .is_some_and(|text| text.contains(needle))
+                    })
+                })
+        })
+    }
 
-    // test 1: after compaction, we should have one environment message, one user message, and one user message with summary prefix
-    let compaction_indices = [2, 4, 6];
+    let initial_input = normalize_inputs(input);
+    let environment_message_text = initial_input[0]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let work_notes_request_indices = requests_payloads
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, request)| {
+            let body = request.body_json();
+            let input = body.get("input").and_then(|v| v.as_array()).unwrap();
+            let input = normalize_inputs(input);
+            input_contains_substring(&input, WORK_NOTES_REQUEST_TAG).then_some(idx)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(work_notes_request_indices.len(), 3);
+
+    let compaction_request_indices = requests_payloads
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, request)| {
+            let body = request.body_json();
+            let input = body.get("input").and_then(|v| v.as_array()).unwrap();
+            let input = normalize_inputs(input);
+            input_contains_substring(&input, SUMMARIZATION_PROMPT).then_some(idx)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(compaction_request_indices.len(), 3);
+
+    for (notes_index, compact_index) in work_notes_request_indices
+        .iter()
+        .copied()
+        .zip(compaction_request_indices.iter().copied())
+    {
+        assert_eq!(compact_index, notes_index + 1);
+    }
+
     let expected_summaries = [
         prefixed_first_summary.as_str(),
         prefixed_second_summary.as_str(),
         prefixed_third_summary.as_str(),
     ];
-    for (i, expected_summary) in compaction_indices.into_iter().zip(expected_summaries) {
-        let body = requests_payloads.clone()[i].body_json();
+    let expected_work_notes = ["WORK_NOTES_1", "WORK_NOTES_2", "WORK_NOTES_3"];
+    for ((compact_index, expected_summary), expected_work_notes) in compaction_request_indices
+        .into_iter()
+        .zip(expected_summaries)
+        .zip(expected_work_notes)
+    {
+        let post_compaction_request_index = compact_index + 1;
+        let body = requests_payloads[post_compaction_request_index].body_json();
         let input = body.get("input").and_then(|v| v.as_array()).unwrap();
         let input = normalize_inputs(input);
-        assert_eq!(input.len(), 3);
-        let environment_message = input[0]["content"][0]["text"].as_str().unwrap();
-        let user_message_received = input[1]["content"][0]["text"].as_str().unwrap();
-        let summary_message = input[2]["content"][0]["text"].as_str().unwrap();
-        assert_eq!(environment_message, environment_message);
-        assert_eq!(user_message_received, user_message);
+
+        assert_eq!(input.len(), 4);
         assert_eq!(
-            summary_message, expected_summary,
-            "compaction request at index {i} should include the prefixed summary"
+            input[0]["content"][0]["text"].as_str().unwrap(),
+            environment_message_text.as_str()
         );
+        assert_eq!(
+            input[1]["content"][0]["text"].as_str().unwrap(),
+            user_message
+        );
+
+        let preserved_notes_message = input[2]["content"][0]["text"].as_str().unwrap();
+        assert!(preserved_notes_message.contains("<AUTO_COMPACT_WORK_NOTES>"));
+        assert!(preserved_notes_message.contains(expected_work_notes));
+
+        let summary_message = input[3]["content"][0]["text"].as_str().unwrap();
+        assert_eq!(summary_message, expected_summary);
     }
-
-    // test 2: the expected requests inputs should be as follows:
-    let expected_requests_inputs = json!([
-    [
-        // 0: first request of the user message.
-      {
-        "content": [
-          {
-            "text": environment_message,
-            "type": "input_text"
-          }
-        ],
-        "role": "user",
-        "type": "message"
-      },
-      {
-        "content": [
-          {
-            "text": "create an app",
-            "type": "input_text"
-          }
-        ],
-        "role": "user",
-        "type": "message"
-      }
-    ]
-    ,
-    [
-        // 1: first automatic compaction request.
-      {
-        "content": [
-          {
-            "text": environment_message,
-            "type": "input_text"
-          }
-        ],
-        "role": "user",
-        "type": "message"
-      },
-      {
-        "content": [
-          {
-            "text": "create an app",
-            "type": "input_text"
-          }
-        ],
-        "role": "user",
-        "type": "message"
-      },
-      {
-        "content": null,
-        "encrypted_content": encrypted_content_1,
-        "summary": [
-          {
-            "text": "I will create a react app",
-            "type": "summary_text"
-          }
-        ],
-        "type": "reasoning"
-      },
-      {
-        "action": {
-          "command": [
-            "echo",
-            "make-react"
-          ],
-          "env": null,
-          "timeout_ms": null,
-          "type": "exec",
-          "user": null,
-          "working_directory": null
-        },
-        "call_id": "r1-shell",
-        "status": "completed",
-        "type": "local_shell_call"
-      },
-      {
-        "call_id": "r1-shell",
-        "output": "execution error: Io(Os { code: 2, kind: NotFound, message: \"No such file or directory\" })",
-        "type": "function_call_output"
-      },
-      {
-        "content": [
-          {
-            "text": SUMMARIZATION_PROMPT,
-            "type": "input_text"
-          }
-        ],
-        "role": "user",
-        "type": "message"
-      }
-    ]
-    ,
-    [
-      // 2: request after first automatic compaction.
-      {
-        "content": [
-          {
-            "text": environment_message,
-            "type": "input_text"
-          }
-        ],
-        "role": "user",
-        "type": "message"
-      },
-      {
-        "content": [
-          {
-            "text": "create an app",
-            "type": "input_text"
-          }
-        ],
-        "role": "user",
-        "type": "message"
-      },
-      {
-        "content": [
-          {
-            "text": prefixed_first_summary.clone(),
-            "type": "input_text"
-          }
-        ],
-        "role": "user",
-        "type": "message"
-      }
-    ]
-    ,
-    [
-        // 3: request for second automatic compaction.
-      {
-        "content": [
-          {
-            "text": environment_message,
-            "type": "input_text"
-          }
-        ],
-        "role": "user",
-        "type": "message"
-      },
-      {
-        "content": [
-          {
-            "text": "create an app",
-            "type": "input_text"
-          }
-        ],
-        "role": "user",
-        "type": "message"
-      },
-      {
-        "content": [
-          {
-            "text": prefixed_first_summary.clone(),
-            "type": "input_text"
-          }
-        ],
-        "role": "user",
-        "type": "message"
-      },
-      {
-        "content": null,
-        "encrypted_content": encrypted_content_2,
-        "summary": [
-          {
-            "text": "I will create a node app",
-            "type": "summary_text"
-          }
-        ],
-        "type": "reasoning"
-      },
-      {
-        "action": {
-          "command": [
-            "echo",
-            "make-node"
-          ],
-          "env": null,
-          "timeout_ms": null,
-          "type": "exec",
-          "user": null,
-          "working_directory": null
-        },
-        "call_id": "r3-shell",
-        "status": "completed",
-        "type": "local_shell_call"
-      },
-      {
-        "call_id": "r3-shell",
-        "output": "execution error: Io(Os { code: 2, kind: NotFound, message: \"No such file or directory\" })",
-        "type": "function_call_output"
-      },
-      {
-        "content": [
-          {
-            "text": SUMMARIZATION_PROMPT,
-            "type": "input_text"
-          }
-        ],
-        "role": "user",
-        "type": "message"
-      }
-    ]
-    ,
-    // 4: request after second automatic compaction.
-    [
-      {
-        "content": [
-          {
-            "text": environment_message,
-            "type": "input_text"
-          }
-        ],
-        "role": "user",
-        "type": "message"
-      },
-      {
-        "content": [
-          {
-            "text": "create an app",
-            "type": "input_text"
-          }
-        ],
-        "role": "user",
-        "type": "message"
-      },
-      {
-        "content": [
-          {
-            "text": prefixed_second_summary.clone(),
-            "type": "input_text"
-          }
-        ],
-        "role": "user",
-        "type": "message"
-      }
-    ]
-    ,
-    [
-      // 5: request for third automatic compaction.
-      {
-        "content": [
-          {
-            "text": environment_message,
-            "type": "input_text"
-          }
-        ],
-        "role": "user",
-        "type": "message"
-      },
-      {
-        "content": [
-          {
-            "text": "create an app",
-            "type": "input_text"
-          }
-        ],
-        "role": "user",
-        "type": "message"
-      },
-      {
-        "content": [
-          {
-            "text": prefixed_second_summary.clone(),
-            "type": "input_text"
-          }
-        ],
-        "role": "user",
-        "type": "message"
-      },
-      {
-        "content": null,
-        "encrypted_content": encrypted_content_3,
-        "summary": [
-          {
-            "text": "I will create a python app",
-            "type": "summary_text"
-          }
-        ],
-        "type": "reasoning"
-      },
-      {
-        "action": {
-          "command": [
-            "echo",
-            "make-python"
-          ],
-          "env": null,
-          "timeout_ms": null,
-          "type": "exec",
-          "user": null,
-          "working_directory": null
-        },
-        "call_id": "r6-shell",
-        "status": "completed",
-        "type": "local_shell_call"
-      },
-      {
-        "call_id": "r6-shell",
-        "output": "execution error: Io(Os { code: 2, kind: NotFound, message: \"No such file or directory\" })",
-        "type": "function_call_output"
-      },
-      {
-        "content": [
-          {
-            "text": SUMMARIZATION_PROMPT,
-            "type": "input_text"
-          }
-        ],
-        "role": "user",
-        "type": "message"
-      }
-    ]
-    ,
-    [
-      {
-        // 6: request after third automatic compaction.
-        "content": [
-          {
-            "text": environment_message,
-            "type": "input_text"
-          }
-        ],
-        "role": "user",
-        "type": "message"
-      },
-      {
-        "content": [
-          {
-            "text": "create an app",
-            "type": "input_text"
-          }
-        ],
-        "role": "user",
-        "type": "message"
-      },
-      {
-        "content": [
-          {
-            "text": prefixed_third_summary.clone(),
-            "type": "input_text"
-          }
-        ],
-        "role": "user",
-        "type": "message"
-      }
-    ]
-    ]);
-
-    for (i, request) in requests_payloads.iter().enumerate() {
-        let body = request.body_json();
-        let input = body.get("input").and_then(|v| v.as_array()).unwrap();
-        let expected_input = expected_requests_inputs[i].as_array().unwrap();
-        assert_eq!(normalize_inputs(input), normalize_inputs(expected_input));
-    }
-
-    // test 3: the number of requests should be 7
-    assert_eq!(requests_payloads.len(), 7);
 }
 
 // Windows CI only: bump to 4 workers to prevent SSE/event starvation and test timeouts.
@@ -1205,6 +938,7 @@ async fn auto_compact_runs_after_token_limit_hit() {
     skip_if_no_network!();
 
     let server = start_mock_server().await;
+    let work_notes = work_notes_message("PRE_SAMPLING_WORK_NOTES");
 
     let sse1 = sse(vec![
         ev_assistant_message("m1", FIRST_REPLY),
@@ -1217,16 +951,20 @@ async fn auto_compact_runs_after_token_limit_hit() {
     ]);
 
     let sse3 = sse(vec![
-        ev_assistant_message("m3", AUTO_SUMMARY_TEXT),
-        ev_completed_with_tokens("r3", 200),
+        ev_assistant_message("m3", &work_notes),
+        ev_completed_with_tokens("r3", 100),
     ]);
     let sse4 = sse(vec![
-        ev_assistant_message("m4", FINAL_REPLY),
-        ev_completed_with_tokens("r4", 120),
+        ev_assistant_message("m4", AUTO_SUMMARY_TEXT),
+        ev_completed_with_tokens("r4", 200),
+    ]);
+    let sse5 = sse(vec![
+        ev_assistant_message("m5", FINAL_REPLY),
+        ev_completed_with_tokens("r5", 120),
     ]);
     let prefixed_auto_summary = AUTO_SUMMARY_TEXT;
 
-    let request_log = mount_sse_sequence(&server, vec![sse1, sse2, sse3, sse4]).await;
+    let request_log = mount_sse_sequence(&server, vec![sse1, sse2, sse3, sse4, sse5]).await;
 
     let model_provider = non_openai_model_provider(&server);
 
@@ -1283,8 +1021,8 @@ async fn auto_compact_runs_after_token_limit_hit() {
         .collect();
     assert_eq!(
         request_bodies.len(),
-        4,
-        "expected user turns, a compaction request, and the follow-up turn; got {}",
+        5,
+        "expected user turns, work notes, compaction request, and the follow-up turn; got {}",
         request_bodies.len()
     );
     let auto_compact_count = request_bodies
@@ -1301,8 +1039,17 @@ async fn auto_compact_runs_after_token_limit_hit() {
         .find_map(|(idx, body)| body_contains_text(body, SUMMARIZATION_PROMPT).then_some(idx))
         .expect("auto compact request missing");
     assert_eq!(
-        auto_compact_index, 2,
-        "auto compact should add a third request"
+        auto_compact_index, 3,
+        "auto compact should add a fourth request"
+    );
+    let work_notes_index = request_bodies
+        .iter()
+        .enumerate()
+        .find_map(|(idx, body)| body.contains(WORK_NOTES_REQUEST_TAG).then_some(idx))
+        .expect("work-notes request missing");
+    assert!(
+        work_notes_index < auto_compact_index,
+        "work-notes request should happen before compaction"
     );
 
     let follow_up_index = request_bodies
@@ -1314,7 +1061,7 @@ async fn auto_compact_runs_after_token_limit_hit() {
                 .then_some(idx)
         })
         .expect("follow-up request missing");
-    assert_eq!(follow_up_index, 3, "follow-up request should be last");
+    assert_eq!(follow_up_index, 4, "follow-up request should be last");
 
     let body_first = requests[0].body_json();
     let body_auto = requests[auto_compact_index].body_json();
@@ -1389,6 +1136,10 @@ async fn auto_compact_runs_after_token_limit_hit() {
             .any(|text| text.contains(prefixed_auto_summary)),
         "auto compact follow-up request should include the summary message"
     );
+    assert!(
+        user_texts.iter().any(|text| text.contains(&work_notes)),
+        "auto compact follow-up request should include preserved work notes"
+    );
 }
 
 // Windows CI only: bump to 4 workers to prevent SSE/event starvation and test timeouts.
@@ -1398,6 +1149,7 @@ async fn auto_compact_emits_context_compaction_items() {
     skip_if_no_network!();
 
     let server = start_mock_server().await;
+    let work_notes = work_notes_message("PRE_SAMPLING_WORK_NOTES");
 
     let sse1 = sse(vec![
         ev_assistant_message("m1", FIRST_REPLY),
@@ -1408,15 +1160,19 @@ async fn auto_compact_emits_context_compaction_items() {
         ev_completed_with_tokens("r2", 330_000),
     ]);
     let sse3 = sse(vec![
-        ev_assistant_message("m3", AUTO_SUMMARY_TEXT),
-        ev_completed_with_tokens("r3", 200),
+        ev_assistant_message("m3", &work_notes),
+        ev_completed_with_tokens("r3", 100),
     ]);
     let sse4 = sse(vec![
-        ev_assistant_message("m4", FINAL_REPLY),
-        ev_completed_with_tokens("r4", 120),
+        ev_assistant_message("m4", AUTO_SUMMARY_TEXT),
+        ev_completed_with_tokens("r4", 200),
+    ]);
+    let sse5 = sse(vec![
+        ev_assistant_message("m5", FINAL_REPLY),
+        ev_completed_with_tokens("r5", 120),
     ]);
 
-    mount_sse_sequence(&server, vec![sse1, sse2, sse3, sse4]).await;
+    mount_sse_sequence(&server, vec![sse1, sse2, sse3, sse4, sse5]).await;
 
     let model_provider = non_openai_model_provider(&server);
     let mut builder = test_codex().with_config(move |config| {
@@ -1481,6 +1237,7 @@ async fn auto_compact_starts_after_turn_started() {
     skip_if_no_network!();
 
     let server = start_mock_server().await;
+    let work_notes = work_notes_message("PRE_SAMPLING_WORK_NOTES");
 
     let sse1 = sse(vec![
         ev_assistant_message("m1", FIRST_REPLY),
@@ -1491,15 +1248,19 @@ async fn auto_compact_starts_after_turn_started() {
         ev_completed_with_tokens("r2", 330_000),
     ]);
     let sse3 = sse(vec![
-        ev_assistant_message("m3", AUTO_SUMMARY_TEXT),
-        ev_completed_with_tokens("r3", 200),
+        ev_assistant_message("m3", &work_notes),
+        ev_completed_with_tokens("r3", 100),
     ]);
     let sse4 = sse(vec![
-        ev_assistant_message("m4", FINAL_REPLY),
-        ev_completed_with_tokens("r4", 120),
+        ev_assistant_message("m4", AUTO_SUMMARY_TEXT),
+        ev_completed_with_tokens("r4", 200),
+    ]);
+    let sse5 = sse(vec![
+        ev_assistant_message("m5", FINAL_REPLY),
+        ev_completed_with_tokens("r5", 120),
     ]);
 
-    mount_sse_sequence(&server, vec![sse1, sse2, sse3, sse4]).await;
+    mount_sse_sequence(&server, vec![sse1, sse2, sse3, sse4, sse5]).await;
 
     let model_provider = non_openai_model_provider(&server);
     let mut builder = test_codex().with_config(move |config| {
@@ -1695,6 +1456,7 @@ async fn pre_sampling_compact_runs_on_switch_to_smaller_context_model() {
     let server = MockServer::start().await;
     let previous_model = "gpt-5.2-codex";
     let next_model = "gpt-5.1-codex-max";
+    let work_notes = work_notes_message("PRE_SAMPLING_WORK_NOTES");
 
     let models_mock = mount_models_once(
         &server,
@@ -1715,12 +1477,16 @@ async fn pre_sampling_compact_runs_on_switch_to_smaller_context_model() {
                 ev_completed_with_tokens("r1", 120_000),
             ]),
             sse(vec![
-                ev_assistant_message("m2", "PRE_SAMPLING_SUMMARY"),
+                ev_assistant_message("m2", &work_notes),
                 ev_completed_with_tokens("r2", 10),
             ]),
             sse(vec![
-                ev_assistant_message("m3", "after switch"),
+                ev_assistant_message("m3", "PRE_SAMPLING_SUMMARY"),
                 ev_completed_with_tokens("r3", 100),
+            ]),
+            sse(vec![
+                ev_assistant_message("m4", "after switch"),
+                ev_completed_with_tokens("r4", 100),
             ]),
         ],
     )
@@ -1785,13 +1551,14 @@ async fn pre_sampling_compact_runs_on_switch_to_smaller_context_model() {
     assert_eq!(models_mock.requests().len(), 1);
     assert_eq!(
         requests.len(),
-        3,
-        "expected user, compact, and follow-up requests"
+        4,
+        "expected user, work notes, compact, and follow-up requests"
     );
     assert_pre_sampling_switch_compaction_requests(
         &requests[0].body_json(),
         &requests[1].body_json(),
         &requests[2].body_json(),
+        &requests[3].body_json(),
         previous_model,
         next_model,
     );
@@ -1802,10 +1569,11 @@ async fn pre_sampling_compact_runs_on_switch_to_smaller_context_model() {
             "Pre-sampling compaction on model switch to a smaller context window: current behavior compacts using prior-turn history only (incoming user message excluded), and the follow-up request carries compacted history plus the new user message.",
             &[
                 ("Initial Request (Previous Model)", &requests[0]),
-                ("Pre-sampling Compaction Request", &requests[1]),
+                ("Pre-sampling Work Notes Request", &requests[1]),
+                ("Pre-sampling Compaction Request", &requests[2]),
                 (
                     "Post-Compaction Follow-up Request (Next Model)",
-                    &requests[2]
+                    &requests[3]
                 ),
             ]
         )
@@ -1819,6 +1587,7 @@ async fn pre_sampling_compact_runs_after_resume_and_switch_to_smaller_model() {
     let server = MockServer::start().await;
     let previous_model = "gpt-5.2-codex";
     let next_model = "gpt-5.1-codex-max";
+    let work_notes = work_notes_message("PRE_SAMPLING_WORK_NOTES");
 
     let models_mock = mount_models_once(
         &server,
@@ -1839,12 +1608,16 @@ async fn pre_sampling_compact_runs_after_resume_and_switch_to_smaller_model() {
                 ev_completed_with_tokens("r1", 120_000),
             ]),
             sse(vec![
-                ev_assistant_message("m2", "PRE_SAMPLING_SUMMARY"),
+                ev_assistant_message("m2", &work_notes),
                 ev_completed_with_tokens("r2", 10),
             ]),
             sse(vec![
-                ev_assistant_message("m3", "after resume"),
+                ev_assistant_message("m3", "PRE_SAMPLING_SUMMARY"),
                 ev_completed_with_tokens("r3", 100),
+            ]),
+            sse(vec![
+                ev_assistant_message("m4", "after resume"),
+                ev_completed_with_tokens("r4", 100),
             ]),
         ],
     )
@@ -1943,13 +1716,14 @@ async fn pre_sampling_compact_runs_after_resume_and_switch_to_smaller_model() {
     assert_eq!(models_mock.requests().len(), 1);
     assert_eq!(
         requests.len(),
-        3,
-        "expected user, compact, and follow-up requests"
+        4,
+        "expected user, work notes, compact, and follow-up requests"
     );
     assert_pre_sampling_switch_compaction_requests(
         &requests[0].body_json(),
         &requests[1].body_json(),
         &requests[2].body_json(),
+        &requests[3].body_json(),
         previous_model,
         next_model,
     );
@@ -1960,6 +1734,7 @@ async fn auto_compact_persists_rollout_entries() {
     skip_if_no_network!();
 
     let server = start_mock_server().await;
+    let work_notes = work_notes_message("PRE_SAMPLING_WORK_NOTES");
 
     let sse1 = sse(vec![
         ev_assistant_message("m1", FIRST_REPLY),
@@ -1973,12 +1748,16 @@ async fn auto_compact_persists_rollout_entries() {
 
     let auto_summary_payload = auto_summary(AUTO_SUMMARY_TEXT);
     let sse3 = sse(vec![
-        ev_assistant_message("m3", &auto_summary_payload),
-        ev_completed_with_tokens("r3", 200),
+        ev_assistant_message("m3", &work_notes),
+        ev_completed_with_tokens("r3", 100),
     ]);
     let sse4 = sse(vec![
-        ev_assistant_message("m4", FINAL_REPLY),
-        ev_completed_with_tokens("r4", 120),
+        ev_assistant_message("m4", &auto_summary_payload),
+        ev_completed_with_tokens("r4", 200),
+    ]);
+    let sse5 = sse(vec![
+        ev_assistant_message("m5", FINAL_REPLY),
+        ev_completed_with_tokens("r5", 120),
     ]);
 
     let first_matcher = |req: &wiremock::Request| {
@@ -1999,15 +1778,21 @@ async fn auto_compact_persists_rollout_entries() {
 
     let third_matcher = |req: &wiremock::Request| {
         let body = std::str::from_utf8(&req.body).unwrap_or("");
-        body_contains_text(body, SUMMARIZATION_PROMPT)
+        body.contains(WORK_NOTES_REQUEST_TAG)
     };
     mount_sse_once_match(&server, third_matcher, sse3).await;
 
     let fourth_matcher = |req: &wiremock::Request| {
         let body = std::str::from_utf8(&req.body).unwrap_or("");
-        body.contains(POST_AUTO_USER_MSG) && !body_contains_text(body, SUMMARIZATION_PROMPT)
+        body_contains_text(body, SUMMARIZATION_PROMPT)
     };
     mount_sse_once_match(&server, fourth_matcher, sse4).await;
+
+    let fifth_matcher = |req: &wiremock::Request| {
+        let body = std::str::from_utf8(&req.body).unwrap_or("");
+        body.contains(POST_AUTO_USER_MSG) && !body_contains_text(body, SUMMARIZATION_PROMPT)
+    };
+    mount_sse_once_match(&server, fifth_matcher, sse5).await;
 
     let model_provider = non_openai_model_provider(&server);
 
@@ -2481,6 +2266,8 @@ async fn auto_compact_allows_multiple_attempts_when_interleaved_with_other_turn_
     skip_if_no_network!();
 
     let server = start_mock_server().await;
+    let first_work_notes = work_notes_message("PRE_SAMPLING_WORK_NOTES_1");
+    let second_work_notes = work_notes_message("PRE_SAMPLING_WORK_NOTES_2");
 
     let sse1 = sse(vec![
         ev_assistant_message("m1", FIRST_REPLY),
@@ -2488,30 +2275,42 @@ async fn auto_compact_allows_multiple_attempts_when_interleaved_with_other_turn_
     ]);
     let first_summary_payload = auto_summary(FIRST_AUTO_SUMMARY);
     let sse2 = sse(vec![
-        ev_assistant_message("m2", &first_summary_payload),
-        ev_completed_with_tokens("r2", 50),
+        ev_assistant_message("m2", &first_work_notes),
+        ev_completed_with_tokens("r2", 10),
     ]);
     let sse3 = sse(vec![
-        ev_function_call(DUMMY_CALL_ID, DUMMY_FUNCTION_NAME, "{}"),
-        ev_completed_with_tokens("r3", 150),
+        ev_assistant_message("m3", &first_summary_payload),
+        ev_completed_with_tokens("r3", 50),
     ]);
     let sse4 = sse(vec![
-        ev_assistant_message("m4", SECOND_LARGE_REPLY),
-        ev_completed_with_tokens("r4", 450),
+        ev_function_call(DUMMY_CALL_ID, DUMMY_FUNCTION_NAME, "{}"),
+        ev_completed_with_tokens("r4", 150),
     ]);
     let second_summary_payload = auto_summary(SECOND_AUTO_SUMMARY);
     let sse5 = sse(vec![
-        ev_assistant_message("m5", &second_summary_payload),
-        ev_completed_with_tokens("r5", 60),
+        ev_assistant_message("m5", SECOND_LARGE_REPLY),
+        ev_completed_with_tokens("r5", 450),
     ]);
     let sse6 = sse(vec![
-        ev_assistant_message("m6", FINAL_REPLY),
-        ev_completed_with_tokens("r6", 120),
+        ev_assistant_message("m6", &second_work_notes),
+        ev_completed_with_tokens("r6", 10),
+    ]);
+    let sse7 = sse(vec![
+        ev_assistant_message("m7", &second_summary_payload),
+        ev_completed_with_tokens("r7", 60),
+    ]);
+    let sse8 = sse(vec![
+        ev_assistant_message("m8", FINAL_REPLY),
+        ev_completed_with_tokens("r8", 120),
     ]);
     let follow_up_user = "FOLLOW_UP_AUTO_COMPACT";
     let final_user = "FINAL_AUTO_COMPACT";
 
-    let request_log = mount_sse_sequence(&server, vec![sse1, sse2, sse3, sse4, sse5, sse6]).await;
+    let request_log = mount_sse_sequence(
+        &server,
+        vec![sse1, sse2, sse3, sse4, sse5, sse6, sse7, sse8],
+    )
+    .await;
 
     let model_provider = non_openai_model_provider(&server);
 
@@ -2566,24 +2365,46 @@ async fn auto_compact_allows_multiple_attempts_when_interleaved_with_other_turn_
         .collect();
     assert_eq!(
         request_bodies.len(),
-        6,
-        "expected six requests including two auto compactions"
+        8,
+        "expected eight requests including two work-notes rounds and two auto compactions"
     );
     assert!(
         request_bodies[0].contains(MULTI_AUTO_MSG),
         "first request should contain the user input"
     );
-    assert!(
-        body_contains_text(&request_bodies[1], SUMMARIZATION_PROMPT),
-        "first auto compact request should include the summarization prompt"
+    let work_notes_indices = request_bodies
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, body)| body.contains(WORK_NOTES_REQUEST_TAG).then_some(idx))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        work_notes_indices.len(),
+        2,
+        "expected two work-notes capture requests"
+    );
+
+    let compact_indices = request_bodies
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, body)| body_contains_text(body, SUMMARIZATION_PROMPT).then_some(idx))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        compact_indices.len(),
+        2,
+        "expected two auto compact requests"
     );
     assert!(
-        request_bodies[3].contains(&format!("unsupported call: {DUMMY_FUNCTION_NAME}")),
+        work_notes_indices[0] < compact_indices[0] && work_notes_indices[1] < compact_indices[1],
+        "each work-notes request should happen before its compaction request"
+    );
+
+    let function_call_output_index = request_bodies
+        .iter()
+        .position(|body| body.contains(&format!("unsupported call: {DUMMY_FUNCTION_NAME}")))
+        .expect("function call output request missing");
+    assert!(
+        function_call_output_index < compact_indices[1],
         "function call output should be sent before the second auto compact"
-    );
-    assert!(
-        body_contains_text(&request_bodies[4], SUMMARIZATION_PROMPT),
-        "second auto compact request should include the summarization prompt"
     );
 }
 
@@ -2592,6 +2413,7 @@ async fn snapshot_request_shape_mid_turn_continuation_compaction() {
     skip_if_no_network!();
 
     let server = start_mock_server().await;
+    let work_notes = work_notes_message("MID_TURN_WORK_NOTES");
 
     let context_window = 100;
     let limit = context_window * 90 / 100;
@@ -2601,18 +2423,23 @@ async fn snapshot_request_shape_mid_turn_continuation_compaction() {
         ev_function_call(DUMMY_CALL_ID, DUMMY_FUNCTION_NAME, "{}"),
         ev_completed_with_tokens("r1", over_limit_tokens),
     ]);
+    let work_notes_turn = sse(vec![
+        ev_assistant_message("m2", &work_notes),
+        ev_completed_with_tokens("r2", 5),
+    ]);
     let auto_summary_payload = auto_summary(AUTO_SUMMARY_TEXT);
     let auto_compact_turn = sse(vec![
-        ev_assistant_message("m2", &auto_summary_payload),
+        ev_assistant_message("m3", &auto_summary_payload),
         ev_completed_with_tokens("r3", 10),
     ]);
     let post_auto_compact_turn = sse(vec![
-        ev_assistant_message("m3", FINAL_REPLY),
+        ev_assistant_message("m4", FINAL_REPLY),
         ev_completed_with_tokens("r4", 10),
     ]);
 
     // Mount responses in order and keep mocks only for the ones we assert on.
     let first_turn_mock = mount_sse_once(&server, first_turn).await;
+    let work_notes_mock = mount_sse_once(&server, work_notes_turn).await;
     let auto_compact_mock = mount_sse_once(&server, auto_compact_turn).await;
     let post_auto_compact_mock = mount_sse_once(&server, post_auto_compact_turn).await;
 
@@ -2653,6 +2480,15 @@ async fn snapshot_request_shape_mid_turn_continuation_compaction() {
                     == Some(FUNCTION_CALL_LIMIT_MSG)
         }),
         "first request should include the user message that triggers the function call"
+    );
+
+    assert!(
+        work_notes_mock
+            .single_request()
+            .body_json()
+            .to_string()
+            .contains(WORK_NOTES_REQUEST_TAG),
+        "work-notes request should include work-notes request tag"
     );
 
     let function_call_output = auto_compact_mock
@@ -2696,6 +2532,7 @@ async fn auto_compact_clamps_config_limit_to_context_window() {
     skip_if_no_network!();
 
     let server = start_mock_server().await;
+    let work_notes = work_notes_message("PRE_SAMPLING_WORK_NOTES");
 
     let context_window = 100;
     let config_limit = 200;
@@ -2705,14 +2542,19 @@ async fn auto_compact_clamps_config_limit_to_context_window() {
         ev_assistant_message("m1", FIRST_REPLY),
         ev_completed_with_tokens("r1", over_limit_tokens),
     ]);
+    let work_notes_turn = sse(vec![
+        ev_assistant_message("m2", &work_notes),
+        ev_completed_with_tokens("r2", 5),
+    ]);
     let auto_summary_payload = auto_summary(AUTO_SUMMARY_TEXT);
     let auto_compact_turn = sse(vec![
-        ev_assistant_message("m2", &auto_summary_payload),
-        ev_completed_with_tokens("r2", 10),
+        ev_assistant_message("m3", &auto_summary_payload),
+        ev_completed_with_tokens("r3", 10),
     ]);
-    let post_auto_compact_turn = sse(vec![ev_completed_with_tokens("r3", 10)]);
+    let post_auto_compact_turn = sse(vec![ev_completed_with_tokens("r4", 10)]);
 
     let first_turn_mock = mount_sse_once(&server, first_turn).await;
+    mount_sse_once(&server, work_notes_turn).await;
     let auto_compact_mock = mount_sse_once(&server, auto_compact_turn).await;
     mount_sse_once(&server, post_auto_compact_turn).await;
 
@@ -2754,6 +2596,7 @@ async fn auto_compact_counts_encrypted_reasoning_before_last_user() {
     skip_if_no_network!();
 
     let server = start_mock_server().await;
+    let work_notes = work_notes_message("PRE_SAMPLING_WORK_NOTES");
 
     let first_user = "COUNT_PRE_LAST_REASONING";
     let second_user = "TRIGGER_COMPACT_AT_LIMIT";
@@ -2782,6 +2625,11 @@ async fn auto_compact_counts_encrypted_reasoning_before_last_user() {
             first_turn,
             // Turn 2: reasoning after last user (should be ignored for compaction).
             second_turn,
+            // Pre-sampling work-notes capture before remote compaction.
+            sse(vec![
+                ev_assistant_message("pre-sampling-work-notes", &work_notes),
+                ev_completed_with_tokens("r3", 1),
+            ]),
             // Turn 3: next user turn after remote compaction.
             third_turn,
         ],
@@ -2855,15 +2703,21 @@ async fn auto_compact_counts_encrypted_reasoning_before_last_user() {
     let requests = request_log.requests();
     assert_eq!(
         requests.len(),
-        3,
-        "conversation should include three user turns"
+        4,
+        "conversation should include three user turns plus work-notes capture"
     );
     let second_request_body = requests[1].body_json().to_string();
     assert!(
         !second_request_body.contains("REMOTE_COMPACT_SUMMARY"),
         "second turn should not include compacted history"
     );
-    let third_request_body = requests[2].body_json().to_string();
+    let work_notes_request_body = requests[2].body_json().to_string();
+    assert!(
+        work_notes_request_body.contains(WORK_NOTES_REQUEST_TAG),
+        "expected pre-sampling work-notes request before remote compaction"
+    );
+
+    let third_request_body = requests[3].body_json().to_string();
     assert!(
         third_request_body.contains("REMOTE_COMPACT_SUMMARY")
             || third_request_body.contains(FINAL_REPLY),
@@ -2872,6 +2726,10 @@ async fn auto_compact_counts_encrypted_reasoning_before_last_user() {
     assert!(
         third_request_body.contains("ENCRYPTED_COMPACTION_SUMMARY"),
         "third turn should include compaction summary item"
+    );
+    assert!(
+        third_request_body.contains("PRE_SAMPLING_WORK_NOTES"),
+        "third turn should preserve the latest pre-sampling work notes"
     );
 }
 
@@ -2964,6 +2822,7 @@ async fn snapshot_request_shape_pre_turn_compaction_including_incoming_user_mess
     skip_if_no_network!();
 
     let server = start_mock_server().await;
+    let work_notes = work_notes_message("PRE_TURN_WORK_NOTES");
 
     let sse1 = sse(vec![
         ev_assistant_message("m1", FIRST_REPLY),
@@ -2974,14 +2833,18 @@ async fn snapshot_request_shape_pre_turn_compaction_including_incoming_user_mess
         ev_completed_with_tokens("r2", 500),
     ]);
     let sse3 = sse(vec![
-        ev_assistant_message("m3", "PRE_TURN_SUMMARY"),
-        ev_completed_with_tokens("r3", 100),
+        ev_assistant_message("m3", &work_notes),
+        ev_completed_with_tokens("r3", 5),
     ]);
     let sse4 = sse(vec![
-        ev_assistant_message("m4", FINAL_REPLY),
-        ev_completed_with_tokens("r4", 80),
+        ev_assistant_message("m4", "PRE_TURN_SUMMARY"),
+        ev_completed_with_tokens("r4", 100),
     ]);
-    let request_log = mount_sse_sequence(&server, vec![sse1, sse2, sse3, sse4]).await;
+    let sse5 = sse(vec![
+        ev_assistant_message("m5", FINAL_REPLY),
+        ev_completed_with_tokens("r5", 80),
+    ]);
+    let request_log = mount_sse_sequence(&server, vec![sse1, sse2, sse3, sse4, sse5]).await;
 
     let model_provider = non_openai_model_provider(&server);
     let codex = test_codex()
@@ -3043,31 +2906,35 @@ async fn snapshot_request_shape_pre_turn_compaction_including_incoming_user_mess
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     let requests = request_log.requests();
-    assert_eq!(requests.len(), 4, "expected user, user, compact, follow-up");
+    assert_eq!(
+        requests.len(),
+        5,
+        "expected user, user, work notes, compact, follow-up"
+    );
 
     insta::assert_snapshot!(
         "pre_turn_compaction_including_incoming_shapes",
         format_labeled_requests_snapshot(
             "Pre-turn auto-compaction with a context override emits the context diff in the compact request while the incoming user message is still excluded.",
             &[
-                ("Local Compaction Request", &requests[2]),
-                ("Local Post-Compaction History Layout", &requests[3]),
+                ("Local Compaction Request", &requests[3]),
+                ("Local Post-Compaction History Layout", &requests[4]),
             ]
         )
     );
-    let compact_request_user_texts = requests[2].message_input_texts("user");
+    let compact_request_user_texts = requests[3].message_input_texts("user");
     assert!(
         !compact_request_user_texts
             .iter()
             .any(|text| text == "USER_THREE"),
         "current behavior excludes incoming user message from pre-turn compaction input"
     );
-    let follow_up_user_texts = requests[3].message_input_texts("user");
+    let follow_up_user_texts = requests[4].message_input_texts("user");
     assert!(
         follow_up_user_texts.iter().any(|text| text == "USER_THREE"),
         "expected post-compaction follow-up request to keep incoming user text"
     );
-    let follow_up_user_images = requests[3].message_input_image_urls("user");
+    let follow_up_user_images = requests[4].message_input_image_urls("user");
     assert!(
         follow_up_user_images
             .iter()
@@ -3085,6 +2952,7 @@ async fn snapshot_request_shape_pre_turn_compaction_strips_incoming_model_switch
     let server = start_mock_server().await;
     let previous_model = "gpt-5.1-codex-max";
     let next_model = "gpt-5.2-codex";
+    let work_notes = work_notes_message("PRE_TURN_WORK_NOTES");
 
     let request_log = mount_sse_sequence(
         &server,
@@ -3094,12 +2962,16 @@ async fn snapshot_request_shape_pre_turn_compaction_strips_incoming_model_switch
                 ev_completed_with_tokens("r1", 500),
             ]),
             sse(vec![
-                ev_assistant_message("m2", "PRETURN_SWITCH_SUMMARY"),
-                ev_completed_with_tokens("r2", 100),
+                ev_assistant_message("m2", &work_notes),
+                ev_completed_with_tokens("r2", 5),
             ]),
             sse(vec![
-                ev_assistant_message("m3", "AFTER_SWITCH_REPLY"),
+                ev_assistant_message("m3", "PRETURN_SWITCH_SUMMARY"),
                 ev_completed_with_tokens("r3", 100),
+            ]),
+            sse(vec![
+                ev_assistant_message("m4", "AFTER_SWITCH_REPLY"),
+                ev_completed_with_tokens("r4", 100),
             ]),
         ],
     )
@@ -3172,11 +3044,11 @@ async fn snapshot_request_shape_pre_turn_compaction_strips_incoming_model_switch
     let requests = request_log.requests();
     assert_eq!(
         requests.len(),
-        3,
-        "expected first turn, pre-turn compact, and post-compact follow-up requests"
+        4,
+        "expected first turn, work notes, pre-turn compact, and post-compact follow-up requests"
     );
 
-    let compact_body = requests[1].body_json().to_string();
+    let compact_body = requests[2].body_json().to_string();
     assert!(
         body_contains_text(&compact_body, SUMMARIZATION_PROMPT),
         "pre-turn compaction request should include summarization prompt"
@@ -3186,7 +3058,7 @@ async fn snapshot_request_shape_pre_turn_compaction_strips_incoming_model_switch
         "pre-turn compaction request should strip incoming model-switch update item"
     );
 
-    let follow_up_body = requests[2].body_json().to_string();
+    let follow_up_body = requests[3].body_json().to_string();
     assert!(
         follow_up_body.contains("<model_switch>"),
         "post-compaction follow-up should include model-switch update item"
@@ -3198,8 +3070,9 @@ async fn snapshot_request_shape_pre_turn_compaction_strips_incoming_model_switch
             "Pre-turn compaction during model switch (without pre-sampling model-switch compaction): current behavior strips incoming <model_switch> from the compact request and restores it in the post-compaction follow-up request.",
             &[
                 ("Initial Request (Previous Model)", &requests[0]),
-                ("Local Compaction Request", &requests[1]),
-                ("Local Post-Compaction History Layout", &requests[2]),
+                ("Pre-turn Work Notes Request", &requests[1]),
+                ("Local Compaction Request", &requests[2]),
+                ("Local Post-Compaction History Layout", &requests[3]),
             ]
         )
     );
@@ -3217,7 +3090,7 @@ async fn snapshot_request_shape_pre_turn_compaction_context_window_exceeded() {
     ]);
     let mut responses = vec![first_turn];
     responses.extend(
-        (0..5).map(|_| {
+        (0..6).map(|_| {
             sse_failed(
                 "compact-failed",
                 "context_length_exceeded",
@@ -3271,8 +3144,8 @@ async fn snapshot_request_shape_pre_turn_compaction_context_window_exceeded() {
 
     let requests = request_log.requests();
     assert!(
-        requests.len() >= 2,
-        "expected first turn and at least one compaction request"
+        requests.len() >= 3,
+        "expected first turn, work notes request, and at least one compaction request"
     );
 
     insta::assert_snapshot!(
@@ -3281,7 +3154,7 @@ async fn snapshot_request_shape_pre_turn_compaction_context_window_exceeded() {
             "Pre-turn auto-compaction context-window failure: compaction request excludes the incoming user message and the turn errors.",
             &[(
                 "Local Compaction Request (Incoming User Excluded)",
-                &requests[1]
+                &requests[2]
             ),]
         )
     );

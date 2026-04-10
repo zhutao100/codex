@@ -1,8 +1,18 @@
 ---
 source: core/tests/suite/compact_remote.rs
-expression: "format_labeled_requests_snapshot(\"Remote pre-turn auto-compaction after realtime was closed between turns: the follow-up request emits realtime-end instructions from previous-turn settings even though compaction cleared the reference baseline.\",\n&[(\"Remote Compaction Request\", &compact_request),\n(\"Remote Post-Compaction History Layout\", post_compact_request),])"
+expression: "format_labeled_requests_snapshot(\"Remote pre-turn auto-compaction after realtime was closed between turns: the follow-up request emits realtime-end instructions from previous-turn settings even though compaction cleared the reference baseline.\",\n&[(\"Pre-turn Work Notes Request\", &requests[1]),\n(\"Remote Compaction Request\", &compact_request),\n(\"Remote Post-Compaction History Layout\", post_compact_request),])"
 ---
 Scenario: Remote pre-turn auto-compaction after realtime was closed between turns: the follow-up request emits realtime-end instructions from previous-turn settings even though compaction cleared the reference baseline.
+
+## Pre-turn Work Notes Request
+00:message/developer:<PERMISSIONS_INSTRUCTIONS>
+01:message/user[2]:
+    [01] <AGENTS_MD>
+    [02] <ENVIRONMENT_CONTEXT:cwd=<CWD>>
+02:message/developer:<realtime_conversation>\nRealtime conversation started.\n\nYou a...
+03:message/user:USER_ONE
+04:message/assistant:REMOTE_FIRST_REPLY
+05:message/developer:<AUTO_COMPACT_WORK_NOTES_REQUEST>\nToken limit is approaching an...
 
 ## Remote Compaction Request
 00:message/developer:<PERMISSIONS_INSTRUCTIONS>
@@ -14,11 +24,12 @@ Scenario: Remote pre-turn auto-compaction after realtime was closed between turn
 04:message/assistant:REMOTE_FIRST_REPLY
 
 ## Remote Post-Compaction History Layout
-00:compaction:encrypted=true
-01:message/developer[2]:
+00:message/user:Immediately before compaction, the previous model emitted the fo...
+01:compaction:encrypted=true
+02:message/developer[2]:
     [01] <PERMISSIONS_INSTRUCTIONS>
     [02] <realtime_conversation>\nRealtime conversation ended.\n\nSubsequ...
-02:message/user[2]:
+03:message/user[2]:
     [01] <AGENTS_MD>
     [02] <ENVIRONMENT_CONTEXT:cwd=<CWD>>
-03:message/user:USER_TWO
+04:message/user:USER_TWO

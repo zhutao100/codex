@@ -1,8 +1,18 @@
 ---
 source: core/tests/suite/compact_remote.rs
-expression: "format_labeled_requests_snapshot(\"Remote mid-turn continuation compaction after tool output: compact request includes tool artifacts and the follow-up request includes the returned compaction item.\",\n&[(\"Remote Compaction Request\", &compact_request),\n(\"Remote Post-Compaction History Layout\", &requests[1]),])"
+expression: "format_labeled_requests_snapshot(\"Remote mid-turn continuation compaction after tool output: compact request includes tool artifacts and the follow-up request includes the returned compaction item.\",\n&[(\"Mid-turn Work Notes Request\", &requests[1]),\n(\"Remote Compaction Request\", &compact_request),\n(\"Remote Post-Compaction History Layout\", &requests[2]),])"
 ---
 Scenario: Remote mid-turn continuation compaction after tool output: compact request includes tool artifacts and the follow-up request includes the returned compaction item.
+
+## Mid-turn Work Notes Request
+00:message/developer:<PERMISSIONS_INSTRUCTIONS>
+01:message/user[2]:
+    [01] <AGENTS_MD>
+    [02] <ENVIRONMENT_CONTEXT:cwd=<CWD>>
+02:message/user:USER_ONE
+03:function_call/test_tool
+04:function_call_output:unsupported call: test_tool
+05:message/developer:<AUTO_COMPACT_WORK_NOTES_REQUEST>\nToken limit is approaching an...
 
 ## Remote Compaction Request
 00:message/developer:<PERMISSIONS_INSTRUCTIONS>
@@ -19,4 +29,5 @@ Scenario: Remote mid-turn continuation compaction after tool output: compact req
     [01] <AGENTS_MD>
     [02] <ENVIRONMENT_CONTEXT:cwd=<CWD>>
 02:message/user:USER_ONE
-03:compaction:encrypted=true
+03:message/user:Immediately before compaction, the previous model emitted the fo...
+04:compaction:encrypted=true

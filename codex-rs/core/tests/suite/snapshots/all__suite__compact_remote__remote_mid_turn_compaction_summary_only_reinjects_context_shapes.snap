@@ -1,8 +1,18 @@
 ---
 source: core/tests/suite/compact_remote.rs
-expression: "format_labeled_requests_snapshot(\"Remote mid-turn compaction where compact output has only a compaction item: continuation layout reinjects context before that compaction item.\",\n&[(\"Remote Compaction Request\", &compact_request),\n(\"Remote Post-Compaction History Layout\", &post_compact_turn_request),])"
+expression: "format_labeled_requests_snapshot(\"Remote mid-turn compaction where compact output has only a compaction item: continuation layout reinjects context before that compaction item.\",\n&[(\"Mid-turn Work Notes Request\", &requests[1]),\n(\"Remote Compaction Request\", &compact_request),\n(\"Remote Post-Compaction History Layout\", post_compact_turn_request),])"
 ---
 Scenario: Remote mid-turn compaction where compact output has only a compaction item: continuation layout reinjects context before that compaction item.
+
+## Mid-turn Work Notes Request
+00:message/developer:<PERMISSIONS_INSTRUCTIONS>
+01:message/user[2]:
+    [01] <AGENTS_MD>
+    [02] <ENVIRONMENT_CONTEXT:cwd=<CWD>>
+02:message/user:USER_ONE
+03:function_call/test_tool
+04:function_call_output:unsupported call: test_tool
+05:message/developer:<AUTO_COMPACT_WORK_NOTES_REQUEST>\nToken limit is approaching an...
 
 ## Remote Compaction Request
 00:message/developer:<PERMISSIONS_INSTRUCTIONS>
@@ -18,4 +28,5 @@ Scenario: Remote mid-turn compaction where compact output has only a compaction 
 01:message/user[2]:
     [01] <AGENTS_MD>
     [02] <ENVIRONMENT_CONTEXT:cwd=<CWD>>
-02:compaction:encrypted=true
+02:message/user:Immediately before compaction, the previous model emitted the fo...
+03:compaction:encrypted=true

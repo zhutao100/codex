@@ -54,9 +54,15 @@ fn estimate_compact_payload_tokens(request: &responses::ResponsesRequest) -> i64
 
 const PRETURN_CONTEXT_DIFF_CWD: &str = "/tmp/PRETURN_CONTEXT_DIFF_CWD";
 const DUMMY_FUNCTION_NAME: &str = "test_tool";
+const WORK_NOTES_REQUEST_TAG: &str = "<AUTO_COMPACT_WORK_NOTES_REQUEST>";
+const WORK_NOTES_TAG: &str = "<AUTO_COMPACT_WORK_NOTES>";
 
 fn summary_with_prefix(summary: &str) -> String {
     format!("{SUMMARY_PREFIX}\n{summary}")
+}
+
+fn work_notes_message(notes: &str) -> String {
+    format!("{WORK_NOTES_TAG}\n{notes}\n</AUTO_COMPACT_WORK_NOTES>")
 }
 
 fn context_snapshot_options() -> ContextSnapshotOptions {
@@ -306,21 +312,24 @@ async fn remote_compact_runs_automatically() -> Result<()> {
     .await?;
     let codex = harness.test().codex.clone();
     let session_id = harness.test().session_configured.session_id.to_string();
+    let work_notes = work_notes_message("REMOTE_WORK_NOTES");
 
-    mount_sse_once(
+    let responses_mock = responses::mount_sse_sequence(
         harness.server(),
-        sse(vec![
-            responses::ev_shell_command_call("m1", "echo 'hi'"),
-            responses::ev_completed_with_tokens("resp-1", 100000000), // over token limit
-        ]),
-    )
-    .await;
-    let responses_mock = mount_sse_once(
-        harness.server(),
-        responses::sse(vec![
-            responses::ev_assistant_message("m2", "AFTER_COMPACT_REPLY"),
-            responses::ev_completed("resp-2"),
-        ]),
+        vec![
+            responses::sse(vec![
+                responses::ev_shell_command_call("m1", "echo 'hi'"),
+                responses::ev_completed_with_tokens("resp-1", 100000000), // over token limit
+            ]),
+            responses::sse(vec![
+                responses::ev_assistant_message("work-notes", &work_notes),
+                responses::ev_completed_with_tokens("work-notes-response", 100),
+            ]),
+            responses::sse(vec![
+                responses::ev_assistant_message("m2", "AFTER_COMPACT_REPLY"),
+                responses::ev_completed("resp-2"),
+            ]),
+        ],
     )
     .await;
 
@@ -355,9 +364,28 @@ async fn remote_compact_runs_automatically() -> Result<()> {
             .as_deref(),
         Some(session_id.as_str())
     );
-    let follow_up_request = responses_mock.single_request();
+    let response_requests = responses_mock.requests();
+    assert_eq!(
+        response_requests.len(),
+        3,
+        "expected initial, work-notes, and post-compaction follow-up requests"
+    );
+    assert!(
+        response_requests[1]
+            .body_json()
+            .to_string()
+            .contains(WORK_NOTES_REQUEST_TAG),
+        "expected work-notes request before remote compaction"
+    );
+    let follow_up_request = response_requests
+        .last()
+        .expect("post-compaction follow-up request missing");
     let follow_up_body = follow_up_request.body_json().to_string();
     assert!(follow_up_body.contains("REMOTE_COMPACTED_SUMMARY"));
+    assert!(
+        follow_up_body.contains("REMOTE_WORK_NOTES"),
+        "expected follow-up request to include preserved work notes"
+    );
 
     Ok(())
 }
@@ -625,27 +653,26 @@ async fn auto_remote_compact_failure_stops_agent_loop() -> Result<()> {
     )
     .await?;
     let codex = harness.test().codex.clone();
+    let work_notes = work_notes_message("REMOTE_PRETURN_WORK_NOTES");
 
-    mount_sse_once(
+    let responses_mock = responses::mount_sse_sequence(
         harness.server(),
-        sse(vec![
-            responses::ev_assistant_message("initial-assistant", "initial turn complete"),
-            responses::ev_completed_with_tokens("initial-response", 500_000),
-        ]),
+        vec![
+            sse(vec![
+                responses::ev_assistant_message("initial-assistant", "initial turn complete"),
+                responses::ev_completed_with_tokens("initial-response", 500_000),
+            ]),
+            sse(vec![
+                responses::ev_assistant_message("preturn-work-notes", &work_notes),
+                responses::ev_completed_with_tokens("work-notes-response", 10),
+            ]),
+        ],
     )
     .await;
 
     let first_compact_mock = responses::mount_compact_json_once(
         harness.server(),
         serde_json::json!({ "output": "invalid compact payload shape" }),
-    )
-    .await;
-    let post_compact_turn_mock = mount_sse_once(
-        harness.server(),
-        sse(vec![
-            responses::ev_assistant_message("post-compact-assistant", "should not run"),
-            responses::ev_completed("post-compact-response"),
-        ]),
     )
     .await;
 
@@ -686,9 +713,25 @@ async fn auto_remote_compact_failure_stops_agent_loop() -> Result<()> {
         1,
         "expected first remote compact attempt with incoming items"
     );
+    let response_requests = responses_mock.requests();
+    assert_eq!(
+        response_requests.len(),
+        2,
+        "expected initial + work-notes requests"
+    );
     assert!(
-        post_compact_turn_mock.requests().is_empty(),
-        "expected agent loop to stop after compaction failure"
+        response_requests[1]
+            .body_json()
+            .to_string()
+            .contains(WORK_NOTES_REQUEST_TAG),
+        "expected work-notes request before remote compaction"
+    );
+    assert!(
+        !response_requests[1]
+            .body_json()
+            .to_string()
+            .contains("turn that triggers auto compact"),
+        "did not expect incoming user message to be sent after compaction failure"
     );
 
     insta::assert_snapshot!(
@@ -1420,6 +1463,7 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_restates_realtime_sta
         config.model_auto_compact_token_limit = Some(200);
     });
     let test = builder.build(&server).await?;
+    let work_notes = work_notes_message("REMOTE_PRETURN_WORK_NOTES");
 
     let responses_mock = responses::mount_sse_sequence(
         &server,
@@ -1427,6 +1471,10 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_restates_realtime_sta
             responses::sse(vec![
                 responses::ev_assistant_message("m1", "REMOTE_FIRST_REPLY"),
                 responses::ev_completed_with_tokens("r1", 500),
+            ]),
+            responses::sse(vec![
+                responses::ev_assistant_message("preturn-work-notes", &work_notes),
+                responses::ev_completed_with_tokens("work-notes-response", 10),
             ]),
             responses::sse(vec![
                 responses::ev_assistant_message("m2", "REMOTE_SECOND_REPLY"),
@@ -1471,10 +1519,21 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_restates_realtime_sta
 
     assert_eq!(compact_mock.requests().len(), 1);
     let requests = responses_mock.requests();
-    assert_eq!(requests.len(), 2, "expected two model requests");
+    assert_eq!(
+        requests.len(),
+        3,
+        "expected work-notes request plus two model turns"
+    );
+    assert!(
+        requests[1]
+            .body_json()
+            .to_string()
+            .contains(WORK_NOTES_REQUEST_TAG),
+        "expected work-notes request before remote compaction"
+    );
 
     let compact_request = compact_mock.single_request();
-    let post_compact_request = &requests[1];
+    let post_compact_request = &requests[2];
     assert_request_contains_realtime_start(post_compact_request);
 
     insta::assert_snapshot!(
@@ -1482,6 +1541,7 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_restates_realtime_sta
         format_labeled_requests_snapshot(
             "Remote pre-turn auto-compaction while realtime remains active: compaction clears the reference baseline, so the follow-up request restates realtime-start instructions.",
             &[
+                ("Pre-turn Work Notes Request", &requests[1]),
                 ("Remote Compaction Request", &compact_request),
                 (
                     "Remote Post-Compaction History Layout",
@@ -1506,6 +1566,7 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_restates_realtime_end
         config.model_auto_compact_token_limit = Some(200);
     });
     let test = builder.build(&server).await?;
+    let work_notes = work_notes_message("REMOTE_PRETURN_WORK_NOTES");
 
     let responses_mock = responses::mount_sse_sequence(
         &server,
@@ -1513,6 +1574,10 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_restates_realtime_end
             responses::sse(vec![
                 responses::ev_assistant_message("m1", "REMOTE_FIRST_REPLY"),
                 responses::ev_completed_with_tokens("r1", 500),
+            ]),
+            responses::sse(vec![
+                responses::ev_assistant_message("preturn-work-notes", &work_notes),
+                responses::ev_completed_with_tokens("work-notes-response", 10),
             ]),
             responses::sse(vec![
                 responses::ev_assistant_message("m2", "REMOTE_SECOND_REPLY"),
@@ -1559,10 +1624,21 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_restates_realtime_end
 
     assert_eq!(compact_mock.requests().len(), 1);
     let requests = responses_mock.requests();
-    assert_eq!(requests.len(), 2, "expected two model requests");
+    assert_eq!(
+        requests.len(),
+        3,
+        "expected work-notes request plus two model turns"
+    );
+    assert!(
+        requests[1]
+            .body_json()
+            .to_string()
+            .contains(WORK_NOTES_REQUEST_TAG),
+        "expected work-notes request before remote compaction"
+    );
 
     let compact_request = compact_mock.single_request();
-    let post_compact_request = &requests[1];
+    let post_compact_request = &requests[2];
     assert_request_contains_realtime_end(post_compact_request);
 
     insta::assert_snapshot!(
@@ -1570,6 +1646,7 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_restates_realtime_end
         format_labeled_requests_snapshot(
             "Remote pre-turn auto-compaction after realtime was closed between turns: the follow-up request emits realtime-end instructions from previous-turn settings even though compaction cleared the reference baseline.",
             &[
+                ("Pre-turn Work Notes Request", &requests[1]),
                 ("Remote Compaction Request", &compact_request),
                 (
                     "Remote Post-Compaction History Layout",
@@ -1681,6 +1758,7 @@ async fn snapshot_request_shape_remote_mid_turn_compaction_does_not_restate_real
         config.model_auto_compact_token_limit = Some(200);
     });
     let test = builder.build(&server).await?;
+    let work_notes = work_notes_message("REMOTE_MID_TURN_WORK_NOTES");
 
     let responses_mock = responses::mount_sse_sequence(
         &server,
@@ -1692,6 +1770,10 @@ async fn snapshot_request_shape_remote_mid_turn_compaction_does_not_restate_real
             responses::sse(vec![
                 responses::ev_function_call("call-remote-mid-turn", DUMMY_FUNCTION_NAME, "{}"),
                 responses::ev_completed_with_tokens("r1", 500),
+            ]),
+            responses::sse(vec![
+                responses::ev_assistant_message("mid-turn-work-notes", &work_notes),
+                responses::ev_completed_with_tokens("work-notes-response", 10),
             ]),
             responses::sse(vec![
                 responses::ev_assistant_message("m2", "REMOTE_MID_TURN_FINAL_REPLY"),
@@ -1738,11 +1820,22 @@ async fn snapshot_request_shape_remote_mid_turn_compaction_does_not_restate_real
 
     assert_eq!(compact_mock.requests().len(), 1);
     let requests = responses_mock.requests();
-    assert_eq!(requests.len(), 3, "expected three model requests");
+    assert_eq!(
+        requests.len(),
+        4,
+        "expected setup + mid-turn + work-notes + follow-up requests"
+    );
 
     let second_turn_request = &requests[1];
     let compact_request = compact_mock.single_request();
-    let post_compact_request = &requests[2];
+    assert!(
+        requests[2]
+            .body_json()
+            .to_string()
+            .contains(WORK_NOTES_REQUEST_TAG),
+        "expected mid-turn work-notes request before remote compaction"
+    );
+    let post_compact_request = &requests[3];
     assert_request_contains_realtime_end(second_turn_request);
     assert!(
         !post_compact_request
@@ -1758,6 +1851,7 @@ async fn snapshot_request_shape_remote_mid_turn_compaction_does_not_restate_real
             "Remote mid-turn continuation compaction after realtime was closed before the turn: the initial second-turn request emits realtime-end instructions, but the continuation request does not restate them after compaction because the current turn already established the inactive baseline.",
             &[
                 ("Second Turn Initial Request", second_turn_request),
+                ("Mid-turn Work Notes Request", &requests[2]),
                 ("Remote Compaction Request", &compact_request),
                 (
                     "Remote Post-Compaction History Layout",
@@ -1889,6 +1983,7 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_including_incoming_us
     )
     .await?;
     let codex = harness.test().codex.clone();
+    let work_notes = work_notes_message("REMOTE_PRETURN_WORK_NOTES");
 
     let responses_mock = responses::mount_sse_sequence(
         harness.server(),
@@ -1900,6 +1995,10 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_including_incoming_us
             responses::sse(vec![
                 responses::ev_assistant_message("m2", "REMOTE_SECOND_REPLY"),
                 responses::ev_completed_with_tokens("r2", 500),
+            ]),
+            responses::sse(vec![
+                responses::ev_assistant_message("preturn-work-notes", &work_notes),
+                responses::ev_completed_with_tokens("work-notes-response", 10),
             ]),
             responses::sse(vec![
                 responses::ev_assistant_message("m3", "REMOTE_FINAL_REPLY"),
@@ -1948,8 +2047,8 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_including_incoming_us
     let requests = responses_mock.requests();
     assert_eq!(
         requests.len(),
-        3,
-        "expected user, user, and post-compact turn"
+        4,
+        "expected user, user, work-notes, and post-compact turn"
     );
 
     let compact_request = compact_mock.single_request();
@@ -1958,13 +2057,14 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_including_incoming_us
         format_labeled_requests_snapshot(
             "Remote pre-turn auto-compaction with a context override emits the context diff in the compact request while excluding the incoming user message.",
             &[
+                ("Pre-turn Work Notes Request", &requests[2]),
                 ("Remote Compaction Request", &compact_request),
-                ("Remote Post-Compaction History Layout", &requests[2]),
+                ("Remote Post-Compaction History Layout", &requests[3]),
             ]
         )
     );
     assert_eq!(
-        requests[2]
+        requests[3]
             .message_input_texts("user")
             .iter()
             .filter(|text| text.as_str() == "USER_THREE")
@@ -1993,21 +2093,24 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_strips_incoming_model
     )
     .await?;
     let codex = harness.test().codex.clone();
+    let work_notes = work_notes_message("REMOTE_PRETURN_WORK_NOTES");
 
-    let initial_turn_request_mock = responses::mount_sse_once(
+    let responses_mock = responses::mount_sse_sequence(
         harness.server(),
-        responses::sse(vec![
-            responses::ev_assistant_message("m1", "BEFORE_SWITCH_REPLY"),
-            responses::ev_completed_with_tokens("r1", 500),
-        ]),
-    )
-    .await;
-    let post_compact_turn_request_mock = responses::mount_sse_once(
-        harness.server(),
-        responses::sse(vec![
-            responses::ev_assistant_message("m2", "AFTER_SWITCH_REPLY"),
-            responses::ev_completed_with_tokens("r2", 80),
-        ]),
+        vec![
+            responses::sse(vec![
+                responses::ev_assistant_message("m1", "BEFORE_SWITCH_REPLY"),
+                responses::ev_completed_with_tokens("r1", 500),
+            ]),
+            responses::sse(vec![
+                responses::ev_assistant_message("preturn-work-notes", &work_notes),
+                responses::ev_completed_with_tokens("work-notes-response", 10),
+            ]),
+            responses::sse(vec![
+                responses::ev_assistant_message("m2", "AFTER_SWITCH_REPLY"),
+                responses::ev_completed_with_tokens("r2", 80),
+            ]),
+        ],
     )
     .await;
     let compact_mock = responses::mount_compact_user_history_with_summary_once(
@@ -2057,20 +2160,23 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_strips_incoming_model
         1,
         "expected a single remote pre-turn compaction request"
     );
+    let requests = responses_mock.requests();
     assert_eq!(
-        initial_turn_request_mock.requests().len(),
-        1,
-        "expected initial turn request"
+        requests.len(),
+        3,
+        "expected user, work-notes, and post-compact requests"
     );
-    assert_eq!(
-        post_compact_turn_request_mock.requests().len(),
-        1,
-        "expected post-compaction follow-up request"
+    assert!(
+        requests[1]
+            .body_json()
+            .to_string()
+            .contains(WORK_NOTES_REQUEST_TAG),
+        "expected work-notes request before remote pre-turn compaction"
     );
 
-    let initial_turn_request = initial_turn_request_mock.single_request();
+    let initial_turn_request = &requests[0];
     let compact_request = compact_mock.single_request();
-    let post_compact_turn_request = post_compact_turn_request_mock.single_request();
+    let post_compact_turn_request = &requests[2];
     let compact_body = compact_request.body_json().to_string();
     assert!(
         !compact_body.contains("AFTER_SWITCH_USER"),
@@ -2100,11 +2206,12 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_strips_incoming_model
         format_labeled_requests_snapshot(
             "Remote pre-turn compaction during model switch currently excludes incoming user input, strips incoming <model_switch> from the compact request payload, and restores it in the post-compaction follow-up request.",
             &[
-                ("Initial Request (Previous Model)", &initial_turn_request),
+                ("Initial Request (Previous Model)", initial_turn_request),
+                ("Pre-turn Work Notes Request", &requests[1]),
                 ("Remote Compaction Request", &compact_request),
                 (
                     "Remote Post-Compaction History Layout",
-                    &post_compact_turn_request
+                    post_compact_turn_request
                 ),
             ]
         )
@@ -2128,13 +2235,20 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_context_window_exceed
     )
     .await?;
     let codex = harness.test().codex.clone();
+    let work_notes = work_notes_message("REMOTE_PRETURN_WORK_NOTES");
 
     let responses_mock = responses::mount_sse_sequence(
         harness.server(),
-        vec![responses::sse(vec![
-            responses::ev_assistant_message("m1", "REMOTE_FIRST_REPLY"),
-            responses::ev_completed_with_tokens("r1", 500),
-        ])],
+        vec![
+            responses::sse(vec![
+                responses::ev_assistant_message("m1", "REMOTE_FIRST_REPLY"),
+                responses::ev_completed_with_tokens("r1", 500),
+            ]),
+            responses::sse(vec![
+                responses::ev_assistant_message("preturn-work-notes", &work_notes),
+                responses::ev_completed_with_tokens("work-notes-response", 10),
+            ]),
+        ],
     )
     .await;
 
@@ -2146,14 +2260,6 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_context_window_exceed
                 "message": "Your input exceeds the context window of this model. Please adjust your input and try again."
             }
         })),
-    )
-    .await;
-    let post_compact_turn_mock = responses::mount_sse_once(
-        harness.server(),
-        responses::sse(vec![
-            responses::ev_assistant_message("m2", "REMOTE_POST_COMPACT_SHOULD_NOT_RUN"),
-            responses::ev_completed_with_tokens("r2", 80),
-        ]),
     )
     .await;
 
@@ -2188,12 +2294,15 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_context_window_exceed
     let requests = responses_mock.requests();
     assert_eq!(
         requests.len(),
-        1,
-        "expected no post-compaction follow-up turn request after compact failure"
+        2,
+        "expected initial + work-notes requests before compact failure"
     );
     assert!(
-        post_compact_turn_mock.requests().is_empty(),
-        "expected turn to stop after compaction failure"
+        requests[1]
+            .body_json()
+            .to_string()
+            .contains(WORK_NOTES_REQUEST_TAG),
+        "expected work-notes request before remote pre-turn compaction"
     );
 
     let include_attempt_request = compact_mock.single_request();
@@ -2228,6 +2337,7 @@ async fn snapshot_request_shape_remote_mid_turn_continuation_compaction() -> Res
     )
     .await?;
     let codex = harness.test().codex.clone();
+    let work_notes = work_notes_message("REMOTE_MID_TURN_WORK_NOTES");
 
     let responses_mock = responses::mount_sse_sequence(
         harness.server(),
@@ -2235,6 +2345,10 @@ async fn snapshot_request_shape_remote_mid_turn_continuation_compaction() -> Res
             responses::sse(vec![
                 responses::ev_function_call("call-remote-mid-turn", DUMMY_FUNCTION_NAME, "{}"),
                 responses::ev_completed_with_tokens("r1", 500),
+            ]),
+            responses::sse(vec![
+                responses::ev_assistant_message("mid-turn-work-notes", &work_notes),
+                responses::ev_completed_with_tokens("work-notes-response", 10),
             ]),
             responses::sse(vec![
                 responses::ev_assistant_message("m2", "REMOTE_MID_TURN_FINAL_REPLY"),
@@ -2265,8 +2379,8 @@ async fn snapshot_request_shape_remote_mid_turn_continuation_compaction() -> Res
     let requests = responses_mock.requests();
     assert_eq!(
         requests.len(),
-        2,
-        "expected initial and post-compact requests"
+        3,
+        "expected initial, work-notes, and post-compact requests"
     );
 
     let compact_request = compact_mock.single_request();
@@ -2275,8 +2389,9 @@ async fn snapshot_request_shape_remote_mid_turn_continuation_compaction() -> Res
         format_labeled_requests_snapshot(
             "Remote mid-turn continuation compaction after tool output: compact request includes tool artifacts and the follow-up request includes the returned compaction item.",
             &[
+                ("Mid-turn Work Notes Request", &requests[1]),
                 ("Remote Compaction Request", &compact_request),
-                ("Remote Post-Compaction History Layout", &requests[1]),
+                ("Remote Post-Compaction History Layout", &requests[2]),
             ]
         )
     );
@@ -2298,21 +2413,24 @@ async fn snapshot_request_shape_remote_mid_turn_compaction_summary_only_reinject
     )
     .await?;
     let codex = harness.test().codex.clone();
+    let work_notes = work_notes_message("REMOTE_MID_TURN_WORK_NOTES");
 
-    let initial_turn_request_mock = responses::mount_sse_once(
+    let responses_mock = responses::mount_sse_sequence(
         harness.server(),
-        responses::sse(vec![
-            responses::ev_function_call("call-remote-summary-only", DUMMY_FUNCTION_NAME, "{}"),
-            responses::ev_completed_with_tokens("r1", 500),
-        ]),
-    )
-    .await;
-    let post_compact_turn_request_mock = responses::mount_sse_once(
-        harness.server(),
-        responses::sse(vec![
-            responses::ev_assistant_message("m2", "REMOTE_SUMMARY_ONLY_FINAL_REPLY"),
-            responses::ev_completed_with_tokens("r2", 80),
-        ]),
+        vec![
+            responses::sse(vec![
+                responses::ev_function_call("call-remote-summary-only", DUMMY_FUNCTION_NAME, "{}"),
+                responses::ev_completed_with_tokens("r1", 500),
+            ]),
+            responses::sse(vec![
+                responses::ev_assistant_message("mid-turn-work-notes", &work_notes),
+                responses::ev_completed_with_tokens("work-notes-response", 10),
+            ]),
+            responses::sse(vec![
+                responses::ev_assistant_message("m2", "REMOTE_SUMMARY_ONLY_FINAL_REPLY"),
+                responses::ev_completed_with_tokens("r2", 80),
+            ]),
+        ],
     )
     .await;
 
@@ -2337,28 +2455,32 @@ async fn snapshot_request_shape_remote_mid_turn_compaction_summary_only_reinject
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     assert_eq!(compact_mock.requests().len(), 1);
+    let requests = responses_mock.requests();
     assert_eq!(
-        initial_turn_request_mock.requests().len(),
-        1,
-        "expected initial turn request"
+        requests.len(),
+        3,
+        "expected initial, work-notes, and post-compaction requests"
     );
-    assert_eq!(
-        post_compact_turn_request_mock.requests().len(),
-        1,
-        "expected post-compaction request"
+    assert!(
+        requests[1]
+            .body_json()
+            .to_string()
+            .contains(WORK_NOTES_REQUEST_TAG),
+        "expected mid-turn work-notes request before remote compaction"
     );
 
     let compact_request = compact_mock.single_request();
-    let post_compact_turn_request = post_compact_turn_request_mock.single_request();
+    let post_compact_turn_request = &requests[2];
     insta::assert_snapshot!(
         "remote_mid_turn_compaction_summary_only_reinjects_context_shapes",
         format_labeled_requests_snapshot(
             "Remote mid-turn compaction where compact output has only a compaction item: continuation layout reinjects context before that compaction item.",
             &[
+                ("Mid-turn Work Notes Request", &requests[1]),
                 ("Remote Compaction Request", &compact_request),
                 (
                     "Remote Post-Compaction History Layout",
-                    &post_compact_turn_request
+                    post_compact_turn_request
                 ),
             ]
         )
@@ -2381,21 +2503,24 @@ async fn snapshot_request_shape_remote_mid_turn_compaction_multi_summary_reinjec
     )
     .await?;
     let codex = harness.test().codex.clone();
+    let work_notes = work_notes_message("REMOTE_PRETURN_WORK_NOTES");
 
-    let setup_turn_request_mock = responses::mount_sse_once(
+    let responses_mock = responses::mount_sse_sequence(
         harness.server(),
-        responses::sse(vec![
-            responses::ev_assistant_message("setup", "REMOTE_SETUP_REPLY"),
-            responses::ev_completed_with_tokens("setup-response", 60),
-        ]),
-    )
-    .await;
-    let second_turn_request_mock = responses::mount_sse_once(
-        harness.server(),
-        responses::sse(vec![
-            responses::ev_shell_command_call("call-remote-multi-summary", "echo multi-summary"),
-            responses::ev_completed_with_tokens("r1", 1_000),
-        ]),
+        vec![
+            responses::sse(vec![
+                responses::ev_assistant_message("setup", "REMOTE_SETUP_REPLY"),
+                responses::ev_completed_with_tokens("setup-response", 60),
+            ]),
+            responses::sse(vec![
+                responses::ev_assistant_message("preturn-work-notes", &work_notes),
+                responses::ev_completed_with_tokens("work-notes-response", 10),
+            ]),
+            responses::sse(vec![
+                responses::ev_shell_command_call("call-remote-multi-summary", "echo multi-summary"),
+                responses::ev_completed_with_tokens("r1", 1_000),
+            ]),
+        ],
     )
     .await;
 
@@ -2434,15 +2559,18 @@ async fn snapshot_request_shape_remote_mid_turn_compaction_multi_summary_reinjec
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     assert_eq!(compact_mock.requests().len(), 2);
+    let requests = responses_mock.requests();
     assert_eq!(
-        setup_turn_request_mock.requests().len(),
-        1,
-        "expected setup turn request"
+        requests.len(),
+        3,
+        "expected setup, work-notes, and post-compaction second-turn requests"
     );
-    assert_eq!(
-        second_turn_request_mock.requests().len(),
-        1,
-        "expected second-turn pre-compaction request"
+    assert!(
+        requests[1]
+            .body_json()
+            .to_string()
+            .contains(WORK_NOTES_REQUEST_TAG),
+        "expected work-notes request before remote auto-compaction"
     );
 
     let compact_requests = compact_mock.requests();
@@ -2452,7 +2580,7 @@ async fn snapshot_request_shape_remote_mid_turn_compaction_multi_summary_reinjec
         "expected one setup compact and one mid-turn compact request"
     );
     let compact_request = compact_requests[1].clone();
-    let second_turn_request = second_turn_request_mock.single_request();
+    let second_turn_request = &requests[2];
     assert!(
         compact_request.body_contains_text("REMOTE_OLDER_SUMMARY"),
         "older summary should round-trip from conversation history into the next compact request"
@@ -2462,10 +2590,11 @@ async fn snapshot_request_shape_remote_mid_turn_compaction_multi_summary_reinjec
         format_labeled_requests_snapshot(
             "After a prior manual /compact produced an older remote compaction item, the next turn hits remote auto-compaction before the next sampling request. The compact request carries forward that earlier compaction item, and the next sampling request shows the latest compaction item with context reinjected before USER_TWO.",
             &[
+                ("Pre-turn Work Notes Request", &requests[1]),
                 ("Remote Compaction Request", &compact_request),
                 (
                     "Second Turn Request (After Compaction)",
-                    &second_turn_request
+                    second_turn_request
                 ),
             ]
         )
