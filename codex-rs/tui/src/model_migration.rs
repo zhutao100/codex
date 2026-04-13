@@ -138,6 +138,15 @@ pub(crate) async fn run_model_migration_prompt(
     tui: &mut Tui,
     copy: ModelMigrationCopy,
 ) -> ModelMigrationOutcome {
+    // Model migration prompts are disabled in custom builds.
+    if !model_migration_prompt_enabled() {
+        return if copy.can_opt_out {
+            ModelMigrationOutcome::Rejected
+        } else {
+            ModelMigrationOutcome::Accepted
+        };
+    }
+
     let alt = AltScreenGuard::enter(tui);
     let mut screen = ModelMigrationScreen::new(alt.tui.frame_requester(), copy);
 
@@ -166,6 +175,10 @@ pub(crate) async fn run_model_migration_prompt(
     }
 
     screen.outcome()
+}
+
+fn model_migration_prompt_enabled() -> bool {
+    false
 }
 
 struct ModelMigrationScreen {
