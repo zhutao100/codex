@@ -3,6 +3,7 @@ use crate::config::edit::ConfigEdit;
 use crate::config::edit::ConfigEditsBuilder;
 use crate::config::types::AppsConfigToml;
 use crate::config::types::DEFAULT_OTEL_ENVIRONMENT;
+use crate::config::types::DiffBackgroundMode;
 use crate::config::types::History;
 use crate::config::types::McpServerConfig;
 use crate::config::types::McpServerDisabledReason;
@@ -319,6 +320,15 @@ pub struct Config {
 
     /// Syntax highlighting theme override (kebab-case name).
     pub tui_theme: Option<String>,
+
+    /// Controls how diff add/remove backgrounds are rendered in the TUI.
+    pub tui_diff_background: DiffBackgroundMode,
+
+    /// Custom insert-line background color (`#RRGGBB`).
+    pub tui_diff_add_bg: Option<String>,
+
+    /// Custom delete-line background color (`#RRGGBB`).
+    pub tui_diff_del_bg: Option<String>,
 
     /// The directory that should be treated as the current working directory
     /// for the session. All relative paths inside the business-logic layer are
@@ -2502,6 +2512,13 @@ impl Config {
                 .unwrap_or_default(),
             tui_status_line: cfg.tui.as_ref().and_then(|t| t.status_line.clone()),
             tui_theme: cfg.tui.as_ref().and_then(|t| t.theme.clone()),
+            tui_diff_background: cfg
+                .tui
+                .as_ref()
+                .map(|t| t.diff_background)
+                .unwrap_or_default(),
+            tui_diff_add_bg: cfg.tui.as_ref().and_then(|t| t.diff_add_bg.clone()),
+            tui_diff_del_bg: cfg.tui.as_ref().and_then(|t| t.diff_del_bg.clone()),
             otel: {
                 let t: OtelConfigToml = cfg.otel.unwrap_or_default();
                 let log_user_prompt = t.log_user_prompt.unwrap_or(false);

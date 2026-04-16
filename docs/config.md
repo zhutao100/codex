@@ -36,6 +36,29 @@ Codex stores the SQLite-backed state DB under `sqlite_home` (config key) or the
 `CODEX_SQLITE_HOME` environment variable. When unset, WorkspaceWrite sandbox
 sessions default to a temp directory; other modes default to `CODEX_HOME`.
 
+## TUI
+
+Configure diff add/remove line backgrounds:
+
+```toml
+[tui]
+# off (default), auto, theme, custom
+diff_background = "off"
+```
+
+- `off`: Disable add/remove line backgrounds.
+- `auto`: Use built-in adaptive backgrounds.
+- `theme`: Use syntax-theme scope backgrounds (`markup.inserted`/`markup.deleted`, then
+  `diff.inserted`/`diff.deleted` fallback).
+- `custom`: Use explicit colors below:
+
+```toml
+[tui]
+diff_background = "custom"
+diff_add_bg = "#213A2B"
+diff_del_bg = "#4A221D"
+```
+
 ## Notices
 
 Codex stores "do not show again" flags for some UI prompts under the `[notice]` table.

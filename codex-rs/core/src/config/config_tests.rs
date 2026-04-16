@@ -2,6 +2,7 @@ use crate::config::edit::ConfigEdit;
 use crate::config::edit::ConfigEditsBuilder;
 use crate::config::edit::apply_blocking;
 use crate::config::types::BundledSkillsConfig;
+use crate::config::types::DiffBackgroundMode;
 use crate::config::types::FeedbackConfigToml;
 use crate::config::types::HistoryPersistence;
 use crate::config::types::McpServerTransportConfig;
@@ -195,6 +196,9 @@ fn config_toml_deserializes_model_availability_nux() {
             alternate_screen: AltScreenMode::default(),
             status_line: None,
             theme: None,
+            diff_background: DiffBackgroundMode::Off,
+            diff_add_bg: None,
+            diff_del_bg: None,
             model_availability_nux: ModelAvailabilityNuxConfig {
                 shown_count: HashMap::from([
                     ("gpt-bar".to_string(), 4),
@@ -860,6 +864,21 @@ fn tui_theme_defaults_to_none() {
 }
 
 #[test]
+fn tui_diff_background_deserializes_from_toml() {
+    let cfg = r##"
+[tui]
+diff_background = "custom"
+diff_add_bg = "#213A2B"
+diff_del_bg = "#4A221D"
+"##;
+    let parsed = toml::from_str::<ConfigToml>(cfg).expect("TOML deserialization should succeed");
+    let tui = parsed.tui.expect("config should include tui section");
+    assert_eq!(tui.diff_background, DiffBackgroundMode::Custom);
+    assert_eq!(tui.diff_add_bg.as_deref(), Some("#213A2B"));
+    assert_eq!(tui.diff_del_bg.as_deref(), Some("#4A221D"));
+}
+
+#[test]
 fn tui_config_missing_notifications_field_defaults_to_enabled() {
     let cfg = r#"
 [tui]
@@ -879,6 +898,9 @@ fn tui_config_missing_notifications_field_defaults_to_enabled() {
             alternate_screen: AltScreenMode::Auto,
             status_line: None,
             theme: None,
+            diff_background: DiffBackgroundMode::Off,
+            diff_add_bg: None,
+            diff_del_bg: None,
             model_availability_nux: ModelAvailabilityNuxConfig::default(),
         }
     );
@@ -3264,6 +3286,9 @@ fn test_precedence_fixture_with_o3_profile() -> std::io::Result<()> {
             tui_alternate_screen: AltScreenMode::Auto,
             tui_status_line: None,
             tui_theme: None,
+            tui_diff_background: Default::default(),
+            tui_diff_add_bg: None,
+            tui_diff_del_bg: None,
             otel: OtelConfig::default(),
         },
         o3_profile_config
@@ -3399,6 +3424,9 @@ fn test_precedence_fixture_with_gpt3_profile() -> std::io::Result<()> {
         tui_alternate_screen: AltScreenMode::Auto,
         tui_status_line: None,
         tui_theme: None,
+        tui_diff_background: Default::default(),
+        tui_diff_add_bg: None,
+        tui_diff_del_bg: None,
         otel: OtelConfig::default(),
     };
 
@@ -3532,6 +3560,9 @@ fn test_precedence_fixture_with_zdr_profile() -> std::io::Result<()> {
         tui_alternate_screen: AltScreenMode::Auto,
         tui_status_line: None,
         tui_theme: None,
+        tui_diff_background: Default::default(),
+        tui_diff_add_bg: None,
+        tui_diff_del_bg: None,
         otel: OtelConfig::default(),
     };
 
@@ -3651,6 +3682,9 @@ fn test_precedence_fixture_with_gpt5_profile() -> std::io::Result<()> {
         tui_alternate_screen: AltScreenMode::Auto,
         tui_status_line: None,
         tui_theme: None,
+        tui_diff_background: Default::default(),
+        tui_diff_add_bg: None,
+        tui_diff_del_bg: None,
         otel: OtelConfig::default(),
     };
 
