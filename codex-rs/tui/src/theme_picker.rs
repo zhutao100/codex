@@ -425,9 +425,17 @@ mod tests {
             .collect()
     }
 
+    fn diff_marker_col(buf: &Buffer, row: u16, width: u16) -> Option<u16> {
+        (0..width).find(|&col| buf[(col, row)].symbol() == "-" || buf[(col, row)].symbol() == "+")
+    }
+
+    fn marker_style_modifier(buf: &Buffer, row: u16, width: u16) -> Option<Modifier> {
+        let marker_col = diff_marker_col(buf, row, width)?;
+        Some(buf[(marker_col, row)].style().add_modifier)
+    }
+
     fn first_non_space_style_after_marker(buf: &Buffer, row: u16, width: u16) -> Option<Modifier> {
-        let marker_col = (0..width)
-            .find(|&col| buf[(col, row)].symbol() == "-" || buf[(col, row)].symbol() == "+")?;
+        let marker_col = diff_marker_col(buf, row, width)?;
         for col in marker_col + 1..width {
             if buf[(col, row)].symbol() != " " {
                 return Some(buf[(col, row)].style().add_modifier);
@@ -552,22 +560,39 @@ mod tests {
     }
 
     #[test]
-    fn deleted_preview_code_uses_dim_overlay_like_real_diff_renderer() {
+    fn preview_diff_sign_is_dim_but_code_is_not() {
         let width = 80;
         let height = 6;
         let buf = render_buffer(&ThemePreviewNarrowRenderable, width, height);
         let lines = render_lines(&ThemePreviewNarrowRenderable, width, height);
+        let add_row = lines
+            .iter()
+            .enumerate()
+            .find_map(|(row, line)| (preview_line_marker(line) == Some('+')).then_some(row as u16))
+            .expect("expected an added preview row");
         let deleted_row = lines
             .iter()
             .enumerate()
             .find_map(|(row, line)| (preview_line_marker(line) == Some('-')).then_some(row as u16))
             .expect("expected a deleted preview row");
-        let modifiers = first_non_space_style_after_marker(&buf, deleted_row, width)
-            .expect("expected code text after diff marker");
-        assert!(
-            modifiers.contains(Modifier::DIM),
-            "expected deleted preview code to be dimmed"
-        );
+        for (row, description) in [
+            (add_row, "added preview row"),
+            (deleted_row, "deleted preview row"),
+        ] {
+            let sign_modifiers = marker_style_modifier(&buf, row, width)
+                .unwrap_or_else(|| panic!("expected diff marker for {description}"));
+            assert!(
+                sign_modifiers.contains(Modifier::DIM),
+                "expected diff marker to be dimmed for {description}"
+            );
+
+            let code_modifiers = first_non_space_style_after_marker(&buf, row, width)
+                .unwrap_or_else(|| panic!("expected code text after marker for {description}"));
+            assert!(
+                !code_modifiers.contains(Modifier::DIM),
+                "expected preview code not to be dimmed for {description}"
+            );
+        }
     }
 
     #[test]
