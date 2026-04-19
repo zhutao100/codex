@@ -65,7 +65,7 @@ Issue **#15416** reports that even at codex-cli **0.116.0**, macOS **Terminal.ap
 So PR #13037 improved correctness (theme-awareness, ANSI-16 safety) but did not fully solve:
 
 * **Contrast failures in ANSI-256 terminals whose ANSI palette choices make `Color::Green/Red` too close to the chosen background tint**, and/or
-* **Terminal.app capability mismatches** (Terminal.app does not support truecolor on Monterey-era versions, and capability detection can be tricky). ([GitHub][1])
+* **Terminal.app capability mismatches** (macOS 14/15 Terminal.app should be treated as ANSI-256; truecolor arrives in macOS 26, and capability detection can be tricky — see `context_macos_terminal_color_support.md`). ([GitHub][1])
 
 ---
 
@@ -155,7 +155,7 @@ This would mirror what PR #12581 already did for *light theme* (bg set, fg not s
 
 ### Option B — Apple Terminal capability/behavior guardrail
 
-Given macOS Terminal.app’s historical lack of truecolor on Monterey-era releases, and the variety of detection pitfalls, codex can harden behavior by:
+Given macOS 14/15 Terminal.app’s lack of truecolor (see `context_macos_terminal_color_support.md`), and the variety of detection pitfalls, codex can harden behavior by:
 
 * If `terminal_info().name == AppleTerminal`, only allow TrueColor when an explicit marker exists (`COLORTERM=truecolor`/`24bit`), otherwise cap to ANSI-256.
 
@@ -284,7 +284,7 @@ This should materially improve Terminal.app readability immediately, even before
 
 1. **Manual terminal matrix**
 
-   * macOS: Terminal.app (Monterey-era), iTerm2
+   * macOS: Terminal.app (macOS 14/15; pre-26), iTerm2
    * Windows: Windows Terminal, Warp
    * Linux: GNOME Terminal / Alacritty / kitty
 

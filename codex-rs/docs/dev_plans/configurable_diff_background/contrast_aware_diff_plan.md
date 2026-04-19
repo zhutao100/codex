@@ -168,8 +168,8 @@ This directly implements your preference: “reverse the dim: dim the `+/-`, do 
 ---
 
 ## Optional Follow-up (only if still broken): Terminal.app capability guardrail (Plan D)
-If after contrast hardening the glitch persists and evidence suggests Terminal.app is treated as TrueColor incorrectly:
-- Add a Terminal.app-specific cap: require `COLORTERM=truecolor|24bit` to use TrueColor; otherwise downgrade to ANSI-256.
+If after contrast hardening the glitch persists and evidence suggests Terminal.app is treated as TrueColor incorrectly (macOS 14/15 Terminal.app should be ANSI-256 per `context_macos_terminal_color_support.md`):
+- Add a Terminal.app-specific cap: require `COLORTERM=truecolor|24bit` to use TrueColor; otherwise cap to ANSI-256.
 - Add unit tests for the policy table (`diff_color_level_for_terminal`) covering `TerminalName::AppleTerminal`.
 
 ---
