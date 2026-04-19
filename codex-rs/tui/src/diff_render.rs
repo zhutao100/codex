@@ -2470,14 +2470,23 @@ mod tests {
         );
 
         let lines = create_diff_summary(&changes, &PathBuf::from("/"), 80);
-        let has_rgb = lines.iter().any(|line| {
-            line.spans
-                .iter()
-                .any(|s| matches!(s.style.fg, Some(ratatui::style::Color::Rgb(..))))
+        let has_highlighted_spans = lines.iter().any(|line| {
+            let Some(sign_idx) = line.spans.iter().position(|sp| sp.content.as_ref() == "+") else {
+                return false;
+            };
+            if sign_idx == 0 {
+                return false;
+            }
+            let gutter = &line.spans[sign_idx - 1];
+            let trimmed_gutter = gutter.content.trim();
+            if trimmed_gutter.is_empty() || !trimmed_gutter.chars().all(|c| c.is_ascii_digit()) {
+                return false;
+            }
+            line.spans.len().saturating_sub(sign_idx + 1) > 1
         });
         assert!(
-            has_rgb,
-            "add diff for .rs file should produce syntax-highlighted (RGB) spans"
+            has_highlighted_spans,
+            "add diff for .rs file should produce syntax-highlighted spans"
         );
     }
 
@@ -2492,14 +2501,23 @@ mod tests {
         );
 
         let lines = create_diff_summary(&changes, &PathBuf::from("/"), 80);
-        let has_rgb = lines.iter().any(|line| {
-            line.spans
-                .iter()
-                .any(|s| matches!(s.style.fg, Some(ratatui::style::Color::Rgb(..))))
+        let has_highlighted_spans = lines.iter().any(|line| {
+            let Some(sign_idx) = line.spans.iter().position(|sp| sp.content.as_ref() == "-") else {
+                return false;
+            };
+            if sign_idx == 0 {
+                return false;
+            }
+            let gutter = &line.spans[sign_idx - 1];
+            let trimmed_gutter = gutter.content.trim();
+            if trimmed_gutter.is_empty() || !trimmed_gutter.chars().all(|c| c.is_ascii_digit()) {
+                return false;
+            }
+            line.spans.len().saturating_sub(sign_idx + 1) > 1
         });
         assert!(
-            has_rgb,
-            "delete diff for .py file should produce syntax-highlighted (RGB) spans"
+            has_highlighted_spans,
+            "delete diff for .py file should produce syntax-highlighted spans"
         );
     }
 
@@ -2677,18 +2695,29 @@ mod tests {
             lines.len(),
         );
 
-        // No span should contain an RGB foreground color (syntax themes
-        // produce RGB; plain diff styles only use named Color variants).
+        // With highlighting disabled, diff lines should be emitted as a single
+        // styled content span (plus gutter/sign), rather than many token spans.
         for line in &lines {
-            for span in &line.spans {
-                if let Some(ratatui::style::Color::Rgb(..)) = span.style.fg {
-                    panic!(
-                        "large diff should not have syntax-highlighted spans, \
-                         got RGB color in style {:?} for {:?}",
-                        span.style, span.content,
-                    );
-                }
+            let Some(sign_idx) = line
+                .spans
+                .iter()
+                .position(|sp| matches!(sp.content.as_ref(), "+" | "-"))
+            else {
+                continue;
+            };
+            if sign_idx == 0 {
+                continue;
             }
+            let gutter = &line.spans[sign_idx - 1];
+            let trimmed_gutter = gutter.content.trim();
+            if trimmed_gutter.is_empty() || !trimmed_gutter.chars().all(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            assert_eq!(
+                line.spans.len().saturating_sub(sign_idx + 1),
+                1,
+                "large diff should not have syntax-highlighted spans, got extra spans: {line:?}"
+            );
         }
     }
 
@@ -2711,14 +2740,23 @@ mod tests {
         );
 
         let lines = create_diff_summary(&changes, &PathBuf::from("/"), 80);
-        let has_rgb = lines.iter().any(|line| {
-            line.spans
-                .iter()
-                .any(|s| matches!(s.style.fg, Some(ratatui::style::Color::Rgb(..))))
+        let has_highlighted_spans = lines.iter().any(|line| {
+            let Some(sign_idx) = line.spans.iter().position(|sp| sp.content.as_ref() == "+") else {
+                return false;
+            };
+            if sign_idx == 0 {
+                return false;
+            }
+            let gutter = &line.spans[sign_idx - 1];
+            let trimmed_gutter = gutter.content.trim();
+            if trimmed_gutter.is_empty() || !trimmed_gutter.chars().all(|c| c.is_ascii_digit()) {
+                return false;
+            }
+            line.spans.len().saturating_sub(sign_idx + 1) > 1
         });
         assert!(
-            has_rgb,
-            "rename from .xyzzy to .rs should produce syntax-highlighted (RGB) spans"
+            has_highlighted_spans,
+            "rename from .xyzzy to .rs should produce syntax-highlighted spans"
         );
     }
 

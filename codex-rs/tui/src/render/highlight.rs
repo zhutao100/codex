@@ -26,8 +26,10 @@ use ratatui::style::Modifier;
 use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::text::Span;
+use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::RwLock;
 use syntect::easy::HighlightLines;
@@ -43,6 +45,12 @@ use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
 use two_face::theme::EmbeddedThemeName;
 
+use crate::terminal_palette::StdoutColorLevel;
+use crate::terminal_palette::XTERM_COLORS;
+use crate::terminal_palette::stdout_color_level;
+use codex_core::terminal::TerminalName;
+use codex_core::terminal::terminal_info;
+
 // -- Global singletons -------------------------------------------------------
 
 static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
@@ -55,6 +63,66 @@ static CODEX_HOME: OnceLock<Option<PathBuf>> = OnceLock::new();
 const ANSI_ALPHA_INDEX: u8 = 0x00;
 const ANSI_ALPHA_DEFAULT: u8 = 0x01;
 const OPAQUE_ALPHA: u8 = 0xFF;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HighlightColorLevel {
+    TrueColor,
+    Ansi256,
+    Ansi16,
+}
+
+fn colorterm_is_truecolor() -> bool {
+    std::env::var("COLORTERM").is_ok_and(|v| {
+        let v = v.to_ascii_lowercase();
+        v == "truecolor" || v == "24bit"
+    })
+}
+
+fn highlight_color_level() -> HighlightColorLevel {
+    highlight_color_level_for_terminal(
+        stdout_color_level(),
+        terminal_info().name,
+        std::env::var_os("WT_SESSION").is_some(),
+        std::env::var_os("FORCE_COLOR").is_some(),
+        colorterm_is_truecolor(),
+    )
+}
+
+fn highlight_color_level_for_terminal(
+    stdout_level: StdoutColorLevel,
+    terminal_name: TerminalName,
+    has_wt_session: bool,
+    has_force_color_override: bool,
+    colorterm_is_truecolor: bool,
+) -> HighlightColorLevel {
+    // Match the diff renderer's Windows Terminal promotion rules: Windows
+    // Terminal supports truecolor but often fails to advertise it.
+    if has_wt_session && !has_force_color_override {
+        return HighlightColorLevel::TrueColor;
+    }
+
+    let mut level = match stdout_level {
+        StdoutColorLevel::TrueColor => HighlightColorLevel::TrueColor,
+        StdoutColorLevel::Ansi256 => HighlightColorLevel::Ansi256,
+        StdoutColorLevel::Ansi16 | StdoutColorLevel::Unknown => HighlightColorLevel::Ansi16,
+    };
+
+    if stdout_level == StdoutColorLevel::Ansi16 && terminal_name == TerminalName::WindowsTerminal {
+        level = HighlightColorLevel::TrueColor;
+    }
+
+    // macOS 14/15 Terminal.app is ANSI-256 only. Truecolor support lands in
+    // macOS 26, and Terminal may not advertise it via terminfo. Keep this
+    // conservative unless `COLORTERM` explicitly opts in.
+    if terminal_name == TerminalName::AppleTerminal
+        && level == HighlightColorLevel::TrueColor
+        && !colorterm_is_truecolor
+    {
+        level = HighlightColorLevel::Ansi256;
+    }
+
+    level
+}
 
 fn syntax_set() -> &'static SyntaxSet {
     SYNTAX_SET.get_or_init(two_face::syntax::extra_newlines)
@@ -182,11 +250,25 @@ fn load_custom_theme(name: &str, codex_home: &Path) -> Option<Theme> {
 }
 
 fn adaptive_default_theme_selection() -> (EmbeddedThemeName, &'static str) {
-    match crate::terminal_palette::default_bg() {
-        Some(bg) if crate::color::is_light(bg) => {
-            (EmbeddedThemeName::CatppuccinLatte, "catppuccin-latte")
-        }
-        _ => (EmbeddedThemeName::CatppuccinMocha, "catppuccin-mocha"),
+    adaptive_default_theme_selection_for(
+        crate::terminal_palette::default_bg(),
+        highlight_color_level(),
+    )
+}
+
+fn adaptive_default_theme_selection_for(
+    bg: Option<(u8, u8, u8)>,
+    color_level: HighlightColorLevel,
+) -> (EmbeddedThemeName, &'static str) {
+    match color_level {
+        HighlightColorLevel::TrueColor => match bg {
+            Some(bg) if crate::color::is_light(bg) => {
+                (EmbeddedThemeName::CatppuccinLatte, "catppuccin-latte")
+            }
+            _ => (EmbeddedThemeName::CatppuccinMocha, "catppuccin-mocha"),
+        },
+        HighlightColorLevel::Ansi256 => (EmbeddedThemeName::Base16_256, "base16-256"),
+        HighlightColorLevel::Ansi16 => (EmbeddedThemeName::Ansi, "ansi"),
     }
 }
 
@@ -444,8 +526,87 @@ fn ansi_palette_color(index: u8) -> RtColor {
         0x06 => RtColor::Cyan,
         // ANSI code 37 is "white", represented as `Gray` in ratatui.
         0x07 => RtColor::Gray,
+        0x08 => RtColor::DarkGray,
+        0x09 => RtColor::LightRed,
+        0x0A => RtColor::LightGreen,
+        0x0B => RtColor::LightYellow,
+        0x0C => RtColor::LightBlue,
+        0x0D => RtColor::LightMagenta,
+        0x0E => RtColor::LightCyan,
+        0x0F => RtColor::White,
         n => RtColor::Indexed(n),
     }
+}
+
+static RGB_TO_XTERM256: OnceLock<Mutex<HashMap<(u8, u8, u8), RtColor>>> = OnceLock::new();
+static RGB_TO_ANSI16: OnceLock<Mutex<HashMap<(u8, u8, u8), RtColor>>> = OnceLock::new();
+
+fn quantize_rgb_to_xterm256(rgb: (u8, u8, u8)) -> RtColor {
+    let cache = RGB_TO_XTERM256.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = match cache.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some(color) = guard.get(&rgb) {
+        return *color;
+    }
+
+    let mut chosen = 16usize;
+    let mut best = f32::INFINITY;
+    for (idx, candidate) in XTERM_COLORS.into_iter().enumerate().skip(16) {
+        let d = crate::color::perceptual_distance(candidate, rgb);
+        if d < best {
+            best = d;
+            chosen = idx;
+        }
+    }
+
+    let resolved = crate::terminal_palette::indexed_color(chosen as u8);
+    guard.insert(rgb, resolved);
+    resolved
+}
+
+fn quantize_rgb_to_ansi16(rgb: (u8, u8, u8)) -> RtColor {
+    let cache = RGB_TO_ANSI16.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = match cache.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some(color) = guard.get(&rgb) {
+        return *color;
+    }
+
+    let candidates: &[(RtColor, (u8, u8, u8))] = &[
+        (RtColor::Black, XTERM_COLORS[0]),
+        (RtColor::Red, XTERM_COLORS[1]),
+        (RtColor::Green, XTERM_COLORS[2]),
+        (RtColor::Yellow, XTERM_COLORS[3]),
+        (RtColor::Blue, XTERM_COLORS[4]),
+        (RtColor::Magenta, XTERM_COLORS[5]),
+        (RtColor::Cyan, XTERM_COLORS[6]),
+        (RtColor::Gray, XTERM_COLORS[7]),
+        (RtColor::DarkGray, XTERM_COLORS[8]),
+        (RtColor::LightRed, XTERM_COLORS[9]),
+        (RtColor::LightGreen, XTERM_COLORS[10]),
+        (RtColor::LightYellow, XTERM_COLORS[11]),
+        (RtColor::LightBlue, XTERM_COLORS[12]),
+        (RtColor::LightMagenta, XTERM_COLORS[13]),
+        (RtColor::LightCyan, XTERM_COLORS[14]),
+        (RtColor::White, XTERM_COLORS[15]),
+    ];
+
+    let mut chosen = RtColor::White;
+    let mut best = f32::INFINITY;
+    for (color, candidate) in candidates {
+        let d = crate::color::perceptual_distance(*candidate, rgb);
+        if d < best {
+            best = d;
+            chosen = *color;
+        }
+    }
+
+    guard.insert(rgb, chosen);
+    chosen
 }
 
 /// Decode a syntect foreground `Color` into a ratatui color, respecting the
@@ -462,16 +623,25 @@ fn ansi_palette_color(index: u8) -> RtColor {
 /// `clippy::disallowed_methods` is explicitly allowed here because this helper
 /// intentionally constructs `ratatui::style::Color::Rgb`.
 #[allow(clippy::disallowed_methods)]
-fn convert_syntect_color(color: SyntectColor) -> Option<RtColor> {
+fn convert_syntect_color(color: SyntectColor, color_level: HighlightColorLevel) -> Option<RtColor> {
+    let rgb = (color.r, color.g, color.b);
     match color.a {
         // Bat-compatible encoding used by `ansi`, `base16`, and `base16-256`:
         // alpha 0x00 means `r` stores an ANSI palette index, not RGB red.
         ANSI_ALPHA_INDEX => Some(ansi_palette_color(color.r)),
         // alpha 0x01 means "use terminal default foreground/background".
         ANSI_ALPHA_DEFAULT => None,
-        OPAQUE_ALPHA => Some(RtColor::Rgb(color.r, color.g, color.b)),
+        OPAQUE_ALPHA => match color_level {
+            HighlightColorLevel::TrueColor => Some(RtColor::Rgb(color.r, color.g, color.b)),
+            HighlightColorLevel::Ansi256 => Some(quantize_rgb_to_xterm256(rgb)),
+            HighlightColorLevel::Ansi16 => Some(quantize_rgb_to_ansi16(rgb)),
+        },
         // Non-ANSI alpha values appear in some bundled themes; treat as plain RGB.
-        _ => Some(RtColor::Rgb(color.r, color.g, color.b)),
+        _ => match color_level {
+            HighlightColorLevel::TrueColor => Some(RtColor::Rgb(color.r, color.g, color.b)),
+            HighlightColorLevel::Ansi256 => Some(quantize_rgb_to_xterm256(rgb)),
+            HighlightColorLevel::Ansi16 => Some(quantize_rgb_to_ansi16(rgb)),
+        },
     }
 }
 
@@ -479,10 +649,10 @@ fn convert_syntect_color(color: SyntectColor) -> Option<RtColor> {
 ///
 /// Most themes produce RGB colors. The built-in `ansi`/`base16`/`base16-256`
 /// themes encode ANSI palette semantics in the alpha channel, matching bat.
-fn convert_style(syn_style: SyntectStyle) -> Style {
+fn convert_style(syn_style: SyntectStyle, color_level: HighlightColorLevel) -> Style {
     let mut rt_style = Style::default();
 
-    if let Some(fg) = convert_syntect_color(syn_style.foreground) {
+    if let Some(fg) = convert_syntect_color(syn_style.foreground, color_level) {
         rt_style = rt_style.fg(fg);
     }
     // Intentionally skip background to avoid overwriting terminal bg.
@@ -571,6 +741,7 @@ fn highlight_to_line_spans_with_theme(
     code: &str,
     lang: &str,
     theme: &Theme,
+    color_level: HighlightColorLevel,
 ) -> Option<Vec<Vec<Span<'static>>>> {
     // Empty input has nothing to highlight; fall back to the plain text path
     // which correctly produces a single empty Line.
@@ -599,7 +770,10 @@ fn highlight_to_line_spans_with_theme(
             if text.is_empty() {
                 continue;
             }
-            spans.push(Span::styled(text.to_string(), convert_style(style)));
+            spans.push(Span::styled(
+                text.to_string(),
+                convert_style(style, color_level),
+            ));
         }
         if spans.is_empty() {
             spans.push(Span::raw(String::new()));
@@ -618,7 +792,7 @@ fn highlight_to_line_spans(code: &str, lang: &str) -> Option<Vec<Vec<Span<'stati
         Ok(theme_guard) => theme_guard,
         Err(poisoned) => poisoned.into_inner(),
     };
-    highlight_to_line_spans_with_theme(code, lang, &theme_guard)
+    highlight_to_line_spans_with_theme(code, lang, &theme_guard, highlight_color_level())
 }
 
 // -- Public API ---------------------------------------------------------------
@@ -756,6 +930,7 @@ mod tests {
             "fn main() { let answer = 42; println!(\"hello\"); }\n",
             "rust",
             &theme,
+            HighlightColorLevel::TrueColor,
         )
         .expect("expected highlighted spans");
         let mut colors: Vec<String> = lines
@@ -875,7 +1050,7 @@ mod tests {
             },
             font_style: FontStyle::BOLD | FontStyle::ITALIC,
         };
-        let rt = convert_style(syn);
+        let rt = convert_style(syn, HighlightColorLevel::TrueColor);
         assert_eq!(rt.fg, Some(RtColor::Rgb(255, 128, 0)));
         // Background is intentionally skipped.
         assert_eq!(rt.bg, None);
@@ -905,7 +1080,7 @@ mod tests {
             },
             font_style: FontStyle::UNDERLINE,
         };
-        let rt = convert_style(syn);
+        let rt = convert_style(syn, HighlightColorLevel::TrueColor);
         assert!(
             !rt.add_modifier.contains(Modifier::UNDERLINED),
             "convert_style should suppress UNDERLINE from themes — \
@@ -931,7 +1106,7 @@ mod tests {
             },
             font_style: FontStyle::empty(),
         };
-        let rt = convert_style(syn);
+        let rt = convert_style(syn, HighlightColorLevel::TrueColor);
         assert_eq!(rt.fg, Some(RtColor::Green));
     }
 
@@ -952,7 +1127,7 @@ mod tests {
             },
             font_style: FontStyle::empty(),
         };
-        let rt = convert_style(syn);
+        let rt = convert_style(syn, HighlightColorLevel::TrueColor);
         assert!(matches!(rt.fg, Some(RtColor::Indexed(0x9a))));
     }
 
@@ -973,7 +1148,7 @@ mod tests {
             },
             font_style: FontStyle::empty(),
         };
-        let rt = convert_style(syn);
+        let rt = convert_style(syn, HighlightColorLevel::TrueColor);
         assert_eq!(rt.fg, None);
     }
 
@@ -994,8 +1169,94 @@ mod tests {
             },
             font_style: FontStyle::empty(),
         };
-        let rt = convert_style(syn);
+        let rt = convert_style(syn, HighlightColorLevel::TrueColor);
         assert!(matches!(rt.fg, Some(RtColor::Rgb(10, 20, 30))));
+    }
+
+    #[test]
+    fn style_conversion_quantizes_rgb_when_color_level_is_ansi256() {
+        let syn = SyntectStyle {
+            foreground: syntect::highlighting::Color {
+                r: 10,
+                g: 20,
+                b: 30,
+                a: 0xFF,
+            },
+            background: syntect::highlighting::Color {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 0xFF,
+            },
+            font_style: FontStyle::empty(),
+        };
+        let rt = convert_style(syn, HighlightColorLevel::Ansi256);
+        assert!(matches!(rt.fg, Some(RtColor::Indexed(idx)) if idx >= 16));
+    }
+
+    #[test]
+    fn style_conversion_quantizes_rgb_when_color_level_is_ansi16() {
+        let syn = SyntectStyle {
+            foreground: syntect::highlighting::Color {
+                r: 10,
+                g: 20,
+                b: 30,
+                a: 0xFF,
+            },
+            background: syntect::highlighting::Color {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 0xFF,
+            },
+            font_style: FontStyle::empty(),
+        };
+        let rt = convert_style(syn, HighlightColorLevel::Ansi16);
+        assert!(matches!(
+            rt.fg,
+            Some(
+                RtColor::Black
+                    | RtColor::Red
+                    | RtColor::Green
+                    | RtColor::Yellow
+                    | RtColor::Blue
+                    | RtColor::Magenta
+                    | RtColor::Cyan
+                    | RtColor::Gray
+                    | RtColor::DarkGray
+                    | RtColor::LightRed
+                    | RtColor::LightGreen
+                    | RtColor::LightYellow
+                    | RtColor::LightBlue
+                    | RtColor::LightMagenta
+                    | RtColor::LightCyan
+                    | RtColor::White
+            )
+        ));
+    }
+
+    #[test]
+    fn highlight_color_level_caps_truecolor_on_apple_terminal_without_colorterm() {
+        let level = highlight_color_level_for_terminal(
+            StdoutColorLevel::TrueColor,
+            TerminalName::AppleTerminal,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(level, HighlightColorLevel::Ansi256);
+    }
+
+    #[test]
+    fn highlight_color_level_allows_truecolor_on_apple_terminal_with_colorterm() {
+        let level = highlight_color_level_for_terminal(
+            StdoutColorLevel::TrueColor,
+            TerminalName::AppleTerminal,
+            false,
+            false,
+            true,
+        );
+        assert_eq!(level, HighlightColorLevel::TrueColor);
     }
 
     #[test]
@@ -1012,6 +1273,7 @@ mod tests {
                 "fn main() { let answer = 42; println!(\"hello\"); }\n",
                 "rust",
                 &theme,
+                HighlightColorLevel::TrueColor,
             )
             .expect("expected highlighted spans");
             let mut has_non_default_fg = false;

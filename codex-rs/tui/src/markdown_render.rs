@@ -849,13 +849,9 @@ mod tests {
         for info in &["rust,no_run", "rust no_run", "rust title=\"demo\""] {
             let markdown = format!("```{info}\nfn main() {{}}\n```\n");
             let rendered = render_markdown_text(&markdown);
-            let has_rgb = rendered.lines.iter().any(|line| {
-                line.spans
-                    .iter()
-                    .any(|s| matches!(s.style.fg, Some(ratatui::style::Color::Rgb(..))))
-            });
+            let has_syntax_spans = rendered.lines.iter().any(|line| line.spans.len() > 1);
             assert!(
-                has_rgb,
+                has_syntax_spans,
                 "info string \"{info}\" should still produce syntax highlighting"
             );
         }
