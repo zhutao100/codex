@@ -398,6 +398,7 @@ pub(crate) fn build_theme_picker_params(
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+    use ratatui::style::Color;
     use ratatui::style::Modifier;
 
     fn render_buffer(renderable: &dyn Renderable, width: u16, height: u16) -> Buffer {
@@ -439,6 +440,16 @@ mod tests {
         for col in marker_col + 1..width {
             if buf[(col, row)].symbol() != " " {
                 return Some(buf[(col, row)].style().add_modifier);
+            }
+        }
+        None
+    }
+
+    fn first_non_space_fg_after_marker(buf: &Buffer, row: u16, width: u16) -> Option<Color> {
+        let marker_col = diff_marker_col(buf, row, width)?;
+        for col in marker_col + 1..width {
+            if buf[(col, row)].symbol() != " " {
+                return buf[(col, row)].style().fg;
             }
         }
         None
@@ -560,7 +571,7 @@ mod tests {
     }
 
     #[test]
-    fn preview_diff_sign_is_dim_but_code_is_not() {
+    fn preview_diff_sign_is_not_dim_and_deleted_code_is_red() {
         let width = 80;
         let height = 6;
         let buf = render_buffer(&ThemePreviewNarrowRenderable, width, height);
@@ -582,8 +593,8 @@ mod tests {
             let sign_modifiers = marker_style_modifier(&buf, row, width)
                 .unwrap_or_else(|| panic!("expected diff marker for {description}"));
             assert!(
-                sign_modifiers.contains(Modifier::DIM),
-                "expected diff marker to be dimmed for {description}"
+                !sign_modifiers.contains(Modifier::DIM),
+                "expected diff marker not to be dimmed for {description}"
             );
 
             let code_modifiers = first_non_space_style_after_marker(&buf, row, width)
@@ -591,6 +602,51 @@ mod tests {
             assert!(
                 !code_modifiers.contains(Modifier::DIM),
                 "expected preview code not to be dimmed for {description}"
+            );
+        }
+
+        let deleted_fg = first_non_space_fg_after_marker(&buf, deleted_row, width)
+            .expect("expected code text after marker for deleted preview row");
+        assert_eq!(deleted_fg, Color::Red);
+    }
+
+    #[test]
+    fn preview_context_lines_dim_when_no_diff_background_is_available() {
+        let width = 80;
+        let height = 6;
+        let buf = render_buffer(&ThemePreviewNarrowRenderable, width, height);
+        let lines = render_lines(&ThemePreviewNarrowRenderable, width, height);
+
+        for preview_row in NARROW_PREVIEW_ROWS
+            .iter()
+            .filter(|row| row.kind == PreviewDiffKind::Context)
+        {
+            let (row_idx, line) = lines
+                .iter()
+                .enumerate()
+                .find(|(_, line)| {
+                    preview_line_number(line) == Some(preview_row.line_no)
+                        && preview_line_marker(line) == Some(' ')
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "expected context preview row to contain `{}`",
+                        preview_row.code
+                    )
+                });
+            let col = line.find(preview_row.code).unwrap_or_else(|| {
+                panic!(
+                    "expected `{}` to be present in preview row",
+                    preview_row.code
+                )
+            }) as u16;
+            assert!(
+                buf[(col, row_idx as u16)]
+                    .style()
+                    .add_modifier
+                    .contains(Modifier::DIM),
+                "expected context preview row to be dimmed for `{}`",
+                preview_row.code
             );
         }
     }

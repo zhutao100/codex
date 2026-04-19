@@ -1281,7 +1281,7 @@ fn style_sign_for_line(
             DiffLineFgKind::Add => Style::default().fg(Color::Green),
             DiffLineFgKind::Del => Style::default().fg(Color::Red),
         };
-        return base.add_modifier(Modifier::DIM);
+        return base;
     }
 
     if let Some(bg_rgb) = line_bg_rgb
@@ -1371,6 +1371,20 @@ fn adjust_syntax_span_style_for_diff(
     line_bg_rgb: Option<(u8, u8, u8)>,
     neutral_fg: Option<Color>,
 ) -> Style {
+    if fg_kind == Some(DiffLineFgKind::Del) && line_bg_rgb.is_none() {
+        return Style::default().fg(Color::Red);
+    }
+
+    if fg_kind.is_none()
+        && style_context.diff_backgrounds == ResolvedDiffBackgrounds::default()
+        && line_bg_rgb.is_none()
+    {
+        let mut dimmed = style;
+        dimmed.add_modifier |= Modifier::DIM;
+        dimmed.sub_modifier.remove(Modifier::DIM);
+        return dimmed;
+    }
+
     let Some(bg_rgb) = line_bg_rgb else {
         return style;
     };
@@ -1570,7 +1584,7 @@ mod tests {
     }
 
     #[test]
-    fn off_mode_dims_sign_but_not_syntax_content() {
+    fn off_mode_does_not_dim_sign_and_renders_delete_content_in_red() {
         let style_context = DiffRenderStyleContext {
             theme: DiffTheme::Dark,
             color_level: DiffColorLevel::Ansi256,
@@ -1591,15 +1605,36 @@ mod tests {
         );
         let spans = &lines[0].spans;
         let sign_style = spans[1].style;
-        assert!(
-            sign_style.add_modifier.contains(Modifier::DIM),
-            "expected sign to be dimmed"
-        );
+        assert_eq!(sign_style.add_modifier, Modifier::empty());
+        assert_eq!(sign_style.fg, Some(Color::Red));
         let content_style = spans[2].style;
-        assert!(
-            !content_style.add_modifier.contains(Modifier::DIM),
-            "expected content not to be dimmed"
+        assert_eq!(content_style.add_modifier, Modifier::empty());
+        assert_eq!(content_style.fg, Some(Color::Red));
+    }
+
+    #[test]
+    fn syntax_highlighted_context_lines_dim_when_no_diff_background_is_available() {
+        let style_context = DiffRenderStyleContext {
+            theme: DiffTheme::Dark,
+            color_level: DiffColorLevel::Ansi256,
+            diff_backgrounds: ResolvedDiffBackgrounds::default(),
+            diff_background_mode: DiffBackgroundMode::Off,
+            terminal_name: TerminalName::AppleTerminal,
+            terminal_default_fg_rgb: None,
+        };
+        let syntax_spans = [RtSpan::styled("hello".to_string(), Style::default())];
+        let lines = push_wrapped_diff_line_with_syntax_and_style_context(
+            1,
+            DiffLineType::Context,
+            "hello",
+            80,
+            1,
+            &syntax_spans,
+            style_context,
         );
+        let spans = &lines[0].spans;
+        let content_style = spans[2].style;
+        assert!(content_style.add_modifier.contains(Modifier::DIM));
     }
 
     #[test]
