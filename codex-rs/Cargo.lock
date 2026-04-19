@@ -1501,6 +1501,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "codex-codexd"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "codex-app-server-protocol",
+ "libc",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "codex-common"
 version = "0.0.0"
 dependencies = [

@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "codexd",
     "backend-client",
     "ansi-escape",
     "async-utils",
@@ -80,6 +81,7 @@ codex-cloud-requirements = { path = "cloud-requirements" }
 codex-chatgpt = { path = "chatgpt" }
 codex-cli = { path = "cli"}
 codex-client = { path = "codex-client" }
+codex-codexd = { path = "codexd" }
 codex-common = { path = "common" }
 codex-core = { path = "core" }
 codex-secrets = { path = "secrets" }
