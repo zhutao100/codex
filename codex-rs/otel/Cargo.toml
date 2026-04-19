@@ -22,7 +22,6 @@ disable-default-metrics-exporter = []
 [dependencies]
 chrono = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
-codex-utils-string = { workspace = true }
 codex-api = { workspace = true }
 codex-protocol = { workspace = true }
 eventsource-stream = { workspace = true }
@@ -50,7 +49,6 @@ opentelemetry_sdk = { workspace = true, features = [
     "trace",
 ] }
 http = { workspace = true }
-os_info = { workspace = true }
 reqwest = { workspace = true, features = ["blocking", "rustls-tls"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
