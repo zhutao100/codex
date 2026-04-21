@@ -10,6 +10,8 @@ use crate::protocol::EventMsg;
 use crate::protocol::McpInvocation;
 use crate::protocol::McpToolCallBeginEvent;
 use crate::protocol::McpToolCallEndEvent;
+use crate::protocol::ProgressTraceCategory;
+use crate::protocol::ProgressTraceState;
 use codex_protocol::mcp::CallToolResult;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputPayload;
@@ -161,6 +163,29 @@ pub(crate) async fn handle_mcp_tool_call(
 }
 
 async fn notify_mcp_tool_call_event(sess: &Session, turn_context: &TurnContext, event: EventMsg) {
+    match &event {
+        EventMsg::McpToolCallBegin(_) => {
+            sess.emit_progress_trace(
+                turn_context,
+                ProgressTraceCategory::Tool,
+                ProgressTraceState::Started,
+                None,
+                Some("mcp_tool"),
+            )
+            .await;
+        }
+        EventMsg::McpToolCallEnd(_) => {
+            sess.emit_progress_trace(
+                turn_context,
+                ProgressTraceCategory::Tool,
+                ProgressTraceState::Completed,
+                None,
+                Some("mcp_tool"),
+            )
+            .await;
+        }
+        _ => {}
+    }
     sess.send_event(turn_context, event).await;
 }
 

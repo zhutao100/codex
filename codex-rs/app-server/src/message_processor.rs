@@ -127,6 +127,8 @@ pub(crate) struct MessageProcessorArgs {
     pub(crate) cloud_requirements: CloudRequirementsLoader,
     pub(crate) feedback: CodexFeedback,
     pub(crate) config_warnings: Vec<ConfigWarningNotification>,
+    pub(crate) auth_manager: Option<Arc<AuthManager>>,
+    pub(crate) thread_manager: Option<Arc<ThreadManager>>,
 }
 
 impl MessageProcessor {
@@ -142,21 +144,27 @@ impl MessageProcessor {
             cloud_requirements,
             feedback,
             config_warnings,
+            auth_manager,
+            thread_manager,
         } = args;
-        let auth_manager = AuthManager::shared(
-            config.codex_home.clone(),
-            false,
-            config.cli_auth_credentials_store_mode,
-        );
+        let auth_manager = auth_manager.unwrap_or_else(|| {
+            AuthManager::shared(
+                config.codex_home.clone(),
+                false,
+                config.cli_auth_credentials_store_mode,
+            )
+        });
         auth_manager.set_forced_chatgpt_workspace_id(config.forced_chatgpt_workspace_id.clone());
         auth_manager.set_external_auth_refresher(Arc::new(ExternalAuthRefreshBridge {
             outgoing: outgoing.clone(),
         }));
-        let thread_manager = Arc::new(ThreadManager::new(
-            config.codex_home.clone(),
-            auth_manager.clone(),
-            SessionSource::VSCode,
-        ));
+        let thread_manager = thread_manager.unwrap_or_else(|| {
+            Arc::new(ThreadManager::new(
+                config.codex_home.clone(),
+                auth_manager.clone(),
+                SessionSource::VSCode,
+            ))
+        });
         let codex_message_processor = CodexMessageProcessor::new(CodexMessageProcessorArgs {
             auth_manager,
             thread_manager,
@@ -290,6 +298,9 @@ impl MessageProcessor {
                             ))
                             .await;
                     }
+                    self.codex_message_processor
+                        .attach_loaded_thread_listeners()
+                        .await;
 
                     return;
                 }

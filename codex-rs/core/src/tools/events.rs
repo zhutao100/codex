@@ -12,6 +12,8 @@ use crate::protocol::ExecCommandSource;
 use crate::protocol::FileChange;
 use crate::protocol::PatchApplyBeginEvent;
 use crate::protocol::PatchApplyEndEvent;
+use crate::protocol::ProgressTraceCategory;
+use crate::protocol::ProgressTraceState;
 use crate::protocol::TurnDiffEvent;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::sandboxing::ToolError;
@@ -80,6 +82,15 @@ pub(crate) async fn emit_exec_command_begin(
                 source,
                 interaction_input,
             }),
+        )
+        .await;
+    ctx.session
+        .emit_progress_trace(
+            ctx.turn,
+            ProgressTraceCategory::Tool,
+            ProgressTraceState::Started,
+            None,
+            Some("exec_command"),
         )
         .await;
 }
@@ -185,6 +196,15 @@ impl ToolEmitter {
                             auto_approved: *auto_approved,
                             changes: changes.clone(),
                         }),
+                    )
+                    .await;
+                ctx.session
+                    .emit_progress_trace(
+                        ctx.turn,
+                        ProgressTraceCategory::Edit,
+                        ProgressTraceState::Started,
+                        None,
+                        Some("apply_patch"),
                     )
                     .await;
             }
@@ -430,6 +450,15 @@ async fn emit_exec_end(
             }),
         )
         .await;
+    ctx.session
+        .emit_progress_trace(
+            ctx.turn,
+            ProgressTraceCategory::Tool,
+            ProgressTraceState::Completed,
+            None,
+            Some("exec_command"),
+        )
+        .await;
 }
 
 async fn emit_patch_end(
@@ -450,6 +479,15 @@ async fn emit_patch_end(
                 success,
                 changes,
             }),
+        )
+        .await;
+    ctx.session
+        .emit_progress_trace(
+            ctx.turn,
+            ProgressTraceCategory::Edit,
+            ProgressTraceState::Completed,
+            None,
+            Some("apply_patch"),
         )
         .await;
 

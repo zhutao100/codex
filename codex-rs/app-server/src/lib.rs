@@ -3,6 +3,7 @@
 use codex_cloud_requirements::cloud_requirements_loader;
 use codex_common::CliConfigOverrides;
 use codex_core::AuthManager;
+use codex_core::ThreadManager;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
 use codex_core::config_loader::CloudRequirementsLoader;
@@ -11,6 +12,8 @@ use codex_core::config_loader::LoaderOverrides;
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::io::Result as IoResult;
+use std::net::SocketAddr;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -25,18 +28,23 @@ use crate::transport::TransportEvent;
 use crate::transport::has_initialized_connections;
 use crate::transport::route_outgoing_envelope;
 use crate::transport::start_stdio_connection;
+#[cfg(unix)]
+use crate::transport::start_uds_acceptor;
 use crate::transport::start_websocket_acceptor;
 use codex_app_server_protocol::ConfigLayerSource;
 use codex_app_server_protocol::ConfigWarningNotification;
 use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::TextPosition as AppTextPosition;
 use codex_app_server_protocol::TextRange as AppTextRange;
+use codex_codexd::producer::CodexdProducerClient;
+use codex_codexd::producer::RuntimeMetadata;
 use codex_core::ExecPolicyError;
 use codex_core::check_execpolicy_for_warnings;
 use codex_core::config_loader::ConfigLoadError;
 use codex_core::config_loader::TextRange as CoreTextRange;
 use codex_feedback::CodexFeedback;
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use toml::Value as TomlValue;
 use tracing::error;
@@ -60,6 +68,50 @@ mod outgoing_message;
 mod transport;
 
 pub use crate::transport::AppServerTransport;
+
+pub enum EmbeddedAppServerEndpoint {
+    WebSocketUrl(String),
+    #[cfg(unix)]
+    UnixSocketPath(PathBuf),
+}
+
+pub struct EmbeddedAppServerHandle {
+    endpoint: EmbeddedAppServerEndpoint,
+    shutdown_tx: Option<oneshot::Sender<()>>,
+    supervisor_handle: Option<JoinHandle<()>>,
+}
+
+impl EmbeddedAppServerHandle {
+    pub fn websocket_url(&self) -> Option<&str> {
+        match &self.endpoint {
+            EmbeddedAppServerEndpoint::WebSocketUrl(url) => Some(url.as_str()),
+            #[cfg(unix)]
+            EmbeddedAppServerEndpoint::UnixSocketPath(_) => None,
+        }
+    }
+
+    #[cfg(unix)]
+    pub fn socket_path(&self) -> Option<&Path> {
+        match &self.endpoint {
+            EmbeddedAppServerEndpoint::WebSocketUrl(_) => None,
+            EmbeddedAppServerEndpoint::UnixSocketPath(path) => Some(path.as_path()),
+        }
+    }
+
+    pub async fn shutdown(mut self) -> IoResult<()> {
+        if let Some(shutdown_tx) = self.shutdown_tx.take() {
+            let _ = shutdown_tx.send(());
+        }
+        if let Some(supervisor_handle) = self.supervisor_handle.take()
+            && let Err(err) = supervisor_handle.await
+        {
+            return Err(std::io::Error::other(format!(
+                "embedded app-server task failed: {err}"
+            )));
+        }
+        Ok(())
+    }
+}
 
 fn config_warning_from_error(
     summary: impl Into<String>,
@@ -205,8 +257,9 @@ pub async fn run_main_with_transport(
             start_stdio_connection(transport_event_tx.clone(), &mut stdio_handles).await?;
         }
         AppServerTransport::WebSocket { bind_address } => {
-            websocket_accept_handle =
-                Some(start_websocket_acceptor(bind_address, transport_event_tx.clone()).await?);
+            let (_local_addr, handle) =
+                start_websocket_acceptor(bind_address, transport_event_tx.clone(), None).await?;
+            websocket_accept_handle = Some(handle);
         }
     }
     let shutdown_when_no_connections = matches!(transport, AppServerTransport::Stdio);
@@ -339,7 +392,11 @@ pub async fn run_main_with_transport(
     }
 
     let processor_handle = tokio::spawn({
-        let outgoing_message_sender = Arc::new(OutgoingMessageSender::new(outgoing_tx));
+        let codexd_producer = create_codexd_producer(&config, "appServer");
+        let outgoing_message_sender = Arc::new(OutgoingMessageSender::new_with_codexd(
+            outgoing_tx,
+            codexd_producer,
+        ));
         let cli_overrides: Vec<(String, TomlValue)> = cli_kv_overrides.clone();
         let loader_overrides = loader_overrides_for_config_api;
         let mut processor = MessageProcessor::new(MessageProcessorArgs {
@@ -351,6 +408,8 @@ pub async fn run_main_with_transport(
             cloud_requirements: cloud_requirements.clone(),
             feedback: feedback.clone(),
             config_warnings,
+            auth_manager: None,
+            thread_manager: None,
         });
         let mut thread_created_rx = processor.thread_created_receiver();
         let mut connections = HashMap::<ConnectionId, ConnectionState>::new();
@@ -445,4 +504,263 @@ pub async fn run_main_with_transport(
     }
 
     Ok(())
+}
+
+struct EmbeddedProcessorArgs {
+    codex_linux_sandbox_exe: Option<PathBuf>,
+    config: Arc<Config>,
+    auth_manager: Arc<AuthManager>,
+    thread_manager: Arc<ThreadManager>,
+    cli_overrides: Vec<(String, TomlValue)>,
+    outgoing_tx: mpsc::Sender<OutgoingEnvelope>,
+}
+
+fn spawn_embedded_processor(
+    args: EmbeddedProcessorArgs,
+    mut transport_event_rx: mpsc::Receiver<TransportEvent>,
+    mut outgoing_rx: mpsc::Receiver<OutgoingEnvelope>,
+) -> (oneshot::Sender<()>, JoinHandle<()>) {
+    let EmbeddedProcessorArgs {
+        codex_linux_sandbox_exe,
+        config,
+        auth_manager,
+        thread_manager,
+        cli_overrides,
+        outgoing_tx,
+    } = args;
+
+    let loader_overrides = LoaderOverrides::default();
+    let cloud_requirements =
+        cloud_requirements_loader(auth_manager.clone(), config.chatgpt_base_url.clone());
+    let feedback = CodexFeedback::new();
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+
+    let processor_handle = tokio::spawn({
+        let codexd_producer = create_codexd_producer(config.as_ref(), "appServer");
+        let outgoing_message_sender = Arc::new(OutgoingMessageSender::new_with_codexd(
+            outgoing_tx,
+            codexd_producer,
+        ));
+        let mut processor = MessageProcessor::new(MessageProcessorArgs {
+            outgoing: outgoing_message_sender,
+            codex_linux_sandbox_exe,
+            config,
+            cli_overrides,
+            loader_overrides,
+            cloud_requirements,
+            feedback,
+            config_warnings: Vec::new(),
+            auth_manager: Some(auth_manager),
+            thread_manager: Some(thread_manager),
+        });
+        let mut thread_created_rx = processor.thread_created_receiver();
+        let mut connections = HashMap::<ConnectionId, ConnectionState>::new();
+        async move {
+            let mut listen_for_threads = true;
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_rx => {
+                        break;
+                    }
+                    event = transport_event_rx.recv() => {
+                        let Some(event) = event else {
+                            break;
+                        };
+                        match event {
+                            TransportEvent::ConnectionOpened { connection_id, writer } => {
+                                connections.insert(connection_id, ConnectionState::new(writer));
+                            }
+                            TransportEvent::ConnectionClosed { connection_id } => {
+                                connections.remove(&connection_id);
+                            }
+                            TransportEvent::IncomingMessage { connection_id, message } => {
+                                match message {
+                                    JSONRPCMessage::Request(request) => {
+                                        let Some(connection_state) = connections.get_mut(&connection_id) else {
+                                            warn!("dropping request from unknown connection: {:?}", connection_id);
+                                            continue;
+                                        };
+                                        processor
+                                            .process_request(
+                                                connection_id,
+                                                request,
+                                                &mut connection_state.session,
+                                            )
+                                            .await;
+                                    }
+                                    JSONRPCMessage::Response(response) => {
+                                        processor.process_response(response).await;
+                                    }
+                                    JSONRPCMessage::Notification(notification) => {
+                                        processor.process_notification(notification).await;
+                                    }
+                                    JSONRPCMessage::Error(err) => {
+                                        processor.process_error(err).await;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    envelope = outgoing_rx.recv() => {
+                        let Some(envelope) = envelope else {
+                            break;
+                        };
+                        route_outgoing_envelope(&mut connections, envelope).await;
+                    }
+                    created = thread_created_rx.recv(), if listen_for_threads => {
+                        match created {
+                            Ok(thread_id) => {
+                                if has_initialized_connections(&connections) {
+                                    processor.try_attach_thread_listener(thread_id).await;
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                warn!("thread_created receiver lagged; skipping resync");
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                listen_for_threads = false;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    (shutdown_tx, processor_handle)
+}
+
+fn create_codexd_producer(config: &Config, session_source: &str) -> Option<CodexdProducerClient> {
+    #[cfg(unix)]
+    {
+        let runtime_metadata = RuntimeMetadata {
+            runtime_id: format!("pid:{}", std::process::id()),
+            pid: Some(std::process::id()),
+            session_source: Some(session_source.to_string()),
+            cwd: Some(config.cwd.to_string_lossy().into_owned()),
+            display_name: Some("codex-app-server".to_string()),
+        };
+        Some(CodexdProducerClient::spawn(
+            config.codex_home.as_path(),
+            runtime_metadata,
+        ))
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = (config, session_source);
+        None
+    }
+}
+
+pub async fn start_embedded_websocket_server(
+    codex_linux_sandbox_exe: Option<PathBuf>,
+    config: Arc<Config>,
+    auth_manager: Arc<AuthManager>,
+    thread_manager: Arc<ThreadManager>,
+    cli_overrides: Vec<(String, TomlValue)>,
+    bind_address: SocketAddr,
+) -> IoResult<EmbeddedAppServerHandle> {
+    start_embedded_websocket_server_with_auth(
+        codex_linux_sandbox_exe,
+        config,
+        auth_manager,
+        thread_manager,
+        cli_overrides,
+        bind_address,
+        None,
+    )
+    .await
+}
+
+pub async fn start_embedded_websocket_server_with_auth(
+    codex_linux_sandbox_exe: Option<PathBuf>,
+    config: Arc<Config>,
+    auth_manager: Arc<AuthManager>,
+    thread_manager: Arc<ThreadManager>,
+    cli_overrides: Vec<(String, TomlValue)>,
+    bind_address: SocketAddr,
+    required_bearer_token: Option<String>,
+) -> IoResult<EmbeddedAppServerHandle> {
+    let (transport_event_tx, transport_event_rx) =
+        mpsc::channel::<TransportEvent>(CHANNEL_CAPACITY);
+    let (outgoing_tx, outgoing_rx) = mpsc::channel::<OutgoingEnvelope>(CHANNEL_CAPACITY);
+    let (local_addr, websocket_accept_handle) = start_websocket_acceptor(
+        bind_address,
+        transport_event_tx.clone(),
+        required_bearer_token,
+    )
+    .await?;
+    let websocket_url = format!("ws://{local_addr}");
+    let (shutdown_tx, processor_handle) = spawn_embedded_processor(
+        EmbeddedProcessorArgs {
+            codex_linux_sandbox_exe,
+            config,
+            auth_manager,
+            thread_manager,
+            cli_overrides,
+            outgoing_tx,
+        },
+        transport_event_rx,
+        outgoing_rx,
+    );
+
+    drop(transport_event_tx);
+
+    let supervisor_handle = tokio::spawn(async move {
+        let _ = processor_handle.await;
+        websocket_accept_handle.abort();
+        let _ = websocket_accept_handle.await;
+    });
+
+    Ok(EmbeddedAppServerHandle {
+        endpoint: EmbeddedAppServerEndpoint::WebSocketUrl(websocket_url),
+        shutdown_tx: Some(shutdown_tx),
+        supervisor_handle: Some(supervisor_handle),
+    })
+}
+
+#[cfg(unix)]
+pub async fn start_embedded_uds_server(
+    codex_linux_sandbox_exe: Option<PathBuf>,
+    config: Arc<Config>,
+    auth_manager: Arc<AuthManager>,
+    thread_manager: Arc<ThreadManager>,
+    cli_overrides: Vec<(String, TomlValue)>,
+    socket_path: PathBuf,
+) -> IoResult<EmbeddedAppServerHandle> {
+    let (transport_event_tx, transport_event_rx) =
+        mpsc::channel::<TransportEvent>(CHANNEL_CAPACITY);
+    let (outgoing_tx, outgoing_rx) = mpsc::channel::<OutgoingEnvelope>(CHANNEL_CAPACITY);
+    let uds_accept_handle =
+        start_uds_acceptor(socket_path.as_path(), transport_event_tx.clone()).await?;
+    let socket_path_for_cleanup = socket_path.clone();
+    let (shutdown_tx, processor_handle) = spawn_embedded_processor(
+        EmbeddedProcessorArgs {
+            codex_linux_sandbox_exe,
+            config,
+            auth_manager,
+            thread_manager,
+            cli_overrides,
+            outgoing_tx: outgoing_tx.clone(),
+        },
+        transport_event_rx,
+        outgoing_rx,
+    );
+
+    drop(transport_event_tx);
+    drop(outgoing_tx);
+
+    let supervisor_handle = tokio::spawn(async move {
+        let _ = processor_handle.await;
+        uds_accept_handle.abort();
+        let _ = uds_accept_handle.await;
+        let _ = tokio::fs::remove_file(socket_path_for_cleanup).await;
+    });
+
+    Ok(EmbeddedAppServerHandle {
+        endpoint: EmbeddedAppServerEndpoint::UnixSocketPath(socket_path),
+        shutdown_tx: Some(shutdown_tx),
+        supervisor_handle: Some(supervisor_handle),
+    })
 }

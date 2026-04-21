@@ -45,6 +45,8 @@ use codex_app_server_protocol::McpToolCallStatus;
 use codex_app_server_protocol::PatchApplyStatus;
 use codex_app_server_protocol::PatchChangeKind as V2PatchChangeKind;
 use codex_app_server_protocol::PlanDeltaNotification;
+use codex_app_server_protocol::ProgressTraceCategory as V2ProgressTraceCategory;
+use codex_app_server_protocol::ProgressTraceState as V2ProgressTraceState;
 use codex_app_server_protocol::RawResponseItemCompletedNotification;
 use codex_app_server_protocol::ReasoningSummaryPartAddedNotification;
 use codex_app_server_protocol::ReasoningSummaryTextDeltaNotification;
@@ -68,6 +70,7 @@ use codex_app_server_protocol::TurnError;
 use codex_app_server_protocol::TurnInterruptResponse;
 use codex_app_server_protocol::TurnPlanStep;
 use codex_app_server_protocol::TurnPlanUpdatedNotification;
+use codex_app_server_protocol::TurnProgressTraceNotification;
 use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::build_turns_from_event_msgs;
 use codex_core::CodexThread;
@@ -82,6 +85,7 @@ use codex_core::protocol::FileChange as CoreFileChange;
 use codex_core::protocol::McpToolCallBeginEvent;
 use codex_core::protocol::McpToolCallEndEvent;
 use codex_core::protocol::Op;
+use codex_core::protocol::ProgressTraceEvent;
 use codex_core::protocol::ReviewDecision;
 use codex_core::protocol::TokenCountEvent;
 use codex_core::protocol::TurnDiffEvent;
@@ -100,6 +104,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::oneshot;
 use tracing::error;
+use tracing::warn;
 
 type JsonValue = serde_json::Value;
 
@@ -120,7 +125,12 @@ pub(crate) async fn apply_bespoke_event_handling(
         msg,
     } = event;
     match msg {
-        EventMsg::TurnStarted(_) => {}
+        EventMsg::TurnStarted(_) => {
+            let mut map = turn_summary_store.lock().await;
+            let summary = map.entry(conversation_id).or_default();
+            summary.active_turn_id = Some(event_turn_id.clone());
+            summary.last_error = None;
+        }
         EventMsg::TurnComplete(_ev) => {
             handle_turn_complete(
                 conversation_id,
@@ -707,7 +717,16 @@ pub(crate) async fn apply_bespoke_event_handling(
                 codex_error_info: ev.codex_error_info.map(V2CodexErrorInfo::from),
                 additional_details: None,
             };
-            handle_error(conversation_id, turn_error.clone(), &turn_summary_store).await;
+            let should_notify = handle_error(
+                conversation_id,
+                &event_turn_id,
+                turn_error.clone(),
+                &turn_summary_store,
+            )
+            .await;
+            if !should_notify {
+                return;
+            }
             outgoing
                 .send_server_notification(ServerNotification::Error(ErrorNotification {
                     error: turn_error.clone(),
@@ -1126,6 +1145,9 @@ pub(crate) async fn apply_bespoke_event_handling(
                     .await;
             }
         }
+        EventMsg::ProgressTrace(progress_trace_event) => {
+            handle_turn_progress_trace(progress_trace_event, api_version, outgoing.as_ref()).await;
+        }
         EventMsg::TurnDiff(turn_diff_event) => {
             handle_turn_diff(
                 conversation_id,
@@ -1170,6 +1192,25 @@ async fn handle_turn_diff(
     }
 }
 
+async fn handle_turn_progress_trace(
+    progress_trace_event: ProgressTraceEvent,
+    api_version: ApiVersion,
+    outgoing: &OutgoingMessageSender,
+) {
+    if let ApiVersion::V2 = api_version {
+        let notification = TurnProgressTraceNotification {
+            thread_id: progress_trace_event.thread_id.to_string(),
+            turn_id: progress_trace_event.turn_id,
+            category: V2ProgressTraceCategory::from(progress_trace_event.category),
+            state: V2ProgressTraceState::from(progress_trace_event.state),
+            label: progress_trace_event.label,
+        };
+        outgoing
+            .send_server_notification(ServerNotification::TurnProgressTrace(notification))
+            .await;
+    }
+}
+
 async fn handle_turn_plan_update(
     conversation_id: ThreadId,
     event_turn_id: &str,
@@ -1200,13 +1241,14 @@ async fn emit_turn_completed_with_status(
     event_turn_id: String,
     status: TurnStatus,
     error: Option<TurnError>,
+    model: Option<String>,
     outgoing: &OutgoingMessageSender,
 ) {
     let notification = TurnCompletedNotification {
         thread_id: conversation_id.to_string(),
         turn: Turn {
             id: event_turn_id,
-            model: None,
+            model,
             items: vec![],
             error,
             status,
@@ -1318,12 +1360,28 @@ async fn handle_turn_complete(
 ) {
     let turn_summary = find_and_remove_turn_summary(conversation_id, turn_summary_store).await;
 
+    if let Some(active_turn_id) = turn_summary.active_turn_id.clone()
+        && active_turn_id != event_turn_id
+    {
+        warn!(
+            "received completion for non-active turn {event_turn_id} in thread {conversation_id}; active summary turn is {active_turn_id}"
+        );
+    }
+
     let (status, error) = match turn_summary.last_error {
         Some(error) => (TurnStatus::Failed, Some(error)),
         None => (TurnStatus::Completed, None),
     };
 
-    emit_turn_completed_with_status(conversation_id, event_turn_id, status, error, outgoing).await;
+    emit_turn_completed_with_status(
+        conversation_id,
+        event_turn_id,
+        status,
+        error,
+        turn_summary.active_turn_model,
+        outgoing,
+    )
+    .await;
 }
 
 async fn handle_turn_interrupted(
@@ -1332,13 +1390,20 @@ async fn handle_turn_interrupted(
     outgoing: &OutgoingMessageSender,
     turn_summary_store: &TurnSummaryStore,
 ) {
-    find_and_remove_turn_summary(conversation_id, turn_summary_store).await;
-
+    let turn_summary = find_and_remove_turn_summary(conversation_id, turn_summary_store).await;
+    if let Some(active_turn_id) = turn_summary.active_turn_id
+        && active_turn_id != event_turn_id
+    {
+        warn!(
+            "received interrupt for non-active turn {event_turn_id} in thread {conversation_id}; active summary turn is {active_turn_id}"
+        );
+    }
     emit_turn_completed_with_status(
         conversation_id,
         event_turn_id,
         TurnStatus::Interrupted,
         None,
+        turn_summary.active_turn_model,
         outgoing,
     )
     .await;
@@ -1399,11 +1464,22 @@ async fn handle_token_count_event(
 
 async fn handle_error(
     conversation_id: ThreadId,
+    event_turn_id: &str,
     error: TurnError,
     turn_summary_store: &TurnSummaryStore,
-) {
+) -> bool {
     let mut map = turn_summary_store.lock().await;
-    map.entry(conversation_id).or_default().last_error = Some(error);
+    let summary = map.entry(conversation_id).or_default();
+    if let Some(active_turn_id) = summary.active_turn_id.as_deref()
+        && active_turn_id != event_turn_id
+    {
+        warn!(
+            "received error for non-active turn {event_turn_id} in thread {conversation_id}; active summary turn is {active_turn_id}"
+        );
+        return false;
+    }
+    summary.last_error = Some(error);
+    true
 }
 
 async fn on_patch_approval_response(
@@ -1841,6 +1917,9 @@ mod tests {
     use codex_app_server_protocol::TurnPlanStepStatus;
     use codex_core::protocol::CreditsSnapshot;
     use codex_core::protocol::McpInvocation;
+    use codex_core::protocol::ProgressTraceCategory as CoreProgressTraceCategory;
+    use codex_core::protocol::ProgressTraceEvent;
+    use codex_core::protocol::ProgressTraceState as CoreProgressTraceState;
     use codex_core::protocol::RateLimitSnapshot;
     use codex_core::protocol::RateLimitWindow;
     use codex_core::protocol::TokenUsage;
@@ -1890,6 +1969,7 @@ mod tests {
 
         handle_error(
             conversation_id,
+            "turn-1",
             TurnError {
                 message: "boom".to_string(),
                 codex_error_info: Some(V2CodexErrorInfo::InternalServerError),
@@ -1908,6 +1988,32 @@ mod tests {
                 additional_details: None,
             })
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_handle_error_ignores_non_active_turn_errors() -> Result<()> {
+        let conversation_id = ThreadId::new();
+        let turn_summary_store = new_turn_summary_store();
+        {
+            let mut map = turn_summary_store.lock().await;
+            map.entry(conversation_id).or_default().active_turn_id = Some("active".to_string());
+        }
+
+        handle_error(
+            conversation_id,
+            "stale",
+            TurnError {
+                message: "late error".to_string(),
+                codex_error_info: Some(V2CodexErrorInfo::Other),
+                additional_details: None,
+            },
+            &turn_summary_store,
+        )
+        .await;
+
+        let turn_summary = find_and_remove_turn_summary(conversation_id, &turn_summary_store).await;
+        assert_eq!(turn_summary.last_error, None);
         Ok(())
     }
 
@@ -1947,6 +2053,7 @@ mod tests {
         let turn_summary_store = new_turn_summary_store();
         handle_error(
             conversation_id,
+            &event_turn_id,
             TurnError {
                 message: "oops".to_string(),
                 codex_error_info: None,
@@ -1986,6 +2093,7 @@ mod tests {
         let turn_summary_store = new_turn_summary_store();
         handle_error(
             conversation_id,
+            &event_turn_id,
             TurnError {
                 message: "bad".to_string(),
                 codex_error_info: Some(V2CodexErrorInfo::Other),
@@ -2228,6 +2336,7 @@ mod tests {
         let a_turn1 = "a_turn1".to_string();
         handle_error(
             conversation_a,
+            &a_turn1,
             TurnError {
                 message: "a1".to_string(),
                 codex_error_info: Some(V2CodexErrorInfo::BadRequest),
@@ -2248,6 +2357,7 @@ mod tests {
         let b_turn1 = "b_turn1".to_string();
         handle_error(
             conversation_b,
+            &b_turn1,
             TurnError {
                 message: "b1".to_string(),
                 codex_error_info: None,
@@ -2457,6 +2567,67 @@ mod tests {
         };
 
         assert_eq!(notification, expected);
+    }
+
+    #[tokio::test]
+    async fn test_handle_turn_progress_trace_emits_v2_notification() -> Result<()> {
+        let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let outgoing = OutgoingMessageSender::new(tx);
+        let thread_id = ThreadId::new();
+
+        handle_turn_progress_trace(
+            ProgressTraceEvent {
+                thread_id,
+                turn_id: "turn-1".to_string(),
+                category: CoreProgressTraceCategory::Tool,
+                state: CoreProgressTraceState::Started,
+                label: Some("running tool call".to_string()),
+                source: None,
+            },
+            ApiVersion::V2,
+            &outgoing,
+        )
+        .await;
+
+        let msg = recv_broadcast_message(&mut rx).await?;
+        match msg {
+            OutgoingMessage::AppServerNotification(ServerNotification::TurnProgressTrace(
+                notification,
+            )) => {
+                assert_eq!(notification.thread_id, thread_id.to_string());
+                assert_eq!(notification.turn_id, "turn-1");
+                assert_eq!(notification.category, V2ProgressTraceCategory::Tool);
+                assert_eq!(notification.state, V2ProgressTraceState::Started);
+                assert_eq!(notification.label.as_deref(), Some("running tool call"));
+            }
+            other => bail!("unexpected message: {other:?}"),
+        }
+
+        assert!(rx.try_recv().is_err(), "no extra messages expected");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_handle_turn_progress_trace_is_noop_for_v1() -> Result<()> {
+        let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let outgoing = OutgoingMessageSender::new(tx);
+
+        handle_turn_progress_trace(
+            ProgressTraceEvent {
+                thread_id: ThreadId::new(),
+                turn_id: "turn-1".to_string(),
+                category: CoreProgressTraceCategory::Network,
+                state: CoreProgressTraceState::Completed,
+                label: None,
+                source: None,
+            },
+            ApiVersion::V1,
+            &outgoing,
+        )
+        .await;
+
+        assert!(rx.try_recv().is_err(), "no messages expected");
+        Ok(())
     }
 
     #[tokio::test]

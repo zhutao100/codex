@@ -73,6 +73,7 @@ async fn thread_resume_returns_original_thread() -> Result<()> {
     } = to_response::<ThreadResumeResponse>(resume_resp)?;
     let mut expected = thread;
     expected.updated_at = resumed.updated_at;
+    expected.model = resumed.model.clone();
     assert_eq!(resumed, expected);
 
     Ok(())
@@ -302,6 +303,7 @@ async fn thread_resume_prefers_path_over_thread_id() -> Result<()> {
     } = to_response::<ThreadResumeResponse>(resume_resp)?;
     let mut expected = thread;
     expected.updated_at = resumed.updated_at;
+    expected.model = resumed.model.clone();
     assert_eq!(resumed, expected);
 
     Ok(())

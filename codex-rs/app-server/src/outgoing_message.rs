@@ -8,6 +8,7 @@ use codex_app_server_protocol::Result;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::ServerRequestPayload;
+use codex_codexd::producer::CodexdProducerClient;
 use serde::Serialize;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
@@ -46,14 +47,24 @@ pub(crate) struct OutgoingMessageSender {
     next_server_request_id: AtomicI64,
     sender: mpsc::Sender<OutgoingEnvelope>,
     request_id_to_callback: Mutex<HashMap<RequestId, oneshot::Sender<Result>>>,
+    codexd_producer: Option<CodexdProducerClient>,
 }
 
 impl OutgoingMessageSender {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn new(sender: mpsc::Sender<OutgoingEnvelope>) -> Self {
+        Self::new_with_codexd(sender, None)
+    }
+
+    pub(crate) fn new_with_codexd(
+        sender: mpsc::Sender<OutgoingEnvelope>,
+        codexd_producer: Option<CodexdProducerClient>,
+    ) -> Self {
         Self {
             next_server_request_id: AtomicI64::new(0),
             sender,
             request_id_to_callback: Mutex::new(HashMap::new()),
+            codexd_producer,
         }
     }
 
@@ -172,6 +183,14 @@ impl OutgoingMessageSender {
     }
 
     pub(crate) async fn send_server_notification(&self, notification: ServerNotification) {
+        if should_publish_to_codexd(&notification)
+            && let Some(codexd_producer) = &self.codexd_producer
+        {
+            codexd_producer
+                .publish_server_notification(&notification)
+                .await;
+        }
+
         if let Err(err) = self
             .sender
             .send(OutgoingEnvelope::Broadcast {
@@ -218,6 +237,23 @@ impl OutgoingMessageSender {
             warn!("failed to send error to client: {err:?}");
         }
     }
+}
+
+fn should_publish_to_codexd(notification: &ServerNotification) -> bool {
+    matches!(
+        notification,
+        ServerNotification::ThreadStarted(_)
+            | ServerNotification::ThreadNameUpdated(_)
+            | ServerNotification::ThreadTokenUsageUpdated(_)
+            | ServerNotification::TurnStarted(_)
+            | ServerNotification::TurnCompleted(_)
+            | ServerNotification::TurnPlanUpdated(_)
+            | ServerNotification::TurnProgressTrace(_)
+            | ServerNotification::ItemStarted(_)
+            | ServerNotification::ItemCompleted(_)
+            | ServerNotification::Error(_)
+            | ServerNotification::AccountRateLimitsUpdated(_)
+    )
 }
 
 /// Outgoing message from the server to the client.

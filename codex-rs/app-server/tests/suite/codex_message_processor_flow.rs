@@ -388,6 +388,7 @@ async fn test_send_user_turn_updates_sandbox_and_cwd_between_turns() -> Result<(
             "call-first",
         )?,
         create_final_assistant_message_sse_response("done first")?,
+        create_final_assistant_message_sse_response("thread title")?,
         create_shell_command_sse_response(
             vec!["echo".to_string(), "second".to_string(), "turn".to_string()],
             None,

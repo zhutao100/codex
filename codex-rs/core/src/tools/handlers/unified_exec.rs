@@ -1,6 +1,8 @@
 use crate::function_tool::FunctionCallError;
 use crate::is_safe_command::is_known_safe_command;
 use crate::protocol::EventMsg;
+use crate::protocol::ProgressTraceCategory;
+use crate::protocol::ProgressTraceState;
 use crate::protocol::TerminalInteractionEvent;
 use crate::sandboxing::SandboxPermissions;
 use crate::shell::Shell;
@@ -226,6 +228,27 @@ impl ToolHandler for UnifiedExecHandler {
                 session
                     .send_event(turn.as_ref(), EventMsg::TerminalInteraction(interaction))
                     .await;
+                if args.chars.is_empty() {
+                    session
+                        .emit_progress_trace(
+                            turn.as_ref(),
+                            ProgressTraceCategory::Waiting,
+                            ProgressTraceState::Started,
+                            Some("Waiting for background terminal".to_string()),
+                            Some("unified_exec"),
+                        )
+                        .await;
+                } else {
+                    session
+                        .emit_progress_trace(
+                            turn.as_ref(),
+                            ProgressTraceCategory::Waiting,
+                            ProgressTraceState::Completed,
+                            None,
+                            Some("unified_exec"),
+                        )
+                        .await;
+                }
 
                 response
             }

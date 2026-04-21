@@ -25,6 +25,8 @@ use crate::protocol::EventMsg;
 use crate::protocol::McpInvocation;
 use crate::protocol::McpToolCallBeginEvent;
 use crate::protocol::McpToolCallEndEvent;
+use crate::protocol::ProgressTraceCategory;
+use crate::protocol::ProgressTraceState;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
@@ -555,6 +557,15 @@ async fn emit_tool_call_begin(
     invocation: McpInvocation,
 ) {
     session
+        .emit_progress_trace(
+            turn,
+            ProgressTraceCategory::Tool,
+            ProgressTraceState::Started,
+            None,
+            Some("mcp_tool"),
+        )
+        .await;
+    session
         .send_event(
             turn,
             EventMsg::McpToolCallBegin(McpToolCallBeginEvent {
@@ -573,6 +584,15 @@ async fn emit_tool_call_end(
     duration: Duration,
     result: Result<CallToolResult, String>,
 ) {
+    session
+        .emit_progress_trace(
+            turn,
+            ProgressTraceCategory::Tool,
+            ProgressTraceState::Completed,
+            None,
+            Some("mcp_tool"),
+        )
+        .await;
     session
         .send_event(
             turn,

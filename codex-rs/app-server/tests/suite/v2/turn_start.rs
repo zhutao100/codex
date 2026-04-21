@@ -578,9 +578,16 @@ async fn turn_start_change_personality_mid_thread_v2() -> Result<()> {
     .await??;
 
     let requests = response_mock.requests();
-    assert_eq!(requests.len(), 2, "expected two requests");
-
-    let first_developer_texts = requests[0].message_input_texts("developer");
+    let first_request = requests
+        .iter()
+        .find(|request| {
+            request
+                .message_input_texts("user")
+                .iter()
+                .any(|text| text.contains("Hello"))
+        })
+        .expect("expected first turn request");
+    let first_developer_texts = first_request.message_input_texts("developer");
     assert!(
         first_developer_texts
             .iter()
@@ -588,7 +595,16 @@ async fn turn_start_change_personality_mid_thread_v2() -> Result<()> {
         "expected no personality update message in first request, got {first_developer_texts:?}"
     );
 
-    let second_developer_texts = requests[1].message_input_texts("developer");
+    let second_request = requests
+        .iter()
+        .find(|request| {
+            request
+                .message_input_texts("user")
+                .iter()
+                .any(|text| text.contains("Hello again"))
+        })
+        .expect("expected second turn request");
+    let second_developer_texts = second_request.message_input_texts("developer");
     assert!(
         second_developer_texts
             .iter()
@@ -1054,6 +1070,7 @@ async fn turn_start_updates_sandbox_and_cwd_between_turns_v2() -> Result<()> {
             "call-first",
         )?,
         create_final_assistant_message_sse_response("done first")?,
+        create_final_assistant_message_sse_response("thread title")?,
         create_shell_command_sse_response(
             vec!["echo".to_string(), "second".to_string(), "turn".to_string()],
             None,
@@ -1386,6 +1403,7 @@ async fn turn_start_file_change_approval_accept_for_session_persists_v2() -> Res
     let responses = vec![
         create_apply_patch_sse_response(patch_1, "patch-call-1")?,
         create_final_assistant_message_sse_response("patch 1 applied")?,
+        create_final_assistant_message_sse_response("thread title")?,
         create_apply_patch_sse_response(patch_2, "patch-call-2")?,
         create_final_assistant_message_sse_response("patch 2 applied")?,
     ];

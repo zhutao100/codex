@@ -150,6 +150,7 @@ Start a fresh thread when you need a new Codex conversation.
     "thread": {
         "id": "thr_123",
         "preview": "",
+        "model": "gpt-5.2",
         "modelProvider": "openai",
         "createdAt": 1730910000
     }
@@ -198,8 +199,8 @@ Example:
 } }
 { "id": 20, "result": {
     "data": [
-        { "id": "thr_a", "preview": "Create a TUI", "modelProvider": "openai", "createdAt": 1730831111, "updatedAt": 1730831111 },
-        { "id": "thr_b", "preview": "Fix tests", "modelProvider": "openai", "createdAt": 1730750000, "updatedAt": 1730750000 }
+        { "id": "thr_a", "preview": "Create a TUI", "model": "gpt-5.2", "modelProvider": "openai", "createdAt": 1730831111, "updatedAt": 1730831111 },
+        { "id": "thr_b", "preview": "Fix tests", "model": "gpt-5.2", "modelProvider": "openai", "createdAt": 1730750000, "updatedAt": 1730750000 }
     ],
     "nextCursor": "opaque-token-or-null"
 } }
@@ -463,11 +464,11 @@ Event notifications are the server-initiated event stream for thread lifecycles,
 
 The app-server streams JSON-RPC notifications while a turn is running. Each turn starts with `turn/started` (initial `turn`) and ends with `turn/completed` (final `turn` status). Token usage events stream separately via `thread/tokenUsage/updated`. Clients subscribe to the events they care about, rendering each item incrementally as updates arrive. The per-item lifecycle is always: `item/started` → zero or more item-specific deltas → `item/completed`.
 
-- `turn/started` — `{ turn }` with the turn id, empty `items`, and `status: "inProgress"`.
-- `turn/completed` — `{ turn }` where `turn.status` is `completed`, `interrupted`, or `failed`; failures carry `{ error: { message, codexErrorInfo?, additionalDetails? } }`.
+- `turn/started` — `{ turn }` with the turn id, optional `model`, empty `items`, and `status: "inProgress"`.
+- `turn/completed` — `{ turn }` where `turn.status` is `completed`, `interrupted`, or `failed`; failures carry `{ error: { message, codexErrorInfo?, additionalDetails? } }`. `turn.model` is included when known.
 - `turn/diff/updated` — `{ threadId, turnId, diff }` represents the up-to-date snapshot of the turn-level unified diff, emitted after every FileChange item. `diff` is the latest aggregated unified diff across every file change in the turn. UIs can render this to show the full "what changed" view without stitching individual `fileChange` items.
 - `turn/plan/updated` — `{ turnId, explanation?, plan }` whenever the agent shares or changes its plan; each `plan` entry is `{ step, status }` with `status` in `pending`, `inProgress`, or `completed`.
-- `turn/progressTrace` — `{ threadId, turnId, category, state, label? }` for lightweight progress spans (for example, `category: "tool"`, `state: "started"`).
+- `turn/progressTrace` — `{ threadId, turnId, category, state, label }` for terminal-style progress tracing. `category` is one of `tool`, `edit`, `waiting`, `network`, `prefill`, `reasoning`, or `gen`, and `state` is `started` or `completed`. `label` may be null when no detail text is available.
 
 Today both notifications carry an empty `items` array even when item events were streamed; rely on `item/*` notifications for the canonical item list until this is fixed.
 
