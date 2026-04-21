@@ -194,7 +194,9 @@ fn skill_roots_from_layer_stack_inner(
                 });
 
                 // `$HOME/.agents/skills` (user-installed skills).
-                if let Some(home_dir) = home_dir {
+                if let Some(home_dir) = home_dir
+                    && config_folder.as_path().starts_with(home_dir)
+                {
                     roots.push(SkillRoot {
                         path: home_dir.join(AGENTS_DIR_NAME).join(SKILLS_DIR_NAME),
                         scope: SkillScope::User,
@@ -2209,7 +2211,9 @@ interface:
             .map(|root| root.scope)
             .collect();
         let mut expected = vec![SkillScope::User, SkillScope::System];
-        if home_dir().is_some() {
+        if let Some(home_dir) = home_dir()
+            && cfg.codex_home.starts_with(&home_dir)
+        {
             expected.insert(1, SkillScope::User);
         }
         if cfg!(unix) {
