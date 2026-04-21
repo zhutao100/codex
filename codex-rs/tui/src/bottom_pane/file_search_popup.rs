@@ -118,6 +118,7 @@ impl WidgetRef for &FileSearchPopup {
             self.matches
                 .iter()
                 .map(|m| GenericDisplayRow {
+                    name_prefix: None,
                     name: m.path.to_string_lossy().to_string(),
                     match_indices: m
                         .indices

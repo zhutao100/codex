@@ -92,6 +92,7 @@ impl ExperimentalFeaturesView {
             let marker = if item.enabled { 'x' } else { ' ' };
             let name = format!("{prefix} [{marker}] {}", item.name);
             rows.push(GenericDisplayRow {
+                name_prefix: None,
                 name,
                 description: Some(item.description.clone()),
                 ..Default::default()

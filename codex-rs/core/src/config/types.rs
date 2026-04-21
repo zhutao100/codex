@@ -452,8 +452,8 @@ impl fmt::Display for NotificationMethod {
 #[derive(Default)]
 pub enum DiffView {
     #[default]
-    Pretty,
     Line,
+    Pretty,
     Inline,
     SideBySide,
 }
@@ -609,7 +609,7 @@ pub struct Tui {
 
     /// Default diff format shown in the TUI.
     ///
-    /// Defaults to `pretty`.
+    /// Defaults to `line`.
     #[serde(default)]
     pub diff_view: DiffView,
 }

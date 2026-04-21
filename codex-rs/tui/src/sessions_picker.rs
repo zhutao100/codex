@@ -43,41 +43,38 @@ use codex_protocol::ThreadId;
 
 const PAGE_SIZE: usize = 25;
 const LOAD_NEAR_THRESHOLD: usize = 5;
-#[derive(Debug, Clone)]
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionSelection {
     StartFresh,
     Resume(PathBuf),
-    Fork(PathBuf),
+    Manage(SessionManagementAction),
     Exit,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub enum SessionPickerAction {
-    Resume,
-    Fork,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionManagementActionKind {
+    Archive,
+    DeletePermanent,
 }
 
-impl SessionPickerAction {
-    fn title(self) -> &'static str {
-        match self {
-            SessionPickerAction::Resume => "Resume a previous session",
-            SessionPickerAction::Fork => "Fork a previous session",
-        }
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionManagementAction {
+    pub kind: SessionManagementActionKind,
+    pub path: PathBuf,
+    pub thread_id: Option<ThreadId>,
+    pub is_current_session: bool,
+}
 
-    fn action_label(self) -> &'static str {
-        match self {
-            SessionPickerAction::Resume => "resume",
-            SessionPickerAction::Fork => "fork",
-        }
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionView {
+    Active,
+    Archived,
+}
 
-    fn selection(self, path: PathBuf) -> SessionSelection {
-        match self {
-            SessionPickerAction::Resume => SessionSelection::Resume(path),
-            SessionPickerAction::Fork => SessionSelection::Fork(path),
-        }
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionPickerExit {
+    Close,
 }
 
 #[derive(Clone)]
@@ -88,6 +85,7 @@ struct PageLoadRequest {
     search_token: Option<usize>,
     default_provider: String,
     sort_key: ThreadSortKey,
+    view: SessionView,
 }
 
 type PageLoader = Arc<dyn Fn(PageLoadRequest) + Send + Sync>;
@@ -116,34 +114,23 @@ enum BackgroundEvent {
 /// 1. Provider and source filtering at the backend (only interactive CLI sessions
 ///    for the current model provider).
 /// 2. Working-directory filtering at the picker (unless `--all` is passed).
-pub async fn run_resume_picker(
+pub async fn run_sessions_picker(
     tui: &mut Tui,
     codex_home: &Path,
     default_provider: &str,
     show_all: bool,
+    initial_view: SessionView,
+    exit_behavior: SessionPickerExit,
+    current_session_path: Option<PathBuf>,
 ) -> Result<SessionSelection> {
     run_session_picker(
         tui,
         codex_home,
         default_provider,
         show_all,
-        SessionPickerAction::Resume,
-    )
-    .await
-}
-
-pub async fn run_fork_picker(
-    tui: &mut Tui,
-    codex_home: &Path,
-    default_provider: &str,
-    show_all: bool,
-) -> Result<SessionSelection> {
-    run_session_picker(
-        tui,
-        codex_home,
-        default_provider,
-        show_all,
-        SessionPickerAction::Fork,
+        initial_view,
+        exit_behavior,
+        current_session_path,
     )
     .await
 }
@@ -153,7 +140,9 @@ async fn run_session_picker(
     codex_home: &Path,
     default_provider: &str,
     show_all: bool,
-    action: SessionPickerAction,
+    initial_view: SessionView,
+    exit_behavior: SessionPickerExit,
+    current_session_path: Option<PathBuf>,
 ) -> Result<SessionSelection> {
     let alt = AltScreenGuard::enter(tui);
     let (bg_tx, bg_rx) = mpsc::unbounded_channel();
@@ -170,16 +159,32 @@ async fn run_session_picker(
         let tx = loader_tx.clone();
         tokio::spawn(async move {
             let provider_filter = vec![request.default_provider.clone()];
-            let page = RolloutRecorder::list_threads(
-                &request.codex_home,
-                PAGE_SIZE,
-                request.cursor.as_ref(),
-                request.sort_key,
-                INTERACTIVE_SESSION_SOURCES,
-                Some(provider_filter.as_slice()),
-                request.default_provider.as_str(),
-            )
-            .await;
+            let page = match request.view {
+                SessionView::Active => {
+                    RolloutRecorder::list_threads(
+                        &request.codex_home,
+                        PAGE_SIZE,
+                        request.cursor.as_ref(),
+                        request.sort_key,
+                        INTERACTIVE_SESSION_SOURCES,
+                        Some(provider_filter.as_slice()),
+                        request.default_provider.as_str(),
+                    )
+                    .await
+                }
+                SessionView::Archived => {
+                    RolloutRecorder::list_archived_threads(
+                        &request.codex_home,
+                        PAGE_SIZE,
+                        request.cursor.as_ref(),
+                        request.sort_key,
+                        INTERACTIVE_SESSION_SOURCES,
+                        Some(provider_filter.as_slice()),
+                        request.default_provider.as_str(),
+                    )
+                    .await
+                }
+            };
             let _ = tx.send(BackgroundEvent::PageLoaded {
                 request_token: request.request_token,
                 search_token: request.search_token,
@@ -195,7 +200,9 @@ async fn run_session_picker(
         default_provider.clone(),
         show_all,
         filter_cwd,
-        action,
+        initial_view,
+        exit_behavior,
+        current_session_path,
     );
     state.start_initial_load();
     state.request_frame();
@@ -281,11 +288,19 @@ struct PickerState {
     default_provider: String,
     show_all: bool,
     filter_cwd: Option<PathBuf>,
-    action: SessionPickerAction,
+    view: SessionView,
+    exit_behavior: SessionPickerExit,
+    current_session_path: Option<PathBuf>,
     sort_key: ThreadSortKey,
     thread_name_cache: HashMap<ThreadId, Option<String>>,
     thread_label_cache: HashMap<ThreadId, Option<String>>,
     fork_parent_id_cache: HashMap<PathBuf, Option<ThreadId>>,
+    pending_management_confirmation: Option<PendingManagementConfirmation>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingManagementConfirmation {
+    action: SessionManagementAction,
 }
 
 struct PaginationState {
@@ -375,7 +390,9 @@ impl PickerState {
         default_provider: String,
         show_all: bool,
         filter_cwd: Option<PathBuf>,
-        action: SessionPickerAction,
+        view: SessionView,
+        exit_behavior: SessionPickerExit,
+        current_session_path: Option<PathBuf>,
     ) -> Self {
         Self {
             codex_home,
@@ -400,11 +417,14 @@ impl PickerState {
             default_provider,
             show_all,
             filter_cwd,
-            action,
+            view,
+            exit_behavior,
+            current_session_path,
             sort_key: ThreadSortKey::CreatedAt,
             thread_name_cache: HashMap::new(),
             thread_label_cache: HashMap::new(),
             fork_parent_id_cache: HashMap::new(),
+            pending_management_confirmation: None,
         }
     }
 
@@ -413,8 +433,35 @@ impl PickerState {
     }
 
     async fn handle_key(&mut self, key: KeyEvent) -> Result<Option<SessionSelection>> {
+        if let Some(pending) = self.pending_management_confirmation.clone() {
+            match key.code {
+                KeyCode::Esc => {
+                    self.pending_management_confirmation = None;
+                    self.request_frame();
+                }
+                KeyCode::Enter => {
+                    self.pending_management_confirmation = None;
+                    return Ok(Some(SessionSelection::Manage(pending.action)));
+                }
+                KeyCode::Char('c')
+                    if key
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                {
+                    return Ok(Some(SessionSelection::Exit));
+                }
+                _ => {}
+            }
+            return Ok(None);
+        }
+
         match key.code {
-            KeyCode::Esc => return Ok(Some(SessionSelection::StartFresh)),
+            KeyCode::Esc => {
+                let exit = match self.exit_behavior {
+                    SessionPickerExit::Close => SessionSelection::Exit,
+                };
+                return Ok(Some(exit));
+            }
             KeyCode::Char('c')
                 if key
                     .modifiers
@@ -424,7 +471,17 @@ impl PickerState {
             }
             KeyCode::Enter => {
                 if let Some(row) = self.filtered_rows.get(self.selected) {
-                    return Ok(Some(self.action.selection(row.path.clone())));
+                    if self
+                        .current_session_path
+                        .as_ref()
+                        .is_some_and(|path| paths_match(path, &row.path))
+                    {
+                        let exit = match self.exit_behavior {
+                            SessionPickerExit::Close => SessionSelection::Exit,
+                        };
+                        return Ok(Some(exit));
+                    }
+                    return Ok(Some(SessionSelection::Resume(row.path.clone())));
                 }
             }
             KeyCode::Up => {
@@ -463,6 +520,34 @@ impl PickerState {
             KeyCode::Tab => {
                 self.toggle_sort_key();
                 self.request_frame();
+            }
+            KeyCode::Char('a')
+                if self.query.is_empty()
+                    && !key
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(crossterm::event::KeyModifiers::ALT) =>
+            {
+                self.toggle_view();
+            }
+            KeyCode::Char('o')
+                if self.query.is_empty()
+                    && !key
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(crossterm::event::KeyModifiers::ALT) =>
+            {
+                self.toggle_show_all();
+                self.request_frame();
+            }
+            KeyCode::Char('d')
+                if self.query.is_empty()
+                    && !key
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(crossterm::event::KeyModifiers::ALT) =>
+            {
+                self.begin_management_confirmation_for_selected();
             }
             KeyCode::Backspace => {
                 let mut new_query = self.query.clone();
@@ -516,6 +601,7 @@ impl PickerState {
             search_token,
             default_provider: self.default_provider.clone(),
             sort_key: self.sort_key,
+            view: self.view,
         });
     }
 
@@ -883,6 +969,7 @@ impl PickerState {
             search_token,
             default_provider: self.default_provider.clone(),
             sort_key: self.sort_key,
+            view: self.view,
         });
     }
 
@@ -898,6 +985,24 @@ impl PickerState {
         token
     }
 
+    fn toggle_view(&mut self) {
+        self.view = match self.view {
+            SessionView::Active => SessionView::Archived,
+            SessionView::Archived => SessionView::Active,
+        };
+        self.start_initial_load();
+    }
+
+    fn toggle_show_all(&mut self) {
+        self.show_all = !self.show_all;
+        self.filter_cwd = if self.show_all {
+            None
+        } else {
+            std::env::current_dir().ok()
+        };
+        self.apply_filter();
+    }
+
     /// Cycles the sort order between creation time and last-updated time.
     ///
     /// Triggers a full reload because the backend must re-sort all sessions.
@@ -909,6 +1014,63 @@ impl PickerState {
             ThreadSortKey::UpdatedAt => ThreadSortKey::CreatedAt,
         };
         self.start_initial_load();
+    }
+
+    fn begin_management_confirmation_for_selected(&mut self) {
+        let Some(row) = self.filtered_rows.get(self.selected) else {
+            return;
+        };
+
+        let is_current_session = self
+            .current_session_path
+            .as_ref()
+            .is_some_and(|path| paths_match(path, &row.path));
+        let kind = match self.view {
+            SessionView::Active => SessionManagementActionKind::Archive,
+            SessionView::Archived => SessionManagementActionKind::DeletePermanent,
+        };
+        let action = SessionManagementAction {
+            kind,
+            path: row.path.clone(),
+            thread_id: row_thread_id(row),
+            is_current_session,
+        };
+        self.pending_management_confirmation = Some(PendingManagementConfirmation { action });
+        self.request_frame();
+    }
+
+    fn confirmation_hint_line(&self) -> Option<Line<'static>> {
+        let pending = self.pending_management_confirmation.as_ref()?;
+        let action = pending.action.kind;
+        let warning = if pending.action.is_current_session {
+            match action {
+                SessionManagementActionKind::Archive => {
+                    "This is the currently open chat. Archiving it will end this session."
+                }
+                SessionManagementActionKind::DeletePermanent => {
+                    "This is the currently open chat. Permanent delete will end this session."
+                }
+            }
+        } else {
+            match action {
+                SessionManagementActionKind::Archive => "Archive this chat?",
+                SessionManagementActionKind::DeletePermanent => {
+                    "Delete this archived chat permanently? This cannot be undone."
+                }
+            }
+        };
+
+        Some(
+            vec![
+                warning.bold(),
+                "  ".into(),
+                key_hint::plain(KeyCode::Enter).into(),
+                " confirm ".dim(),
+                key_hint::plain(KeyCode::Esc).into(),
+                " cancel".dim(),
+            ]
+            .into(),
+        )
     }
 }
 
@@ -996,14 +1158,16 @@ fn draw_picker(tui: &mut Tui, state: &PickerState) -> std::io::Result<()> {
         .areas(area);
 
         // Header
-        let header_line: Line = vec![
-            state.action.title().bold().cyan(),
-            "  ".into(),
-            "Sort:".dim(),
-            " ".into(),
-            sort_key_label(state.sort_key).magenta(),
-        ]
-        .into();
+        let mut header_spans: Vec<Span<'static>> = vec!["Sessions".bold().cyan()];
+        if state.view == SessionView::Archived {
+            header_spans.push(" ".into());
+            header_spans.push("(archived)".dim());
+        }
+        header_spans.push("  ".into());
+        header_spans.push("Sort:".dim());
+        header_spans.push(" ".into());
+        header_spans.push(sort_key_label(state.sort_key).magenta());
+        let header_line: Line = header_spans.into();
         frame.render_widget_ref(header_line, header);
 
         // Search line
@@ -1021,26 +1185,44 @@ fn draw_picker(tui: &mut Tui, state: &PickerState) -> std::io::Result<()> {
         render_list(frame, list, state, &metrics);
 
         // Hint line
-        let action_label = state.action.action_label();
-        let hint_line: Line = vec![
-            key_hint::plain(KeyCode::Enter).into(),
-            format!(" to {action_label} ").dim(),
-            "    ".dim(),
-            key_hint::plain(KeyCode::Esc).into(),
-            " to start new ".dim(),
-            "    ".dim(),
-            key_hint::ctrl(KeyCode::Char('c')).into(),
-            " to quit ".dim(),
-            "    ".dim(),
-            key_hint::plain(KeyCode::Tab).into(),
-            " to toggle sort ".dim(),
-            "    ".dim(),
-            key_hint::plain(KeyCode::Up).into(),
-            "/".dim(),
-            key_hint::plain(KeyCode::Down).into(),
-            " to browse".dim(),
-        ]
-        .into();
+        let action_label = "switch";
+        let toggle_archived = match state.view {
+            SessionView::Active => "archived",
+            SessionView::Archived => "active",
+        };
+        let toggle_scope = if state.show_all { "scoped" } else { "all" };
+        let hint_line: Line = if let Some(confirm_line) = state.confirmation_hint_line() {
+            confirm_line
+        } else {
+            vec![
+                key_hint::plain(KeyCode::Enter).into(),
+                format!(" to {action_label} ").dim(),
+                "    ".dim(),
+                key_hint::plain(KeyCode::Esc).into(),
+                " to start new ".dim(),
+                "    ".dim(),
+                key_hint::ctrl(KeyCode::Char('c')).into(),
+                " to quit ".dim(),
+                "    ".dim(),
+                key_hint::plain(KeyCode::Tab).into(),
+                " to toggle sort ".dim(),
+                "    ".dim(),
+                key_hint::plain(KeyCode::Char('a')).into(),
+                format!(" {toggle_archived} ").dim(),
+                "    ".dim(),
+                key_hint::plain(KeyCode::Char('o')).into(),
+                format!(" {toggle_scope} ").dim(),
+                "    ".dim(),
+                key_hint::plain(KeyCode::Char('d')).into(),
+                " manage ".dim(),
+                "    ".dim(),
+                key_hint::plain(KeyCode::Up).into(),
+                "/".dim(),
+                key_hint::plain(KeyCode::Down).into(),
+                " to browse".dim(),
+            ]
+            .into()
+        };
         frame.render_widget_ref(hint_line, hint);
     })
 }
@@ -1172,7 +1354,11 @@ fn render_list(
     }
 
     if state.pagination.loading.is_pending() && y < area.y.saturating_add(area.height) {
-        let loading_line: Line = vec!["  ".into(), "Loading older sessions…".italic().dim()].into();
+        let loading_text = match state.view {
+            SessionView::Active => "Loading older sessions…",
+            SessionView::Archived => "Loading archived sessions…",
+        };
+        let loading_line: Line = vec!["  ".into(), loading_text.italic().dim()].into();
         let rect = Rect::new(area.x, y, area.width, 1);
         frame.render_widget_ref(loading_line, rect);
     }
@@ -1186,9 +1372,13 @@ fn render_empty_state_line(state: &PickerState) -> Line<'static> {
             return vec!["Searching…".italic().dim()].into();
         }
         if state.pagination.reached_scan_cap {
+            let noun = match state.view {
+                SessionView::Active => "sessions",
+                SessionView::Archived => "archived sessions",
+            };
             let msg = format!(
-                "Search scanned first {} sessions; more may exist",
-                state.pagination.num_scanned_files
+                "Search scanned first {} {noun}; more may exist",
+                state.pagination.num_scanned_files,
             );
             return vec![Span::from(msg).italic().dim()].into();
         }
@@ -1196,14 +1386,23 @@ fn render_empty_state_line(state: &PickerState) -> Line<'static> {
     }
 
     if state.all_rows.is_empty() && state.pagination.num_scanned_files == 0 {
-        return vec!["No sessions yet".italic().dim()].into();
+        return match state.view {
+            SessionView::Active => vec!["No sessions yet".italic().dim()].into(),
+            SessionView::Archived => vec!["No archived sessions yet".italic().dim()].into(),
+        };
     }
 
     if state.pagination.loading.is_pending() {
-        return vec!["Loading older sessions…".italic().dim()].into();
+        return match state.view {
+            SessionView::Active => vec!["Loading older sessions…".italic().dim()].into(),
+            SessionView::Archived => vec!["Loading archived sessions…".italic().dim()].into(),
+        };
     }
 
-    vec!["No sessions yet".italic().dim()].into()
+    match state.view {
+        SessionView::Active => vec!["No sessions yet".italic().dim()].into(),
+        SessionView::Archived => vec!["No archived sessions yet".italic().dim()].into(),
+    }
 }
 
 fn human_time_ago(ts: DateTime<Utc>) -> String {
@@ -1450,409 +1649,229 @@ fn column_visibility(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Duration;
-    use codex_protocol::ThreadId;
-    use codex_protocol::protocol::EventMsg;
-    use codex_protocol::protocol::RolloutItem;
-    use codex_protocol::protocol::RolloutLine;
-    use codex_protocol::protocol::SessionMeta;
-    use codex_protocol::protocol::SessionMetaLine;
-    use codex_protocol::protocol::SessionSource;
-    use codex_protocol::protocol::UserMessageEvent;
-    use crossterm::event::KeyCode;
-    use crossterm::event::KeyEvent;
+    use chrono::DateTime;
+    use chrono::Utc;
     use crossterm::event::KeyModifiers;
-    use insta::assert_snapshot;
     use pretty_assertions::assert_eq;
-    use serde_json::json;
-    use std::fs::FileTimes;
-    use std::fs::OpenOptions;
-    use std::path::Path;
-    use std::path::PathBuf;
-    use std::sync::Arc;
-    use std::sync::Mutex;
+    use tokio::sync::broadcast;
 
-    fn make_item(path: &str, ts: &str, preview: &str) -> ThreadItem {
-        ThreadItem {
-            path: PathBuf::from(path),
-            thread_id: None,
-            first_user_message: Some(preview.to_string()),
-            cwd: None,
-            git_branch: None,
-            git_sha: None,
-            git_origin_url: None,
-            source: None,
-            model_provider: None,
-            cli_version: None,
-            created_at: Some(ts.to_string()),
-            updated_at: Some(ts.to_string()),
-        }
-    }
-
-    fn cursor_from_str(repr: &str) -> Cursor {
-        serde_json::from_str::<Cursor>(&format!("\"{repr}\""))
-            .expect("cursor format should deserialize")
-    }
-
-    fn page(
-        items: Vec<ThreadItem>,
-        next_cursor: Option<Cursor>,
-        num_scanned_files: usize,
-        reached_scan_cap: bool,
-    ) -> ThreadsPage {
-        ThreadsPage {
-            items,
-            next_cursor,
-            num_scanned_files,
-            reached_scan_cap,
-        }
-    }
-
-    fn set_rollout_mtime(path: &Path, updated_at: DateTime<Utc>) {
-        let times = FileTimes::new().set_modified(updated_at.into());
-        OpenOptions::new()
-            .append(true)
-            .open(path)
-            .expect("open rollout")
-            .set_times(times)
-            .expect("set times");
-    }
-
-    #[tokio::test]
-    async fn resume_picker_orders_by_updated_at() {
-        use uuid::Uuid;
-
-        let tempdir = tempfile::tempdir().expect("tempdir");
-        let sessions_root = tempdir.path().join("sessions");
-        std::fs::create_dir_all(&sessions_root).expect("mkdir sessions root");
-
-        let now = Utc::now();
-
-        let write_rollout = |ts: DateTime<Utc>, preview: &str| -> PathBuf {
-            let dir = sessions_root
-                .join(ts.format("%Y").to_string())
-                .join(ts.format("%m").to_string())
-                .join(ts.format("%d").to_string());
-            std::fs::create_dir_all(&dir).expect("mkdir date dirs");
-            let filename = format!(
-                "rollout-{}-{}.jsonl",
-                ts.format("%Y-%m-%dT%H-%M-%S"),
-                Uuid::new_v4()
-            );
-            let path = dir.join(filename);
-            let meta = SessionMeta {
-                id: ThreadId::new(),
-                forked_from_id: None,
-                timestamp: ts.to_rfc3339(),
-                cwd: PathBuf::from("/tmp"),
-                originator: String::from("user"),
-                cli_version: String::from("0.0.0"),
-                source: SessionSource::Cli,
-                model_provider: Some(String::from("openai")),
-                base_instructions: None,
-                dynamic_tools: None,
-            };
-            let meta_line = RolloutLine {
-                timestamp: ts.to_rfc3339(),
-                item: RolloutItem::SessionMeta(SessionMetaLine { meta, git: None }),
-            };
-            let user_line = RolloutLine {
-                timestamp: ts.to_rfc3339(),
-                item: RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
-                    message: preview.to_string(),
-                    images: None,
-                    text_elements: Vec::new(),
-                    local_images: Vec::new(),
-                })),
-            };
-            let meta_json = serde_json::to_string(&meta_line).expect("serialize meta");
-            let user_json = serde_json::to_string(&user_line).expect("serialize user");
-            std::fs::write(&path, format!("{meta_json}\n{user_json}\n")).expect("write rollout");
-            path
-        };
-
-        let created_a = now - Duration::minutes(1);
-        let created_b = now - Duration::minutes(2);
-
-        let path_a = write_rollout(created_a, "A (created newer)");
-        let path_b = write_rollout(created_b, "B (created older)");
-
-        set_rollout_mtime(&path_a, now - Duration::minutes(10));
-        set_rollout_mtime(&path_b, now - Duration::seconds(10));
-
-        let page = RolloutRecorder::list_threads(
-            tempdir.path(),
-            PAGE_SIZE,
+    fn make_state(
+        view: SessionView,
+        row_path: PathBuf,
+        thread_id: Option<ThreadId>,
+        current_session_path: Option<PathBuf>,
+    ) -> PickerState {
+        let (draw_tx, _draw_rx) = broadcast::channel(1);
+        let requester = FrameRequester::new(draw_tx);
+        let loader: PageLoader = Arc::new(|_request| {});
+        let mut state = PickerState::new(
+            PathBuf::from("/tmp/codex-home"),
+            requester,
+            loader,
+            "openai".to_string(),
+            true,
             None,
-            ThreadSortKey::UpdatedAt,
-            INTERACTIVE_SESSION_SOURCES,
-            Some(&[String::from("openai")]),
-            "openai",
-        )
-        .await
-        .expect("list threads");
-
-        let rows = rows_from_items(page.items);
-        let previews: Vec<String> = rows.iter().map(|row| row.preview.clone()).collect();
-
-        assert_eq!(
-            previews,
-            vec![
-                "B (created older)".to_string(),
-                "A (created newer)".to_string()
-            ]
+            view,
+            SessionPickerExit::Close,
+            current_session_path,
         );
-    }
-
-    #[test]
-    fn head_to_row_uses_first_user_message() {
-        let item = ThreadItem {
-            path: PathBuf::from("/tmp/a.jsonl"),
-            thread_id: None,
-            first_user_message: Some("real question".to_string()),
-            cwd: None,
-            git_branch: None,
-            git_sha: None,
-            git_origin_url: None,
-            source: None,
-            model_provider: None,
-            cli_version: None,
-            created_at: Some("2025-01-01T00:00:00Z".into()),
-            updated_at: Some("2025-01-01T00:00:00Z".into()),
-        };
-        let row = head_to_row(&item);
-        assert_eq!(row.preview, "real question");
-    }
-
-    #[test]
-    fn rows_from_items_preserves_backend_order() {
-        // Construct two items with different timestamps and real user text.
-        let a = ThreadItem {
-            path: PathBuf::from("/tmp/a.jsonl"),
-            thread_id: None,
-            first_user_message: Some("A".to_string()),
-            cwd: None,
-            git_branch: None,
-            git_sha: None,
-            git_origin_url: None,
-            source: None,
-            model_provider: None,
-            cli_version: None,
-            created_at: Some("2025-01-01T00:00:00Z".into()),
-            updated_at: Some("2025-01-01T00:00:00Z".into()),
-        };
-        let b = ThreadItem {
-            path: PathBuf::from("/tmp/b.jsonl"),
-            thread_id: None,
-            first_user_message: Some("B".to_string()),
-            cwd: None,
-            git_branch: None,
-            git_sha: None,
-            git_origin_url: None,
-            source: None,
-            model_provider: None,
-            cli_version: None,
-            created_at: Some("2025-01-02T00:00:00Z".into()),
-            updated_at: Some("2025-01-02T00:00:00Z".into()),
-        };
-        let rows = rows_from_items(vec![a, b]);
-        assert_eq!(rows.len(), 2);
-        // Preserve the given order even if timestamps differ; backend already provides newest-first.
-        assert!(rows[0].preview.contains('A'));
-        assert!(rows[1].preview.contains('B'));
-    }
-
-    #[test]
-    fn row_uses_tail_timestamp_for_updated_at() {
-        let item = ThreadItem {
-            path: PathBuf::from("/tmp/a.jsonl"),
-            thread_id: None,
-            first_user_message: Some("Hello".to_string()),
-            cwd: None,
-            git_branch: None,
-            git_sha: None,
-            git_origin_url: None,
-            source: None,
-            model_provider: None,
-            cli_version: None,
-            created_at: Some("2025-01-01T00:00:00Z".into()),
-            updated_at: Some("2025-01-01T01:00:00Z".into()),
-        };
-
-        let row = head_to_row(&item);
-        let expected_created = chrono::DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let expected_updated = chrono::DateTime::parse_from_rfc3339("2025-01-01T01:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-
-        assert_eq!(row.created_at, Some(expected_created));
-        assert_eq!(row.updated_at, Some(expected_updated));
-    }
-
-    #[test]
-    fn row_display_preview_prefers_thread_name() {
         let row = Row {
-            path: PathBuf::from("/tmp/a.jsonl"),
-            preview: String::from("first message"),
-            thread_id: None,
-            thread_name: Some(String::from("My session")),
+            path: row_path,
+            preview: "preview".to_string(),
+            thread_id,
+            thread_name: None,
             created_at: None,
             updated_at: None,
             cwd: None,
             git_branch: None,
         };
-
-        assert_eq!(row.display_preview(), "My session");
+        state.all_rows = vec![row.clone()];
+        state.filtered_rows = vec![row];
+        state
     }
 
     #[tokio::test]
-    async fn update_thread_names_reapplies_cached_names_after_reload() {
-        let loader: PageLoader = Arc::new(|_| {});
-        let mut state = PickerState::new(
-            PathBuf::from("/tmp"),
-            FrameRequester::test_dummy(),
-            loader,
-            String::from("openai"),
-            true,
-            None,
-            SessionPickerAction::Resume,
-        );
-
+    async fn d_then_enter_emits_archive_management_action_in_active_view() {
         let thread_id = ThreadId::new();
-        state
-            .thread_name_cache
-            .insert(thread_id, Some("Saved title".to_string()));
-        state.all_rows = vec![Row {
-            path: PathBuf::from("/tmp/reloaded.jsonl"),
-            preview: String::from("first prompt"),
-            thread_id: Some(thread_id),
-            thread_name: None,
-            created_at: None,
-            updated_at: None,
-            cwd: None,
-            git_branch: None,
-        }];
-        state.filtered_rows = state.all_rows.clone();
+        let row_path = PathBuf::from("/tmp/codex-home/sessions/rollout-a.jsonl");
+        let mut state = make_state(SessionView::Active, row_path.clone(), Some(thread_id), None);
 
-        state.update_thread_names().await;
+        let first = state
+            .handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE))
+            .await
+            .expect("key handling should succeed");
+        assert_eq!(first, None);
+        assert!(state.pending_management_confirmation.is_some());
 
+        let second = state
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .expect("key handling should succeed");
         assert_eq!(
-            state
-                .all_rows
-                .first()
-                .and_then(|row| row.thread_name.clone()),
-            Some("Saved title".to_string())
+            second,
+            Some(SessionSelection::Manage(SessionManagementAction {
+                kind: SessionManagementActionKind::Archive,
+                path: row_path,
+                thread_id: Some(thread_id),
+                is_current_session: false,
+            }))
         );
     }
 
     #[tokio::test]
-    async fn update_thread_names_uses_fork_prefix_for_untitled_forks() {
-        let loader: PageLoader = Arc::new(|_| {});
-        let mut state = PickerState::new(
-            PathBuf::from("/tmp"),
-            FrameRequester::test_dummy(),
-            loader,
-            String::from("openai"),
-            true,
+    async fn d_then_enter_emits_permanent_delete_management_action_in_archived_view() {
+        let thread_id = ThreadId::new();
+        let row_path = PathBuf::from("/tmp/codex-home/archived_sessions/rollout-a.jsonl");
+        let mut state = make_state(
+            SessionView::Archived,
+            row_path.clone(),
+            Some(thread_id),
             None,
-            SessionPickerAction::Resume,
         );
 
-        let parent_id = ThreadId::new();
-        let child_id = ThreadId::new();
-        let child_path =
-            PathBuf::from(format!("/tmp/rollout-2025-01-01T00-00-00-{child_id}.jsonl"));
+        let first = state
+            .handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE))
+            .await
+            .expect("key handling should succeed");
+        assert_eq!(first, None);
+        assert!(state.pending_management_confirmation.is_some());
 
-        state.all_rows = vec![Row {
-            path: child_path.clone(),
-            preview: String::from("child first prompt"),
-            thread_id: Some(child_id),
-            thread_name: None,
-            created_at: None,
-            updated_at: None,
-            cwd: None,
-            git_branch: None,
-        }];
-        state.filtered_rows = state.all_rows.clone();
-        state
-            .fork_parent_id_cache
-            .insert(child_path, Some(parent_id));
-        state
-            .thread_label_cache
-            .insert(parent_id, Some("Parent thread title".to_string()));
-
-        state.update_thread_names().await;
-
+        let second = state
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .expect("key handling should succeed");
         assert_eq!(
-            state
-                .all_rows
-                .first()
-                .map(Row::display_preview)
-                .map(str::to_string),
-            Some("Fork#1 Parent thread title".to_string())
+            second,
+            Some(SessionSelection::Manage(SessionManagementAction {
+                kind: SessionManagementActionKind::DeletePermanent,
+                path: row_path,
+                thread_id: Some(thread_id),
+                is_current_session: false,
+            }))
+        );
+    }
+
+    #[tokio::test]
+    async fn current_session_delete_sets_current_session_flag() {
+        let thread_id = ThreadId::new();
+        let row_path = PathBuf::from("/tmp/codex-home/archived_sessions/rollout-a.jsonl");
+        let mut state = make_state(
+            SessionView::Archived,
+            row_path.clone(),
+            Some(thread_id),
+            Some(row_path),
+        );
+
+        let first = state
+            .handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE))
+            .await
+            .expect("key handling should succeed");
+        assert_eq!(first, None);
+
+        let pending = state
+            .pending_management_confirmation
+            .as_ref()
+            .expect("pending confirmation should be set");
+        assert!(pending.action.is_current_session);
+        assert!(
+            state.confirmation_hint_line().is_some(),
+            "expected confirmation hint line to be visible"
+        );
+    }
+
+    #[tokio::test]
+    async fn management_action_uses_thread_id_from_rollout_path() {
+        let expected_id = ThreadId::new();
+        let wrong_id = ThreadId::new();
+        let row_path = PathBuf::from(format!(
+            "/tmp/codex-home/sessions/rollout-2025-01-01T00-00-00-{expected_id}.jsonl"
+        ));
+        let mut state = make_state(SessionView::Active, row_path.clone(), Some(wrong_id), None);
+
+        let first = state
+            .handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE))
+            .await
+            .expect("key handling should succeed");
+        assert_eq!(first, None);
+
+        let second = state
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .expect("key handling should succeed");
+        assert_eq!(
+            second,
+            Some(SessionSelection::Manage(SessionManagementAction {
+                kind: SessionManagementActionKind::Archive,
+                path: row_path,
+                thread_id: Some(expected_id),
+                is_current_session: false,
+            }))
         );
     }
 
     #[tokio::test]
     async fn update_thread_names_numbers_multiple_untitled_forks() {
-        let loader: PageLoader = Arc::new(|_| {});
+        let (draw_tx, _draw_rx) = broadcast::channel(1);
+        let requester = FrameRequester::new(draw_tx);
+        let loader: PageLoader = Arc::new(|_request| {});
         let mut state = PickerState::new(
-            PathBuf::from("/tmp"),
-            FrameRequester::test_dummy(),
+            PathBuf::from("/tmp/codex-home"),
+            requester,
             loader,
-            String::from("openai"),
+            "openai".to_string(),
             true,
             None,
-            SessionPickerAction::Resume,
+            SessionView::Active,
+            SessionPickerExit::Close,
+            None,
         );
 
         let parent_id = ThreadId::new();
         let path_a = PathBuf::from(format!(
-            "/tmp/rollout-2025-01-01T00-00-00-{}.jsonl",
+            "/tmp/codex-home/sessions/rollout-2025-01-01T00-00-00-{}.jsonl",
             ThreadId::new()
         ));
         let path_b = PathBuf::from(format!(
-            "/tmp/rollout-2025-01-01T00-00-00-{}.jsonl",
+            "/tmp/codex-home/sessions/rollout-2025-01-01T00-00-00-{}.jsonl",
             ThreadId::new()
         ));
         let path_c = PathBuf::from(format!(
-            "/tmp/rollout-2025-01-01T00-00-00-{}.jsonl",
+            "/tmp/codex-home/sessions/rollout-2025-01-01T00-00-00-{}.jsonl",
             ThreadId::new()
         ));
 
+        let row = |path: PathBuf, preview: &str, created_at: DateTime<Utc>| Row {
+            path,
+            preview: preview.to_string(),
+            thread_id: None,
+            thread_name: None,
+            created_at: Some(created_at),
+            updated_at: None,
+            cwd: None,
+            git_branch: None,
+        };
         state.all_rows = vec![
-            Row {
-                path: path_c.clone(),
-                preview: String::from("third"),
-                thread_id: None,
-                thread_name: None,
-                created_at: parse_timestamp_str("2025-01-03T00:00:00Z"),
-                updated_at: None,
-                cwd: None,
-                git_branch: None,
-            },
-            Row {
-                path: path_a.clone(),
-                preview: String::from("first"),
-                thread_id: None,
-                thread_name: None,
-                created_at: parse_timestamp_str("2025-01-01T00:00:00Z"),
-                updated_at: None,
-                cwd: None,
-                git_branch: None,
-            },
-            Row {
-                path: path_b.clone(),
-                preview: String::from("second"),
-                thread_id: None,
-                thread_name: None,
-                created_at: parse_timestamp_str("2025-01-02T00:00:00Z"),
-                updated_at: None,
-                cwd: None,
-                git_branch: None,
-            },
+            row(
+                path_c.clone(),
+                "third",
+                DateTime::parse_from_rfc3339("2025-01-03T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+            row(
+                path_a.clone(),
+                "first",
+                DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+            row(
+                path_b.clone(),
+                "second",
+                DateTime::parse_from_rfc3339("2025-01-02T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
         ];
         state.filtered_rows = state.all_rows.clone();
         state.fork_parent_id_cache.insert(path_a, Some(parent_id));
@@ -1878,737 +1897,5 @@ mod tests {
                 "Fork#2 Parent thread title".to_string(),
             ]
         );
-    }
-
-    #[test]
-    fn resume_table_snapshot() {
-        use crate::custom_terminal::Terminal;
-        use crate::test_backend::VT100Backend;
-        use ratatui::layout::Constraint;
-        use ratatui::layout::Layout;
-
-        let loader: PageLoader = Arc::new(|_| {});
-        let mut state = PickerState::new(
-            PathBuf::from("/tmp"),
-            FrameRequester::test_dummy(),
-            loader,
-            String::from("openai"),
-            true,
-            None,
-            SessionPickerAction::Resume,
-        );
-
-        let now = Utc::now();
-        let rows = vec![
-            Row {
-                path: PathBuf::from("/tmp/a.jsonl"),
-                preview: String::from("Fix resume picker timestamps"),
-                thread_id: None,
-                thread_name: None,
-                created_at: Some(now - Duration::minutes(16)),
-                updated_at: Some(now - Duration::seconds(42)),
-                cwd: None,
-                git_branch: None,
-            },
-            Row {
-                path: PathBuf::from("/tmp/b.jsonl"),
-                preview: String::from("Investigate lazy pagination cap"),
-                thread_id: None,
-                thread_name: None,
-                created_at: Some(now - Duration::hours(1)),
-                updated_at: Some(now - Duration::minutes(35)),
-                cwd: None,
-                git_branch: None,
-            },
-            Row {
-                path: PathBuf::from("/tmp/c.jsonl"),
-                preview: String::from("Explain the codebase"),
-                thread_id: None,
-                thread_name: None,
-                created_at: Some(now - Duration::hours(2)),
-                updated_at: Some(now - Duration::hours(2)),
-                cwd: None,
-                git_branch: None,
-            },
-        ];
-        state.all_rows = rows.clone();
-        state.filtered_rows = rows;
-        state.view_rows = Some(3);
-        state.selected = 1;
-        state.scroll_top = 0;
-        state.update_view_rows(3);
-
-        let metrics = calculate_column_metrics(&state.filtered_rows, state.show_all);
-
-        let width: u16 = 80;
-        let height: u16 = 6;
-        let backend = VT100Backend::new(width, height);
-        let mut terminal = Terminal::with_options(backend).expect("terminal");
-        terminal.set_viewport_area(Rect::new(0, 0, width, height));
-
-        {
-            let mut frame = terminal.get_frame();
-            let area = frame.area();
-            let segments =
-                Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(area);
-            render_column_headers(&mut frame, segments[0], &metrics, state.sort_key);
-            render_list(&mut frame, segments[1], &state, &metrics);
-        }
-        terminal.flush().expect("flush");
-
-        let snapshot = terminal.backend().to_string();
-        assert_snapshot!("resume_picker_table", snapshot);
-    }
-
-    #[tokio::test]
-    async fn resume_picker_screen_snapshot() {
-        use crate::custom_terminal::Terminal;
-        use crate::test_backend::VT100Backend;
-        use uuid::Uuid;
-
-        // Create real rollout files so the snapshot uses the actual listing pipeline.
-        let tempdir = tempfile::tempdir().expect("tempdir");
-        let sessions_root = tempdir.path().join("sessions");
-        std::fs::create_dir_all(&sessions_root).expect("mkdir sessions root");
-
-        let now = Utc::now();
-
-        // Helper to write a rollout file with minimal meta + one user message.
-        let write_rollout = |ts: DateTime<Utc>, cwd: &str, branch: &str, preview: &str| {
-            let dir = sessions_root
-                .join(ts.format("%Y").to_string())
-                .join(ts.format("%m").to_string())
-                .join(ts.format("%d").to_string());
-            std::fs::create_dir_all(&dir).expect("mkdir date dirs");
-            let filename = format!(
-                "rollout-{}-{}.jsonl",
-                ts.format("%Y-%m-%dT%H-%M-%S"),
-                Uuid::new_v4()
-            );
-            let path = dir.join(filename);
-            let meta = serde_json::json!({
-                "timestamp": ts.to_rfc3339(),
-                "item": {
-                    "SessionMeta": {
-                        "meta": {
-                            "id": Uuid::new_v4(),
-                            "timestamp": ts.to_rfc3339(),
-                            "cwd": cwd,
-                            "originator": "user",
-                            "cli_version": "0.0.0",
-                            "source": "Cli",
-                            "model_provider": "openai",
-                        }
-                    }
-                }
-            });
-            let user = serde_json::json!({
-                "timestamp": ts.to_rfc3339(),
-                "item": {
-                    "EventMsg": {
-                        "UserMessage": {
-                            "message": preview,
-                            "images": null
-                        }
-                    }
-                }
-            });
-            let branch_meta = serde_json::json!({
-                "timestamp": ts.to_rfc3339(),
-                "item": {
-                    "EventMsg": {
-                        "SessionMeta": {
-                            "meta": {
-                                "git_branch": branch
-                            }
-                        }
-                    }
-                }
-            });
-            std::fs::write(&path, format!("{meta}\n{user}\n{branch_meta}\n"))
-                .expect("write rollout");
-        };
-
-        write_rollout(
-            now - Duration::seconds(42),
-            "/tmp/project",
-            "feature/resume",
-            "Fix resume picker timestamps",
-        );
-        write_rollout(
-            now - Duration::minutes(35),
-            "/tmp/other",
-            "main",
-            "Investigate lazy pagination cap",
-        );
-
-        let loader: PageLoader = Arc::new(|_| {});
-        let mut state = PickerState::new(
-            PathBuf::from("/tmp"),
-            FrameRequester::test_dummy(),
-            loader,
-            String::from("openai"),
-            true,
-            None,
-            SessionPickerAction::Resume,
-        );
-
-        let page = RolloutRecorder::list_threads(
-            &state.codex_home,
-            PAGE_SIZE,
-            None,
-            ThreadSortKey::CreatedAt,
-            INTERACTIVE_SESSION_SOURCES,
-            Some(&[String::from("openai")]),
-            "openai",
-        )
-        .await
-        .expect("list conversations");
-
-        let rows = rows_from_items(page.items);
-        state.all_rows = rows.clone();
-        state.filtered_rows = rows;
-        state.view_rows = Some(4);
-        state.selected = 0;
-        state.scroll_top = 0;
-        state.update_view_rows(4);
-
-        let metrics = calculate_column_metrics(&state.filtered_rows, state.show_all);
-
-        let width: u16 = 80;
-        let height: u16 = 9;
-        let backend = VT100Backend::new(width, height);
-        let mut terminal = Terminal::with_options(backend).expect("terminal");
-        terminal.set_viewport_area(Rect::new(0, 0, width, height));
-
-        {
-            let mut frame = terminal.get_frame();
-            let area = frame.area();
-            let [header, search, columns, list, hint] = Layout::vertical([
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Min(area.height.saturating_sub(4)),
-                Constraint::Length(1),
-            ])
-            .areas(area);
-
-            frame.render_widget_ref(
-                Line::from(vec![
-                    "Resume a previous session".bold().cyan(),
-                    "  ".into(),
-                    "Sort:".dim(),
-                    " ".into(),
-                    "Created at".magenta(),
-                ]),
-                header,
-            );
-
-            frame.render_widget_ref(Line::from("Type to search".dim()), search);
-
-            render_column_headers(&mut frame, columns, &metrics, state.sort_key);
-            render_list(&mut frame, list, &state, &metrics);
-
-            let hint_line: Line = vec![
-                key_hint::plain(KeyCode::Enter).into(),
-                " to resume ".dim(),
-                "    ".dim(),
-                key_hint::plain(KeyCode::Esc).into(),
-                " to start new ".dim(),
-                "    ".dim(),
-                key_hint::ctrl(KeyCode::Char('c')).into(),
-                " to quit ".dim(),
-                "    ".dim(),
-                key_hint::plain(KeyCode::Tab).into(),
-                " to toggle sort ".dim(),
-            ]
-            .into();
-            frame.render_widget_ref(hint_line, hint);
-        }
-        terminal.flush().expect("flush");
-
-        let snapshot = terminal.backend().to_string();
-        assert_snapshot!("resume_picker_screen", snapshot);
-    }
-
-    #[tokio::test]
-    async fn resume_picker_thread_names_snapshot() {
-        use crate::custom_terminal::Terminal;
-        use crate::test_backend::VT100Backend;
-        use ratatui::layout::Constraint;
-        use ratatui::layout::Layout;
-
-        let tempdir = tempfile::tempdir().expect("tempdir");
-        let session_index_path = tempdir.path().join("session_index.jsonl");
-
-        let id1 =
-            ThreadId::from_string("11111111-1111-1111-1111-111111111111").expect("thread id 1");
-        let id2 =
-            ThreadId::from_string("22222222-2222-2222-2222-222222222222").expect("thread id 2");
-        let entries = vec![
-            json!({
-                "id": id1,
-                "thread_name": "Keep this for now",
-                "updated_at": "2025-01-01T00:00:00Z",
-            }),
-            json!({
-                "id": id2,
-                "thread_name": "Named thread",
-                "updated_at": "2025-01-01T00:00:00Z",
-            }),
-        ];
-        let mut out = String::new();
-        for entry in entries {
-            out.push_str(&serde_json::to_string(&entry).expect("session index entry"));
-            out.push('\n');
-        }
-        std::fs::write(&session_index_path, out).expect("write session index");
-
-        let loader: PageLoader = Arc::new(|_| {});
-        let mut state = PickerState::new(
-            tempdir.path().to_path_buf(),
-            FrameRequester::test_dummy(),
-            loader,
-            String::from("openai"),
-            true,
-            None,
-            SessionPickerAction::Resume,
-        );
-
-        let now = Utc::now();
-        let rows = vec![
-            Row {
-                path: PathBuf::from("/tmp/a.jsonl"),
-                preview: String::from("First message preview"),
-                thread_id: Some(id1),
-                thread_name: None,
-                created_at: None,
-                updated_at: Some(now - Duration::days(2)),
-                cwd: None,
-                git_branch: None,
-            },
-            Row {
-                path: PathBuf::from("/tmp/b.jsonl"),
-                preview: String::from("Second message preview"),
-                thread_id: Some(id2),
-                thread_name: None,
-                created_at: None,
-                updated_at: Some(now - Duration::days(3)),
-                cwd: None,
-                git_branch: None,
-            },
-        ];
-        state.all_rows = rows.clone();
-        state.filtered_rows = rows;
-        state.view_rows = Some(2);
-        state.selected = 0;
-        state.scroll_top = 0;
-        state.update_view_rows(2);
-
-        state.update_thread_names().await;
-
-        let metrics = calculate_column_metrics(&state.filtered_rows, state.show_all);
-
-        let width: u16 = 80;
-        let height: u16 = 5;
-        let backend = VT100Backend::new(width, height);
-        let mut terminal = Terminal::with_options(backend).expect("terminal");
-        terminal.set_viewport_area(Rect::new(0, 0, width, height));
-
-        {
-            let mut frame = terminal.get_frame();
-            let area = frame.area();
-            let segments =
-                Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(area);
-            render_column_headers(&mut frame, segments[0], &metrics, state.sort_key);
-            render_list(&mut frame, segments[1], &state, &metrics);
-        }
-        terminal.flush().expect("flush");
-
-        let snapshot = terminal.backend().to_string();
-        assert_snapshot!("resume_picker_thread_names", snapshot);
-    }
-
-    #[test]
-    fn pageless_scrolling_deduplicates_and_keeps_order() {
-        let loader: PageLoader = Arc::new(|_| {});
-        let mut state = PickerState::new(
-            PathBuf::from("/tmp"),
-            FrameRequester::test_dummy(),
-            loader,
-            String::from("openai"),
-            true,
-            None,
-            SessionPickerAction::Resume,
-        );
-
-        state.reset_pagination();
-        state.ingest_page(page(
-            vec![
-                make_item("/tmp/a.jsonl", "2025-01-03T00:00:00Z", "third"),
-                make_item("/tmp/b.jsonl", "2025-01-02T00:00:00Z", "second"),
-            ],
-            Some(cursor_from_str(
-                "2025-01-02T00-00-00|00000000-0000-0000-0000-000000000000",
-            )),
-            2,
-            false,
-        ));
-
-        state.ingest_page(page(
-            vec![
-                make_item("/tmp/a.jsonl", "2025-01-03T00:00:00Z", "duplicate"),
-                make_item("/tmp/c.jsonl", "2025-01-01T00:00:00Z", "first"),
-            ],
-            Some(cursor_from_str(
-                "2025-01-01T00-00-00|00000000-0000-0000-0000-000000000001",
-            )),
-            2,
-            false,
-        ));
-
-        state.ingest_page(page(
-            vec![make_item(
-                "/tmp/d.jsonl",
-                "2024-12-31T23:00:00Z",
-                "very old",
-            )],
-            None,
-            1,
-            false,
-        ));
-
-        let previews: Vec<_> = state
-            .filtered_rows
-            .iter()
-            .map(|row| row.preview.as_str())
-            .collect();
-        assert_eq!(previews, vec!["third", "second", "first", "very old"]);
-
-        let unique_paths = state
-            .filtered_rows
-            .iter()
-            .map(|row| row.path.clone())
-            .collect::<std::collections::HashSet<_>>();
-        assert_eq!(unique_paths.len(), 4);
-    }
-
-    #[test]
-    fn ensure_minimum_rows_prefetches_when_underfilled() {
-        let recorded_requests: Arc<Mutex<Vec<PageLoadRequest>>> = Arc::new(Mutex::new(Vec::new()));
-        let request_sink = recorded_requests.clone();
-        let loader: PageLoader = Arc::new(move |req: PageLoadRequest| {
-            request_sink.lock().unwrap().push(req);
-        });
-
-        let mut state = PickerState::new(
-            PathBuf::from("/tmp"),
-            FrameRequester::test_dummy(),
-            loader,
-            String::from("openai"),
-            true,
-            None,
-            SessionPickerAction::Resume,
-        );
-        state.reset_pagination();
-        state.ingest_page(page(
-            vec![
-                make_item("/tmp/a.jsonl", "2025-01-01T00:00:00Z", "one"),
-                make_item("/tmp/b.jsonl", "2025-01-02T00:00:00Z", "two"),
-            ],
-            Some(cursor_from_str(
-                "2025-01-03T00-00-00|00000000-0000-0000-0000-000000000000",
-            )),
-            2,
-            false,
-        ));
-
-        assert!(recorded_requests.lock().unwrap().is_empty());
-        state.ensure_minimum_rows_for_view(10);
-        let guard = recorded_requests.lock().unwrap();
-        assert_eq!(guard.len(), 1);
-        assert!(guard[0].search_token.is_none());
-    }
-
-    #[test]
-    fn column_visibility_hides_extra_date_column_when_narrow() {
-        let metrics = ColumnMetrics {
-            max_created_width: 8,
-            max_updated_width: 12,
-            max_branch_width: 0,
-            max_cwd_width: 0,
-            labels: Vec::new(),
-        };
-
-        let created = column_visibility(30, &metrics, ThreadSortKey::CreatedAt);
-        assert_eq!(
-            created,
-            ColumnVisibility {
-                show_created: true,
-                show_updated: false,
-                show_branch: false,
-                show_cwd: false,
-            }
-        );
-
-        let updated = column_visibility(30, &metrics, ThreadSortKey::UpdatedAt);
-        assert_eq!(
-            updated,
-            ColumnVisibility {
-                show_created: false,
-                show_updated: true,
-                show_branch: false,
-                show_cwd: false,
-            }
-        );
-
-        let wide = column_visibility(40, &metrics, ThreadSortKey::CreatedAt);
-        assert_eq!(
-            wide,
-            ColumnVisibility {
-                show_created: true,
-                show_updated: true,
-                show_branch: false,
-                show_cwd: false,
-            }
-        );
-    }
-
-    #[tokio::test]
-    async fn toggle_sort_key_reloads_with_new_sort() {
-        let recorded_requests: Arc<Mutex<Vec<PageLoadRequest>>> = Arc::new(Mutex::new(Vec::new()));
-        let request_sink = recorded_requests.clone();
-        let loader: PageLoader = Arc::new(move |req: PageLoadRequest| {
-            request_sink.lock().unwrap().push(req);
-        });
-
-        let mut state = PickerState::new(
-            PathBuf::from("/tmp"),
-            FrameRequester::test_dummy(),
-            loader,
-            String::from("openai"),
-            true,
-            None,
-            SessionPickerAction::Resume,
-        );
-
-        state.start_initial_load();
-        {
-            let guard = recorded_requests.lock().unwrap();
-            assert_eq!(guard.len(), 1);
-            assert_eq!(guard[0].sort_key, ThreadSortKey::CreatedAt);
-        }
-
-        state
-            .handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
-            .await
-            .unwrap();
-
-        let guard = recorded_requests.lock().unwrap();
-        assert_eq!(guard.len(), 2);
-        assert_eq!(guard[1].sort_key, ThreadSortKey::UpdatedAt);
-    }
-
-    #[tokio::test]
-    async fn page_navigation_uses_view_rows() {
-        let loader: PageLoader = Arc::new(|_| {});
-        let mut state = PickerState::new(
-            PathBuf::from("/tmp"),
-            FrameRequester::test_dummy(),
-            loader,
-            String::from("openai"),
-            true,
-            None,
-            SessionPickerAction::Resume,
-        );
-
-        let mut items = Vec::new();
-        for idx in 0..20 {
-            let ts = format!("2025-01-{:02}T00:00:00Z", idx + 1);
-            let preview = format!("item-{idx}");
-            let path = format!("/tmp/item-{idx}.jsonl");
-            items.push(make_item(&path, &ts, &preview));
-        }
-
-        state.reset_pagination();
-        state.ingest_page(page(items, None, 20, false));
-        state.update_view_rows(5);
-
-        assert_eq!(state.selected, 0);
-        state
-            .handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE))
-            .await
-            .unwrap();
-        assert_eq!(state.selected, 5);
-
-        state
-            .handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE))
-            .await
-            .unwrap();
-        assert_eq!(state.selected, 10);
-
-        state
-            .handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE))
-            .await
-            .unwrap();
-        assert_eq!(state.selected, 5);
-    }
-
-    #[tokio::test]
-    async fn up_at_bottom_does_not_scroll_when_visible() {
-        let loader: PageLoader = Arc::new(|_| {});
-        let mut state = PickerState::new(
-            PathBuf::from("/tmp"),
-            FrameRequester::test_dummy(),
-            loader,
-            String::from("openai"),
-            true,
-            None,
-            SessionPickerAction::Resume,
-        );
-
-        let mut items = Vec::new();
-        for idx in 0..10 {
-            let ts = format!("2025-02-{:02}T00:00:00Z", idx + 1);
-            let preview = format!("item-{idx}");
-            let path = format!("/tmp/item-{idx}.jsonl");
-            items.push(make_item(&path, &ts, &preview));
-        }
-
-        state.reset_pagination();
-        state.ingest_page(page(items, None, 10, false));
-        state.update_view_rows(5);
-
-        state.selected = state.filtered_rows.len().saturating_sub(1);
-        state.ensure_selected_visible();
-
-        let initial_top = state.scroll_top;
-        assert_eq!(initial_top, state.filtered_rows.len().saturating_sub(5));
-
-        state
-            .handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
-            .await
-            .unwrap();
-
-        assert_eq!(state.scroll_top, initial_top);
-        assert_eq!(state.selected, state.filtered_rows.len().saturating_sub(2));
-    }
-
-    #[tokio::test]
-    async fn set_query_loads_until_match_and_respects_scan_cap() {
-        let recorded_requests: Arc<Mutex<Vec<PageLoadRequest>>> = Arc::new(Mutex::new(Vec::new()));
-        let request_sink = recorded_requests.clone();
-        let loader: PageLoader = Arc::new(move |req: PageLoadRequest| {
-            request_sink.lock().unwrap().push(req);
-        });
-
-        let mut state = PickerState::new(
-            PathBuf::from("/tmp"),
-            FrameRequester::test_dummy(),
-            loader,
-            String::from("openai"),
-            true,
-            None,
-            SessionPickerAction::Resume,
-        );
-        state.reset_pagination();
-        state.ingest_page(page(
-            vec![make_item(
-                "/tmp/start.jsonl",
-                "2025-01-01T00:00:00Z",
-                "alpha",
-            )],
-            Some(cursor_from_str(
-                "2025-01-02T00-00-00|00000000-0000-0000-0000-000000000000",
-            )),
-            1,
-            false,
-        ));
-        recorded_requests.lock().unwrap().clear();
-
-        state.set_query("target".to_string());
-        let first_request = {
-            let guard = recorded_requests.lock().unwrap();
-            assert_eq!(guard.len(), 1);
-            guard[0].clone()
-        };
-
-        state
-            .handle_background_event(BackgroundEvent::PageLoaded {
-                request_token: first_request.request_token,
-                search_token: first_request.search_token,
-                page: Ok(page(
-                    vec![make_item("/tmp/beta.jsonl", "2025-01-02T00:00:00Z", "beta")],
-                    Some(cursor_from_str(
-                        "2025-01-03T00-00-00|00000000-0000-0000-0000-000000000001",
-                    )),
-                    5,
-                    false,
-                )),
-            })
-            .await
-            .unwrap();
-
-        let second_request = {
-            let guard = recorded_requests.lock().unwrap();
-            assert_eq!(guard.len(), 2);
-            guard[1].clone()
-        };
-        assert!(state.search_state.is_active());
-        assert!(state.filtered_rows.is_empty());
-
-        state
-            .handle_background_event(BackgroundEvent::PageLoaded {
-                request_token: second_request.request_token,
-                search_token: second_request.search_token,
-                page: Ok(page(
-                    vec![make_item(
-                        "/tmp/match.jsonl",
-                        "2025-01-03T00:00:00Z",
-                        "target log",
-                    )],
-                    Some(cursor_from_str(
-                        "2025-01-04T00-00-00|00000000-0000-0000-0000-000000000002",
-                    )),
-                    7,
-                    false,
-                )),
-            })
-            .await
-            .unwrap();
-
-        assert!(!state.filtered_rows.is_empty());
-        assert!(!state.search_state.is_active());
-
-        recorded_requests.lock().unwrap().clear();
-        state.set_query("missing".to_string());
-        let active_request = {
-            let guard = recorded_requests.lock().unwrap();
-            assert_eq!(guard.len(), 1);
-            guard[0].clone()
-        };
-
-        state
-            .handle_background_event(BackgroundEvent::PageLoaded {
-                request_token: second_request.request_token,
-                search_token: second_request.search_token,
-                page: Ok(page(Vec::new(), None, 0, false)),
-            })
-            .await
-            .unwrap();
-        assert_eq!(recorded_requests.lock().unwrap().len(), 1);
-
-        state
-            .handle_background_event(BackgroundEvent::PageLoaded {
-                request_token: active_request.request_token,
-                search_token: active_request.search_token,
-                page: Ok(page(Vec::new(), None, 3, true)),
-            })
-            .await
-            .unwrap();
-
-        assert!(state.filtered_rows.is_empty());
-        assert!(!state.search_state.is_active());
-        assert!(state.pagination.reached_scan_cap);
     }
 }

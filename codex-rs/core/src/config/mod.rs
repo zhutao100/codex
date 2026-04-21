@@ -2020,7 +2020,7 @@ persistence = "none"
                 copy_code_ui_mode: CopyUiMode::Picker,
                 copy_message_ui_mode: CopyUiMode::Picker,
                 syntax_highlight_theme: "base16-ocean.dark".to_string(),
-                diff_view: DiffView::Pretty,
+                diff_view: DiffView::Line,
             }
         );
     }
@@ -3978,7 +3978,7 @@ model_verbosity = "high"
                 tui_copy_code_ui_mode: CopyUiMode::Picker,
                 tui_copy_message_ui_mode: CopyUiMode::Picker,
                 tui_syntax_highlight_theme: "base16-ocean.dark".to_string(),
-                diff_view: DiffView::Pretty,
+                diff_view: DiffView::Line,
                 otel: OtelConfig::default(),
             },
             o3_profile_config
@@ -4072,7 +4072,7 @@ model_verbosity = "high"
             tui_copy_code_ui_mode: CopyUiMode::Picker,
             tui_copy_message_ui_mode: CopyUiMode::Picker,
             tui_syntax_highlight_theme: "base16-ocean.dark".to_string(),
-            diff_view: DiffView::Pretty,
+            diff_view: DiffView::Line,
             otel: OtelConfig::default(),
         };
 
@@ -4181,7 +4181,7 @@ model_verbosity = "high"
             tui_copy_code_ui_mode: CopyUiMode::Picker,
             tui_copy_message_ui_mode: CopyUiMode::Picker,
             tui_syntax_highlight_theme: "base16-ocean.dark".to_string(),
-            diff_view: DiffView::Pretty,
+            diff_view: DiffView::Line,
             otel: OtelConfig::default(),
         };
 
@@ -4276,7 +4276,7 @@ model_verbosity = "high"
             tui_copy_code_ui_mode: CopyUiMode::Picker,
             tui_copy_message_ui_mode: CopyUiMode::Picker,
             tui_syntax_highlight_theme: "base16-ocean.dark".to_string(),
-            diff_view: DiffView::Pretty,
+            diff_view: DiffView::Line,
             otel: OtelConfig::default(),
         };
 

@@ -12,8 +12,24 @@ const ALT_PREFIX: &str = "⌥ + ";
 const ALT_PREFIX: &str = "⌥ + ";
 #[cfg(all(not(test), not(target_os = "macos")))]
 const ALT_PREFIX: &str = "alt + ";
+#[cfg(test)]
+const CTRL_PREFIX: &str = "⌃ + ";
+#[cfg(all(not(test), target_os = "macos"))]
+const CTRL_PREFIX: &str = "⌃ + ";
+#[cfg(all(not(test), not(target_os = "macos")))]
 const CTRL_PREFIX: &str = "ctrl + ";
+#[cfg(test)]
+const SHIFT_PREFIX: &str = "⇧ + ";
+#[cfg(all(not(test), target_os = "macos"))]
+const SHIFT_PREFIX: &str = "⇧ + ";
+#[cfg(all(not(test), not(target_os = "macos")))]
 const SHIFT_PREFIX: &str = "shift + ";
+#[cfg(test)]
+const SUPER_PREFIX: &str = "⌘ + ";
+#[cfg(all(not(test), target_os = "macos"))]
+const SUPER_PREFIX: &str = "⌘ + ";
+#[cfg(all(not(test), not(target_os = "macos")))]
+const SUPER_PREFIX: &str = "super + ";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct KeyBinding {
@@ -26,10 +42,14 @@ impl KeyBinding {
         Self { key, modifiers }
     }
 
-    pub fn is_press(&self, event: KeyEvent) -> bool {
+    pub(crate) fn matches(&self, event: &KeyEvent) -> bool {
         self.key == event.code
             && self.modifiers == event.modifiers
             && (event.kind == KeyEventKind::Press || event.kind == KeyEventKind::Repeat)
+    }
+
+    pub fn is_press(&self, event: KeyEvent) -> bool {
+        self.matches(&event)
     }
 }
 
@@ -64,6 +84,9 @@ fn modifiers_to_string(modifiers: KeyModifiers) -> String {
     if modifiers.contains(KeyModifiers::ALT) {
         result.push_str(ALT_PREFIX);
     }
+    if modifiers.contains(KeyModifiers::SUPER) {
+        result.push_str(SUPER_PREFIX);
+    }
     result
 }
 
@@ -83,8 +106,23 @@ impl From<&KeyBinding> for Span<'static> {
             KeyCode::Down => "↓".to_string(),
             KeyCode::Left => "←".to_string(),
             KeyCode::Right => "→".to_string(),
+            #[cfg(target_os = "macos")]
+            KeyCode::PageUp => "pgup (fn + ↑)".to_string(),
+            #[cfg(not(target_os = "macos"))]
             KeyCode::PageUp => "pgup".to_string(),
+            #[cfg(target_os = "macos")]
+            KeyCode::PageDown => "pgdn (fn + ↓)".to_string(),
+            #[cfg(not(target_os = "macos"))]
             KeyCode::PageDown => "pgdn".to_string(),
+            #[cfg(target_os = "macos")]
+            KeyCode::Home => "home (fn + ←)".to_string(),
+            #[cfg(not(target_os = "macos"))]
+            KeyCode::Home => "home".to_string(),
+            #[cfg(target_os = "macos")]
+            KeyCode::End => "end (fn + →)".to_string(),
+            #[cfg(not(target_os = "macos"))]
+            KeyCode::End => "end".to_string(),
+            KeyCode::F(n) => format!("f{n}"),
             _ => format!("{key}").to_ascii_lowercase(),
         };
         Span::styled(format!("{modifiers}{key}"), key_hint_style())

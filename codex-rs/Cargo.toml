@@ -214,6 +214,8 @@ sha2 = "0.10"
 semver = "1.0"
 shlex = "1.3.0"
 similar = "2.7.0"
+syntect = "5"
+vscode-theme-syntect = "0.1.1"
 socket2 = "0.6.1"
 sqlx = { version = "0.8.6", default-features = false, features = ["chrono", "json", "macros", "migrate", "runtime-tokio-rustls", "sqlite", "time", "uuid"] }
 starlark = "0.13.0"

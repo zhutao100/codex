@@ -30,11 +30,13 @@ base64 = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 clap = { workspace = true, features = ["derive"] }
 codex-ansi-escape = { workspace = true }
+codex-app-server = { workspace = true }
 codex-app-server-protocol = { workspace = true }
 codex-arg0 = { workspace = true }
 codex-backend-client = { workspace = true }
 codex-chatgpt = { workspace = true }
 codex-cloud-requirements = { workspace = true }
+codex-codexd = { workspace = true }
 codex-common = { workspace = true, features = [
     "cli",
     "elapsed",
@@ -73,9 +75,11 @@ rmcp = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["preserve_order"] }
 shlex = { workspace = true }
+similar = { workspace = true }
 strum = { workspace = true }
 strum_macros = { workspace = true }
 supports-color = { workspace = true }
+syntect = { workspace = true }
 tempfile = { workspace = true }
 textwrap = { workspace = true }
 thiserror = { workspace = true }
@@ -99,6 +103,7 @@ unicode-segmentation = { workspace = true }
 unicode-width = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
+vscode-theme-syntect = { workspace = true }
 
 codex-windows-sandbox = { workspace = true }
 tokio-util = { workspace = true, features = ["time"] }

@@ -20,14 +20,59 @@ use codex_protocol::openai_models::ModelPreset;
 
 use crate::bottom_pane::ApprovalRequest;
 use crate::bottom_pane::StatusLineItem;
+use crate::get_git_diff::GitDiffResult;
 use crate::history_cell::HistoryCell;
+use crate::sessions_picker::SessionView;
 
+use codex_core::config::types::ProgressLegendMode;
 use codex_core::features::Feature;
 use codex_core::protocol::AskForApproval;
 use codex_core::protocol::SandboxPolicy;
 use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::config_types::Personality;
 use codex_protocol::openai_models::ReasoningEffort;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CopyCodeBlockScope {
+    LastResponse,
+    AllResponses,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CopyMessageFilter {
+    Responses,
+    User,
+    Both,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChatExportFormat {
+    Markdown,
+    Json,
+}
+
+impl ChatExportFormat {
+    pub(crate) const fn extension(self) -> &'static str {
+        match self {
+            Self::Markdown => "md",
+            Self::Json => "json",
+        }
+    }
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Markdown => "Markdown",
+            Self::Json => "JSON",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ExportOverrides {
+    pub(crate) output_path: Option<PathBuf>,
+    pub(crate) output_dir: Option<PathBuf>,
+    pub(crate) name: Option<String>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -61,6 +106,11 @@ pub(crate) enum AppEvent {
 
     /// Open the resume picker inside the running TUI session.
     OpenResumePicker,
+
+    /// Open the sessions manager picker inside the running TUI session.
+    OpenSessionsPicker {
+        view: SessionView,
+    },
 
     /// Fork the current session into a new thread.
     ForkCurrentSession,
@@ -100,7 +150,26 @@ pub(crate) enum AppEvent {
     ConnectorsLoaded(Result<ConnectorsSnapshot, String>),
 
     /// Result of computing a `/diff` command.
-    DiffResult(String),
+    DiffResult(GitDiffResult),
+
+    /// Export the current chat in the selected format.
+    ExportChat {
+        format: Option<ChatExportFormat>,
+        overrides: ExportOverrides,
+    },
+
+    /// Prompt for a custom export path.
+    OpenExportPathPrompt {
+        format: ChatExportFormat,
+    },
+
+    /// Result of exporting the current chat.
+    ExportResult {
+        path: PathBuf,
+        messages: usize,
+        error: Option<String>,
+        format: ChatExportFormat,
+    },
 
     /// Open the app link view in the bottom pane.
     OpenAppLink {
@@ -135,6 +204,57 @@ pub(crate) enum AppEvent {
         effort: Option<ReasoningEffort>,
     },
 
+    /// Start editing the selected queued message in the composer.
+    QueueStartEdit {
+        id: u64,
+    },
+
+    /// Delete one queued message by id.
+    QueueDelete {
+        id: u64,
+    },
+
+    /// Move one queued message one position earlier.
+    QueueMoveUp {
+        id: u64,
+    },
+
+    /// Move one queued message one position later.
+    QueueMoveDown {
+        id: u64,
+    },
+
+    /// Move one queued message to the front so it is sent next.
+    QueueMoveToFront {
+        id: u64,
+    },
+
+    /// Open model picker for a queued message override.
+    QueueOpenModelPicker {
+        id: u64,
+    },
+
+    /// Open thinking picker for a queued message override.
+    QueueOpenThinkingPicker {
+        id: u64,
+    },
+
+    /// Set or clear queued-message model override.
+    QueueSetModelOverride {
+        id: u64,
+        model: Option<String>,
+    },
+
+    /// Set or clear queued-message thinking override.
+    ///
+    /// - `None`: inherit session thinking.
+    /// - `Some(None)`: explicit model default.
+    /// - `Some(Some(..))`: explicit effort.
+    QueueSetThinkingOverride {
+        id: u64,
+        effort: Option<Option<ReasoningEffort>>,
+    },
+
     /// Persist the selected personality to the appropriate config.
     PersistPersonalitySelection {
         personality: Personality,
@@ -149,6 +269,47 @@ pub(crate) enum AppEvent {
     OpenAllModelsPopup {
         models: Vec<ModelPreset>,
     },
+
+    /// Change the copy-code scope and reopen the current copy UI.
+    SetCopyCodeBlockScope {
+        scope: CopyCodeBlockScope,
+    },
+
+    /// Toggle copy-code UI mode between picker and navigator (session only).
+    ToggleCopyCodeBlockUiMode,
+
+    /// Toggle copy-code selection mode between single and multi (session only).
+    ToggleCopyCodeBlockMultiSelect,
+
+    /// Toggle a code-block candidate in multi-select mode.
+    ToggleCopyCodeBlockSelection {
+        id: String,
+    },
+
+    /// Copy all currently selected code blocks.
+    CopySelectedCodeBlocks,
+
+    /// Change the copy-message filter and reopen the current copy UI.
+    SetCopyMessageFilter {
+        filter: CopyMessageFilter,
+    },
+
+    /// Toggle copy-message UI mode between picker and navigator (session only).
+    ToggleCopyMessageUiMode,
+
+    /// Toggle copy-message selection mode between single and multi (session only).
+    ToggleCopyMessageMultiSelect,
+
+    /// Toggle a message candidate in multi-select mode.
+    ToggleCopyMessageSelection {
+        id: String,
+    },
+
+    /// Copy all currently selected messages.
+    CopySelectedMessages,
+
+    /// Open the progress legend mode picker.
+    OpenProgressLegendModePicker,
 
     /// Open the confirmation prompt before enabling full access mode.
     OpenFullAccessConfirmation {
@@ -294,6 +455,9 @@ pub(crate) enum AppEvent {
     /// Launch the external editor after a normal draw has completed.
     LaunchExternalEditor,
 
+    /// Open the text prompt for manually renaming the current thread.
+    OpenRenameThreadPrompt,
+
     /// Async update of the current git branch for status line rendering.
     StatusLineBranchUpdated {
         cwd: PathBuf,
@@ -305,6 +469,10 @@ pub(crate) enum AppEvent {
     },
     /// Dismiss the status-line setup UI without changing config.
     StatusLineSetupCancelled,
+    /// Persist and apply the progress legend visibility mode.
+    SetProgressLegendMode {
+        mode: ProgressLegendMode,
+    },
 }
 
 /// The exit strategy requested by the UI layer.

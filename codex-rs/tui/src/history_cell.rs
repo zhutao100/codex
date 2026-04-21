@@ -21,6 +21,8 @@ use crate::exec_command::relativize_to_home;
 use crate::exec_command::strip_bash_lc_and_escape;
 use crate::live_wrap::take_prefix_by_width;
 use crate::markdown::append_markdown;
+use crate::progress_trace_style::ProgressTraceStyles;
+use crate::progress_trace_style::progress_trace_span;
 use crate::render::line_utils::line_to_static;
 use crate::render::line_utils::prefix_lines;
 use crate::render::line_utils::push_owned_lines;
@@ -39,6 +41,7 @@ use crate::wrapping::word_wrap_lines;
 use base64::Engine;
 use codex_common::format_env_display::format_env_display;
 use codex_core::config::Config;
+use codex_core::config::types::DiffView;
 use codex_core::config::types::McpServerTransportConfig;
 use codex_core::protocol::FileChange;
 use codex_core::protocol::McpAuthStatus;
@@ -54,6 +57,7 @@ use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::plan_tool::PlanItemArg;
 use codex_protocol::plan_tool::StepStatus;
 use codex_protocol::plan_tool::UpdatePlanArgs;
+use codex_protocol::protocol::ProgressTraceCategory;
 use codex_protocol::request_user_input::RequestUserInputAnswer;
 use codex_protocol::request_user_input::RequestUserInputQuestion;
 use codex_protocol::user_input::TextElement;
@@ -799,11 +803,12 @@ pub(crate) fn new_review_status_line(message: String) -> PlainHistoryCell {
 pub(crate) struct PatchHistoryCell {
     changes: HashMap<PathBuf, FileChange>,
     cwd: PathBuf,
+    view: DiffView,
 }
 
 impl HistoryCell for PatchHistoryCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        create_diff_summary(&self.changes, &self.cwd, width as usize)
+        create_diff_summary(&self.changes, &self.cwd, width as usize, self.view)
     }
 }
 
@@ -2050,10 +2055,12 @@ impl HistoryCell for PlanUpdateCell {
 pub(crate) fn new_patch_event(
     changes: HashMap<PathBuf, FileChange>,
     cwd: &Path,
+    view: DiffView,
 ) -> PatchHistoryCell {
     PatchHistoryCell {
         changes,
         cwd: cwd.to_path_buf(),
+        view,
     }
 }
 
@@ -2129,16 +2136,22 @@ pub(crate) fn new_reasoning_summary_block(full_reasoning_buffer: String) -> Box<
 pub struct FinalMessageSeparator {
     elapsed_seconds: Option<u64>,
     runtime_metrics: Option<RuntimeMetricsSummary>,
+    progress_trace: Option<Vec<ProgressTraceCategory>>,
+    progress_trace_styles: ProgressTraceStyles,
 }
 impl FinalMessageSeparator {
     /// Creates a separator; `elapsed_seconds` typically comes from the status indicator timer.
     pub(crate) fn new(
         elapsed_seconds: Option<u64>,
         runtime_metrics: Option<RuntimeMetricsSummary>,
+        progress_trace: Option<Vec<ProgressTraceCategory>>,
+        progress_trace_styles: ProgressTraceStyles,
     ) -> Self {
         Self {
             elapsed_seconds,
             runtime_metrics,
+            progress_trace,
+            progress_trace_styles,
         }
     }
 }
@@ -2156,19 +2169,37 @@ impl HistoryCell for FinalMessageSeparator {
             label_parts.push(metrics_label);
         }
 
+        let mut lines = Vec::new();
         if label_parts.is_empty() {
-            return vec![Line::from_iter(["─".repeat(width as usize).dim()])];
+            lines.push(Line::from_iter(["─".repeat(width as usize).dim()]));
+        } else {
+            let label = format!("─ {} ─", label_parts.join(" • "));
+            let (label, _suffix, label_width) = take_prefix_by_width(&label, width as usize);
+            lines.push(
+                Line::from_iter([
+                    label,
+                    "─".repeat((width as usize).saturating_sub(label_width)),
+                ])
+                .dim(),
+            );
         }
 
-        let label = format!("─ {} ─", label_parts.join(" • "));
-        let (label, _suffix, label_width) = take_prefix_by_width(&label, width as usize);
-        vec![
-            Line::from_iter([
-                label,
-                "─".repeat((width as usize).saturating_sub(label_width)),
-            ])
-            .dim(),
-        ]
+        if let Some(trace) = self
+            .progress_trace
+            .as_ref()
+            .filter(|trace| !trace.is_empty())
+        {
+            let mut spans = Vec::new();
+            spans.push("Trace ".dim());
+            let max_segments = usize::from(width.saturating_sub(6));
+            let start = trace.len().saturating_sub(max_segments);
+            for category in &trace[start..] {
+                spans.push(progress_trace_span(*category, &self.progress_trace_styles));
+            }
+            lines.push(Line::from(spans));
+        }
+
+        lines
     }
 }
 
@@ -2392,7 +2423,12 @@ mod tests {
             responses_api_overhead_ms: 650,
             responses_api_inference_time_ms: 1_940,
         };
-        let cell = FinalMessageSeparator::new(Some(12), Some(summary));
+        let cell = FinalMessageSeparator::new(
+            Some(12),
+            Some(summary),
+            None,
+            ProgressTraceStyles::default(),
+        );
         let rendered = render_lines(&cell.display_lines(300));
 
         assert_eq!(rendered.len(), 1);
@@ -2408,11 +2444,30 @@ mod tests {
 
     #[test]
     fn final_message_separator_includes_worked_label_after_one_minute() {
-        let cell = FinalMessageSeparator::new(Some(61), None);
+        let cell = FinalMessageSeparator::new(Some(61), None, None, ProgressTraceStyles::default());
         let rendered = render_lines(&cell.display_lines(200));
 
         assert_eq!(rendered.len(), 1);
         assert!(rendered[0].contains("Worked for"));
+    }
+
+    #[test]
+    fn final_message_separator_renders_trace_bar_line() {
+        let cell = FinalMessageSeparator::new(
+            Some(61),
+            None,
+            Some(vec![
+                ProgressTraceCategory::Tool,
+                ProgressTraceCategory::Reasoning,
+                ProgressTraceCategory::Gen,
+            ]),
+            ProgressTraceStyles::default(),
+        );
+        let rendered = render_lines(&cell.display_lines(80));
+
+        assert_eq!(rendered.len(), 2);
+        assert!(rendered[1].contains("Trace"));
+        assert!(rendered[1].contains("▮▮▮"));
     }
 
     #[test]

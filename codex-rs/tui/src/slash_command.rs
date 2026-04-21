@@ -21,8 +21,12 @@ pub enum SlashCommand {
     Skills,
     Review,
     Rename,
+    Export,
     New,
     Resume,
+    #[strum(serialize = "sessions", serialize = "session")]
+    Session,
+    Archived,
     Fork,
     Init,
     Compact,
@@ -33,11 +37,18 @@ pub enum SlashCommand {
     Diff,
     Copy,
     Mention,
+    #[strum(serialize = "copy-code")]
+    CopyCodeBlock,
+    #[strum(serialize = "copy-messages")]
+    CopyMessage,
     Status,
     DebugConfig,
     Statusline,
+    Legend,
+    LegendMode,
     Mcp,
     Apps,
+    Queue,
     Logout,
     Quit,
     Exit,
@@ -58,17 +69,26 @@ impl SlashCommand {
             SlashCommand::Compact => "summarize conversation to prevent hitting the context limit",
             SlashCommand::Review => "review my current changes and find issues",
             SlashCommand::Rename => "rename the current thread",
+            SlashCommand::Export => "export this chat",
             SlashCommand::Resume => "resume a saved chat",
+            SlashCommand::Session => "manage saved chats",
+            SlashCommand::Archived => "view archived chats",
             SlashCommand::Fork => "fork the current chat",
             // SlashCommand::Undo => "ask Codex to undo a turn",
             SlashCommand::Quit | SlashCommand::Exit => "exit Codex",
             SlashCommand::Diff => "show git diff (including untracked files)",
             SlashCommand::Copy => "copy the latest Codex output to your clipboard",
             SlashCommand::Mention => "mention a file",
+            SlashCommand::CopyCodeBlock => {
+                "choose and copy a code block from the last assistant output"
+            }
+            SlashCommand::CopyMessage => "copy a previous message from this chat",
             SlashCommand::Skills => "use skills to improve how Codex performs specific tasks",
             SlashCommand::Status => "show current session configuration and token usage",
             SlashCommand::DebugConfig => "show config layers and requirement sources for debugging",
             SlashCommand::Statusline => "configure which items appear in the status line",
+            SlashCommand::Legend => "show progress timeline legend",
+            SlashCommand::LegendMode => "set progress timeline legend mode",
             SlashCommand::Ps => "list background terminals",
             SlashCommand::Model => "choose what model and reasoning effort to use",
             SlashCommand::Personality => "choose a communication style for Codex",
@@ -81,6 +101,7 @@ impl SlashCommand {
             SlashCommand::Experimental => "toggle experimental features",
             SlashCommand::Mcp => "list configured MCP tools",
             SlashCommand::Apps => "manage apps",
+            SlashCommand::Queue => "view and edit queued messages",
             SlashCommand::Logout => "log out of Codex",
             SlashCommand::Rollout => "print the rollout file path",
             SlashCommand::TestApproval => "test approval request",
@@ -97,7 +118,12 @@ impl SlashCommand {
     pub fn supports_inline_args(self) -> bool {
         matches!(
             self,
-            SlashCommand::Review | SlashCommand::Rename | SlashCommand::Plan
+            SlashCommand::Review
+                | SlashCommand::Rename
+                | SlashCommand::Plan
+                | SlashCommand::Export
+                | SlashCommand::Diff
+                | SlashCommand::LegendMode
         )
     }
 
@@ -106,11 +132,13 @@ impl SlashCommand {
         match self {
             SlashCommand::New
             | SlashCommand::Resume
+            | SlashCommand::Session
+            | SlashCommand::Archived
             | SlashCommand::Fork
+            | SlashCommand::Export
             | SlashCommand::Init
             | SlashCommand::Compact
             // | SlashCommand::Undo
-            | SlashCommand::Model
             | SlashCommand::Personality
             | SlashCommand::Approvals
             | SlashCommand::Permissions
@@ -123,13 +151,19 @@ impl SlashCommand {
             | SlashCommand::Copy
             | SlashCommand::Rename
             | SlashCommand::Mention
+            | SlashCommand::CopyCodeBlock
+            | SlashCommand::CopyMessage
             | SlashCommand::Skills
             | SlashCommand::Status
             | SlashCommand::DebugConfig
+            | SlashCommand::Legend
+            | SlashCommand::LegendMode
             | SlashCommand::Ps
             | SlashCommand::Mcp
             | SlashCommand::Apps
+            | SlashCommand::Queue
             | SlashCommand::Feedback
+            | SlashCommand::Model
             | SlashCommand::Quit
             | SlashCommand::Exit => true,
             SlashCommand::Rollout => true,
@@ -143,7 +177,9 @@ impl SlashCommand {
     fn is_visible(self) -> bool {
         match self {
             SlashCommand::Rollout | SlashCommand::TestApproval => cfg!(debug_assertions),
-            SlashCommand::Copy => !cfg!(target_os = "android"),
+            SlashCommand::Copy | SlashCommand::CopyCodeBlock | SlashCommand::CopyMessage => {
+                !cfg!(target_os = "android")
+            }
             _ => true,
         }
     }

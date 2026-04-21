@@ -19,12 +19,10 @@ use crate::truncate::TruncationPolicy;
 use crate::truncate::approx_token_count;
 use crate::truncate::truncate_text;
 
-const CHAT_TITLE_INSTRUCTION: &str =
-    "Return a concise 3-6 word title for the conversation below. Output only the title.";
+const THREAD_NAME_INSTRUCTION: &str = "Return a concise 3-6 word thread name for the conversation below. Output only the thread name.";
 const MAX_CONTEXT_TOKENS: usize = 40_000;
-const MAX_TITLE_CHARS: usize = 80;
 
-pub(crate) async fn generate_chat_title(
+pub(crate) async fn generate_thread_name(
     session: &Session,
     turn_context: &TurnContext,
 ) -> Result<Option<String>> {
@@ -40,9 +38,9 @@ pub(crate) async fn generate_chat_title(
         if selected.is_empty() {
             return Ok(None);
         }
-        let prompt_text = format_title_prompt(&selected);
-        match stream_title(session, turn_context, &prompt_text).await {
-            Ok(title) => return Ok(title),
+        let prompt_text = format_thread_name_prompt(&selected);
+        match stream_thread_name(session, turn_context, &prompt_text).await {
+            Ok(thread_name) => return Ok(thread_name),
             Err(CodexErr::ContextWindowExceeded) => {
                 if selected.len() <= 1 {
                     return Err(CodexErr::ContextWindowExceeded);
@@ -129,15 +127,15 @@ fn select_blocks_with_token_budget(blocks: &[String], max_tokens: usize) -> Vec<
     selected
 }
 
-fn format_title_prompt(selected: &[String]) -> String {
+fn format_thread_name_prompt(selected: &[String]) -> String {
     let mut prompt = String::new();
-    prompt.push_str(CHAT_TITLE_INSTRUCTION);
+    prompt.push_str(THREAD_NAME_INSTRUCTION);
     prompt.push_str("\n\nConversation:\n");
     prompt.push_str(&selected.join("\n\n"));
     prompt
 }
 
-async fn stream_title(
+async fn stream_thread_name(
     session: &Session,
     turn_context: &TurnContext,
     prompt_text: &str,
@@ -210,20 +208,22 @@ async fn stream_title(
 
     if !completed && last_message.is_none() && output_buffer.trim().is_empty() {
         return Err(CodexErr::Stream(
-            "chat title generation did not complete".to_string(),
+            "thread name generation did not complete".to_string(),
             None,
         ));
     }
 
-    let raw_title = last_message.or_else(|| {
+    let raw_thread_name = last_message.or_else(|| {
         let trimmed = output_buffer.trim();
         (!trimmed.is_empty()).then(|| output_buffer.to_string())
     });
 
-    Ok(raw_title.as_deref().and_then(normalize_title))
+    Ok(raw_thread_name
+        .as_deref()
+        .and_then(normalize_thread_name_output))
 }
 
-fn normalize_title(raw: &str) -> Option<String> {
+fn normalize_thread_name_output(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return None;
@@ -236,13 +236,20 @@ fn normalize_title(raw: &str) -> Option<String> {
         return None;
     }
 
-    let mut title = collapsed.to_string();
-    if title.chars().count() > MAX_TITLE_CHARS {
-        title = title.chars().take(MAX_TITLE_CHARS).collect();
-        title = title.trim().to_string();
+    let mut thread_name = collapsed.to_string();
+    if thread_name.chars().count() > crate::util::MAX_THREAD_NAME_CHARS {
+        thread_name = thread_name
+            .chars()
+            .take(crate::util::MAX_THREAD_NAME_CHARS)
+            .collect();
+        thread_name = thread_name.trim().to_string();
     }
 
-    if title.is_empty() { None } else { Some(title) }
+    if thread_name.is_empty() {
+        None
+    } else {
+        Some(thread_name)
+    }
 }
 
 fn strip_wrapping_quotes(value: &str) -> &str {
@@ -261,26 +268,26 @@ fn strip_wrapping_quotes(value: &str) -> &str {
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use super::normalize_title;
+    use super::normalize_thread_name_output;
 
     #[test]
-    fn normalize_title_trims_and_collapses_whitespace() {
+    fn normalize_thread_name_trims_and_collapses_whitespace() {
         assert_eq!(
-            normalize_title("  Hello   world  "),
+            normalize_thread_name_output("  Hello   world  "),
             Some("Hello world".to_string())
         );
     }
 
     #[test]
-    fn normalize_title_strips_wrapping_quotes() {
+    fn normalize_thread_name_strips_wrapping_quotes() {
         assert_eq!(
-            normalize_title("\"Hello world\""),
+            normalize_thread_name_output("\"Hello world\""),
             Some("Hello world".to_string())
         );
     }
 
     #[test]
-    fn normalize_title_returns_none_for_empty() {
-        assert_eq!(normalize_title("\n  "), None);
+    fn normalize_thread_name_returns_none_for_empty() {
+        assert_eq!(normalize_thread_name_output("\n  "), None);
     }
 }

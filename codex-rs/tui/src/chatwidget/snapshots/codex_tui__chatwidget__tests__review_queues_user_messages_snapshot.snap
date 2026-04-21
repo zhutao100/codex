@@ -2,20 +2,10 @@
 source: tui/src/chatwidget/tests.rs
 expression: term.backend().vt100().screen().contents()
 ---
-
-
-
-
-
-
-
-
-
-
 • Working (0s • esc to interrupt)
 
   ↳ Queued while /review is running.
-    ⌥ + ↑ edit
+    ⌥ + ↑ edit · ⌃ + o queue · /queue
 
 › Ask Codex to do anything
 

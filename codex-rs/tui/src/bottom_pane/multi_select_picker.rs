@@ -260,6 +260,7 @@ impl MultiSelectPicker {
                     let item_name = truncate_text(&item.name, ITEM_NAME_TRUNCATE_LEN);
                     let name = format!("{prefix} [{marker}] {item_name}");
                     GenericDisplayRow {
+                        name_prefix: None,
                         name,
                         description: item.description.clone(),
                         ..Default::default()

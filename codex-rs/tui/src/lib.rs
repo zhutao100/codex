@@ -72,6 +72,7 @@ mod debug_config;
 mod diff_render;
 mod exec_cell;
 mod exec_command;
+mod export_markdown;
 mod external_editor;
 mod file_search;
 mod frames;
@@ -79,20 +80,24 @@ mod get_git_diff;
 mod history_cell;
 pub mod insert_history;
 mod key_hint;
+mod keybindings;
 pub mod live_wrap;
 mod markdown;
 mod markdown_render;
 mod markdown_stream;
+mod menubar_bridge;
 mod model_migration;
 mod notifications;
 pub mod onboarding;
 mod oss_selection;
 mod pager_overlay;
+mod progress_trace_style;
 pub mod public_widgets;
 mod render;
 mod resume_picker;
 mod selection_list;
 mod session_log;
+mod sessions_picker;
 mod shimmer;
 mod skills_helpers;
 mod slash_command;
@@ -272,7 +277,7 @@ pub async fn run_main(
         cwd,
         model_provider: model_provider_override.clone(),
         config_profile: cli.config_profile.clone(),
-        codex_linux_sandbox_exe,
+        codex_linux_sandbox_exe: codex_linux_sandbox_exe.clone(),
         show_raw_agent_reasoning: cli.oss.then_some(true),
         additional_writable_roots: additional_dirs,
         ..Default::default()
@@ -422,6 +427,7 @@ async fn run_ratatui_app(
     mut cloud_requirements: CloudRequirementsLoader,
     feedback: codex_feedback::CodexFeedback,
 ) -> color_eyre::Result<AppExitInfo> {
+    let codex_linux_sandbox_exe = overrides.codex_linux_sandbox_exe.clone();
     color_eyre::install()?;
 
     tooltips::announcement::prewarm();
@@ -536,7 +542,7 @@ async fn run_ratatui_app(
             thread_name: None,
             update_action: None,
             exit_reason: ExitReason::Fatal(format!(
-                "No saved session found with ID {id_str}. Run `codex {action}` without an ID to choose from existing sessions."
+                "No saved session found with ID or name `{id_str}`. Run `codex {action}` without a target to choose from existing sessions."
             )),
         })
     };
@@ -546,7 +552,10 @@ async fn run_ratatui_app(
         if let Some(id_str) = cli.fork_session_id.as_deref() {
             let is_uuid = Uuid::parse_str(id_str).is_ok();
             let path = if is_uuid {
-                find_thread_path_by_id_str(&config.codex_home, id_str).await?
+                match find_thread_path_by_id_str(&config.codex_home, id_str).await? {
+                    Some(path) => Some(path),
+                    None => find_thread_path_by_name_str(&config.codex_home, id_str).await?,
+                }
             } else {
                 find_thread_path_by_name_str(&config.codex_home, id_str).await?
             };
@@ -602,7 +611,10 @@ async fn run_ratatui_app(
     } else if let Some(id_str) = cli.resume_session_id.as_deref() {
         let is_uuid = Uuid::parse_str(id_str).is_ok();
         let path = if is_uuid {
-            find_thread_path_by_id_str(&config.codex_home, id_str).await?
+            match find_thread_path_by_id_str(&config.codex_home, id_str).await? {
+                Some(path) => Some(path),
+                None => find_thread_path_by_name_str(&config.codex_home, id_str).await?,
+            }
         } else {
             find_thread_path_by_name_str(&config.codex_home, id_str).await?
         };
@@ -701,6 +713,7 @@ async fn run_ratatui_app(
 
     let app_result = App::run(
         &mut tui,
+        codex_linux_sandbox_exe,
         auth_manager,
         config,
         cli_kv_overrides.clone(),

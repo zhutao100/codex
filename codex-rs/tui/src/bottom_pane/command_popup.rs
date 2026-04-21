@@ -216,6 +216,7 @@ impl CommandPopup {
                     }
                 };
                 GenericDisplayRow {
+                    name_prefix: None,
                     name,
                     match_indices: indices.map(|v| v.into_iter().map(|i| i + 1).collect()),
                     display_shortcut: None,

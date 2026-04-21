@@ -382,7 +382,11 @@ impl HistoryCell for StatusHistoryCell {
                 .map(str::to_string)
                 .collect();
         let mut seen: BTreeSet<String> = labels.iter().cloned().collect();
-        let thread_name = self.thread_name.as_deref().filter(|name| !name.is_empty());
+        let thread_name = self
+            .thread_name
+            .as_deref()
+            .filter(|name| !name.is_empty())
+            .unwrap_or("Untitled");
 
         if self.model_provider.is_some() {
             push_label(&mut labels, &mut seen, "Model provider");
@@ -390,9 +394,7 @@ impl HistoryCell for StatusHistoryCell {
         if account_value.is_some() {
             push_label(&mut labels, &mut seen, "Account");
         }
-        if thread_name.is_some() {
-            push_label(&mut labels, &mut seen, "Thread name");
-        }
+        push_label(&mut labels, &mut seen, "Thread name");
         if self.session_id.is_some() {
             push_label(&mut labels, &mut seen, "Session");
         }
@@ -451,9 +453,7 @@ impl HistoryCell for StatusHistoryCell {
             lines.push(formatter.line("Account", vec![Span::from(account_value)]));
         }
 
-        if let Some(thread_name) = thread_name {
-            lines.push(formatter.line("Thread name", vec![Span::from(thread_name.to_string())]));
-        }
+        lines.push(formatter.line("Thread name", vec![Span::from(thread_name.to_string())]));
         if let Some(collab_mode) = self.collaboration_mode.as_ref() {
             lines.push(formatter.line("Collaboration mode", vec![Span::from(collab_mode.clone())]));
         }

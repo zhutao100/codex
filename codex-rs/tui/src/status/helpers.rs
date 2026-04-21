@@ -5,15 +5,33 @@ use chrono::Local;
 use codex_core::AuthManager;
 use codex_core::auth::AuthMode as CoreAuthMode;
 use codex_core::config::Config;
+use codex_core::project_doc::DEFAULT_PROJECT_DOC_FILENAME;
 use codex_core::project_doc::discover_project_doc_paths;
 use codex_protocol::account::PlanType;
 use std::path::Path;
+use std::path::PathBuf;
 use unicode_width::UnicodeWidthStr;
 
 use super::account::StatusAccountDisplay;
 
 fn normalize_agents_display_path(path: &Path) -> String {
     dunce::simplified(path).display().to_string()
+}
+
+fn global_agents_path(config: &Config) -> Option<PathBuf> {
+    let candidate = config.codex_home.join(DEFAULT_PROJECT_DOC_FILENAME);
+    match std::fs::symlink_metadata(&candidate) {
+        Ok(metadata) => {
+            let file_type = metadata.file_type();
+            if file_type.is_file() || file_type.is_symlink() {
+                Some(candidate)
+            } else {
+                None
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => None,
+    }
 }
 
 pub(crate) fn compose_model_display(
@@ -38,7 +56,13 @@ pub(crate) fn compose_model_display(
 
 pub(crate) fn compose_agents_summary(config: &Config) -> String {
     match discover_project_doc_paths(config) {
-        Ok(paths) => {
+        Ok(mut paths) => {
+            if let Some(global_path) = global_agents_path(config)
+                && !paths.iter().any(|path| path == &global_path)
+            {
+                paths.push(global_path);
+            }
+
             let mut rels: Vec<String> = Vec::new();
             for p in paths {
                 let file_name = p

@@ -13,6 +13,11 @@ use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::text::Span;
 use ratatui::text::Text;
+use std::sync::OnceLock;
+use std::sync::RwLock;
+
+use crate::render::syntect::DEFAULT_SYNTAX_THEME;
+use crate::render::syntect::SyntectHighlighter;
 
 struct MarkdownStyles {
     h1: Style,
@@ -29,6 +34,7 @@ struct MarkdownStyles {
     unordered_list_marker: Style,
     link: Style,
     blockquote: Style,
+    code_block_frame: Style,
 }
 
 impl Default for MarkdownStyles {
@@ -50,6 +56,7 @@ impl Default for MarkdownStyles {
             unordered_list_marker: Style::new(),
             link: Style::new().cyan().underlined(),
             blockquote: Style::new().green(),
+            code_block_frame: Style::new().dim(),
         }
     }
 }
@@ -75,6 +82,13 @@ pub fn render_markdown_text(input: &str) -> Text<'static> {
     render_markdown_text_with_width(input, None)
 }
 
+pub(crate) fn set_syntax_highlight_theme(theme_name: String) {
+    let lock = syntax_highlight_theme_lock();
+    if let Ok(mut value) = lock.write() {
+        *value = theme_name;
+    }
+}
+
 pub(crate) fn render_markdown_text_with_width(input: &str, width: Option<usize>) -> Text<'static> {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_STRIKETHROUGH);
@@ -82,6 +96,18 @@ pub(crate) fn render_markdown_text_with_width(input: &str, width: Option<usize>)
     let mut w = Writer::new(parser, width);
     w.run();
     w.text
+}
+
+fn syntax_highlight_theme_lock() -> &'static RwLock<String> {
+    static THEME: OnceLock<RwLock<String>> = OnceLock::new();
+    THEME.get_or_init(|| RwLock::new(DEFAULT_SYNTAX_THEME.to_string()))
+}
+
+fn syntax_highlight_theme() -> String {
+    syntax_highlight_theme_lock()
+        .read()
+        .map(|value| value.clone())
+        .unwrap_or_else(|_| DEFAULT_SYNTAX_THEME.to_string())
 }
 
 struct Writer<'a, I>
@@ -99,12 +125,15 @@ where
     pending_marker_line: bool,
     in_paragraph: bool,
     in_code_block: bool,
+    in_fenced_code_block: bool,
     wrap_width: Option<usize>,
     current_line_content: Option<Line<'static>>,
     current_initial_indent: Vec<Span<'static>>,
     current_subsequent_indent: Vec<Span<'static>>,
     current_line_style: Style,
     current_line_in_code_block: bool,
+    syntax_theme: String,
+    code_highlighter: Option<SyntectHighlighter>,
 }
 
 impl<'a, I> Writer<'a, I>
@@ -124,12 +153,15 @@ where
             pending_marker_line: false,
             in_paragraph: false,
             in_code_block: false,
+            in_fenced_code_block: false,
             wrap_width,
             current_line_content: None,
             current_initial_indent: Vec::new(),
             current_subsequent_indent: Vec::new(),
             current_line_style: Style::default(),
             current_line_in_code_block: false,
+            syntax_theme: syntax_highlight_theme(),
+            code_highlighter: None,
         }
     }
 
@@ -173,11 +205,12 @@ where
                     CodeBlockKind::Fenced(_) => None,
                     CodeBlockKind::Indented => Some(Span::from(" ".repeat(4))),
                 };
-                let lang = match kind {
-                    CodeBlockKind::Fenced(lang) => Some(lang.to_string()),
-                    CodeBlockKind::Indented => None,
-                };
-                self.start_codeblock(lang, indent)
+                match kind {
+                    CodeBlockKind::Fenced(lang) => {
+                        self.start_codeblock(Some(lang.to_string()), indent, true)
+                    }
+                    CodeBlockKind::Indented => self.start_codeblock(None, indent, false),
+                }
             }
             Tag::List(start) => self.start_list(start),
             Tag::Item => self.start_item(),
@@ -302,12 +335,18 @@ where
             if i > 0 {
                 self.push_line(Line::default());
             }
-            let content = line.to_string();
-            let span = Span::styled(
-                content,
-                self.inline_styles.last().copied().unwrap_or_default(),
-            );
-            self.push_span(span);
+            if let Some(highlighter) = self.code_highlighter.as_mut() {
+                for span in highlighter.highlight_line(line) {
+                    self.push_span(span);
+                }
+            } else {
+                let content = line.to_string();
+                let span = Span::styled(
+                    content,
+                    self.inline_styles.last().copied().unwrap_or_default(),
+                );
+                self.push_span(span);
+            }
         }
         self.needs_newline = false;
     }
@@ -394,23 +433,54 @@ where
         self.needs_newline = false;
     }
 
-    fn start_codeblock(&mut self, _lang: Option<String>, indent: Option<Span<'static>>) {
+    fn start_codeblock(
+        &mut self,
+        lang: Option<String>,
+        indent: Option<Span<'static>>,
+        is_fenced: bool,
+    ) {
         self.flush_current_line();
         if !self.text.lines.is_empty() {
             self.push_blank_line();
         }
+
+        if is_fenced {
+            let language = lang
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string);
+            let heading = match language.clone() {
+                Some(language) if !language.is_empty() => format!("╭ code: {language}"),
+                _ => "╭ code".to_string(),
+            };
+            let mut spans = self.prefix_spans(false);
+            spans.push(Span::styled(heading, self.styles.code_block_frame));
+            self.text.lines.push(Line::from(spans));
+            self.code_highlighter =
+                SyntectHighlighter::from_language(language.as_deref(), &self.syntax_theme);
+        }
+
         self.in_code_block = true;
-        self.indent_stack.push(IndentContext::new(
-            vec![indent.unwrap_or_default()],
-            None,
-            false,
-        ));
+        self.in_fenced_code_block = is_fenced;
+        let mut prefix = Vec::new();
+        if let Some(indent) = indent {
+            prefix.push(indent);
+        }
+        if is_fenced {
+            prefix.push(Span::styled("│ ".to_string(), self.styles.code_block_frame));
+        }
+        self.indent_stack
+            .push(IndentContext::new(prefix, None, false));
         self.needs_newline = true;
     }
 
     fn end_codeblock(&mut self) {
+        self.flush_current_line();
         self.needs_newline = true;
         self.in_code_block = false;
+        self.in_fenced_code_block = false;
+        self.code_highlighter = None;
         self.indent_stack.pop();
     }
 
@@ -672,7 +742,10 @@ mod tests {
         let lines = lines_to_strings(&rendered);
         assert_eq!(
             lines,
-            vec!["fn main() { println!(\"hi from a long line\"); }".to_string(),]
+            vec![
+                "╭ code".to_string(),
+                "│ fn main() { println!(\"hi from a long line\"); }".to_string(),
+            ]
         );
     }
 }

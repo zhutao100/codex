@@ -13,12 +13,14 @@ use crate::wrapping::word_wrap_lines;
 /// Widget that displays a list of user messages queued while a turn is in progress.
 pub(crate) struct QueuedUserMessages {
     pub messages: Vec<String>,
+    pub show_send_next_hint: bool,
 }
 
 impl QueuedUserMessages {
     pub(crate) fn new() -> Self {
         Self {
             messages: Vec::new(),
+            show_send_next_hint: false,
         }
     }
 
@@ -45,14 +47,24 @@ impl QueuedUserMessages {
             }
         }
 
-        lines.push(
-            Line::from(vec![
-                "    ".into(),
-                key_hint::alt(KeyCode::Up).into(),
-                " edit".into(),
-            ])
-            .dim(),
-        );
+        let mut hint = vec![
+            "    ".into(),
+            key_hint::alt(KeyCode::Up).into(),
+            " edit".into(),
+        ];
+
+        if self.show_send_next_hint {
+            hint.push(" · ".into());
+            hint.push(key_hint::ctrl(KeyCode::Char('y')).into());
+            hint.push(" send next".into());
+        }
+
+        hint.push(" · ".into());
+        hint.push(key_hint::ctrl(KeyCode::Char('o')).into());
+        hint.push(" queue".into());
+
+        hint.push(" · /queue".into());
+        lines.push(Line::from(hint).dim());
 
         Paragraph::new(lines).into()
     }

@@ -22,6 +22,27 @@ impl std::fmt::Display for PasteImageError {
 }
 impl std::error::Error for PasteImageError {}
 
+#[derive(Debug, Clone)]
+pub enum ClipboardTextError {
+    ClipboardUnavailable(String),
+    NoText(String),
+    SetFailed(String),
+}
+
+impl std::fmt::Display for ClipboardTextError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ClipboardTextError::ClipboardUnavailable(msg) => {
+                write!(f, "clipboard unavailable: {msg}")
+            }
+            ClipboardTextError::NoText(msg) => write!(f, "no text on clipboard: {msg}"),
+            ClipboardTextError::SetFailed(msg) => write!(f, "could not set clipboard text: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for ClipboardTextError {}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EncodedImageFormat {
     Png,
@@ -44,6 +65,40 @@ pub struct PastedImageInfo {
     pub width: u32,
     pub height: u32,
     pub encoded_format: EncodedImageFormat, // Always PNG for now.
+}
+
+/// Read text from the system clipboard.
+#[cfg(not(target_os = "android"))]
+pub fn paste_text_from_clipboard() -> Result<String, ClipboardTextError> {
+    let mut cb = arboard::Clipboard::new()
+        .map_err(|e| ClipboardTextError::ClipboardUnavailable(e.to_string()))?;
+    cb.get_text()
+        .map_err(|e| ClipboardTextError::NoText(e.to_string()))
+}
+
+/// Android/Termux does not support arboard; return a clear error.
+#[cfg(target_os = "android")]
+pub fn paste_text_from_clipboard() -> Result<String, ClipboardTextError> {
+    Err(ClipboardTextError::ClipboardUnavailable(
+        "clipboard text paste is unsupported on Android".into(),
+    ))
+}
+
+/// Write text to the system clipboard.
+#[cfg(not(target_os = "android"))]
+pub fn copy_text_to_clipboard(text: &str) -> Result<(), ClipboardTextError> {
+    let mut cb = arboard::Clipboard::new()
+        .map_err(|e| ClipboardTextError::ClipboardUnavailable(e.to_string()))?;
+    cb.set_text(text.to_string())
+        .map_err(|e| ClipboardTextError::SetFailed(e.to_string()))
+}
+
+/// Android/Termux does not support arboard; return a clear error.
+#[cfg(target_os = "android")]
+pub fn copy_text_to_clipboard(_text: &str) -> Result<(), ClipboardTextError> {
+    Err(ClipboardTextError::ClipboardUnavailable(
+        "clipboard copy is unsupported on Android".into(),
+    ))
 }
 
 /// Capture image from system clipboard, encode to PNG, and return bytes + info.

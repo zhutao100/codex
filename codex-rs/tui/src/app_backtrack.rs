@@ -43,6 +43,7 @@ use color_eyre::eyre::Result;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
+use crossterm::event::KeyModifiers;
 
 /// Aggregates all backtrack-related state used by the App.
 #[derive(Default)]
@@ -111,26 +112,71 @@ impl App {
             match event {
                 TuiEvent::Key(KeyEvent {
                     code: KeyCode::Esc,
-                    kind: KeyEventKind::Press | KeyEventKind::Repeat,
-                    ..
-                }) => {
-                    self.overlay_step_backtrack(tui, event)?;
-                    Ok(true)
-                }
-                TuiEvent::Key(KeyEvent {
-                    code: KeyCode::Left,
-                    kind: KeyEventKind::Press | KeyEventKind::Repeat,
-                    ..
-                }) => {
-                    self.overlay_step_backtrack(tui, event)?;
-                    Ok(true)
-                }
-                TuiEvent::Key(KeyEvent {
-                    code: KeyCode::Right,
+                    modifiers: KeyModifiers::SHIFT,
                     kind: KeyEventKind::Press | KeyEventKind::Repeat,
                     ..
                 }) => {
                     self.overlay_step_backtrack_forward(tui, event)?;
+                    Ok(true)
+                }
+                TuiEvent::Key(KeyEvent {
+                    code: KeyCode::Char('n'),
+                    modifiers: KeyModifiers::CONTROL,
+                    kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                    ..
+                })
+                | TuiEvent::Key(KeyEvent {
+                    code: KeyCode::Char('f'),
+                    modifiers: KeyModifiers::ALT,
+                    kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                    ..
+                })
+                | TuiEvent::Key(KeyEvent {
+                    code: KeyCode::Right,
+                    modifiers: KeyModifiers::ALT,
+                    kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                    ..
+                })
+                | TuiEvent::Key(KeyEvent {
+                    code: KeyCode::Right,
+                    modifiers: KeyModifiers::NONE,
+                    kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                    ..
+                })
+                | TuiEvent::Key(KeyEvent {
+                    code: KeyCode::Char('\u{000e}'),
+                    modifiers: KeyModifiers::NONE,
+                    kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                    ..
+                }) => {
+                    self.overlay_step_backtrack_forward(tui, event)?;
+                    Ok(true)
+                }
+                TuiEvent::Key(KeyEvent {
+                    code: KeyCode::Char('p'),
+                    modifiers: KeyModifiers::CONTROL,
+                    kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                    ..
+                })
+                | TuiEvent::Key(KeyEvent {
+                    code: KeyCode::Left,
+                    modifiers: KeyModifiers::NONE,
+                    kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                    ..
+                })
+                | TuiEvent::Key(KeyEvent {
+                    code: KeyCode::Char('\u{0010}'),
+                    modifiers: KeyModifiers::NONE,
+                    kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                    ..
+                })
+                | TuiEvent::Key(KeyEvent {
+                    code: KeyCode::Esc,
+                    modifiers: KeyModifiers::NONE,
+                    kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                    ..
+                }) => {
+                    self.overlay_step_backtrack(tui, event)?;
                     Ok(true)
                 }
                 TuiEvent::Key(KeyEvent {
@@ -175,6 +221,22 @@ impl App {
             self.open_backtrack_preview(tui);
         } else if self.backtrack.overlay_preview_active {
             self.step_backtrack_and_highlight(tui);
+        }
+    }
+
+    /// Handle Shift+Esc presses for stepping forward through backtrack selections.
+    pub(crate) fn handle_backtrack_shift_esc_key(&mut self, tui: &mut tui::Tui) {
+        if !self.chat_widget.composer_is_empty() {
+            return;
+        }
+
+        if !self.backtrack.primed {
+            self.prime_backtrack();
+        } else if self.overlay.is_none() {
+            self.open_backtrack_preview(tui);
+            self.step_forward_backtrack_and_highlight(tui);
+        } else if self.backtrack.overlay_preview_active {
+            self.step_forward_backtrack_and_highlight(tui);
         }
     }
 

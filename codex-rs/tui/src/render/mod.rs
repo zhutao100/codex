@@ -3,6 +3,7 @@ use ratatui::layout::Rect;
 pub mod highlight;
 pub mod line_utils;
 pub mod renderable;
+pub mod syntect;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Insets {

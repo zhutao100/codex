@@ -1,11 +1,13 @@
 ---
 source: tui/src/bottom_pane/footer.rs
-assertion_line: 535
 expression: terminal.backend()
 ---
-"  / for commands                             ! for shell commands               "
-"  ctrl + j for newline                       tab to queue message               "
-"  @ for file paths                           ctrl + v to paste images           "
-"  ctrl + g to edit in external editor        esc esc to edit previous message   "
-"  ctrl + c to exit                           shift + tab to change mode         "
-"                                             ctrl + t to view transcript        "
+"  / for commands                                     ! for shell commands       "
+"  ⌃ + j for newline                                  ⌃ + ⇧ + ← / Ctrl+Shift+→ to"
+"  ⌃ + ⇧ + ↑ / Ctrl+Shift+↓ to change thinking                                   "
+"  tab to queue message                               @ for file paths           "
+"  ⌘ + v to paste from clipboard                      ⌃ + r to copy last output  "
+"  ⌃ + b to copy code block                           ⌃ + l to copy prompt       "
+"  ⌃ + g to edit in external editor                   esc esc to edit or branch p"
+"  ⌃ + c to exit                                      ⇧ + tab to change mode     "
+"                                                     ⌃ + t to view transcript   "

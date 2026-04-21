@@ -1,5 +1,6 @@
 ---
 source: tui/src/status/tests.rs
+assertion_line: 688
 expression: sanitized
 ---
 /status
@@ -15,6 +16,7 @@ expression: sanitized
 │  Approval:         on-request                                     │
 │  Sandbox:          read-only                                      │
 │  Agents.md:        <none>                                         │
+│  Thread name:      Untitled                                       │
 │                                                                   │
 │  Token usage:      2K total  (1.4K input + 600 output)            │
 │  Context window:   100% left (2.2K used / 272K)                   │

@@ -18,6 +18,7 @@ use crate::diff_render::DiffSummary;
 use crate::exec_command::strip_bash_lc_and_escape;
 use crate::external_editor;
 use crate::file_search::FileSearchManager;
+use crate::get_git_diff::GitDiffResult;
 use crate::history_cell;
 use crate::history_cell::HistoryCell;
 #[cfg(not(debug_assertions))]
@@ -28,11 +29,14 @@ use crate::model_migration::run_model_migration_prompt;
 use crate::pager_overlay::Overlay;
 use crate::render::highlight::highlight_bash_to_lines;
 use crate::render::renderable::Renderable;
-use crate::resume_picker::SessionSelection;
+use crate::resume_picker::SessionSelection as ResumeSessionSelection;
+use crate::sessions_picker::SessionManagementAction;
+use crate::sessions_picker::SessionManagementActionKind;
+use crate::sessions_picker::SessionSelection as ManagedSessionSelection;
 use crate::tui;
 use crate::tui::TuiEvent;
 use crate::update_action::UpdateAction;
-use codex_ansi_escape::ansi_escape_line;
+use chrono::Utc;
 use codex_app_server_protocol::ConfigLayerSource;
 use codex_core::AuthManager;
 use codex_core::CodexAuth;
@@ -152,10 +156,10 @@ fn session_summary(
     }
 
     let usage_line = FinalOutput::from(token_usage).to_string();
-    let resume_command = codex_core::util::resume_command(thread_name.as_deref(), thread_id);
+    let resume_commands = codex_core::util::resume_commands(thread_name.as_deref(), thread_id);
     Some(SessionSummary {
         usage_line,
-        resume_command,
+        resume_commands,
     })
 }
 
@@ -232,10 +236,22 @@ fn emit_project_config_warnings(app_event_tx: &AppEventSender, config: &Config) 
     )));
 }
 
+fn emit_syntax_theme_warning(app_event_tx: &AppEventSender, config: &Config) {
+    let Some(message) =
+        crate::render::syntect::validate_syntax_theme(&config.tui_syntax_highlight_theme)
+    else {
+        return;
+    };
+
+    app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
+        history_cell::new_warning_event(message),
+    )));
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SessionSummary {
     usage_line: String,
-    resume_command: Option<String>,
+    resume_commands: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -515,6 +531,7 @@ pub(crate) struct App {
     pub(crate) app_event_tx: AppEventSender,
     pub(crate) chat_widget: ChatWidget,
     pub(crate) auth_manager: Arc<AuthManager>,
+    menubar_bridge: Option<crate::menubar_bridge::MenuBarBridge>,
     /// Config is stored here so we can recreate ChatWidgets as needed.
     pub(crate) config: Config,
     pub(crate) active_profile: Option<String>,
@@ -653,6 +670,207 @@ impl App {
             self.chat_widget.submit_op(Op::Shutdown);
             self.server.remove_thread(&thread_id).await;
         }
+    }
+
+    async fn reset_to_new_session(&mut self, tui: &mut tui::Tui, include_previous_summary: bool) {
+        let model = self.chat_widget.current_model().to_string();
+        let summary = if include_previous_summary {
+            session_summary(
+                self.chat_widget.token_usage(),
+                self.chat_widget.thread_id(),
+                self.chat_widget.thread_name(),
+            )
+        } else {
+            None
+        };
+        self.shutdown_current_thread().await;
+        if let Err(err) = self.server.remove_and_close_all_threads().await {
+            tracing::warn!(error = %err, "failed to close all threads");
+        }
+        let init = crate::chatwidget::ChatWidgetInit {
+            config: self.config.clone(),
+            frame_requester: tui.frame_requester(),
+            app_event_tx: self.app_event_tx.clone(),
+            initial_user_message: None,
+            enhanced_keys_supported: self.enhanced_keys_supported,
+            auth_manager: self.auth_manager.clone(),
+            models_manager: self.server.get_models_manager(),
+            feedback: self.feedback.clone(),
+            is_first_run: false,
+            feedback_audience: self.feedback_audience,
+            model: Some(model),
+            status_line_invalid_items_warned: self.status_line_invalid_items_warned.clone(),
+            otel_manager: self.otel_manager.clone(),
+        };
+        self.chat_widget = ChatWidget::new(init, self.server.clone());
+        self.reset_thread_event_state();
+        if let Some(summary) = summary {
+            let mut lines: Vec<Line<'static>> = vec![summary.usage_line.clone().into()];
+            for command in summary.resume_commands {
+                let spans = vec!["To continue this session, run ".into(), command.cyan()];
+                lines.push(spans.into());
+            }
+            self.chat_widget.add_plain_history_lines(lines);
+        }
+        tui.frame_requester().schedule_frame();
+    }
+
+    async fn apply_session_management_action(
+        &mut self,
+        tui: &mut tui::Tui,
+        action: SessionManagementAction,
+    ) -> Result<()> {
+        if action.is_current_session {
+            self.reset_to_new_session(tui, false).await;
+        }
+
+        match action.kind {
+            SessionManagementActionKind::Archive => {
+                self.archive_session_rollout(action.path.as_path(), action.thread_id)
+                    .await?
+            }
+            SessionManagementActionKind::DeletePermanent => {
+                self.delete_archived_session_rollout(action.path.as_path(), action.thread_id)
+                    .await?
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn archive_session_rollout(
+        &self,
+        path: &Path,
+        thread_id: Option<ThreadId>,
+    ) -> Result<()> {
+        let sessions_dir = self.config.codex_home.join(codex_core::SESSIONS_SUBDIR);
+        let canonical_sessions_dir = tokio::fs::canonicalize(&sessions_dir)
+            .await
+            .wrap_err("failed to resolve sessions directory")?;
+        let canonical_path = tokio::fs::canonicalize(path)
+            .await
+            .wrap_err_with(|| format!("failed to resolve rollout path {}", path.display()))?;
+        if !canonical_path.starts_with(&canonical_sessions_dir) {
+            return Err(color_eyre::eyre::eyre!(
+                "rollout path `{}` must be in sessions directory",
+                path.display()
+            ));
+        }
+        if let Some(thread_id) = thread_id {
+            let required_suffix = format!("{thread_id}.jsonl");
+            let file_name = canonical_path
+                .file_name()
+                .map(|f| f.to_string_lossy().to_string())
+                .ok_or_else(|| {
+                    color_eyre::eyre::eyre!("rollout path `{}` missing file name", path.display())
+                })?;
+            if !file_name.ends_with(required_suffix.as_str()) {
+                return Err(color_eyre::eyre::eyre!(
+                    "rollout path `{}` does not match thread id {thread_id}",
+                    path.display()
+                ));
+            }
+        }
+
+        let file_name = canonical_path
+            .file_name()
+            .ok_or_else(|| {
+                color_eyre::eyre::eyre!("rollout path `{}` missing file name", path.display())
+            })?
+            .to_owned();
+        let archive_dir = self
+            .config
+            .codex_home
+            .join(codex_core::ARCHIVED_SESSIONS_SUBDIR);
+        tokio::fs::create_dir_all(&archive_dir)
+            .await
+            .wrap_err("failed to create archived sessions directory")?;
+        let archived_path = archive_dir.join(file_name);
+        if tokio::fs::try_exists(&archived_path).await.unwrap_or(false) {
+            return Err(color_eyre::eyre::eyre!(
+                "cannot archive session because destination already exists: {}",
+                archived_path.display()
+            ));
+        }
+        tokio::fs::rename(&canonical_path, &archived_path)
+            .await
+            .wrap_err("failed to move session into archived sessions directory")?;
+
+        if let Some(thread_id) = thread_id {
+            let state_db_ctx = codex_core::state_db::open_if_present(
+                &self.config.codex_home,
+                self.config.model_provider_id.as_str(),
+            )
+            .await;
+            if let Some(ctx) = state_db_ctx
+                && let Err(err) = ctx
+                    .mark_archived(thread_id, archived_path.as_path(), Utc::now())
+                    .await
+            {
+                tracing::warn!(
+                    "failed to mark archived session in state db for thread {thread_id}: {err}"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn delete_archived_session_rollout(
+        &self,
+        path: &Path,
+        thread_id: Option<ThreadId>,
+    ) -> Result<()> {
+        let archived_dir = self
+            .config
+            .codex_home
+            .join(codex_core::ARCHIVED_SESSIONS_SUBDIR);
+        let canonical_archived_dir = tokio::fs::canonicalize(&archived_dir)
+            .await
+            .wrap_err("failed to resolve archived sessions directory")?;
+        let canonical_path = tokio::fs::canonicalize(path)
+            .await
+            .wrap_err_with(|| format!("failed to resolve rollout path {}", path.display()))?;
+        if !canonical_path.starts_with(&canonical_archived_dir) {
+            return Err(color_eyre::eyre::eyre!(
+                "rollout path `{}` must be in archived sessions directory",
+                path.display()
+            ));
+        }
+        if let Some(thread_id) = thread_id {
+            let required_suffix = format!("{thread_id}.jsonl");
+            let file_name = canonical_path
+                .file_name()
+                .map(|f| f.to_string_lossy().to_string())
+                .ok_or_else(|| {
+                    color_eyre::eyre::eyre!("rollout path `{}` missing file name", path.display())
+                })?;
+            if !file_name.ends_with(required_suffix.as_str()) {
+                return Err(color_eyre::eyre::eyre!(
+                    "rollout path `{}` does not match thread id {thread_id}",
+                    path.display()
+                ));
+            }
+        }
+
+        tokio::fs::remove_file(&canonical_path)
+            .await
+            .wrap_err_with(|| format!("failed to delete session {}", canonical_path.display()))?;
+        if let Some(thread_id) = thread_id {
+            let state_db_ctx = codex_core::state_db::open_if_present(
+                &self.config.codex_home,
+                self.config.model_provider_id.as_str(),
+            )
+            .await;
+            codex_core::state_db::delete_thread_metadata(
+                state_db_ctx.as_deref(),
+                thread_id,
+                "tui_delete_archived_session",
+            )
+            .await;
+        }
+
+        Ok(())
     }
 
     fn ensure_thread_channel(&mut self, thread_id: ThreadId) -> &mut ThreadEventChannel {
@@ -916,6 +1134,7 @@ impl App {
     #[allow(clippy::too_many_arguments)]
     pub async fn run(
         tui: &mut tui::Tui,
+        codex_linux_sandbox_exe: Option<PathBuf>,
         auth_manager: Arc<AuthManager>,
         mut config: Config,
         cli_kv_overrides: Vec<(String, TomlValue)>,
@@ -923,7 +1142,7 @@ impl App {
         active_profile: Option<String>,
         initial_prompt: Option<String>,
         initial_images: Vec<PathBuf>,
-        session_selection: SessionSelection,
+        session_selection: ResumeSessionSelection,
         feedback: codex_feedback::CodexFeedback,
         is_first_run: bool,
     ) -> Result<AppExitInfo> {
@@ -931,6 +1150,7 @@ impl App {
         let (app_event_tx, mut app_event_rx) = unbounded_channel();
         let app_event_tx = AppEventSender::new(app_event_tx);
         emit_project_config_warnings(&app_event_tx, &config);
+        emit_syntax_theme_warning(&app_event_tx, &config);
         tui.set_notification_method(config.tui_notification_method);
 
         let harness_overrides =
@@ -1002,7 +1222,7 @@ impl App {
 
         let enhanced_keys_supported = tui.enhanced_keys_supported();
         let mut chat_widget = match session_selection {
-            SessionSelection::StartFresh | SessionSelection::Exit => {
+            ResumeSessionSelection::StartFresh | ResumeSessionSelection::Exit => {
                 let init = crate::chatwidget::ChatWidgetInit {
                     config: config.clone(),
                     frame_requester: tui.frame_requester(),
@@ -1025,7 +1245,7 @@ impl App {
                 };
                 ChatWidget::new(init, thread_manager.clone())
             }
-            SessionSelection::Resume(path) => {
+            ResumeSessionSelection::Resume(path) => {
                 let resumed = thread_manager
                     .resume_thread_from_rollout(config.clone(), path.clone(), auth_manager.clone())
                     .await
@@ -1055,7 +1275,7 @@ impl App {
                 };
                 ChatWidget::new_from_existing(init, resumed.thread, resumed.session_configured)
             }
-            SessionSelection::Fork(path) => {
+            ResumeSessionSelection::Fork(path) => {
                 let forked = thread_manager
                     .fork_thread(usize::MAX, config.clone(), path.clone())
                     .await
@@ -1099,6 +1319,7 @@ impl App {
             app_event_tx,
             chat_widget,
             auth_manager: auth_manager.clone(),
+            menubar_bridge: None,
             config,
             active_profile,
             cli_kv_overrides,
@@ -1127,6 +1348,15 @@ impl App {
             primary_session_configured: None,
             pending_primary_events: VecDeque::new(),
         };
+
+        app.menubar_bridge = crate::menubar_bridge::MenuBarBridge::start(
+            codex_linux_sandbox_exe,
+            Arc::new(app.config.clone()),
+            app.auth_manager.clone(),
+            app.server.clone(),
+            app.cli_kv_overrides.clone(),
+        )
+        .await;
 
         // On startup, if Agent mode (workspace-write) or ReadOnly is active, warn about world-writable dirs on Windows.
         #[cfg(target_os = "windows")]
@@ -1226,6 +1456,9 @@ impl App {
                 AppRunControl::Exit(reason) => break reason,
             }
         };
+        if let Some(menubar_bridge) = app.menubar_bridge.take() {
+            menubar_bridge.shutdown().await;
+        }
         tui.terminal.clear()?;
         Ok(AppExitInfo {
             token_usage: app.token_usage(),
@@ -1298,43 +1531,7 @@ impl App {
     async fn handle_event(&mut self, tui: &mut tui::Tui, event: AppEvent) -> Result<AppRunControl> {
         match event {
             AppEvent::NewSession => {
-                let model = self.chat_widget.current_model().to_string();
-                let summary = session_summary(
-                    self.chat_widget.token_usage(),
-                    self.chat_widget.thread_id(),
-                    self.chat_widget.thread_name(),
-                );
-                self.shutdown_current_thread().await;
-                if let Err(err) = self.server.remove_and_close_all_threads().await {
-                    tracing::warn!(error = %err, "failed to close all threads");
-                }
-                let init = crate::chatwidget::ChatWidgetInit {
-                    config: self.config.clone(),
-                    frame_requester: tui.frame_requester(),
-                    app_event_tx: self.app_event_tx.clone(),
-                    // New sessions start without prefilled message content.
-                    initial_user_message: None,
-                    enhanced_keys_supported: self.enhanced_keys_supported,
-                    auth_manager: self.auth_manager.clone(),
-                    models_manager: self.server.get_models_manager(),
-                    feedback: self.feedback.clone(),
-                    is_first_run: false,
-                    feedback_audience: self.feedback_audience,
-                    model: Some(model),
-                    status_line_invalid_items_warned: self.status_line_invalid_items_warned.clone(),
-                    otel_manager: self.otel_manager.clone(),
-                };
-                self.chat_widget = ChatWidget::new(init, self.server.clone());
-                self.reset_thread_event_state();
-                if let Some(summary) = summary {
-                    let mut lines: Vec<Line<'static>> = vec![summary.usage_line.clone().into()];
-                    if let Some(command) = summary.resume_command {
-                        let spans = vec!["To continue this session, run ".into(), command.cyan()];
-                        lines.push(spans.into());
-                    }
-                    self.chat_widget.add_plain_history_lines(lines);
-                }
-                tui.frame_requester().schedule_frame();
+                self.reset_to_new_session(tui, true).await;
             }
             AppEvent::OpenResumePicker => {
                 match crate::resume_picker::run_resume_picker(
@@ -1345,7 +1542,7 @@ impl App {
                 )
                 .await?
                 {
-                    SessionSelection::Resume(path) => {
+                    ResumeSessionSelection::Resume(path) => {
                         let current_cwd = self.config.cwd.clone();
                         let resume_cwd = match crate::resolve_cwd_for_resume_or_fork(
                             tui,
@@ -1406,7 +1603,7 @@ impl App {
                                 if let Some(summary) = summary {
                                     let mut lines: Vec<Line<'static>> =
                                         vec![summary.usage_line.clone().into()];
-                                    if let Some(command) = summary.resume_command {
+                                    for command in summary.resume_commands {
                                         let spans = vec![
                                             "To continue this session, run ".into(),
                                             command.cyan(),
@@ -1424,9 +1621,131 @@ impl App {
                             }
                         }
                     }
-                    SessionSelection::Exit
-                    | SessionSelection::StartFresh
-                    | SessionSelection::Fork(_) => {}
+                    ResumeSessionSelection::Exit
+                    | ResumeSessionSelection::StartFresh
+                    | ResumeSessionSelection::Fork(_) => {}
+                }
+
+                // Leaving alt-screen may blank the inline viewport; force a redraw either way.
+                tui.frame_requester().schedule_frame();
+            }
+            AppEvent::OpenSessionsPicker { view } => {
+                let mut picker_view = view;
+                loop {
+                    match crate::sessions_picker::run_sessions_picker(
+                        tui,
+                        &self.config.codex_home,
+                        &self.config.model_provider_id,
+                        false,
+                        picker_view,
+                        crate::sessions_picker::SessionPickerExit::Close,
+                        self.chat_widget.rollout_path(),
+                    )
+                    .await?
+                    {
+                        ManagedSessionSelection::Resume(path) => {
+                            let current_cwd = self.config.cwd.clone();
+                            let resume_cwd = match crate::resolve_cwd_for_resume_or_fork(
+                                tui,
+                                &current_cwd,
+                                &path,
+                                CwdPromptAction::Resume,
+                                true,
+                            )
+                            .await?
+                            {
+                                Some(cwd) => cwd,
+                                None => current_cwd.clone(),
+                            };
+                            let mut resume_config = if crate::cwds_differ(&current_cwd, &resume_cwd)
+                            {
+                                match self.rebuild_config_for_cwd(resume_cwd).await {
+                                    Ok(cfg) => cfg,
+                                    Err(err) => {
+                                        self.chat_widget.add_error_message(format!(
+                                            "Failed to rebuild configuration for resume: {err}"
+                                        ));
+                                        return Ok(AppRunControl::Continue);
+                                    }
+                                }
+                            } else {
+                                self.config.clone()
+                            };
+                            self.apply_runtime_policy_overrides(&mut resume_config);
+                            let summary = session_summary(
+                                self.chat_widget.token_usage(),
+                                self.chat_widget.thread_id(),
+                                self.chat_widget.thread_name(),
+                            );
+                            match self
+                                .server
+                                .resume_thread_from_rollout(
+                                    resume_config.clone(),
+                                    path.clone(),
+                                    self.auth_manager.clone(),
+                                )
+                                .await
+                            {
+                                Ok(resumed) => {
+                                    self.shutdown_current_thread().await;
+                                    self.config = resume_config;
+                                    tui.set_notification_method(
+                                        self.config.tui_notification_method,
+                                    );
+                                    self.file_search.update_search_dir(self.config.cwd.clone());
+                                    let init = self.chatwidget_init_for_forked_or_resumed_thread(
+                                        tui,
+                                        self.config.clone(),
+                                    );
+                                    self.chat_widget = ChatWidget::new_from_existing(
+                                        init,
+                                        resumed.thread,
+                                        resumed.session_configured,
+                                    );
+                                    self.reset_thread_event_state();
+                                    if let Some(summary) = summary {
+                                        let mut lines: Vec<Line<'static>> =
+                                            vec![summary.usage_line.clone().into()];
+                                        for command in summary.resume_commands {
+                                            let spans = vec![
+                                                "To continue this session, run ".into(),
+                                                command.cyan(),
+                                            ];
+                                            lines.push(spans.into());
+                                        }
+                                        self.chat_widget.add_plain_history_lines(lines);
+                                    }
+                                }
+                                Err(err) => {
+                                    let path_display = path.display();
+                                    self.chat_widget.add_error_message(format!(
+                                        "Failed to resume session from {path_display}: {err}"
+                                    ));
+                                }
+                            }
+                            break;
+                        }
+                        ManagedSessionSelection::Manage(action) => {
+                            let action_kind = action.kind;
+                            if let Err(err) =
+                                self.apply_session_management_action(tui, action).await
+                            {
+                                self.chat_widget
+                                    .add_error_message(format!("Failed to manage session: {err}"));
+                            }
+                            picker_view = match action_kind {
+                                SessionManagementActionKind::Archive => {
+                                    crate::sessions_picker::SessionView::Active
+                                }
+                                SessionManagementActionKind::DeletePermanent => {
+                                    crate::sessions_picker::SessionView::Archived
+                                }
+                            };
+                        }
+                        ManagedSessionSelection::Exit | ManagedSessionSelection::StartFresh => {
+                            break;
+                        }
+                    }
                 }
 
                 // Leaving alt-screen may blank the inline viewport; force a redraw either way.
@@ -1461,7 +1780,7 @@ impl App {
                             if let Some(summary) = summary {
                                 let mut lines: Vec<Line<'static>> =
                                     vec![summary.usage_line.clone().into()];
-                                if let Some(command) = summary.resume_command {
+                                for command in summary.resume_commands {
                                     let spans = vec![
                                         "To continue this session, run ".into(),
                                         command.cyan(),
@@ -1548,21 +1867,49 @@ impl App {
             AppEvent::CodexOp(op) => {
                 self.chat_widget.submit_op(op);
             }
+            AppEvent::OpenRenameThreadPrompt => {
+                self.chat_widget.show_rename_prompt();
+            }
             AppEvent::DiffResult(text) => {
                 // Clear the in-progress state in the bottom pane
                 self.chat_widget.on_diff_complete();
                 // Enter alternate screen using TUI helper and build pager lines
                 let _ = tui.enter_alt_screen();
-                let pager_lines: Vec<ratatui::text::Line<'static>> = if text.trim().is_empty() {
-                    vec!["No changes detected.".italic().into()]
-                } else {
-                    text.lines().map(ansi_escape_line).collect()
+                let pager_lines: Vec<ratatui::text::Line<'static>> = match text {
+                    GitDiffResult::NotGitRepo => {
+                        vec!["`/diff` — _not inside a git repository_".to_string().into()]
+                    }
+                    GitDiffResult::Error(message) => vec![message.red().into()],
+                    GitDiffResult::Lines(lines) => lines,
                 };
                 self.overlay = Some(Overlay::new_static_with_lines(
                     pager_lines,
                     "D I F F".to_string(),
                 ));
                 tui.frame_requester().schedule_frame();
+            }
+            AppEvent::ExportChat { format, overrides } => {
+                self.chat_widget.start_export(format, overrides);
+            }
+            AppEvent::ExportResult {
+                path,
+                messages,
+                error,
+                format,
+            } => {
+                if let Some(error) = error {
+                    self.chat_widget
+                        .add_error_message(format!("Failed to export chat: {error}"));
+                } else {
+                    let label = format.label();
+                    self.chat_widget.add_info_message(
+                        format!("Exported chat as {label}: {}", path.display()),
+                        Some(format!("{messages} messages")),
+                    );
+                }
+            }
+            AppEvent::OpenExportPathPrompt { format } => {
+                self.chat_widget.open_export_path_prompt(format);
             }
             AppEvent::OpenAppLink {
                 title,
@@ -1599,6 +1946,35 @@ impl App {
                 self.chat_widget.set_model(&model);
                 self.refresh_status_line();
             }
+            AppEvent::QueueStartEdit { id } => {
+                self.chat_widget.start_queue_edit(id);
+            }
+            AppEvent::QueueDelete { id } => {
+                self.chat_widget.delete_queued_user_message(id);
+            }
+            AppEvent::QueueMoveUp { id } => {
+                self.chat_widget.move_queued_user_message_up(id);
+            }
+            AppEvent::QueueMoveDown { id } => {
+                self.chat_widget.move_queued_user_message_down(id);
+            }
+            AppEvent::QueueMoveToFront { id } => {
+                self.chat_widget.move_queued_user_message_to_front(id);
+            }
+            AppEvent::QueueOpenModelPicker { id } => {
+                self.chat_widget.open_queue_model_picker(id);
+            }
+            AppEvent::QueueOpenThinkingPicker { id } => {
+                self.chat_widget.open_queue_thinking_picker(id);
+            }
+            AppEvent::QueueSetModelOverride { id, model } => {
+                self.chat_widget
+                    .set_queued_user_message_model_override(id, model);
+            }
+            AppEvent::QueueSetThinkingOverride { id, effort } => {
+                self.chat_widget
+                    .set_queued_user_message_thinking_override(id, effort);
+            }
             AppEvent::UpdateCollaborationMode(mask) => {
                 self.chat_widget.set_collaboration_mask(mask);
                 self.refresh_status_line();
@@ -1611,6 +1987,39 @@ impl App {
             }
             AppEvent::OpenAllModelsPopup { models } => {
                 self.chat_widget.open_all_models_popup(models);
+            }
+            AppEvent::SetCopyCodeBlockScope { scope } => {
+                self.chat_widget.set_copy_code_block_scope(scope);
+            }
+            AppEvent::ToggleCopyCodeBlockUiMode => {
+                self.chat_widget.toggle_copy_code_block_ui_mode();
+            }
+            AppEvent::ToggleCopyCodeBlockMultiSelect => {
+                self.chat_widget.toggle_copy_code_block_multi_select_mode();
+            }
+            AppEvent::ToggleCopyCodeBlockSelection { id } => {
+                self.chat_widget.toggle_copy_code_block_selection(id);
+            }
+            AppEvent::CopySelectedCodeBlocks => {
+                self.chat_widget.copy_selected_code_blocks();
+            }
+            AppEvent::SetCopyMessageFilter { filter } => {
+                self.chat_widget.set_copy_message_filter(filter);
+            }
+            AppEvent::ToggleCopyMessageUiMode => {
+                self.chat_widget.toggle_copy_message_ui_mode();
+            }
+            AppEvent::ToggleCopyMessageMultiSelect => {
+                self.chat_widget.toggle_copy_message_multi_select_mode();
+            }
+            AppEvent::ToggleCopyMessageSelection { id } => {
+                self.chat_widget.toggle_copy_message_selection(id);
+            }
+            AppEvent::CopySelectedMessages => {
+                self.chat_widget.copy_selected_messages();
+            }
+            AppEvent::OpenProgressLegendModePicker => {
+                self.chat_widget.open_progress_legend_mode_picker();
             }
             AppEvent::OpenFullAccessConfirmation {
                 preset,
@@ -1882,7 +2291,7 @@ impl App {
                             message.push_str(profile);
                             message.push_str(" profile");
                         }
-                        self.chat_widget.add_info_message(message, None);
+                        tracing::info!("{message}");
                     }
                     Err(err) => {
                         tracing::error!(
@@ -2200,9 +2609,14 @@ impl App {
                 self.chat_widget.handle_manage_skills_closed();
             }
             AppEvent::FullScreenApprovalRequest(request) => match request {
-                ApprovalRequest::ApplyPatch { cwd, changes, .. } => {
+                ApprovalRequest::ApplyPatch {
+                    cwd,
+                    changes,
+                    diff_view,
+                    ..
+                } => {
                     let _ = tui.enter_alt_screen();
-                    let diff_summary = DiffSummary::new(changes, cwd);
+                    let diff_summary = DiffSummary::new(changes, cwd, diff_view);
                     self.overlay = Some(Overlay::new_static_with_renderables(
                         vec![diff_summary.into()],
                         "P A T C H".to_string(),
@@ -2244,11 +2658,7 @@ impl App {
                     .await;
                 match apply_result {
                     Ok(()) => {
-                        self.config.tui_status_line = if ids.is_empty() {
-                            None
-                        } else {
-                            Some(ids.clone())
-                        };
+                        self.config.tui_status_line = Some(ids.clone());
                         self.chat_widget.setup_status_line(items);
                     }
                     Err(err) => {
@@ -2265,6 +2675,28 @@ impl App {
             AppEvent::StatusLineSetupCancelled => {
                 self.chat_widget.cancel_status_line_setup();
             }
+            AppEvent::SetProgressLegendMode { mode } => {
+                let edit = codex_core::config::edit::progress_legend_mode_edit(mode);
+                let apply_result = ConfigEditsBuilder::new(&self.config.codex_home)
+                    .with_edits([edit])
+                    .apply()
+                    .await;
+                match apply_result {
+                    Ok(()) => {
+                        self.config.tui_progress_legend_mode = mode;
+                        self.chat_widget.set_progress_legend_mode(mode);
+                    }
+                    Err(err) => {
+                        tracing::error!(
+                            error = %err,
+                            "failed to persist progress legend mode; keeping previous selection"
+                        );
+                        self.chat_widget.add_error_message(format!(
+                            "Failed to save progress legend mode: {err}"
+                        ));
+                    }
+                }
+            }
         }
         Ok(AppRunControl::Continue)
     }
@@ -2274,6 +2706,13 @@ impl App {
             event.msg,
             EventMsg::SessionConfigured(_) | EventMsg::TokenCount(_)
         );
+        if let Some(bridge) = self.menubar_bridge.as_mut() {
+            bridge.publish_event(
+                &event.msg,
+                &event.id,
+                self.active_thread_id.map(|thread_id| thread_id.to_string()),
+            );
+        }
         if self.suppress_shutdown_complete && matches!(event.msg, EventMsg::ShutdownComplete) {
             self.suppress_shutdown_complete = false;
             return;
@@ -2495,6 +2934,21 @@ impl App {
                     self.request_external_editor_launch(tui);
                 }
             }
+            // Shift+Esc steps forward through backtracking selections.
+            KeyEvent {
+                code: KeyCode::Esc,
+                modifiers: crossterm::event::KeyModifiers::SHIFT,
+                kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                ..
+            } => {
+                if self.chat_widget.is_normal_backtrack_mode()
+                    && self.chat_widget.composer_is_empty()
+                {
+                    self.handle_backtrack_shift_esc_key(tui);
+                } else {
+                    self.chat_widget.handle_key_event(key_event);
+                }
+            }
             // Esc primes/advances backtracking only in normal (not working) mode
             // with the composer focused and empty. In any other state, forward
             // Esc so the active UI (e.g. status indicator, modals, popups)
@@ -2631,6 +3085,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn emit_syntax_theme_warning_emits_warning_cell_for_invalid_theme() {
+        let codex_home = tempdir().expect("temp codex home");
+        let mut config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .build()
+            .await
+            .expect("config");
+        config.tui_syntax_highlight_theme = "base16-not-a-real-theme".to_string();
+
+        let (tx, mut rx) = unbounded_channel();
+        let app_event_tx = AppEventSender::new(tx);
+        emit_syntax_theme_warning(&app_event_tx, &config);
+
+        let rendered = match rx.try_recv() {
+            Ok(AppEvent::InsertHistoryCell(cell)) => cell
+                .display_lines(120)
+                .into_iter()
+                .flat_map(|line| line.spans.into_iter().map(|span| span.content.to_string()))
+                .collect::<String>(),
+            Ok(other) => panic!("expected warning history cell, got {other:?}"),
+            Err(err) => panic!("expected warning history cell, got {err}"),
+        };
+        assert!(rendered.contains("base16-not-a-real-theme"));
+        assert!(rendered.contains("base16-ocean.dark"));
+    }
+
+    #[tokio::test]
+    async fn emit_syntax_theme_warning_skips_valid_theme() {
+        let codex_home = tempdir().expect("temp codex home");
+        let mut config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .build()
+            .await
+            .expect("config");
+        config.tui_syntax_highlight_theme = "base16-ocean.dark".to_string();
+
+        let (tx, mut rx) = unbounded_channel();
+        let app_event_tx = AppEventSender::new(tx);
+        emit_syntax_theme_warning(&app_event_tx, &config);
+
+        assert!(rx.try_recv().is_err(), "expected no warning history cell");
+    }
+
+    #[tokio::test]
     async fn enqueue_thread_event_does_not_block_when_channel_full() -> Result<()> {
         let mut app = make_test_app().await;
         let thread_id = ThreadId::new();
@@ -2690,6 +3188,7 @@ mod tests {
             app_event_tx,
             chat_widget,
             auth_manager,
+            menubar_bridge: None,
             config,
             active_profile: None,
             cli_kv_overrides: Vec::new(),
@@ -2744,6 +3243,7 @@ mod tests {
                 app_event_tx,
                 chat_widget,
                 auth_manager,
+                menubar_bridge: None,
                 config,
                 active_profile: None,
                 cli_kv_overrides: Vec::new(),
@@ -3147,8 +3647,8 @@ mod tests {
             "Token usage: total=12 input=10 output=2"
         );
         assert_eq!(
-            summary.resume_command,
-            Some("codex resume 123e4567-e89b-12d3-a456-426614174000".to_string())
+            summary.resume_commands,
+            vec!["codex resume 123e4567-e89b-12d3-a456-426614174000".to_string()]
         );
     }
 
@@ -3165,8 +3665,11 @@ mod tests {
         let summary = session_summary(usage, Some(conversation), Some("my-session".to_string()))
             .expect("summary");
         assert_eq!(
-            summary.resume_command,
-            Some("codex resume my-session".to_string())
+            summary.resume_commands,
+            vec![
+                "codex resume my-session".to_string(),
+                "codex resume 123e4567-e89b-12d3-a456-426614174000".to_string()
+            ]
         );
     }
 }

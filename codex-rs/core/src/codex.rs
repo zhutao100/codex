@@ -1024,41 +1024,43 @@ impl Session {
         if thread_name.is_none()
             && let Some(parent_id) = forked_from_id
         {
-            let parent_label = match session_index::find_thread_label_by_id(
-                &config.codex_home,
-                &parent_id,
-            )
-            .await
-            {
-                Ok(Some(label)) => label,
-                Ok(None) => "Untitled".to_string(),
-                Err(err) => {
-                    warn!("Failed to resolve parent thread label for forked session: {err}");
-                    "Untitled".to_string()
-                }
-            };
-            let fork_number =
-                match session_index::next_fork_number_for_parent(&config.codex_home, &parent_id)
-                    .await
+            let parent_thread_name =
+                match session_index::find_thread_name_by_id(&config.codex_home, &parent_id).await {
+                    Ok(name) => name,
+                    Err(err) => {
+                        warn!("Failed to resolve parent thread name for forked session: {err}");
+                        None
+                    }
+                };
+            if let Some(parent_thread_name) = parent_thread_name {
+                let fork_number = match session_index::next_fork_number_for_parent(
+                    &config.codex_home,
+                    &parent_id,
+                )
+                .await
                 {
                     Ok(number) => number,
                     Err(err) => {
-                        warn!("Failed to compute fork number for derived thread title: {err}");
+                        warn!("Failed to compute fork number for derived thread name: {err}");
                         1
                     }
                 };
-            let derived_name = format!("Fork {fork_number} of {parent_label}");
-            if !config.ephemeral
-                && let Err(err) = session_index::append_thread_name(
-                    &config.codex_home,
-                    conversation_id,
-                    &derived_name,
-                )
-                .await
-            {
-                warn!("Failed to write derived fork title to session index: {err}");
+                let derived_name =
+                    crate::util::format_fork_thread_name(fork_number, &parent_thread_name);
+                if let Some(derived_name) = derived_name {
+                    if !config.ephemeral
+                        && let Err(err) = session_index::append_thread_name(
+                            &config.codex_home,
+                            conversation_id,
+                            &derived_name,
+                        )
+                        .await
+                    {
+                        warn!("Failed to write derived fork name to session index: {err}");
+                    }
+                    thread_name = Some(derived_name);
+                }
             }
-            thread_name = Some(derived_name);
         }
         session_configuration.thread_name = thread_name.clone();
         let mut state = SessionState::new(session_configuration.clone());
@@ -3429,31 +3431,29 @@ mod handlers {
 
     pub async fn auto_rename_thread(sess: &Arc<Session>, sub_id: String) {
         let turn_context = sess.new_default_turn_with_sub_id(sub_id.clone()).await;
-        let title = match crate::chat_title::generate_chat_title(
-            sess.as_ref(),
-            turn_context.as_ref(),
-        )
-        .await
-        {
-            Ok(title) => title,
-            Err(err) => {
-                sess.send_event_raw(Event {
-                    id: sub_id,
-                    msg: EventMsg::Error(ErrorEvent {
-                        message: format!("Auto-rename failed: {err}"),
-                        codex_error_info: Some(CodexErrorInfo::Other),
-                    }),
-                })
-                .await;
-                return;
-            }
-        };
+        let thread_name =
+            match crate::thread_name::generate_thread_name(sess.as_ref(), turn_context.as_ref())
+                .await
+            {
+                Ok(thread_name) => thread_name,
+                Err(err) => {
+                    sess.send_event_raw(Event {
+                        id: sub_id,
+                        msg: EventMsg::Error(ErrorEvent {
+                            message: format!("Auto-rename failed: {err}"),
+                            codex_error_info: Some(CodexErrorInfo::Other),
+                        }),
+                    })
+                    .await;
+                    return;
+                }
+            };
 
-        let Some(title) = title else {
+        let Some(thread_name) = thread_name else {
             sess.send_event_raw(Event {
                 id: sub_id,
                 msg: EventMsg::Error(ErrorEvent {
-                    message: "Auto-rename failed: empty title.".to_string(),
+                    message: "Auto-rename failed: empty thread name.".to_string(),
                     codex_error_info: Some(CodexErrorInfo::Other),
                 }),
             })
@@ -3461,7 +3461,7 @@ mod handlers {
             return;
         };
 
-        if let Err(err) = sess.set_thread_name(title.clone()).await {
+        if let Err(err) = sess.set_thread_name(thread_name.clone()).await {
             sess.send_event_raw(Event {
                 id: sub_id,
                 msg: EventMsg::Error(ErrorEvent {
@@ -3477,7 +3477,7 @@ mod handlers {
             id: turn_context.sub_id.clone(),
             msg: EventMsg::ThreadNameUpdated(ThreadNameUpdatedEvent {
                 thread_id: sess.conversation_id,
-                thread_name: Some(title),
+                thread_name: Some(thread_name),
             }),
         })
         .await;

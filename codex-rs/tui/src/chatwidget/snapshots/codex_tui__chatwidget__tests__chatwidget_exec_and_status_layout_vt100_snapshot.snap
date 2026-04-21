@@ -36,9 +36,9 @@ expression: term.backend().vt100().screen().contents()
   └ Search Change Approved
     Read diff_render.rs
 
-• Investigating rendering code (0s • esc to interrupt)
+• Investigating rendering code · gpt-5.4 (reasoning default) · (0s • esc to inte
 
 
 › Summarize recent commits
 
-  tab to queue message                                       100% context left
+  gpt-5.4 default · 100% left · ~/workspace/custom-builds/codex/codex-rs/tui

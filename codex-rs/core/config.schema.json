@@ -313,8 +313,8 @@
     },
     "DiffView": {
       "enum": [
-        "pretty",
         "line",
+        "pretty",
         "inline",
         "side-by-side"
       ],
@@ -1165,8 +1165,8 @@
               "$ref": "#/definitions/DiffView"
             }
           ],
-          "default": "pretty",
-          "description": "Default diff format shown in the TUI.\n\nDefaults to `pretty`."
+          "default": "line",
+          "description": "Default diff format shown in the TUI.\n\nDefaults to `line`."
         },
         "experimental_mode": {
           "allOf": [

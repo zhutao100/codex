@@ -45,6 +45,7 @@ pub(crate) type SelectionAction = Box<dyn Fn(&AppEventSender) + Send + Sync>;
 #[derive(Default)]
 pub(crate) struct SelectionItem {
     pub name: String,
+    pub name_prefix: Option<Span<'static>>,
     pub display_shortcut: Option<KeyBinding>,
     pub description: Option<String>,
     pub selected_description: Option<String>,
@@ -255,6 +256,7 @@ impl ListSelectionView {
                     let is_disabled = item.is_disabled || item.disabled_reason.is_some();
                     GenericDisplayRow {
                         name: display_name,
+                        name_prefix: item.name_prefix.clone(),
                         display_shortcut: item.display_shortcut,
                         match_indices: None,
                         description,

@@ -140,6 +140,7 @@ impl SkillsToggleView {
                     let item_name = truncate_skill_name(&item.name);
                     let name = format!("{prefix} [{marker}] {item_name}");
                     GenericDisplayRow {
+                        name_prefix: None,
                         name,
                         description: Some(item.description.clone()),
                         ..Default::default()

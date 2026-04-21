@@ -12,6 +12,8 @@ use crate::parse_command::shlex_join;
 const INITIAL_DELAY_MS: u64 = 200;
 const BACKOFF_FACTOR: f64 = 2.0;
 
+pub const MAX_THREAD_NAME_CHARS: usize = 80;
+
 /// Emit structured feedback metadata as key/value pairs.
 ///
 /// This logs a tracing event with `target: "feedback_tags"`. If
@@ -75,14 +77,92 @@ pub fn resolve_path(base: &Path, path: &PathBuf) -> PathBuf {
     }
 }
 
-/// Trim a thread name and return `None` if it is empty after trimming.
+/// Normalize a thread name to a single line and clamp its length.
+///
+/// Returns `None` when the name is empty after trimming/collapsing whitespace.
 pub fn normalize_thread_name(name: &str) -> Option<String> {
-    let trimmed = name.trim();
-    if trimmed.is_empty() {
+    let collapsed = name.split_whitespace().collect::<Vec<_>>().join(" ");
+    let collapsed = collapsed.trim();
+    if collapsed.is_empty() {
         None
     } else {
-        Some(trimmed.to_string())
+        let mut normalized = collapsed.to_string();
+        if normalized.chars().count() > MAX_THREAD_NAME_CHARS {
+            normalized = normalized.chars().take(MAX_THREAD_NAME_CHARS).collect();
+            normalized = normalized.trim().to_string();
+        }
+        (!normalized.is_empty()).then_some(normalized)
     }
+}
+
+fn strip_fork_prefix_once(name: &str) -> Option<&str> {
+    let name = name.trim();
+    if let Some(rest) = name.strip_prefix("Fork#") {
+        let bytes = rest.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == 0 {
+            return None;
+        }
+        let mut j = i;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j == i {
+            return None;
+        }
+        return Some(rest[j..].trim());
+    }
+
+    let Some(rest) = name.strip_prefix("Fork") else {
+        return None;
+    };
+    let bytes = rest.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i == 0 {
+        return None;
+    }
+    let start_digits = i;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == start_digits {
+        return None;
+    }
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let rest = rest[i..].trim_start();
+    let Some(rest) = rest.strip_prefix("of") else {
+        return None;
+    };
+    let rest = rest.trim_start();
+    (!rest.is_empty()).then_some(rest.trim())
+}
+
+pub fn strip_fork_prefixes(name: &str) -> &str {
+    let mut current = name.trim();
+    while let Some(next) = strip_fork_prefix_once(current) {
+        if next == current {
+            break;
+        }
+        current = next;
+    }
+    current
+}
+
+pub fn format_fork_thread_name(fork_number: usize, parent_name: &str) -> Option<String> {
+    let base = strip_fork_prefixes(parent_name);
+    if base.is_empty() {
+        return None;
+    }
+
+    normalize_thread_name(&format!("Fork#{fork_number} {base}"))
 }
 
 fn resume_command_for_target(target: String) -> String {
@@ -152,11 +232,47 @@ mod tests {
     }
 
     #[test]
-    fn normalize_thread_name_trims_and_rejects_empty() {
+    fn normalize_thread_name_rejects_empty() {
         assert_eq!(normalize_thread_name("   "), None);
+    }
+
+    #[test]
+    fn normalize_thread_name_trims_collapses_whitespace_and_clamps() {
         assert_eq!(
             normalize_thread_name("  my thread  "),
             Some("my thread".to_string())
+        );
+        assert_eq!(
+            normalize_thread_name("my\nthread\tname"),
+            Some("my thread name".to_string())
+        );
+
+        let long = "a".repeat(MAX_THREAD_NAME_CHARS + 10);
+        let normalized = normalize_thread_name(&long).expect("normalized");
+        assert_eq!(normalized.chars().count(), MAX_THREAD_NAME_CHARS);
+    }
+
+    #[test]
+    fn strip_fork_prefixes_removes_old_and_new_formats() {
+        assert_eq!(
+            strip_fork_prefixes("Fork 2 of Parent thread title"),
+            "Parent thread title"
+        );
+        assert_eq!(
+            strip_fork_prefixes("Fork#3 Parent thread title"),
+            "Parent thread title"
+        );
+        assert_eq!(
+            strip_fork_prefixes("Fork#3 Fork 2 of Parent thread title"),
+            "Parent thread title"
+        );
+    }
+
+    #[test]
+    fn format_fork_thread_name_de_nests_and_normalizes() {
+        assert_eq!(
+            format_fork_thread_name(4, "Fork#1   Parent\nthread\ttitle"),
+            Some("Fork#4 Parent thread title".to_string())
         );
     }
 

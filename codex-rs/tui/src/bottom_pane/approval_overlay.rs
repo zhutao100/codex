@@ -16,6 +16,7 @@ use crate::key_hint::KeyBinding;
 use crate::render::highlight::highlight_bash_to_lines;
 use crate::render::renderable::ColumnRenderable;
 use crate::render::renderable::Renderable;
+use codex_core::config::types::DiffView;
 use codex_core::features::Feature;
 use codex_core::features::Features;
 use codex_core::protocol::ElicitationAction;
@@ -50,6 +51,7 @@ pub(crate) enum ApprovalRequest {
         reason: Option<String>,
         cwd: PathBuf,
         changes: HashMap<PathBuf, FileChange>,
+        diff_view: DiffView,
     },
     McpElicitation {
         server_name: String,
@@ -369,6 +371,7 @@ impl From<ApprovalRequest> for ApprovalRequestState {
                 reason,
                 cwd,
                 changes,
+                diff_view,
             } => {
                 let mut header: Vec<Box<dyn Renderable>> = Vec::new();
                 if let Some(reason) = reason
@@ -380,7 +383,7 @@ impl From<ApprovalRequest> for ApprovalRequestState {
                     ));
                     header.push(Box::new(Line::from("")));
                 }
-                header.push(DiffSummary::new(changes, cwd).into());
+                header.push(DiffSummary::new(changes, cwd, diff_view).into());
                 Self {
                     variant: ApprovalVariant::ApplyPatch { id },
                     header: Box::new(ColumnRenderable::with(header)),

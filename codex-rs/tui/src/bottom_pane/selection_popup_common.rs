@@ -27,6 +27,7 @@ use super::scroll_state::ScrollState;
 #[derive(Default)]
 pub(crate) struct GenericDisplayRow {
     pub name: String,
+    pub name_prefix: Option<Span<'static>>,
     pub display_shortcut: Option<KeyBinding>,
     pub match_indices: Option<Vec<usize>>, // indices to bold (char positions)
     pub description: Option<String>,       // optional grey text after the name
@@ -220,7 +221,11 @@ fn compute_desc_col(
                     .skip(start_idx)
                     .take(visible_items)
                     .map(|(_, row)| {
-                        let mut spans: Vec<Span> = vec![row.name.clone().into()];
+                        let mut spans: Vec<Span> = Vec::new();
+                        if let Some(prefix) = row.name_prefix.clone() {
+                            spans.push(prefix);
+                        }
+                        spans.push(row.name.clone().into());
                         if row.disabled_reason.is_some() {
                             spans.push(" (disabled)".dim());
                         }
@@ -231,7 +236,11 @@ fn compute_desc_col(
                 ColumnWidthMode::AutoAllRows => rows_all
                     .iter()
                     .map(|row| {
-                        let mut spans: Vec<Span> = vec![row.name.clone().into()];
+                        let mut spans: Vec<Span> = Vec::new();
+                        if let Some(prefix) = row.name_prefix.clone() {
+                            spans.push(prefix);
+                        }
+                        spans.push(row.name.clone().into());
                         if row.disabled_reason.is_some() {
                             spans.push(" (disabled)".dim());
                         }
@@ -278,9 +287,13 @@ fn build_full_line(row: &GenericDisplayRow, desc_col: usize) -> Line<'static> {
         .map(|_| desc_col.saturating_sub(2))
         .unwrap_or(usize::MAX);
 
-    let mut name_spans: Vec<Span> = Vec::with_capacity(row.name.len());
+    let mut name_spans: Vec<Span> = Vec::with_capacity(row.name.len().saturating_add(1));
     let mut used_width = 0usize;
     let mut truncated = false;
+    if let Some(prefix) = row.name_prefix.clone() {
+        used_width = used_width.saturating_add(UnicodeWidthStr::width(prefix.content.as_ref()));
+        name_spans.push(prefix);
+    }
 
     if let Some(idxs) = row.match_indices.as_ref() {
         let mut idx_iter = idxs.iter().peekable();

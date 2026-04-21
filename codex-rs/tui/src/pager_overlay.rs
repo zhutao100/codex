@@ -949,7 +949,11 @@ mod tests {
                 content: "hello\nworld\n".to_string(),
             },
         );
-        let approval_cell: Arc<dyn HistoryCell> = Arc::new(new_patch_event(approval_changes, &cwd));
+        let approval_cell: Arc<dyn HistoryCell> = Arc::new(new_patch_event(
+            approval_changes,
+            &cwd,
+            codex_core::config::types::DiffView::Pretty,
+        ));
         cells.push(approval_cell);
 
         let mut apply_changes = HashMap::new();
@@ -959,7 +963,11 @@ mod tests {
                 content: "hello\nworld\n".to_string(),
             },
         );
-        let apply_begin_cell: Arc<dyn HistoryCell> = Arc::new(new_patch_event(apply_changes, &cwd));
+        let apply_begin_cell: Arc<dyn HistoryCell> = Arc::new(new_patch_event(
+            apply_changes,
+            &cwd,
+            codex_core::config::types::DiffView::Pretty,
+        ));
         cells.push(apply_begin_cell);
 
         let apply_end_cell: Arc<dyn HistoryCell> =

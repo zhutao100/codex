@@ -281,6 +281,7 @@ impl RequestUserInputOverlay {
                         let label = opt.label.as_str();
                         let number = idx + 1;
                         GenericDisplayRow {
+                            name_prefix: None,
                             name: format!("{prefix} {number}. {label}"),
                             description: Some(opt.description.clone()),
                             ..Default::default()
@@ -294,6 +295,7 @@ impl RequestUserInputOverlay {
                     let prefix = if selected { '›' } else { ' ' };
                     let number = idx + 1;
                     rows.push(GenericDisplayRow {
+                        name_prefix: None,
                         name: format!("{prefix} {number}. {OTHER_OPTION_LABEL}"),
                         description: Some(OTHER_OPTION_DESCRIPTION.to_string()),
                         ..Default::default()
@@ -820,6 +822,7 @@ impl RequestUserInputOverlay {
                 let prefix = if idx == selected { '›' } else { ' ' };
                 let number = idx + 1;
                 GenericDisplayRow {
+                    name_prefix: None,
                     name: format!("{prefix} {number}. {label}"),
                     description: Some(description.clone()),
                     ..Default::default()

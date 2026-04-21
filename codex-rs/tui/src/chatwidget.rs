@@ -20,6 +20,7 @@
 //! is in progress and while MCP server startup is in progress. Those lifecycles are tracked
 //! independently (`agent_turn_running` and `mcp_startup_status`) and synchronized via
 //! `update_task_running_state`.
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
@@ -83,6 +84,8 @@ use codex_core::protocol::McpToolCallBeginEvent;
 use codex_core::protocol::McpToolCallEndEvent;
 use codex_core::protocol::Op;
 use codex_core::protocol::PatchApplyBeginEvent;
+use codex_core::protocol::ProgressTraceCategory;
+use codex_core::protocol::ProgressTraceEvent;
 use codex_core::protocol::RateLimitSnapshot;
 use codex_core::protocol::ReviewRequest;
 use codex_core::protocol::ReviewTarget;
@@ -132,6 +135,7 @@ use ratatui::style::Modifier;
 use ratatui::style::Style;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
+use ratatui::text::Span;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::Wrap;
 use tokio::sync::mpsc::UnboundedSender;
@@ -145,8 +149,12 @@ const PLAN_IMPLEMENTATION_NO: &str = "No, stay in Plan mode";
 const PLAN_IMPLEMENTATION_CODING_MESSAGE: &str = "Implement the plan.";
 
 use crate::app_event::AppEvent;
+use crate::app_event::ChatExportFormat;
 use crate::app_event::ConnectorsSnapshot;
+use crate::app_event::CopyCodeBlockScope;
+use crate::app_event::CopyMessageFilter;
 use crate::app_event::ExitMode;
+use crate::app_event::ExportOverrides;
 #[cfg(target_os = "windows")]
 use crate::app_event::WindowsSandboxEnableMode;
 use crate::app_event::WindowsSandboxFallbackReason;
@@ -164,12 +172,17 @@ use crate::bottom_pane::FeedbackAudience;
 use crate::bottom_pane::InputResult;
 use crate::bottom_pane::LocalImageAttachment;
 use crate::bottom_pane::QUIT_SHORTCUT_TIMEOUT;
+use crate::bottom_pane::QueuePopup;
+use crate::bottom_pane::QueuePopupItem;
 use crate::bottom_pane::SelectionAction;
 use crate::bottom_pane::SelectionItem;
 use crate::bottom_pane::SelectionViewParams;
 use crate::bottom_pane::custom_prompt_view::CustomPromptView;
 use crate::bottom_pane::popup_consts::standard_popup_hint_line;
+use crate::clipboard_paste::PasteImageError;
+use crate::clipboard_paste::copy_text_to_clipboard;
 use crate::clipboard_paste::paste_image_to_temp_png;
+use crate::clipboard_paste::paste_text_from_clipboard;
 use crate::clipboard_text;
 use crate::collab;
 use crate::collaboration_modes;
@@ -178,6 +191,8 @@ use crate::exec_cell::CommandOutput;
 use crate::exec_cell::ExecCell;
 use crate::exec_cell::new_active_exec_command;
 use crate::exec_command::strip_bash_lc_and_escape;
+use crate::export_markdown;
+use crate::get_git_diff::GitDiffResult;
 use crate::get_git_diff::get_git_diff;
 use crate::history_cell;
 use crate::history_cell::AgentMessageCell;
@@ -187,6 +202,7 @@ use crate::history_cell::PlainHistoryCell;
 use crate::history_cell::WebSearchCell;
 use crate::key_hint;
 use crate::key_hint::KeyBinding;
+use crate::keybindings::Keybindings;
 use crate::markdown::append_markdown;
 use crate::render::Insets;
 use crate::render::renderable::ColumnRenderable;
@@ -210,6 +226,11 @@ mod skills;
 use self::skills::collect_tool_mentions;
 use self::skills::find_app_mentions;
 use self::skills::find_skill_mentions_with_tool_mentions;
+use crate::progress_trace_style::ProgressTraceStyles;
+use crate::progress_trace_style::progress_trace_category_label;
+use crate::progress_trace_style::progress_trace_style_description;
+use crate::progress_trace_style::progress_trace_style_for_category;
+use crate::progress_trace_style::resolve_progress_trace_styles;
 use crate::streaming::chunking::AdaptiveChunkingPolicy;
 use crate::streaming::commit_tick::CommitTickScope;
 use crate::streaming::commit_tick::run_commit_tick;
@@ -222,6 +243,9 @@ use codex_common::approval_presets::builtin_approval_presets;
 use codex_core::AuthManager;
 use codex_core::CodexAuth;
 use codex_core::ThreadManager;
+use codex_core::config::types::CopyUiMode;
+use codex_core::config::types::DiffView;
+use codex_core::config::types::ProgressLegendMode;
 use codex_core::protocol::AskForApproval;
 use codex_core::protocol::SandboxPolicy;
 use codex_file_search::FileMatch;
@@ -487,6 +511,7 @@ pub(crate) struct ChatWidget {
     /// where the overlay may briefly treat new tail content as already cached.
     active_cell_revision: u64,
     config: Config,
+    keybindings: Keybindings,
     /// The unmasked collaboration mode settings (always Default mode).
     ///
     /// Masks are applied on top of this base mode to derive the effective mode.
@@ -541,8 +566,17 @@ pub(crate) struct ChatWidget {
     current_status_header: String,
     // Previous status header to restore after a transient stream retry.
     retry_status_header: Option<String>,
+    // Model used by the currently running turn.
+    running_turn_model: Option<String>,
+    // Reasoning effort used by the currently running turn.
+    running_turn_reasoning_effort: Option<ReasoningEffortConfig>,
     thread_id: Option<ThreadId>,
     thread_name: Option<String>,
+    has_completed_assistant_message: bool,
+    last_assistant_output_markdown: Option<String>,
+    copyable_messages: Vec<CopyableMessage>,
+    copy_code_ui_state: Option<CopyCodeUiState>,
+    copy_message_ui_state: Option<CopyMessageUiState>,
     forked_from: Option<ThreadId>,
     frame_requester: FrameRequester,
     // Whether to include the initial welcome banner on session configured
@@ -551,7 +585,9 @@ pub(crate) struct ChatWidget {
     // immediate redraw on SessionConfigured to prevent a gratuitous UI flicker.
     suppress_session_configured_redraw: bool,
     // User messages queued while a turn is in progress
-    queued_user_messages: VecDeque<UserMessage>,
+    queued_user_messages: VecDeque<QueuedUserMessage>,
+    next_queued_user_message_id: u64,
+    queued_edit_state: Option<QueuedEditState>,
     // Pending notification to show when unfocused on next Draw
     pending_notification: Option<Notification>,
     /// When `Some`, the user has pressed a quit shortcut and the second press
@@ -577,6 +613,14 @@ pub(crate) struct ChatWidget {
     // This gates rendering of the "Worked for …" separator so purely conversational turns don't
     // show an empty divider. It is reset when the separator is emitted.
     had_work_activity: bool,
+    // Progress trace categories collected during the active turn.
+    turn_progress_trace: Vec<ProgressTraceCategory>,
+    // Completed turn trace held until the next separator emission.
+    pending_separator_progress_trace: Option<Vec<ProgressTraceCategory>>,
+    // Configured legend visibility mode for the status indicator.
+    progress_legend_mode: ProgressLegendMode,
+    // Resolved per-category timeline styles.
+    progress_trace_styles: ProgressTraceStyles,
     // Whether the current turn emitted a plan update.
     saw_plan_update_this_turn: bool,
     // Whether the current turn emitted a proposed plan item.
@@ -643,6 +687,41 @@ pub(crate) struct UserMessage {
     mention_paths: HashMap<String, String>,
 }
 
+#[derive(Clone, Debug)]
+struct QueuedUserMessage {
+    id: u64,
+    text: String,
+    local_images: Vec<LocalImageAttachment>,
+    text_elements: Vec<TextElement>,
+    mention_paths: HashMap<String, String>,
+    model_override: Option<String>,
+    effort_override: Option<Option<ReasoningEffortConfig>>,
+}
+
+#[derive(Clone)]
+struct QueuedComposerSnapshot {
+    text: String,
+    text_elements: Vec<TextElement>,
+    local_images: Vec<LocalImageAttachment>,
+    mention_paths: HashMap<String, String>,
+}
+
+#[derive(Clone)]
+struct QueuedUserMessageDraft {
+    text: String,
+    text_elements: Vec<TextElement>,
+    local_images: Vec<LocalImageAttachment>,
+    mention_paths: HashMap<String, String>,
+    model_override: Option<String>,
+    effort_override: Option<Option<ReasoningEffortConfig>>,
+}
+
+struct QueuedEditState {
+    selected_id: u64,
+    composer_before_edit: QueuedComposerSnapshot,
+    drafts: HashMap<u64, QueuedUserMessageDraft>,
+}
+
 impl From<String> for UserMessage {
     fn from(text: String) -> Self {
         Self {
@@ -693,81 +772,6 @@ pub(crate) fn create_initial_user_message(
     }
 }
 
-// When merging multiple queued drafts (e.g., after interrupt), each draft starts numbering
-// its attachments at [Image #1]. Reassign placeholder labels based on the attachment list so
-// the combined local_image_paths order matches the labels, even if placeholders were moved
-// in the text (e.g., [Image #2] appearing before [Image #1]).
-fn remap_placeholders_for_message(message: UserMessage, next_label: &mut usize) -> UserMessage {
-    let UserMessage {
-        text,
-        text_elements,
-        local_images,
-        mention_paths,
-    } = message;
-    if local_images.is_empty() {
-        return UserMessage {
-            text,
-            text_elements,
-            local_images,
-            mention_paths,
-        };
-    }
-
-    let mut mapping: HashMap<String, String> = HashMap::new();
-    let mut remapped_images = Vec::new();
-    for attachment in local_images {
-        let new_placeholder = local_image_label_text(*next_label);
-        *next_label += 1;
-        mapping.insert(attachment.placeholder.clone(), new_placeholder.clone());
-        remapped_images.push(LocalImageAttachment {
-            placeholder: new_placeholder,
-            path: attachment.path,
-        });
-    }
-
-    let mut elements = text_elements;
-    elements.sort_by_key(|elem| elem.byte_range.start);
-
-    let mut cursor = 0usize;
-    let mut rebuilt = String::new();
-    let mut rebuilt_elements = Vec::new();
-    for mut elem in elements {
-        let start = elem.byte_range.start.min(text.len());
-        let end = elem.byte_range.end.min(text.len());
-        if let Some(segment) = text.get(cursor..start) {
-            rebuilt.push_str(segment);
-        }
-
-        let original = text.get(start..end).unwrap_or("");
-        let placeholder = elem.placeholder(&text);
-        let replacement = placeholder
-            .and_then(|ph| mapping.get(ph))
-            .map(String::as_str)
-            .unwrap_or(original);
-
-        let elem_start = rebuilt.len();
-        rebuilt.push_str(replacement);
-        let elem_end = rebuilt.len();
-
-        if let Some(remapped) = placeholder.and_then(|ph| mapping.get(ph)) {
-            elem.set_placeholder(Some(remapped.clone()));
-        }
-        elem.byte_range = (elem_start..elem_end).into();
-        rebuilt_elements.push(elem);
-        cursor = end;
-    }
-    if let Some(segment) = text.get(cursor..) {
-        rebuilt.push_str(segment);
-    }
-
-    UserMessage {
-        text: rebuilt,
-        local_images: remapped_images,
-        text_elements: rebuilt_elements,
-        mention_paths,
-    }
-}
-
 impl ChatWidget {
     /// Synchronize the bottom-pane "task running" indicator with the current lifecycles.
     ///
@@ -776,6 +780,15 @@ impl ChatWidget {
     fn update_task_running_state(&mut self) {
         self.bottom_pane
             .set_task_running(self.agent_turn_running || self.mcp_startup_status.is_some());
+        if self.agent_turn_running {
+            self.bottom_pane
+                .set_active_model(self.running_turn_model.clone());
+            self.bottom_pane
+                .set_active_reasoning_effort(self.running_turn_reasoning_effort);
+        } else {
+            self.bottom_pane.set_active_model(None);
+            self.bottom_pane.set_active_reasoning_effort(None);
+        }
     }
 
     fn restore_reasoning_status_header(&mut self) {
@@ -900,13 +913,19 @@ impl ChatWidget {
 
     /// Applies status-line item selection from the setup view to in-memory config.
     ///
-    /// An empty selection is normalized to `None` so the status line is fully disabled and the
-    /// behavior matches an unset `tui.status_line` config value.
+    /// We persist an explicit empty list when all items are deselected so "unset"
+    /// (`None`) can retain the built-in default footer status line configuration.
     pub(crate) fn setup_status_line(&mut self, items: Vec<StatusLineItem>) {
         tracing::info!("status line setup confirmed with items: {items:#?}");
         let ids = items.iter().map(ToString::to_string).collect::<Vec<_>>();
-        self.config.tui_status_line = if ids.is_empty() { None } else { Some(ids) };
+        self.config.tui_status_line = Some(ids);
         self.refresh_status_line();
+    }
+
+    pub(crate) fn set_progress_legend_mode(&mut self, mode: ProgressLegendMode) {
+        self.progress_legend_mode = mode;
+        self.config.tui_progress_legend_mode = mode;
+        self.bottom_pane.set_progress_legend_mode(mode);
     }
 
     /// Stores async git-branch lookup results for the current status-line cwd.
@@ -951,6 +970,9 @@ impl ChatWidget {
         self.forked_from = event.forked_from_id;
         self.current_rollout_path = event.rollout_path.clone();
         self.current_cwd = Some(event.cwd.clone());
+        self.copyable_messages.clear();
+        self.running_turn_model = None;
+        self.running_turn_reasoning_effort = None;
         let initial_messages = event.initial_messages.clone();
         let forked_from_id = event.forked_from_id;
         self.last_copyable_output = None;
@@ -1043,7 +1065,12 @@ impl ChatWidget {
 
     fn on_thread_name_updated(&mut self, event: codex_core::protocol::ThreadNameUpdatedEvent) {
         if self.thread_id == Some(event.thread_id) {
-            self.thread_name = event.thread_name;
+            self.thread_name = event.thread_name.clone();
+            let message = match event.thread_name.as_deref() {
+                Some(thread_name) => format!("Renamed thread name to \"{thread_name}\"."),
+                None => "Cleared thread name.".to_string(),
+            };
+            self.add_info_message(message, None);
             self.request_redraw();
         }
     }
@@ -1105,7 +1132,15 @@ impl ChatWidget {
         self.request_redraw();
     }
 
-    fn on_agent_message(&mut self, message: String) {
+    fn on_agent_message(&mut self, message: String, from_replay: bool) {
+        if !message.trim().is_empty() {
+            self.has_completed_assistant_message = true;
+            self.last_assistant_output_markdown = Some(message.clone());
+            if from_replay {
+                self.push_copyable_message(CopyableRole::Response, &message);
+            }
+        }
+
         // If we have a stream_controller, then the final agent message is redundant and will be a
         // duplicate of what has already been streamed.
         if self.stream_controller.is_none() && !message.is_empty() {
@@ -1218,6 +1253,10 @@ impl ChatWidget {
     // Raw reasoning uses the same flow as summarized reasoning
 
     fn on_task_started(&mut self) {
+        if self.running_turn_model.is_none() {
+            self.running_turn_model = Some(self.current_model().to_string());
+            self.running_turn_reasoning_effort = self.effective_reasoning_effort();
+        }
         self.agent_turn_running = true;
         self.saw_plan_update_this_turn = false;
         self.saw_plan_item_this_turn = false;
@@ -1232,17 +1271,25 @@ impl ChatWidget {
         self.update_task_running_state();
         self.retry_status_header = None;
         self.bottom_pane.set_interrupt_hint_visible(true);
+        self.bottom_pane.clear_progress_trace();
+        self.turn_progress_trace.clear();
+        self.pending_separator_progress_trace = None;
         self.set_status_header(String::from("Working"));
         self.full_reasoning_buffer.clear();
         self.reasoning_buffer.clear();
+        self.refresh_status_line();
         self.request_redraw();
     }
 
     fn on_task_complete(&mut self, last_agent_message: Option<String>, from_replay: bool) {
-        if let Some(message) = last_agent_message.as_ref()
-            && !message.trim().is_empty()
+        if let Some(last_message) = last_agent_message.as_ref()
+            && !last_message.trim().is_empty()
         {
-            self.last_copyable_output = Some(message.clone());
+            self.last_assistant_output_markdown = Some(last_message.clone());
+            if !from_replay || !self.last_copyable_response_is(last_message) {
+                self.push_copyable_message(CopyableRole::Response, last_message);
+            }
+            self.last_copyable_output = Some(last_message.clone());
         }
         // If a stream is currently active, finalize it.
         self.flush_answer_stream_with_separator();
@@ -1254,6 +1301,11 @@ impl ChatWidget {
         self.flush_unified_exec_wait_streak();
         if !from_replay {
             let runtime_metrics = self.otel_manager.runtime_metrics_summary();
+            let separator_trace = if self.turn_progress_trace.is_empty() {
+                self.pending_separator_progress_trace.take()
+            } else {
+                Some(std::mem::take(&mut self.turn_progress_trace))
+            };
             if runtime_metrics.is_some() {
                 let elapsed_seconds = self
                     .bottom_pane
@@ -1262,6 +1314,8 @@ impl ChatWidget {
                 self.add_to_history(history_cell::FinalMessageSeparator::new(
                     elapsed_seconds,
                     runtime_metrics,
+                    separator_trace,
+                    self.progress_trace_styles,
                 ));
             }
             self.needs_final_message_separator = false;
@@ -1270,12 +1324,18 @@ impl ChatWidget {
         }
         // Mark task stopped and request redraw now that all content is in history.
         self.agent_turn_running = false;
+        self.running_turn_model = None;
+        self.running_turn_reasoning_effort = None;
         self.update_task_running_state();
+        self.bottom_pane.clear_progress_trace();
+        self.turn_progress_trace.clear();
+        self.pending_separator_progress_trace = None;
         self.running_commands.clear();
         self.suppressed_exec_calls.clear();
         self.last_unified_wait = None;
         self.unified_exec_wait_streak = None;
         self.clear_unified_exec_processes();
+        self.refresh_status_line();
         self.request_redraw();
 
         if !from_replay && self.queued_user_messages.is_empty() {
@@ -1491,7 +1551,10 @@ impl ChatWidget {
         self.finalize_active_cell_as_failed();
         // Reset running state and clear streaming buffers.
         self.agent_turn_running = false;
+        self.running_turn_model = None;
+        self.running_turn_reasoning_effort = None;
         self.update_task_running_state();
+        self.bottom_pane.clear_progress_trace();
         self.running_commands.clear();
         self.suppressed_exec_calls.clear();
         self.last_unified_wait = None;
@@ -1501,6 +1564,7 @@ impl ChatWidget {
         self.stream_controller = None;
         self.plan_stream_controller = None;
         self.request_status_line_branch_refresh();
+        self.refresh_status_line();
         self.maybe_show_pending_rate_limit_prompt();
     }
 
@@ -1605,8 +1669,7 @@ impl ChatWidget {
     }
 
     /// Handle a turn aborted due to user interrupt (Esc).
-    /// When there are queued user messages, restore them into the composer
-    /// separated by newlines rather than auto‑submitting the next one.
+    /// Keep queued messages in the queue for later.
     fn on_interrupted_turn(&mut self, reason: TurnAbortReason) {
         // Finalize, log a gentle prompt, and clear running state.
         self.finalize_turn();
@@ -1617,77 +1680,7 @@ impl ChatWidget {
             ));
         }
 
-        if let Some(combined) = self.drain_queued_messages_for_restore() {
-            let combined_local_image_paths = combined
-                .local_images
-                .iter()
-                .map(|img| img.path.clone())
-                .collect();
-            self.bottom_pane.set_composer_text(
-                combined.text,
-                combined.text_elements,
-                combined_local_image_paths,
-            );
-            self.refresh_queued_user_messages();
-        }
-
         self.request_redraw();
-    }
-
-    /// Merge queued drafts (plus the current composer state) into a single message for restore.
-    ///
-    /// Each queued draft numbers attachments from `[Image #1]`. When we concatenate drafts, we
-    /// must renumber placeholders in a stable order so the merged attachment list stays aligned
-    /// with the labels embedded in text. This helper drains the queue, remaps placeholders, and
-    /// fixes text element byte ranges as content is appended. Returns `None` when there is nothing
-    /// to restore.
-    fn drain_queued_messages_for_restore(&mut self) -> Option<UserMessage> {
-        if self.queued_user_messages.is_empty() {
-            return None;
-        }
-
-        let existing_message = UserMessage {
-            text: self.bottom_pane.composer_text(),
-            text_elements: self.bottom_pane.composer_text_elements(),
-            local_images: self.bottom_pane.composer_local_images(),
-            mention_paths: HashMap::new(),
-        };
-
-        let mut to_merge: Vec<UserMessage> = self.queued_user_messages.drain(..).collect();
-        if !existing_message.text.is_empty() || !existing_message.local_images.is_empty() {
-            to_merge.push(existing_message);
-        }
-
-        let mut combined = UserMessage {
-            text: String::new(),
-            text_elements: Vec::new(),
-            local_images: Vec::new(),
-            mention_paths: HashMap::new(),
-        };
-        let mut combined_offset = 0usize;
-        let mut next_image_label = 1usize;
-
-        for (idx, message) in to_merge.into_iter().enumerate() {
-            if idx > 0 {
-                combined.text.push('\n');
-                combined_offset += 1;
-            }
-            let message = remap_placeholders_for_message(message, &mut next_image_label);
-            let base = combined_offset;
-            combined.text.push_str(&message.text);
-            combined_offset += message.text.len();
-            combined
-                .text_elements
-                .extend(message.text_elements.into_iter().map(|mut elem| {
-                    elem.byte_range.start += base;
-                    elem.byte_range.end += base;
-                    elem
-                }));
-            combined.local_images.extend(message.local_images);
-            combined.mention_paths.extend(message.mention_paths);
-        }
-
-        Some(combined)
     }
 
     fn on_plan_update(&mut self, update: UpdatePlanArgs) {
@@ -1727,6 +1720,19 @@ impl ChatWidget {
             |q| q.push_user_input(ev),
             |s| s.handle_request_user_input_now(ev2),
         );
+    }
+
+    fn on_progress_trace(&mut self, ev: ProgressTraceEvent) {
+        if matches!(ev.state, codex_core::protocol::ProgressTraceState::Started) {
+            self.turn_progress_trace.push(ev.category);
+            const MAX_TURN_TRACE_SEGMENTS: usize = 128;
+            if self.turn_progress_trace.len() > MAX_TURN_TRACE_SEGMENTS {
+                let remove_count = self.turn_progress_trace.len() - MAX_TURN_TRACE_SEGMENTS;
+                self.turn_progress_trace.drain(0..remove_count);
+            }
+        }
+        self.bottom_pane
+            .record_progress_trace(ev.category, ev.state, ev.label);
     }
 
     fn on_exec_command_begin(&mut self, ev: ExecCommandBeginEvent) {
@@ -1815,6 +1821,7 @@ impl ChatWidget {
         self.add_to_history(history_cell::new_patch_event(
             event.changes,
             &self.config.cwd,
+            self.config.diff_view,
         ));
     }
 
@@ -2147,9 +2154,16 @@ impl ChatWidget {
                     .status_widget()
                     .map(super::status_indicator_widget::StatusIndicatorWidget::elapsed_seconds)
                     .map(|current| self.worked_elapsed_from(current));
+                let separator_trace = if self.turn_progress_trace.is_empty() {
+                    self.pending_separator_progress_trace.take()
+                } else {
+                    Some(std::mem::take(&mut self.turn_progress_trace))
+                };
                 self.add_to_history(history_cell::FinalMessageSeparator::new(
                     elapsed_seconds,
                     None,
+                    separator_trace,
+                    self.progress_trace_styles,
                 ));
                 self.needs_final_message_separator = false;
                 self.had_work_activity = false;
@@ -2282,6 +2296,7 @@ impl ChatWidget {
             reason: ev.reason,
             changes: ev.changes.clone(),
             cwd: self.config.cwd.clone(),
+            diff_view: self.config.diff_view,
         };
         self.bottom_pane
             .push_approval_request(request, &self.config.features);
@@ -2427,6 +2442,15 @@ impl ChatWidget {
         self.had_work_activity = true;
     }
 
+    fn resolve_keybindings(config: &Config, enhanced_keys_supported: bool) -> Keybindings {
+        #[cfg(target_os = "linux")]
+        let is_wsl = crate::clipboard_paste::is_probably_wsl();
+        #[cfg(not(target_os = "linux"))]
+        let is_wsl = false;
+
+        Keybindings::from_config(&config.keybindings, enhanced_keys_supported, is_wsl)
+    }
+
     pub(crate) fn new(common: ChatWidgetInit, thread_manager: Arc<ThreadManager>) -> Self {
         let ChatWidgetInit {
             config,
@@ -2446,6 +2470,13 @@ impl ChatWidget {
         let model = model.filter(|m| !m.trim().is_empty());
         let mut config = config;
         config.model = model.clone();
+        let keybindings = Self::resolve_keybindings(&config, enhanced_keys_supported);
+        let progress_legend_mode = config.tui_progress_legend_mode;
+        let (progress_trace_styles, progress_trace_style_warnings) =
+            resolve_progress_trace_styles(config.tui_progress_trace_style.as_ref());
+        crate::markdown_render::set_syntax_highlight_theme(
+            config.tui_syntax_highlight_theme.clone(),
+        );
         let mut rng = rand::rng();
         let placeholder = PLACEHOLDERS[rng.random_range(0..PLACEHOLDERS.len())].to_string();
         let codex_op_tx = spawn_agent(config.clone(), app_event_tx.clone(), thread_manager);
@@ -2486,11 +2517,14 @@ impl ChatWidget {
                 placeholder_text: placeholder,
                 disable_paste_burst: config.disable_paste_burst,
                 animations_enabled: config.animations,
+                progress_legend_mode,
+                progress_trace_styles,
                 skills: None,
             }),
             active_cell,
             active_cell_revision: 0,
             config,
+            keybindings,
             skills_all: Vec::new(),
             skills_initial_state: None,
             current_collaboration_mode,
@@ -2524,10 +2558,19 @@ impl ChatWidget {
             full_reasoning_buffer: String::new(),
             current_status_header: String::from("Working"),
             retry_status_header: None,
+            running_turn_model: None,
+            running_turn_reasoning_effort: None,
             thread_id: None,
             thread_name: None,
+            has_completed_assistant_message: false,
+            last_assistant_output_markdown: None,
+            copyable_messages: Vec::new(),
+            copy_code_ui_state: None,
+            copy_message_ui_state: None,
             forked_from: None,
             queued_user_messages: VecDeque::new(),
+            next_queued_user_message_id: 1,
+            queued_edit_state: None,
             show_welcome_banner: is_first_run,
             suppress_session_configured_redraw: false,
             pending_notification: None,
@@ -2537,6 +2580,10 @@ impl ChatWidget {
             pre_review_token_info: None,
             needs_final_message_separator: false,
             had_work_activity: false,
+            turn_progress_trace: Vec::new(),
+            pending_separator_progress_trace: None,
+            progress_legend_mode,
+            progress_trace_styles,
             saw_plan_update_this_turn: false,
             saw_plan_item_this_turn: false,
             plan_delta_buffer: String::new(),
@@ -2555,17 +2602,21 @@ impl ChatWidget {
             external_editor_state: ExternalEditorState::Closed,
         };
 
+        for warning in progress_trace_style_warnings {
+            widget.add_to_history(history_cell::new_warning_event(warning));
+        }
+
+        widget
+            .bottom_pane
+            .set_keybindings(widget.keybindings.clone());
         widget.prefetch_rate_limits();
         widget
             .bottom_pane
             .set_steer_enabled(widget.config.features.enabled(Feature::Steer));
-        widget.bottom_pane.set_status_line_enabled(
-            widget
-                .config
-                .tui_status_line
-                .as_ref()
-                .is_some_and(|items| !items.is_empty()),
-        );
+        let status_line_enabled = !widget.status_line_items_with_invalids().0.is_empty();
+        widget
+            .bottom_pane
+            .set_status_line_enabled(status_line_enabled);
         widget.bottom_pane.set_collaboration_modes_enabled(
             widget.config.features.enabled(Feature::CollaborationModes),
         );
@@ -2579,6 +2630,8 @@ impl ChatWidget {
                 ),
         );
         widget.update_collaboration_mode_indicator();
+        widget.refresh_model_display();
+        widget.refresh_status_line();
 
         widget
             .bottom_pane
@@ -2609,6 +2662,13 @@ impl ChatWidget {
         let model = model.filter(|m| !m.trim().is_empty());
         let mut config = config;
         config.model = model.clone();
+        let keybindings = Self::resolve_keybindings(&config, enhanced_keys_supported);
+        let progress_legend_mode = config.tui_progress_legend_mode;
+        let (progress_trace_styles, progress_trace_style_warnings) =
+            resolve_progress_trace_styles(config.tui_progress_trace_style.as_ref());
+        crate::markdown_render::set_syntax_highlight_theme(
+            config.tui_syntax_highlight_theme.clone(),
+        );
         let mut rng = rand::rng();
         let placeholder = PLACEHOLDERS[rng.random_range(0..PLACEHOLDERS.len())].to_string();
 
@@ -2648,11 +2708,14 @@ impl ChatWidget {
                 placeholder_text: placeholder,
                 disable_paste_burst: config.disable_paste_burst,
                 animations_enabled: config.animations,
+                progress_legend_mode,
+                progress_trace_styles,
                 skills: None,
             }),
             active_cell,
             active_cell_revision: 0,
             config,
+            keybindings,
             skills_all: Vec::new(),
             skills_initial_state: None,
             current_collaboration_mode,
@@ -2686,14 +2749,23 @@ impl ChatWidget {
             full_reasoning_buffer: String::new(),
             current_status_header: String::from("Working"),
             retry_status_header: None,
+            running_turn_model: None,
+            running_turn_reasoning_effort: None,
             thread_id: None,
             thread_name: None,
+            has_completed_assistant_message: false,
+            last_assistant_output_markdown: None,
+            copyable_messages: Vec::new(),
+            copy_code_ui_state: None,
+            copy_message_ui_state: None,
             forked_from: None,
             saw_plan_update_this_turn: false,
             saw_plan_item_this_turn: false,
             plan_delta_buffer: String::new(),
             plan_item_active: false,
             queued_user_messages: VecDeque::new(),
+            next_queued_user_message_id: 1,
+            queued_edit_state: None,
             show_welcome_banner: is_first_run,
             suppress_session_configured_redraw: false,
             pending_notification: None,
@@ -2703,6 +2775,10 @@ impl ChatWidget {
             pre_review_token_info: None,
             needs_final_message_separator: false,
             had_work_activity: false,
+            turn_progress_trace: Vec::new(),
+            pending_separator_progress_trace: None,
+            progress_legend_mode,
+            progress_trace_styles,
             last_separator_elapsed_secs: None,
             last_rendered_width: std::cell::Cell::new(None),
             feedback,
@@ -2717,21 +2793,26 @@ impl ChatWidget {
             external_editor_state: ExternalEditorState::Closed,
         };
 
+        for warning in progress_trace_style_warnings {
+            widget.add_to_history(history_cell::new_warning_event(warning));
+        }
+
+        widget
+            .bottom_pane
+            .set_keybindings(widget.keybindings.clone());
         widget.prefetch_rate_limits();
         widget
             .bottom_pane
             .set_steer_enabled(widget.config.features.enabled(Feature::Steer));
-        widget.bottom_pane.set_status_line_enabled(
-            widget
-                .config
-                .tui_status_line
-                .as_ref()
-                .is_some_and(|items| !items.is_empty()),
-        );
+        let status_line_enabled = !widget.status_line_items_with_invalids().0.is_empty();
+        widget
+            .bottom_pane
+            .set_status_line_enabled(status_line_enabled);
         widget.bottom_pane.set_collaboration_modes_enabled(
             widget.config.features.enabled(Feature::CollaborationModes),
         );
         widget.sync_personality_command_enabled();
+        widget.refresh_status_line();
 
         widget
     }
@@ -2758,6 +2839,13 @@ impl ChatWidget {
             otel_manager,
         } = common;
         let model = model.filter(|m| !m.trim().is_empty());
+        let keybindings = Self::resolve_keybindings(&config, enhanced_keys_supported);
+        let progress_legend_mode = config.tui_progress_legend_mode;
+        let (progress_trace_styles, progress_trace_style_warnings) =
+            resolve_progress_trace_styles(config.tui_progress_trace_style.as_ref());
+        crate::markdown_render::set_syntax_highlight_theme(
+            config.tui_syntax_highlight_theme.clone(),
+        );
         let mut rng = rand::rng();
         let placeholder = PLACEHOLDERS[rng.random_range(0..PLACEHOLDERS.len())].to_string();
 
@@ -2799,11 +2887,14 @@ impl ChatWidget {
                 placeholder_text: placeholder,
                 disable_paste_burst: config.disable_paste_burst,
                 animations_enabled: config.animations,
+                progress_legend_mode,
+                progress_trace_styles,
                 skills: None,
             }),
             active_cell: None,
             active_cell_revision: 0,
             config,
+            keybindings,
             skills_all: Vec::new(),
             skills_initial_state: None,
             current_collaboration_mode,
@@ -2837,10 +2928,19 @@ impl ChatWidget {
             full_reasoning_buffer: String::new(),
             current_status_header: String::from("Working"),
             retry_status_header: None,
+            running_turn_model: None,
+            running_turn_reasoning_effort: None,
             thread_id: None,
             thread_name: None,
+            has_completed_assistant_message: false,
+            last_assistant_output_markdown: None,
+            copyable_messages: Vec::new(),
+            copy_code_ui_state: None,
+            copy_message_ui_state: None,
             forked_from: None,
             queued_user_messages: VecDeque::new(),
+            next_queued_user_message_id: 1,
+            queued_edit_state: None,
             show_welcome_banner: false,
             suppress_session_configured_redraw: true,
             pending_notification: None,
@@ -2850,6 +2950,10 @@ impl ChatWidget {
             pre_review_token_info: None,
             needs_final_message_separator: false,
             had_work_activity: false,
+            turn_progress_trace: Vec::new(),
+            pending_separator_progress_trace: None,
+            progress_legend_mode,
+            progress_trace_styles,
             saw_plan_update_this_turn: false,
             saw_plan_item_this_turn: false,
             plan_delta_buffer: String::new(),
@@ -2868,17 +2972,21 @@ impl ChatWidget {
             external_editor_state: ExternalEditorState::Closed,
         };
 
+        for warning in progress_trace_style_warnings {
+            widget.add_to_history(history_cell::new_warning_event(warning));
+        }
+
+        widget
+            .bottom_pane
+            .set_keybindings(widget.keybindings.clone());
         widget.prefetch_rate_limits();
         widget
             .bottom_pane
             .set_steer_enabled(widget.config.features.enabled(Feature::Steer));
-        widget.bottom_pane.set_status_line_enabled(
-            widget
-                .config
-                .tui_status_line
-                .as_ref()
-                .is_some_and(|items| !items.is_empty()),
-        );
+        let status_line_enabled = !widget.status_line_items_with_invalids().0.is_empty();
+        widget
+            .bottom_pane
+            .set_status_line_enabled(status_line_enabled);
         widget.bottom_pane.set_collaboration_modes_enabled(
             widget.config.features.enabled(Feature::CollaborationModes),
         );
@@ -2892,6 +3000,8 @@ impl ChatWidget {
                 ),
         );
         widget.update_collaboration_mode_indicator();
+        widget.refresh_model_display();
+        widget.refresh_status_line();
 
         widget
     }
@@ -2920,31 +3030,48 @@ impl ChatWidget {
                 self.quit_shortcut_expires_at = None;
                 self.quit_shortcut_key = None;
             }
-            KeyEvent {
-                code: KeyCode::Char(c),
-                modifiers,
-                kind: KeyEventKind::Press,
-                ..
-            } if modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-                && c.eq_ignore_ascii_case(&'v') =>
+            key_event
+                if key_event.kind == KeyEventKind::Press
+                    && self
+                        .keybindings
+                        .paste
+                        .iter()
+                        .any(|binding| binding.matches(&key_event)) =>
             {
-                match paste_image_to_temp_png() {
-                    Ok((path, info)) => {
-                        tracing::debug!(
-                            "pasted image size={}x{} format={}",
-                            info.width,
-                            info.height,
-                            info.encoded_format.label()
-                        );
-                        self.attach_image(path);
-                    }
-                    Err(err) => {
-                        tracing::warn!("failed to paste image: {err}");
-                        self.add_to_history(history_cell::new_error_event(format!(
-                            "Failed to paste image: {err}",
-                        )));
-                    }
-                }
+                self.paste_from_clipboard();
+                return;
+            }
+            key_event
+                if key_event.kind == KeyEventKind::Press
+                    && self
+                        .keybindings
+                        .copy_prompt
+                        .iter()
+                        .any(|binding| binding.matches(&key_event)) =>
+            {
+                self.copy_prompt_to_clipboard();
+                return;
+            }
+            key_event
+                if key_event.kind == KeyEventKind::Press
+                    && self
+                        .keybindings
+                        .copy_last_output
+                        .iter()
+                        .any(|binding| binding.matches(&key_event)) =>
+            {
+                self.copy_last_output_to_clipboard();
+                return;
+            }
+            key_event
+                if key_event.kind == KeyEventKind::Press
+                    && self
+                        .keybindings
+                        .copy_code_block
+                        .iter()
+                        .any(|binding| binding.matches(&key_event)) =>
+            {
+                self.open_copy_code_block_picker();
                 return;
             }
             other if other.kind == KeyEventKind::Press => {
@@ -2955,7 +3082,89 @@ impl ChatWidget {
             _ => {}
         }
 
+        if self.queued_edit_state.is_some()
+            && self.bottom_pane.no_modal_or_popup_active()
+            && self.handle_queue_edit_key_event(key_event)
+        {
+            return;
+        }
+
         match key_event {
+            KeyEvent {
+                code: KeyCode::Char('o' | 'O'),
+                modifiers: KeyModifiers::CONTROL,
+                kind: KeyEventKind::Press,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('\u{000f}'),
+                modifiers: KeyModifiers::NONE,
+                kind: KeyEventKind::Press,
+                ..
+            } if self.bottom_pane.no_modal_or_popup_active()
+                && !self.queued_user_messages.is_empty()
+                && self.queued_edit_state.is_none() =>
+            {
+                self.open_queue_popup();
+            }
+            KeyEvent {
+                code: KeyCode::Char('y' | 'Y'),
+                modifiers: KeyModifiers::CONTROL,
+                kind: KeyEventKind::Press,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('\u{0019}'),
+                modifiers: KeyModifiers::NONE,
+                kind: KeyEventKind::Press,
+                ..
+            } if self.bottom_pane.no_modal_or_popup_active()
+                && !self.bottom_pane.is_task_running()
+                && !self.queued_user_messages.is_empty()
+                && self.queued_edit_state.is_none() =>
+            {
+                self.send_next_queued_user_message();
+            }
+            KeyEvent {
+                code: KeyCode::Right,
+                modifiers,
+                kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                ..
+            } if modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+                && self.bottom_pane.no_modal_or_popup_active() =>
+            {
+                self.cycle_model_shortcut(1);
+            }
+            KeyEvent {
+                code: KeyCode::Left,
+                modifiers,
+                kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                ..
+            } if modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+                && self.bottom_pane.no_modal_or_popup_active() =>
+            {
+                self.cycle_model_shortcut(-1);
+            }
+            KeyEvent {
+                code: KeyCode::Down,
+                modifiers,
+                kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                ..
+            } if modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+                && self.bottom_pane.no_modal_or_popup_active() =>
+            {
+                self.cycle_reasoning_effort_shortcut(-1);
+            }
+            KeyEvent {
+                code: KeyCode::Up,
+                modifiers,
+                kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                ..
+            } if modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+                && self.bottom_pane.no_modal_or_popup_active() =>
+            {
+                self.cycle_reasoning_effort_shortcut(1);
+            }
             KeyEvent {
                 code: KeyCode::BackTab,
                 kind: KeyEventKind::Press,
@@ -2967,26 +3176,20 @@ impl ChatWidget {
                 self.cycle_collaboration_mode();
             }
             KeyEvent {
+                code: KeyCode::Char('q' | 'Q'),
+                modifiers: KeyModifiers::ALT,
+                kind: KeyEventKind::Press,
+                ..
+            } if !self.queued_user_messages.is_empty() && self.queued_edit_state.is_none() => {
+                self.open_queue_popup();
+            }
+            KeyEvent {
                 code: KeyCode::Up,
                 modifiers: KeyModifiers::ALT,
                 kind: KeyEventKind::Press,
                 ..
             } if !self.queued_user_messages.is_empty() => {
-                // Prefer the most recently queued item.
-                if let Some(user_message) = self.queued_user_messages.pop_back() {
-                    let local_image_paths = user_message
-                        .local_images
-                        .iter()
-                        .map(|img| img.path.clone())
-                        .collect();
-                    self.bottom_pane.set_composer_text(
-                        user_message.text,
-                        user_message.text_elements,
-                        local_image_paths,
-                    );
-                    self.refresh_queued_user_messages();
-                    self.request_redraw();
-                }
+                self.begin_queue_edit_most_recent();
             }
             _ => match self.bottom_pane.handle_key_event(key_event) {
                 InputResult::Submitted {
@@ -3115,6 +3318,16 @@ impl ChatWidget {
             SlashCommand::Resume => {
                 self.app_event_tx.send(AppEvent::OpenResumePicker);
             }
+            SlashCommand::Session => {
+                self.app_event_tx.send(AppEvent::OpenSessionsPicker {
+                    view: crate::sessions_picker::SessionView::Active,
+                });
+            }
+            SlashCommand::Archived => {
+                self.app_event_tx.send(AppEvent::OpenSessionsPicker {
+                    view: crate::sessions_picker::SessionView::Archived,
+                });
+            }
             SlashCommand::Fork => {
                 self.app_event_tx.send(AppEvent::ForkCurrentSession);
             }
@@ -3138,7 +3351,10 @@ impl ChatWidget {
                 self.open_review_popup();
             }
             SlashCommand::Rename => {
-                self.show_rename_prompt();
+                self.open_rename_thread_view();
+            }
+            SlashCommand::Export => {
+                self.open_export_picker();
             }
             SlashCommand::Model => {
                 self.open_model_popup();
@@ -3245,18 +3461,16 @@ impl ChatWidget {
             SlashCommand::Diff => {
                 self.add_diff_in_progress();
                 let tx = self.app_event_tx.clone();
+                let cwd = self.config.cwd.clone();
+                let diff_view = self.config.diff_view;
+                let syntax_theme = self.config.tui_syntax_highlight_theme.clone();
+                let width = self.last_rendered_width.get().unwrap_or(80);
                 tokio::spawn(async move {
-                    let text = match get_git_diff().await {
-                        Ok((is_git_repo, diff_text)) => {
-                            if is_git_repo {
-                                diff_text
-                            } else {
-                                "`/diff` — _not inside a git repository_".to_string()
-                            }
-                        }
-                        Err(e) => format!("Failed to compute diff: {e}"),
+                    let result = match get_git_diff(&cwd, diff_view, width, &syntax_theme).await {
+                        Ok(result) => result,
+                        Err(e) => GitDiffResult::Error(format!("Failed to compute diff: {e}")),
                     };
-                    tx.send(AppEvent::DiffResult(text));
+                    tx.send(AppEvent::DiffResult(result));
                 });
             }
             SlashCommand::Copy => {
@@ -3288,6 +3502,12 @@ impl ChatWidget {
             SlashCommand::Mention => {
                 self.insert_str("@");
             }
+            SlashCommand::CopyCodeBlock => {
+                self.open_copy_code_block_picker();
+            }
+            SlashCommand::CopyMessage => {
+                self.open_copy_message_picker(CopyMessageFilter::Responses);
+            }
             SlashCommand::Skills => {
                 self.open_skills_menu();
             }
@@ -3300,6 +3520,15 @@ impl ChatWidget {
             SlashCommand::Statusline => {
                 self.open_status_line_setup();
             }
+            SlashCommand::Legend => {
+                self.open_progress_legend_popup();
+            }
+            SlashCommand::LegendMode => {
+                self.add_info_message(
+                    format!("Progress legend mode is '{}'.", self.progress_legend_mode),
+                    Some("Use /legend-mode off|auto|always to change it.".to_string()),
+                );
+            }
             SlashCommand::Ps => {
                 self.add_ps_output();
             }
@@ -3308,6 +3537,13 @@ impl ChatWidget {
             }
             SlashCommand::Apps => {
                 self.add_connectors_output();
+            }
+            SlashCommand::Queue => {
+                if self.queued_user_messages.is_empty() {
+                    self.add_info_message("Queue is empty.".to_string(), None);
+                } else {
+                    self.open_queue_popup();
+                }
             }
             SlashCommand::Rollout => {
                 if let Some(path) = self.rollout_path() {
@@ -3382,6 +3618,17 @@ impl ChatWidget {
 
         let trimmed = args.trim();
         match cmd {
+            SlashCommand::Export if !trimmed.is_empty() => {
+                match parse_export_args(trimmed, &self.config.cwd) {
+                    Ok(parsed) => {
+                        self.start_export(parsed.format, parsed.overrides);
+                        self.bottom_pane.drain_pending_submission_state();
+                    }
+                    Err(message) => {
+                        self.add_error_message(message);
+                    }
+                }
+            }
             SlashCommand::Rename if !trimmed.is_empty() => {
                 let Some((prepared_args, _prepared_elements)) =
                     self.bottom_pane.prepare_inline_args_submission(false)
@@ -3392,9 +3639,6 @@ impl ChatWidget {
                     self.add_error_message("Thread name cannot be empty.".to_string());
                     return;
                 };
-                let cell = Self::rename_confirmation_cell(&name, self.thread_id);
-                self.add_boxed_history(Box::new(cell));
-                self.request_redraw();
                 self.app_event_tx
                     .send(AppEvent::CodexOp(Op::SetThreadName { name }));
                 self.bottom_pane.drain_pending_submission_state();
@@ -3442,11 +3686,75 @@ impl ChatWidget {
                 });
                 self.bottom_pane.drain_pending_submission_state();
             }
+            SlashCommand::Diff => {
+                let diff_view = match diff_view_override_from_args(trimmed, self.config.diff_view) {
+                    Ok(view) => view,
+                    Err(message) => {
+                        self.add_error_message(message);
+                        return;
+                    }
+                };
+                self.add_diff_in_progress();
+                let tx = self.app_event_tx.clone();
+                let cwd = self.config.cwd.clone();
+                let syntax_theme = self.config.tui_syntax_highlight_theme.clone();
+                let width = self.last_rendered_width.get().unwrap_or(80);
+                tokio::spawn(async move {
+                    let result = match get_git_diff(&cwd, diff_view, width, &syntax_theme).await {
+                        Ok(result) => result,
+                        Err(e) => GitDiffResult::Error(format!("Failed to compute diff: {e}")),
+                    };
+                    tx.send(AppEvent::DiffResult(result));
+                });
+            }
+            SlashCommand::LegendMode => match parse_progress_legend_mode(trimmed) {
+                Ok(mode) => {
+                    self.app_event_tx
+                        .send(AppEvent::SetProgressLegendMode { mode });
+                    self.bottom_pane.drain_pending_submission_state();
+                }
+                Err(err) => {
+                    self.add_error_message(err);
+                }
+            },
             _ => self.dispatch_command(cmd),
         }
     }
 
-    fn show_rename_prompt(&mut self) {
+    fn open_rename_thread_view(&mut self) {
+        let mut items = Vec::new();
+        items.push(SelectionItem {
+            name: "Rename manually".to_string(),
+            description: Some("Set a custom name.".to_string()),
+            actions: vec![Box::new(|tx| {
+                tx.send(AppEvent::OpenRenameThreadPrompt);
+            })],
+            dismiss_on_select: true,
+            ..Default::default()
+        });
+
+        if self.has_completed_assistant_message {
+            items.push(SelectionItem {
+                name: "Generate thread name".to_string(),
+                description: Some("Generate a name automatically.".to_string()),
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::CodexOp(Op::AutoRenameThread));
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            });
+        }
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            title: Some("Rename thread".to_string()),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            ..Default::default()
+        });
+        self.request_redraw();
+    }
+
+    pub(crate) fn show_rename_prompt(&mut self) {
         let tx = self.app_event_tx.clone();
         let has_name = self
             .thread_name
@@ -3457,7 +3765,6 @@ impl ChatWidget {
         } else {
             "Name thread"
         };
-        let thread_id = self.thread_id;
         let view = CustomPromptView::new(
             title.to_string(),
             "Type a name and press Enter".to_string(),
@@ -3469,8 +3776,6 @@ impl ChatWidget {
                     )));
                     return;
                 };
-                let cell = Self::rename_confirmation_cell(&name, thread_id);
-                tx.send(AppEvent::InsertHistoryCell(Box::new(cell)));
                 tx.send(AppEvent::CodexOp(Op::SetThreadName { name }));
             }),
         );
@@ -3478,7 +3783,205 @@ impl ChatWidget {
         self.bottom_pane.show_view(Box::new(view));
     }
 
+    fn open_export_picker(&mut self) {
+        if self.current_rollout_path.is_none() {
+            self.add_info_message("Export is not available yet.".to_string(), None);
+            return;
+        }
+
+        let items = vec![
+            SelectionItem {
+                name: "Markdown (.md)".to_string(),
+                description: Some("Readable transcript for sharing.".to_string()),
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::ExportChat {
+                        format: Some(ChatExportFormat::Markdown),
+                        overrides: ExportOverrides::default(),
+                    });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+            SelectionItem {
+                name: "Markdown (.md) in current dir".to_string(),
+                description: Some("Creates a file in the current directory.".to_string()),
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::ExportChat {
+                        format: Some(ChatExportFormat::Markdown),
+                        overrides: ExportOverrides {
+                            output_dir: Some(PathBuf::from(".")),
+                            ..Default::default()
+                        },
+                    });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+            SelectionItem {
+                name: "Markdown (custom path...)".to_string(),
+                description: Some("Choose a destination path.".to_string()),
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::OpenExportPathPrompt {
+                        format: ChatExportFormat::Markdown,
+                    });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+            SelectionItem {
+                name: "JSON (.json)".to_string(),
+                description: Some("Structured messages for tooling.".to_string()),
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::ExportChat {
+                        format: Some(ChatExportFormat::Json),
+                        overrides: ExportOverrides::default(),
+                    });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+            SelectionItem {
+                name: "JSON (.json) in current dir".to_string(),
+                description: Some("Creates a file in the current directory.".to_string()),
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::ExportChat {
+                        format: Some(ChatExportFormat::Json),
+                        overrides: ExportOverrides {
+                            output_dir: Some(PathBuf::from(".")),
+                            ..Default::default()
+                        },
+                    });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+            SelectionItem {
+                name: "JSON (custom path...)".to_string(),
+                description: Some("Choose a destination path.".to_string()),
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::OpenExportPathPrompt {
+                        format: ChatExportFormat::Json,
+                    });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+        ];
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            title: Some("Export Chat".to_string()),
+            subtitle: Some("Creates a file next to the rollout (.jsonl).".to_string()),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            ..Default::default()
+        });
+        self.request_redraw();
+    }
+
+    pub(crate) fn open_export_path_prompt(&mut self, format: ChatExportFormat) {
+        let Some(rollout_path) = self.current_rollout_path.clone() else {
+            self.add_info_message("Export is not available yet.".to_string(), None);
+            return;
+        };
+
+        let default_path = match resolve_export_destination(
+            &rollout_path,
+            Some(format),
+            &ExportOverrides::default(),
+        ) {
+            Ok(destination) => destination.path,
+            Err(message) => {
+                self.add_error_message(message);
+                return;
+            }
+        };
+
+        let placeholder = format!("Path (default: {})", default_path.display());
+        let context_label = Some(format!("Format: {}", format.label()));
+        let tx = self.app_event_tx.clone();
+        let cwd = self.config.cwd.clone();
+        let view = CustomPromptView::new(
+            "Export path".to_string(),
+            placeholder,
+            context_label,
+            Box::new(move |input: String| {
+                let trimmed = input.trim();
+                let overrides = if trimmed.is_empty() {
+                    ExportOverrides::default()
+                } else {
+                    export_overrides_from_path_input(trimmed, &cwd)
+                };
+                tx.send(AppEvent::ExportChat {
+                    format: Some(format),
+                    overrides,
+                });
+            }),
+        );
+        self.bottom_pane.show_view(Box::new(view));
+        self.request_redraw();
+    }
+
+    pub(crate) fn start_export(
+        &mut self,
+        format: Option<ChatExportFormat>,
+        overrides: ExportOverrides,
+    ) {
+        let Some(rollout_path) = self.current_rollout_path.clone() else {
+            self.add_info_message("Export is not available yet.".to_string(), None);
+            return;
+        };
+
+        let destination = match resolve_export_destination(&rollout_path, format, &overrides) {
+            Ok(destination) => destination,
+            Err(message) => {
+                self.add_error_message(message);
+                return;
+            }
+        };
+
+        let out_path = destination.path;
+        let format = destination.format;
+        let tx = self.app_event_tx.clone();
+        tokio::spawn(async move {
+            let result = async {
+                if let Some(parent) = out_path.parent() {
+                    tokio::fs::create_dir_all(parent).await?;
+                }
+                match format {
+                    ChatExportFormat::Markdown => {
+                        export_markdown::export_rollout_as_markdown(&rollout_path, &out_path).await
+                    }
+                    ChatExportFormat::Json => {
+                        export_markdown::export_rollout_as_json(&rollout_path, &out_path).await
+                    }
+                }
+            }
+            .await;
+
+            match result {
+                Ok(messages) => tx.send(AppEvent::ExportResult {
+                    path: out_path,
+                    messages,
+                    error: None,
+                    format,
+                }),
+                Err(error) => tx.send(AppEvent::ExportResult {
+                    path: out_path,
+                    messages: 0,
+                    error: Some(error.to_string()),
+                    format,
+                }),
+            };
+        });
+    }
+
     pub(crate) fn handle_paste(&mut self, text: String) {
+        if text.is_empty() {
+            // Some terminals (like VS Code) route Cmd+V through terminal paste, which can
+            // yield an empty payload for images. Fall back to reading the clipboard.
+            self.paste_from_clipboard();
+            return;
+        }
         self.bottom_pane.handle_paste(text);
     }
 
@@ -3533,17 +4036,62 @@ impl ChatWidget {
             || self.bottom_pane.is_task_running()
             || self.is_review_mode
         {
-            self.queued_user_messages.push_back(user_message);
+            let id = self.next_queued_user_message_id;
+            self.next_queued_user_message_id = self.next_queued_user_message_id.saturating_add(1);
+            let queued = QueuedUserMessage {
+                id,
+                text: user_message.text,
+                local_images: user_message.local_images,
+                text_elements: user_message.text_elements,
+                mention_paths: user_message.mention_paths,
+                model_override: None,
+                effort_override: None,
+            };
+            self.queued_user_messages.push_back(queued);
             self.refresh_queued_user_messages();
         } else {
             self.submit_user_message(user_message);
         }
     }
 
+    fn submit_queued_user_message(&mut self, queued: QueuedUserMessage) {
+        let user_message = UserMessage {
+            text: queued.text,
+            local_images: queued.local_images,
+            text_elements: queued.text_elements,
+            mention_paths: queued.mention_paths,
+        };
+        self.submit_user_message_with_overrides(
+            user_message,
+            queued.model_override,
+            queued.effort_override,
+        );
+    }
+
     fn submit_user_message(&mut self, user_message: UserMessage) {
+        self.submit_user_message_with_overrides(user_message, None, None);
+    }
+
+    fn submit_user_message_with_overrides(
+        &mut self,
+        user_message: UserMessage,
+        model_override: Option<String>,
+        effort_override: Option<Option<ReasoningEffortConfig>>,
+    ) {
         if !self.is_session_configured() {
             tracing::warn!("cannot submit user message before session is configured; queueing");
-            self.queued_user_messages.push_front(user_message);
+            let id = self.next_queued_user_message_id;
+            self.next_queued_user_message_id = self.next_queued_user_message_id.saturating_add(1);
+            let queued = QueuedUserMessage {
+                id,
+                text: user_message.text,
+                local_images: user_message.local_images,
+                text_elements: user_message.text_elements,
+                mention_paths: user_message.mention_paths,
+                model_override,
+                effort_override,
+            };
+            self.queued_user_messages.push_front(queued);
             self.refresh_queued_user_messages();
             return;
         }
@@ -3624,6 +4172,20 @@ impl ChatWidget {
         }
 
         let effective_mode = self.effective_collaboration_mode();
+        let running_model = model_override
+            .or_else(|| {
+                self.agent_turn_running
+                    .then(|| self.running_turn_model.clone())
+                    .flatten()
+            })
+            .unwrap_or_else(|| effective_mode.model().to_string());
+        let running_effort = effort_override.unwrap_or_else(|| {
+            if self.agent_turn_running {
+                self.running_turn_reasoning_effort
+            } else {
+                effective_mode.reasoning_effort()
+            }
+        });
         let collaboration_mode = if self.collaboration_modes_enabled() {
             self.active_collaboration_mask
                 .as_ref()
@@ -3641,13 +4203,18 @@ impl ChatWidget {
             cwd: self.config.cwd.clone(),
             approval_policy: self.config.approval_policy.value(),
             sandbox_policy: self.config.sandbox_policy.get().clone(),
-            model: effective_mode.model().to_string(),
-            effort: effective_mode.reasoning_effort(),
+            model: running_model.clone(),
+            effort: running_effort,
             summary: self.config.model_reasoning_summary,
             final_output_json_schema: None,
             collaboration_mode,
             personality,
         };
+
+        if !self.agent_turn_running {
+            self.running_turn_model = Some(running_model);
+            self.running_turn_reasoning_effort = running_effort;
+        }
 
         self.codex_op_tx.send(op).unwrap_or_else(|e| {
             tracing::error!("failed to send message: {e}");
@@ -3666,13 +4233,15 @@ impl ChatWidget {
         if !text.is_empty() {
             let local_image_paths = local_images.into_iter().map(|img| img.path).collect();
             self.add_to_history(history_cell::new_user_prompt(
-                text,
+                text.clone(),
                 text_elements,
                 local_image_paths,
             ));
+            self.push_copyable_message(CopyableRole::User, &text);
         }
 
         self.needs_final_message_separator = false;
+        self.refresh_status_line();
     }
 
     /// Restore the blocked submission draft without losing mention resolution state.
@@ -3760,7 +4329,9 @@ impl ChatWidget {
         match msg {
             EventMsg::SessionConfigured(e) => self.on_session_configured(e),
             EventMsg::ThreadNameUpdated(e) => self.on_thread_name_updated(e),
-            EventMsg::AgentMessage(AgentMessageEvent { message }) => self.on_agent_message(message),
+            EventMsg::AgentMessage(AgentMessageEvent { message }) => {
+                self.on_agent_message(message, from_replay)
+            }
             EventMsg::AgentMessageDelta(AgentMessageDeltaEvent { delta }) => {
                 self.on_agent_message_delta(delta)
             }
@@ -3831,6 +4402,7 @@ impl ChatWidget {
             EventMsg::RequestUserInput(ev) => {
                 self.on_request_user_input(ev);
             }
+            EventMsg::ProgressTrace(ev) => self.on_progress_trace(ev),
             EventMsg::ExecCommandBegin(ev) => self.on_exec_command_begin(ev),
             EventMsg::TerminalInteraction(delta) => self.on_terminal_interaction(delta),
             EventMsg::ExecCommandOutputDelta(delta) => self.on_exec_command_output_delta(delta),
@@ -3875,7 +4447,9 @@ impl ChatWidget {
                 self.on_entered_review_mode(review_request, from_replay)
             }
             EventMsg::ExitedReviewMode(review) => self.on_exited_review_mode(review),
-            EventMsg::ContextCompacted(_) => self.on_agent_message("Context compacted".to_owned()),
+            EventMsg::ContextCompacted(_) => {
+                self.on_agent_message("Context compacted".to_owned(), from_replay)
+            }
             EventMsg::CollabAgentSpawnBegin(_) => {}
             EventMsg::CollabAgentSpawnEnd(ev) => self.on_collab_event(collab::spawn_end(ev)),
             EventMsg::CollabAgentInteractionBegin(_) => {}
@@ -3962,6 +4536,7 @@ impl ChatWidget {
 
     fn on_user_message_event(&mut self, event: UserMessageEvent) {
         if !event.message.trim().is_empty() {
+            self.push_copyable_message(CopyableRole::User, &event.message);
             self.add_to_history(history_cell::new_user_prompt(
                 event.message,
                 event.text_elements,
@@ -4029,22 +4604,1453 @@ impl ChatWidget {
 
     // If idle and there are queued inputs, submit exactly one to start the next turn.
     fn maybe_send_next_queued_input(&mut self) {
-        if self.bottom_pane.is_task_running() {
+        if self.bottom_pane.is_task_running()
+            || self.queued_edit_state.is_some()
+            || !self.bottom_pane.no_modal_or_popup_active()
+        {
             return;
         }
-        if let Some(user_message) = self.queued_user_messages.pop_front() {
-            self.submit_user_message(user_message);
+        if let Some(queued) = self.queued_user_messages.pop_front() {
+            self.submit_queued_user_message(queued);
         }
         // Update the list to reflect the remaining queued messages (if any).
         self.refresh_queued_user_messages();
     }
 
+    fn paste_from_clipboard(&mut self) {
+        let active_view = !self.bottom_pane.no_modal_or_popup_active();
+
+        let mut image_error: Option<PasteImageError> = None;
+        if !active_view {
+            match paste_image_to_temp_png() {
+                Ok((path, info)) => {
+                    tracing::debug!(
+                        "pasted image size={}x{} format={}",
+                        info.width,
+                        info.height,
+                        info.encoded_format.label()
+                    );
+                    self.attach_image(path);
+                    return;
+                }
+                Err(err) => {
+                    image_error = Some(err);
+                }
+            }
+        }
+
+        match paste_text_from_clipboard() {
+            Ok(text) => {
+                self.bottom_pane.handle_paste(text);
+            }
+            Err(err) => {
+                let message = if let Some(img_err) = image_error {
+                    format!("Failed to paste from clipboard: {img_err}; {err}")
+                } else {
+                    format!("Failed to paste from clipboard: {err}")
+                };
+                self.add_to_history(history_cell::new_error_event(message));
+                self.request_redraw();
+            }
+        }
+    }
+
+    fn copy_prompt_to_clipboard(&mut self) {
+        if !self.bottom_pane.no_modal_or_popup_active() {
+            return;
+        }
+
+        let text = self.bottom_pane.composer_text();
+        if text.trim().is_empty() {
+            return;
+        }
+
+        if let Err(err) = copy_text_to_clipboard(&text) {
+            self.add_to_history(history_cell::new_error_event(format!(
+                "Failed to copy prompt to clipboard: {err}",
+            )));
+            self.request_redraw();
+        }
+    }
+
+    fn copy_last_output_to_clipboard(&mut self) {
+        if !self.bottom_pane.no_modal_or_popup_active() {
+            return;
+        }
+
+        let Some(markdown) = self
+            .last_assistant_output_markdown
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        else {
+            self.add_to_history(history_cell::new_info_event(
+                "No output to copy.".to_string(),
+                None,
+            ));
+            self.request_redraw();
+            return;
+        };
+
+        if let Err(err) = copy_text_to_clipboard(markdown) {
+            self.add_to_history(history_cell::new_error_event(format!(
+                "Failed to copy last output to clipboard: {err}",
+            )));
+            self.request_redraw();
+            return;
+        }
+
+        self.add_to_history(history_cell::new_info_event(
+            "Copied last output to clipboard.".to_string(),
+            None,
+        ));
+        self.request_redraw();
+    }
+
+    fn open_copy_code_block_picker(&mut self) {
+        if !self.bottom_pane.no_modal_or_popup_active() {
+            return;
+        }
+        self.open_copy_code_block_picker_with_scope(CopyCodeBlockScope::LastResponse);
+    }
+
+    pub(crate) fn open_copy_code_block_picker_with_scope(&mut self, scope: CopyCodeBlockScope) {
+        let scope = scope.into();
+        self.copy_code_ui_state = Some(CopyCodeUiState::new(
+            scope,
+            self.config.tui_copy_code_ui_mode,
+        ));
+        self.show_copy_code_block_view();
+    }
+
+    pub(crate) fn set_copy_code_block_scope(&mut self, scope: CopyCodeBlockScope) {
+        let scope = scope.into();
+        if let Some(state) = self.copy_code_ui_state.as_mut() {
+            state.scope = scope;
+            state.selected_id = None;
+            state.selected_ids.clear();
+        } else {
+            self.copy_code_ui_state = Some(CopyCodeUiState::new(
+                scope,
+                self.config.tui_copy_code_ui_mode,
+            ));
+        }
+        self.show_copy_code_block_view();
+    }
+
+    pub(crate) fn toggle_copy_code_block_ui_mode(&mut self) {
+        if let Some(state) = self.copy_code_ui_state.as_mut() {
+            state.ui_mode = match state.ui_mode {
+                CopyUiMode::Picker => CopyUiMode::Navigator,
+                CopyUiMode::Navigator => CopyUiMode::Picker,
+            };
+        }
+        self.show_copy_code_block_view();
+    }
+
+    pub(crate) fn toggle_copy_code_block_multi_select_mode(&mut self) {
+        if let Some(state) = self.copy_code_ui_state.as_mut() {
+            state.multi_select = !state.multi_select;
+            if !state.multi_select {
+                state.selected_ids.clear();
+            }
+        }
+        self.show_copy_code_block_view();
+    }
+
+    pub(crate) fn toggle_copy_code_block_selection(&mut self, id: String) {
+        if let Some(state) = self.copy_code_ui_state.as_mut() {
+            state.selected_id = Some(id.clone());
+            if !state.selected_ids.insert(id.clone()) {
+                state.selected_ids.remove(&id);
+            }
+        }
+        self.show_copy_code_block_view();
+    }
+
+    pub(crate) fn copy_selected_code_blocks(&mut self) {
+        let Some(state) = self.copy_code_ui_state.as_ref() else {
+            return;
+        };
+        if state.selected_ids.is_empty() {
+            self.add_to_history(history_cell::new_info_event(
+                "No code blocks selected.".to_string(),
+                None,
+            ));
+            self.request_redraw();
+            return;
+        }
+        let selected = state.selected_ids.clone();
+        let contents = self
+            .code_block_candidates_for_scope(state.scope)
+            .into_iter()
+            .filter(|candidate| selected.contains(&candidate.id))
+            .map(|candidate| candidate.content)
+            .collect::<Vec<_>>();
+        if contents.is_empty() {
+            self.add_to_history(history_cell::new_info_event(
+                "No code blocks selected.".to_string(),
+                None,
+            ));
+            self.request_redraw();
+            return;
+        }
+        self.copy_joined_items_to_clipboard(contents, "code block", "code blocks");
+    }
+
+    fn show_copy_code_block_view(&mut self) {
+        let Some(state) = self.copy_code_ui_state.clone() else {
+            return;
+        };
+        let has_any_response = self
+            .copyable_messages
+            .iter()
+            .any(|message| message.role == CopyableRole::Response);
+        let candidates = self.code_block_candidates_for_scope(state.scope);
+        if candidates.is_empty() && !has_any_response {
+            let message = match state.scope {
+                CodeBlockScope::LastResponse => {
+                    if self.last_response_markdown().is_some() {
+                        "No code blocks to copy."
+                    } else {
+                        "No output to scan for code blocks."
+                    }
+                }
+                CodeBlockScope::AllResponses => "No response output to scan for code blocks.",
+            };
+            self.add_to_history(history_cell::new_info_event(message.to_string(), None));
+            self.request_redraw();
+            return;
+        }
+
+        let mut items = vec![
+            SelectionItem {
+                name: format!("View: {}", copy_ui_mode_label(state.ui_mode)),
+                description: Some(
+                    "Switch between picker and navigator (session only).".to_string(),
+                ),
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::ToggleCopyCodeBlockUiMode);
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+            SelectionItem {
+                name: format!("Scope: {}", state.scope.label()),
+                description: Some(state.scope.description().to_string()),
+                actions: vec![Box::new(move |tx| {
+                    tx.send(AppEvent::SetCopyCodeBlockScope {
+                        scope: state.scope.toggle().into(),
+                    });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+            SelectionItem {
+                name: format!(
+                    "Selection: {}",
+                    if state.multi_select {
+                        "multi"
+                    } else {
+                        "single"
+                    }
+                ),
+                description: Some("Toggle multi-select mode.".to_string()),
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::ToggleCopyCodeBlockMultiSelect);
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+        ];
+
+        if state.multi_select {
+            let selected_count = state.selected_ids.len();
+            items.push(SelectionItem {
+                name: format!("Copy selected ({selected_count})"),
+                description: Some("Copy all selected code blocks.".to_string()),
+                is_disabled: selected_count == 0,
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::CopySelectedCodeBlocks);
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            });
+        }
+
+        let top_rows = items.len();
+        let has_candidates = !candidates.is_empty();
+        if !has_candidates {
+            items.push(SelectionItem {
+                name: "No code blocks in this scope".to_string(),
+                is_disabled: true,
+                ..Default::default()
+            });
+        }
+
+        for candidate in &candidates {
+            let id = candidate.id.clone();
+            let content = candidate.content.clone();
+            let selected = state.selected_ids.contains(&id);
+            let label = if state.multi_select {
+                format!("[{}] {}", if selected { "x" } else { " " }, candidate.label)
+            } else {
+                candidate.label.clone()
+            };
+            items.push(SelectionItem {
+                name: label,
+                description: Some(candidate.preview.clone()),
+                search_value: Some(candidate.search_value.clone()),
+                actions: if state.multi_select {
+                    vec![Box::new(move |tx| {
+                        tx.send(AppEvent::ToggleCopyCodeBlockSelection { id: id.clone() });
+                    })]
+                } else {
+                    vec![Box::new(move |tx| match copy_text_to_clipboard(&content) {
+                        Ok(()) => tx.send(AppEvent::InsertHistoryCell(Box::new(
+                            history_cell::new_info_event(
+                                "Copied code block to clipboard.".to_string(),
+                                None,
+                            ),
+                        ))),
+                        Err(err) => tx.send(AppEvent::InsertHistoryCell(Box::new(
+                            history_cell::new_error_event(format!(
+                                "Failed to copy code block to clipboard: {err}",
+                            )),
+                        ))),
+                    })]
+                },
+                dismiss_on_select: true,
+                ..Default::default()
+            });
+        }
+
+        let initial_selected_idx =
+            selected_index_for_candidates(top_rows, &candidates, state.selected_id.as_deref())
+                .or_else(|| has_candidates.then_some(top_rows))
+                .or(Some(0));
+        let (subtitle, searchable, search_placeholder) = match state.ui_mode {
+            CopyUiMode::Picker => (
+                format!("Choose a block to copy · {}", state.scope.label()),
+                true,
+                Some("Type to search code blocks".to_string()),
+            ),
+            CopyUiMode::Navigator => (
+                format!("Navigate blocks in chat order · {}", state.scope.label()),
+                false,
+                None,
+            ),
+        };
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            title: Some("Copy code block".to_string()),
+            subtitle: Some(subtitle),
+            footer_hint: Some(standard_popup_hint_line()),
+            is_searchable: searchable,
+            search_placeholder,
+            items,
+            initial_selected_idx,
+            ..Default::default()
+        });
+        self.request_redraw();
+    }
+
+    pub(crate) fn open_copy_message_picker(&mut self, filter: CopyMessageFilter) {
+        let filter = filter.into();
+        self.copy_message_ui_state = Some(CopyMessageUiState::new(
+            filter,
+            self.config.tui_copy_message_ui_mode,
+        ));
+        self.show_copy_message_view();
+    }
+
+    pub(crate) fn set_copy_message_filter(&mut self, filter: CopyMessageFilter) {
+        let filter = filter.into();
+        if let Some(state) = self.copy_message_ui_state.as_mut() {
+            state.filter = filter;
+            state.selected_id = None;
+            state.selected_ids.clear();
+        } else {
+            self.copy_message_ui_state = Some(CopyMessageUiState::new(
+                filter,
+                self.config.tui_copy_message_ui_mode,
+            ));
+        }
+        self.show_copy_message_view();
+    }
+
+    pub(crate) fn toggle_copy_message_ui_mode(&mut self) {
+        if let Some(state) = self.copy_message_ui_state.as_mut() {
+            state.ui_mode = match state.ui_mode {
+                CopyUiMode::Picker => CopyUiMode::Navigator,
+                CopyUiMode::Navigator => CopyUiMode::Picker,
+            };
+        }
+        self.show_copy_message_view();
+    }
+
+    pub(crate) fn toggle_copy_message_multi_select_mode(&mut self) {
+        if let Some(state) = self.copy_message_ui_state.as_mut() {
+            state.multi_select = !state.multi_select;
+            if !state.multi_select {
+                state.selected_ids.clear();
+            }
+        }
+        self.show_copy_message_view();
+    }
+
+    pub(crate) fn toggle_copy_message_selection(&mut self, id: String) {
+        if let Some(state) = self.copy_message_ui_state.as_mut() {
+            state.selected_id = Some(id.clone());
+            if !state.selected_ids.insert(id.clone()) {
+                state.selected_ids.remove(&id);
+            }
+        }
+        self.show_copy_message_view();
+    }
+
+    pub(crate) fn copy_selected_messages(&mut self) {
+        let Some(state) = self.copy_message_ui_state.as_ref() else {
+            return;
+        };
+        if state.selected_ids.is_empty() {
+            self.add_to_history(history_cell::new_info_event(
+                "No messages selected.".to_string(),
+                None,
+            ));
+            self.request_redraw();
+            return;
+        }
+        let selected = state.selected_ids.clone();
+        let contents = self
+            .message_candidates_for_filter(state.filter)
+            .into_iter()
+            .filter(|candidate| selected.contains(&candidate.id))
+            .map(|candidate| candidate.content)
+            .collect::<Vec<_>>();
+        if contents.is_empty() {
+            self.add_to_history(history_cell::new_info_event(
+                "No messages selected.".to_string(),
+                None,
+            ));
+            self.request_redraw();
+            return;
+        }
+        self.copy_joined_items_to_clipboard(contents, "message", "messages");
+    }
+
+    fn show_copy_message_view(&mut self) {
+        if self.copyable_messages.is_empty() {
+            self.add_to_history(history_cell::new_info_event(
+                "No messages to copy.".to_string(),
+                None,
+            ));
+            self.request_redraw();
+            return;
+        }
+        let Some(state) = self.copy_message_ui_state.clone() else {
+            return;
+        };
+        let candidates = self.message_candidates_for_filter(state.filter);
+        let mut items = vec![
+            SelectionItem {
+                name: format!("View: {}", copy_ui_mode_label(state.ui_mode)),
+                description: Some(
+                    "Switch between picker and navigator (session only).".to_string(),
+                ),
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::ToggleCopyMessageUiMode);
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+            SelectionItem {
+                name: format!("Filter: {}", state.filter.label()),
+                description: Some(state.filter.description().to_string()),
+                actions: vec![Box::new(move |tx| {
+                    tx.send(AppEvent::SetCopyMessageFilter {
+                        filter: state.filter.next().into(),
+                    });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+            SelectionItem {
+                name: format!(
+                    "Selection: {}",
+                    if state.multi_select {
+                        "multi"
+                    } else {
+                        "single"
+                    }
+                ),
+                description: Some("Toggle multi-select mode.".to_string()),
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::ToggleCopyMessageMultiSelect);
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+        ];
+        if state.multi_select {
+            let selected_count = state.selected_ids.len();
+            items.push(SelectionItem {
+                name: format!("Copy selected ({selected_count})"),
+                description: Some("Copy all selected messages.".to_string()),
+                is_disabled: selected_count == 0,
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::CopySelectedMessages);
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            });
+        }
+
+        let top_rows = items.len();
+        let has_candidates = !candidates.is_empty();
+        if !has_candidates {
+            items.push(SelectionItem {
+                name: "No messages in this filter".to_string(),
+                is_disabled: true,
+                ..Default::default()
+            });
+        }
+        for candidate in &candidates {
+            let id = candidate.id.clone();
+            let content = candidate.content.clone();
+            let selected = state.selected_ids.contains(&id);
+            let label = if state.multi_select {
+                format!("[{}] {}", if selected { "x" } else { " " }, candidate.label)
+            } else {
+                candidate.label.clone()
+            };
+            items.push(SelectionItem {
+                name: label,
+                description: Some(candidate.preview.clone()),
+                search_value: Some(candidate.search_value.clone()),
+                actions: if state.multi_select {
+                    vec![Box::new(move |tx| {
+                        tx.send(AppEvent::ToggleCopyMessageSelection { id: id.clone() });
+                    })]
+                } else {
+                    vec![Box::new(move |tx| match copy_text_to_clipboard(&content) {
+                        Ok(()) => tx.send(AppEvent::InsertHistoryCell(Box::new(
+                            history_cell::new_info_event(
+                                "Copied message to clipboard.".to_string(),
+                                None,
+                            ),
+                        ))),
+                        Err(err) => tx.send(AppEvent::InsertHistoryCell(Box::new(
+                            history_cell::new_error_event(format!(
+                                "Failed to copy message to clipboard: {err}",
+                            )),
+                        ))),
+                    })]
+                },
+                dismiss_on_select: true,
+                ..Default::default()
+            });
+        }
+
+        let initial_selected_idx =
+            selected_index_for_candidates(top_rows, &candidates, state.selected_id.as_deref())
+                .or_else(|| has_candidates.then_some(top_rows))
+                .or(Some(0));
+        let (subtitle, searchable, search_placeholder) = match state.ui_mode {
+            CopyUiMode::Picker => (
+                format!("Choose a message to copy · {}", state.filter.label()),
+                true,
+                Some("Type to search messages".to_string()),
+            ),
+            CopyUiMode::Navigator => (
+                format!("Navigate messages in chat order · {}", state.filter.label()),
+                false,
+                None,
+            ),
+        };
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            title: Some("Copy message".to_string()),
+            subtitle: Some(subtitle),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            is_searchable: searchable,
+            search_placeholder,
+            initial_selected_idx,
+            ..Default::default()
+        });
+        self.request_redraw();
+    }
+
+    fn copy_joined_items_to_clipboard(
+        &mut self,
+        contents: Vec<String>,
+        singular: &str,
+        plural: &str,
+    ) {
+        let text = contents.join("\n\n");
+        match copy_text_to_clipboard(&text) {
+            Ok(()) => self.add_to_history(history_cell::new_info_event(
+                format!(
+                    "Copied {} {} to clipboard.",
+                    contents.len(),
+                    if contents.len() == 1 {
+                        singular
+                    } else {
+                        plural
+                    }
+                ),
+                None,
+            )),
+            Err(err) => self.add_to_history(history_cell::new_error_event(format!(
+                "Failed to copy selected {plural} to clipboard: {err}",
+            ))),
+        }
+        self.request_redraw();
+    }
+
+    fn message_candidates_for_filter(&self, filter: MessageFilter) -> Vec<CopyMessageCandidate> {
+        self.copyable_messages
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|(_, message)| filter.includes(message.role))
+            .enumerate()
+            .map(|(display_idx, (message_idx, message))| {
+                let snippet = message
+                    .text
+                    .lines()
+                    .find(|line| !line.trim().is_empty())
+                    .unwrap_or("")
+                    .trim();
+                let preview = if snippet.is_empty() {
+                    "(empty message)".to_string()
+                } else {
+                    truncate_text(snippet, 80)
+                };
+                let role_label = message.role.label();
+                let content = message.text.clone();
+                CopyMessageCandidate {
+                    id: format!("msg-{message_idx}"),
+                    label: format!("#{} · {}", display_idx + 1, role_label),
+                    preview,
+                    search_value: format!("{role_label} {content}"),
+                    content,
+                }
+            })
+            .collect()
+    }
+
+    fn code_block_candidates_for_scope(
+        &self,
+        scope: CodeBlockScope,
+    ) -> Vec<CopyCodeBlockCandidate> {
+        let mut candidates = Vec::new();
+        match scope {
+            CodeBlockScope::LastResponse => {
+                let Some(markdown) = self.last_response_markdown() else {
+                    return candidates;
+                };
+                let extracted = extract_fenced_code_blocks(markdown);
+                for (idx, candidate) in extracted.into_iter().enumerate() {
+                    let label = match candidate.language {
+                        Some(language) => format!("#{} · {}", idx + 1, language),
+                        None => format!("#{} · plain text", idx + 1),
+                    };
+                    let preview = first_non_empty_preview(&candidate.content);
+                    let search_value = format!("{label} {preview}");
+                    candidates.push(CopyCodeBlockCandidate {
+                        id: format!("last-{}", idx + 1),
+                        label,
+                        preview,
+                        search_value,
+                        content: candidate.content,
+                    });
+                }
+            }
+            CodeBlockScope::AllResponses => {
+                for (response_idx, message) in self
+                    .copyable_messages
+                    .iter()
+                    .rev()
+                    .filter(|message| message.role == CopyableRole::Response)
+                    .enumerate()
+                {
+                    let extracted = extract_fenced_code_blocks(&message.text);
+                    for (block_idx, candidate) in extracted.into_iter().enumerate() {
+                        let lang = candidate
+                            .language
+                            .unwrap_or_else(|| "plain text".to_string());
+                        let label = format!("R{} #{} · {lang}", response_idx + 1, block_idx + 1);
+                        let preview = first_non_empty_preview(&candidate.content);
+                        let search_value = format!("{label} {preview}");
+                        candidates.push(CopyCodeBlockCandidate {
+                            id: format!("all-{}-{}", response_idx + 1, block_idx + 1),
+                            label,
+                            preview,
+                            search_value,
+                            content: candidate.content,
+                        });
+                    }
+                }
+            }
+        }
+        candidates
+    }
+
+    fn last_response_markdown(&self) -> Option<&str> {
+        self.last_assistant_output_markdown
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+    }
+
+    fn push_copyable_message(&mut self, role: CopyableRole, text: &str) {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        self.copyable_messages.push(CopyableMessage {
+            role,
+            text: trimmed.to_string(),
+        });
+    }
+
+    fn last_copyable_response_is(&self, text: &str) -> bool {
+        let text = text.trim();
+        self.copyable_messages
+            .last()
+            .is_some_and(|message| message.role == CopyableRole::Response && message.text == text)
+    }
+
+    fn send_next_queued_user_message(&mut self) {
+        if self.bottom_pane.is_task_running()
+            || self.queued_edit_state.is_some()
+            || !self.bottom_pane.no_modal_or_popup_active()
+        {
+            return;
+        }
+        if let Some(queued) = self.queued_user_messages.pop_front() {
+            self.submit_queued_user_message(queued);
+        }
+        self.refresh_queued_user_messages();
+    }
+
+    fn handle_queue_edit_key_event(&mut self, key_event: KeyEvent) -> bool {
+        match key_event {
+            KeyEvent {
+                code: KeyCode::Esc,
+                kind: KeyEventKind::Press,
+                ..
+            } => {
+                self.exit_queue_edit(false);
+                true
+            }
+            KeyEvent {
+                code: KeyCode::Enter,
+                modifiers: KeyModifiers::NONE,
+                kind: KeyEventKind::Press,
+                ..
+            } => {
+                self.exit_queue_edit(true);
+                true
+            }
+            KeyEvent {
+                code: KeyCode::Up,
+                modifiers: KeyModifiers::ALT,
+                kind: KeyEventKind::Press,
+                ..
+            } => {
+                self.switch_queue_edit(-1);
+                true
+            }
+            KeyEvent {
+                code: KeyCode::Down,
+                modifiers: KeyModifiers::ALT,
+                kind: KeyEventKind::Press,
+                ..
+            } => {
+                self.switch_queue_edit(1);
+                true
+            }
+            KeyEvent {
+                code: KeyCode::Char('m' | 'M'),
+                modifiers: KeyModifiers::ALT,
+                kind: KeyEventKind::Press,
+                ..
+            } => {
+                if let Some(id) = self
+                    .queued_edit_state
+                    .as_ref()
+                    .map(|state| state.selected_id)
+                {
+                    self.open_queue_model_picker(id);
+                }
+                true
+            }
+            KeyEvent {
+                code: KeyCode::Char('t' | 'T'),
+                modifiers: KeyModifiers::ALT,
+                kind: KeyEventKind::Press,
+                ..
+            } => {
+                if let Some(id) = self
+                    .queued_edit_state
+                    .as_ref()
+                    .map(|state| state.selected_id)
+                {
+                    self.open_queue_thinking_picker(id);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn queue_popup_items(&self) -> Vec<QueuePopupItem> {
+        let session_model = self.current_model();
+        let session_effort = self.effective_reasoning_effort();
+
+        self.queued_user_messages
+            .iter()
+            .map(|message| {
+                let mut preview = message
+                    .text
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                if preview.is_empty() && !message.local_images.is_empty() {
+                    preview = "[image]".to_string();
+                }
+
+                let effective_model = message.model_override.as_deref().unwrap_or(session_model);
+                let effective_effort = message.effort_override.unwrap_or(session_effort);
+                let mut meta_parts: Vec<String> = Vec::new();
+                if !message.local_images.is_empty() {
+                    meta_parts.push("img".to_string());
+                }
+                meta_parts.push(format!("model: {effective_model}"));
+                meta_parts.push(format!(
+                    "thinking: {}",
+                    Self::status_line_reasoning_effort_label(effective_effort)
+                ));
+
+                QueuePopupItem {
+                    id: message.id,
+                    preview,
+                    meta: Some(meta_parts.join(" · ")),
+                }
+            })
+            .collect()
+    }
+
+    fn open_queue_popup(&mut self) {
+        if !self.bottom_pane.no_modal_or_popup_active()
+            || self.queued_user_messages.is_empty()
+            || self.queued_edit_state.is_some()
+        {
+            return;
+        }
+        let items = self.queue_popup_items();
+        self.bottom_pane
+            .show_view(Box::new(QueuePopup::new(items, self.app_event_tx.clone())));
+        self.request_redraw();
+    }
+
+    fn begin_queue_edit_most_recent(&mut self) {
+        let Some(selected_id) = self.queued_user_messages.back().map(|message| message.id) else {
+            return;
+        };
+        self.start_queue_edit(selected_id);
+    }
+
+    pub(crate) fn start_queue_edit(&mut self, id: u64) {
+        if self.queued_edit_state.is_some()
+            || self.queued_user_messages.is_empty()
+            || !self.bottom_pane.no_modal_or_popup_active()
+        {
+            return;
+        }
+
+        if !self
+            .queued_user_messages
+            .iter()
+            .any(|message| message.id == id)
+        {
+            return;
+        }
+
+        let composer_before_edit = QueuedComposerSnapshot {
+            text: self.bottom_pane.composer_text(),
+            text_elements: self.bottom_pane.composer_text_elements(),
+            local_images: self.bottom_pane.composer_local_images(),
+            mention_paths: self.bottom_pane.composer_mention_paths(),
+        };
+
+        self.queued_edit_state = Some(QueuedEditState {
+            selected_id: id,
+            composer_before_edit,
+            drafts: HashMap::new(),
+        });
+
+        self.load_queue_edit_draft(id);
+        self.update_queue_edit_footer_hint();
+        self.refresh_queued_user_messages();
+        self.request_redraw();
+    }
+
+    pub(crate) fn delete_queued_user_message(&mut self, id: u64) {
+        let Some(idx) = self
+            .queued_user_messages
+            .iter()
+            .position(|message| message.id == id)
+        else {
+            return;
+        };
+
+        self.queued_user_messages.remove(idx);
+        self.refresh_queued_user_messages();
+        self.request_redraw();
+    }
+
+    pub(crate) fn move_queued_user_message_up(&mut self, id: u64) {
+        let Some(idx) = self
+            .queued_user_messages
+            .iter()
+            .position(|message| message.id == id)
+        else {
+            return;
+        };
+        if idx == 0 {
+            return;
+        }
+
+        self.queued_user_messages.swap(idx, idx - 1);
+        self.refresh_queued_user_messages();
+        self.request_redraw();
+    }
+
+    pub(crate) fn move_queued_user_message_down(&mut self, id: u64) {
+        let len = self.queued_user_messages.len();
+        let Some(idx) = self
+            .queued_user_messages
+            .iter()
+            .position(|message| message.id == id)
+        else {
+            return;
+        };
+        if idx + 1 >= len {
+            return;
+        }
+
+        self.queued_user_messages.swap(idx, idx + 1);
+        self.refresh_queued_user_messages();
+        self.request_redraw();
+    }
+
+    pub(crate) fn move_queued_user_message_to_front(&mut self, id: u64) {
+        let Some(idx) = self
+            .queued_user_messages
+            .iter()
+            .position(|message| message.id == id)
+        else {
+            return;
+        };
+        if idx == 0 {
+            return;
+        }
+
+        let Some(message) = self.queued_user_messages.remove(idx) else {
+            return;
+        };
+        self.queued_user_messages.push_front(message);
+        self.refresh_queued_user_messages();
+        self.request_redraw();
+    }
+
+    pub(crate) fn open_queue_model_picker(&mut self, id: u64) {
+        let current_override = self
+            .queued_edit_state
+            .as_ref()
+            .and_then(|state| state.drafts.get(&id))
+            .map(|draft| draft.model_override.clone())
+            .unwrap_or_else(|| {
+                self.queued_user_messages
+                    .iter()
+                    .find(|message| message.id == id)
+                    .and_then(|message| message.model_override.clone())
+            });
+
+        let session_model = self.current_model().to_string();
+        let mut items: Vec<SelectionItem> = vec![SelectionItem {
+            name: "Use session model".to_string(),
+            description: Some(format!("Current session model: {session_model}")),
+            is_current: current_override.is_none(),
+            actions: vec![Box::new(move |tx| {
+                tx.send(AppEvent::QueueSetModelOverride { id, model: None });
+            })],
+            dismiss_on_select: true,
+            ..Default::default()
+        }];
+
+        let mut presets = match self.models_manager.try_list_models(&self.config) {
+            Ok(presets) => presets,
+            Err(_) => {
+                self.add_info_message(
+                    "Models are being updated; please try again in a moment.".to_string(),
+                    None,
+                );
+                return;
+            }
+        };
+        presets.sort_by(|a, b| a.display_name.cmp(&b.display_name));
+
+        for preset in presets {
+            let model_slug = preset.model.clone();
+            let is_current = current_override.as_deref() == Some(model_slug.as_str());
+            let description = (!preset.description.is_empty()).then_some(preset.description);
+            let model_for_action = model_slug.clone();
+            items.push(SelectionItem {
+                name: preset.display_name,
+                description,
+                is_current,
+                actions: vec![Box::new(move |tx| {
+                    tx.send(AppEvent::QueueSetModelOverride {
+                        id,
+                        model: Some(model_for_action.clone()),
+                    });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            });
+        }
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            title: Some("Select Model for Queued Message".to_string()),
+            subtitle: Some("Applies only when this message is sent.".to_string()),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            ..Default::default()
+        });
+    }
+
+    pub(crate) fn open_queue_thinking_picker(&mut self, id: u64) {
+        let model_override = self
+            .queued_edit_state
+            .as_ref()
+            .and_then(|state| state.drafts.get(&id))
+            .map(|draft| draft.model_override.clone())
+            .unwrap_or_else(|| {
+                self.queued_user_messages
+                    .iter()
+                    .find(|message| message.id == id)
+                    .and_then(|message| message.model_override.clone())
+            });
+        let model_slug = model_override.unwrap_or_else(|| self.current_model().to_string());
+
+        let current_override = self
+            .queued_edit_state
+            .as_ref()
+            .and_then(|state| state.drafts.get(&id))
+            .map(|draft| draft.effort_override)
+            .unwrap_or_else(|| {
+                self.queued_user_messages
+                    .iter()
+                    .find(|message| message.id == id)
+                    .and_then(|message| message.effort_override)
+            });
+
+        let presets = match self.models_manager.try_list_models(&self.config) {
+            Ok(presets) => presets,
+            Err(_) => {
+                self.add_info_message(
+                    "Models are being updated; please try again in a moment.".to_string(),
+                    None,
+                );
+                return;
+            }
+        };
+        let Some(preset) = presets
+            .into_iter()
+            .find(|preset| preset.model == model_slug)
+        else {
+            self.add_info_message(
+                format!("Model '{model_slug}' is not available right now."),
+                None,
+            );
+            return;
+        };
+
+        let default_effort = preset.default_reasoning_effort;
+        let mut items: Vec<SelectionItem> = vec![
+            SelectionItem {
+                name: "Use session thinking".to_string(),
+                description: Some("Inherit the current session reasoning level.".to_string()),
+                is_current: current_override.is_none(),
+                actions: vec![Box::new(move |tx| {
+                    tx.send(AppEvent::QueueSetThinkingOverride { id, effort: None });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+            SelectionItem {
+                name: format!("Default ({})", Self::reasoning_effort_label(default_effort)),
+                description: Some("Use the model's default reasoning level.".to_string()),
+                is_current: matches!(current_override, Some(None)),
+                actions: vec![Box::new(move |tx| {
+                    tx.send(AppEvent::QueueSetThinkingOverride {
+                        id,
+                        effort: Some(None),
+                    });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+        ];
+
+        for option in preset.supported_reasoning_efforts {
+            let effort = option.effort;
+            let mut label = Self::reasoning_effort_label(effort).to_string();
+            if effort == default_effort {
+                label.push_str(" (default)");
+            }
+            let description = (!option.description.is_empty()).then_some(option.description);
+            let is_current = current_override == Some(Some(effort));
+            items.push(SelectionItem {
+                name: label,
+                description,
+                is_current,
+                actions: vec![Box::new(move |tx| {
+                    tx.send(AppEvent::QueueSetThinkingOverride {
+                        id,
+                        effort: Some(Some(effort)),
+                    });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            });
+        }
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            title: Some("Select Thinking for Queued Message".to_string()),
+            subtitle: Some(format!("Model: {model_slug}")),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            ..Default::default()
+        });
+    }
+
+    pub(crate) fn set_queued_user_message_model_override(
+        &mut self,
+        id: u64,
+        model: Option<String>,
+    ) {
+        if self.queued_edit_state.is_some() {
+            let selected_id = self
+                .queued_edit_state
+                .as_ref()
+                .map(|state| state.selected_id);
+            let base = self
+                .queued_edit_state
+                .as_ref()
+                .and_then(|state| state.drafts.get(&id).cloned())
+                .or_else(|| {
+                    if selected_id == Some(id) {
+                        self.capture_queue_edit_draft(id)
+                    } else {
+                        self.queued_user_message_draft(id)
+                    }
+                });
+            if let Some(mut draft) = base {
+                draft.model_override = model;
+                if let Some(state) = self.queued_edit_state.as_mut() {
+                    state.drafts.insert(id, draft);
+                }
+            }
+            self.refresh_queued_user_messages();
+            self.request_redraw();
+            return;
+        }
+
+        let Some(message) = self
+            .queued_user_messages
+            .iter_mut()
+            .find(|message| message.id == id)
+        else {
+            return;
+        };
+        message.model_override = model;
+        self.refresh_queued_user_messages();
+        self.request_redraw();
+    }
+
+    pub(crate) fn set_queued_user_message_thinking_override(
+        &mut self,
+        id: u64,
+        effort: Option<Option<ReasoningEffortConfig>>,
+    ) {
+        if self.queued_edit_state.is_some() {
+            let selected_id = self
+                .queued_edit_state
+                .as_ref()
+                .map(|state| state.selected_id);
+            let base = self
+                .queued_edit_state
+                .as_ref()
+                .and_then(|state| state.drafts.get(&id).cloned())
+                .or_else(|| {
+                    if selected_id == Some(id) {
+                        self.capture_queue_edit_draft(id)
+                    } else {
+                        self.queued_user_message_draft(id)
+                    }
+                });
+            if let Some(mut draft) = base {
+                draft.effort_override = effort;
+                if let Some(state) = self.queued_edit_state.as_mut() {
+                    state.drafts.insert(id, draft);
+                }
+            }
+            self.refresh_queued_user_messages();
+            self.request_redraw();
+            return;
+        }
+
+        let Some(message) = self
+            .queued_user_messages
+            .iter_mut()
+            .find(|message| message.id == id)
+        else {
+            return;
+        };
+        message.effort_override = effort;
+        self.refresh_queued_user_messages();
+        self.request_redraw();
+    }
+
+    fn exit_queue_edit(&mut self, save: bool) {
+        let Some(mut state) = self.queued_edit_state.take() else {
+            return;
+        };
+
+        if save {
+            if let Some(draft) = self.capture_queue_edit_draft(state.selected_id) {
+                state.drafts.insert(state.selected_id, draft);
+            }
+
+            for message in &mut self.queued_user_messages {
+                if let Some(draft) = state.drafts.get(&message.id) {
+                    message.text = draft.text.clone();
+                    message.text_elements = draft.text_elements.clone();
+                    message.local_images = draft.local_images.clone();
+                    message.mention_paths = draft.mention_paths.clone();
+                    message.model_override = draft.model_override.clone();
+                    message.effort_override = draft.effort_override;
+                }
+            }
+        }
+
+        let local_image_paths: Vec<PathBuf> = state
+            .composer_before_edit
+            .local_images
+            .iter()
+            .map(|img| img.path.clone())
+            .collect();
+        self.bottom_pane.set_footer_hint_override(None);
+        self.bottom_pane.set_composer_text_with_mention_paths(
+            state.composer_before_edit.text,
+            state.composer_before_edit.text_elements,
+            local_image_paths,
+            state.composer_before_edit.mention_paths,
+        );
+
+        self.refresh_queued_user_messages();
+        self.request_redraw();
+    }
+
+    fn switch_queue_edit(&mut self, direction: isize) {
+        let Some(selected_id) = self
+            .queued_edit_state
+            .as_ref()
+            .map(|state| state.selected_id)
+        else {
+            return;
+        };
+
+        if let Some(draft) = self.capture_queue_edit_draft(selected_id)
+            && let Some(state) = self.queued_edit_state.as_mut()
+        {
+            state.drafts.insert(selected_id, draft);
+        }
+
+        let Some(current_idx) = self
+            .queued_user_messages
+            .iter()
+            .position(|message| message.id == selected_id)
+        else {
+            self.exit_queue_edit(false);
+            return;
+        };
+
+        let len = self.queued_user_messages.len();
+        if len == 0 {
+            self.exit_queue_edit(false);
+            return;
+        }
+
+        let next_idx = ((current_idx as isize + direction).rem_euclid(len as isize)) as usize;
+        let Some(next_id) = self
+            .queued_user_messages
+            .get(next_idx)
+            .map(|message| message.id)
+        else {
+            return;
+        };
+
+        let draft = self
+            .queued_edit_state
+            .as_ref()
+            .and_then(|state| state.drafts.get(&next_id).cloned())
+            .or_else(|| self.queued_user_message_draft(next_id));
+        let Some(draft) = draft else {
+            return;
+        };
+
+        if let Some(state) = self.queued_edit_state.as_mut() {
+            state.selected_id = next_id;
+        }
+
+        let local_image_paths: Vec<PathBuf> = draft
+            .local_images
+            .iter()
+            .map(|img| img.path.clone())
+            .collect();
+        self.bottom_pane.set_composer_text_with_mention_paths(
+            draft.text,
+            draft.text_elements,
+            local_image_paths,
+            draft.mention_paths,
+        );
+        self.update_queue_edit_footer_hint();
+        self.refresh_queued_user_messages();
+        self.request_redraw();
+    }
+
+    fn capture_queue_edit_draft(&self, id: u64) -> Option<QueuedUserMessageDraft> {
+        let message = self
+            .queued_user_messages
+            .iter()
+            .find(|message| message.id == id)?;
+
+        let (model_override, effort_override) = self
+            .queued_edit_state
+            .as_ref()
+            .and_then(|state| state.drafts.get(&id))
+            .map(|draft| (draft.model_override.clone(), draft.effort_override))
+            .unwrap_or_else(|| (message.model_override.clone(), message.effort_override));
+
+        Some(QueuedUserMessageDraft {
+            text: self.bottom_pane.composer_text(),
+            text_elements: self.bottom_pane.composer_text_elements(),
+            local_images: self.bottom_pane.composer_local_images(),
+            mention_paths: self.bottom_pane.composer_mention_paths(),
+            model_override,
+            effort_override,
+        })
+    }
+
+    fn queued_user_message_draft(&self, id: u64) -> Option<QueuedUserMessageDraft> {
+        let message = self
+            .queued_user_messages
+            .iter()
+            .find(|message| message.id == id)?;
+
+        Some(QueuedUserMessageDraft {
+            text: message.text.clone(),
+            text_elements: message.text_elements.clone(),
+            local_images: message.local_images.clone(),
+            mention_paths: message.mention_paths.clone(),
+            model_override: message.model_override.clone(),
+            effort_override: message.effort_override,
+        })
+    }
+
+    fn load_queue_edit_draft(&mut self, id: u64) {
+        let draft = self
+            .queued_edit_state
+            .as_ref()
+            .and_then(|state| state.drafts.get(&id).cloned())
+            .or_else(|| self.queued_user_message_draft(id));
+
+        let Some(draft) = draft else {
+            return;
+        };
+
+        let local_image_paths: Vec<PathBuf> = draft
+            .local_images
+            .iter()
+            .map(|img| img.path.clone())
+            .collect();
+        self.bottom_pane.set_composer_text_with_mention_paths(
+            draft.text,
+            draft.text_elements,
+            local_image_paths,
+            draft.mention_paths,
+        );
+    }
+
+    fn update_queue_edit_footer_hint(&mut self) {
+        let Some(state) = self.queued_edit_state.as_ref() else {
+            return;
+        };
+
+        let total = self.queued_user_messages.len();
+        let position = self
+            .queued_user_messages
+            .iter()
+            .position(|message| message.id == state.selected_id)
+            .map(|idx| idx + 1)
+            .unwrap_or_default();
+
+        self.bottom_pane.set_footer_hint_override(Some(vec![
+            ("Editing".to_string(), format!("{position}/{total}")),
+            ("Enter".to_string(), "save".to_string()),
+            ("Esc".to_string(), "cancel".to_string()),
+            ("Alt+↑/↓".to_string(), "switch".to_string()),
+            ("Alt+M".to_string(), "model".to_string()),
+            ("Alt+T".to_string(), "thinking".to_string()),
+        ]));
+    }
+
     /// Rebuild and update the queued user messages from the current queue.
     fn refresh_queued_user_messages(&mut self) {
+        let session_model = self.current_model();
+        let session_effort = self.effective_reasoning_effort();
+        let editing_id = self
+            .queued_edit_state
+            .as_ref()
+            .map(|state| state.selected_id);
         let messages: Vec<String> = self
             .queued_user_messages
             .iter()
-            .map(|m| m.text.clone())
+            .map(|message| {
+                let effective_model = message.model_override.as_deref().unwrap_or(session_model);
+                let effective_effort = message.effort_override.unwrap_or(session_effort);
+                let mut tag = String::new();
+                if message.model_override.is_some() || message.effort_override.is_some() {
+                    tag = format!(
+                        "[{effective_model} · reasoning {}] ",
+                        Self::status_line_reasoning_effort_label(effective_effort)
+                    );
+                }
+
+                if Some(message.id) == editing_id {
+                    format!("✎ {tag}{}", message.text)
+                } else {
+                    format!("{tag}{}", message.text)
+                }
+            })
             .collect();
         self.bottom_pane.set_queued_user_messages(messages);
     }
@@ -4087,11 +6093,97 @@ impl ChatWidget {
     }
 
     fn open_status_line_setup(&mut self) {
-        let view = StatusLineSetupView::new(
-            self.config.tui_status_line.as_deref(),
-            self.app_event_tx.clone(),
-        );
+        let selected_items = self
+            .config
+            .tui_status_line
+            .clone()
+            .unwrap_or_else(Self::default_status_line_item_ids);
+        let view =
+            StatusLineSetupView::new(Some(selected_items.as_slice()), self.app_event_tx.clone());
         self.bottom_pane.show_view(Box::new(view));
+    }
+
+    fn open_progress_legend_popup(&mut self) {
+        let mut items = vec![SelectionItem {
+            name: format!("Mode: {}", self.progress_legend_mode),
+            description: Some("Choose when the progress legend is shown.".to_string()),
+            actions: vec![Box::new(|tx| {
+                tx.send(AppEvent::OpenProgressLegendModePicker);
+            })],
+            dismiss_on_select: false,
+            ..Default::default()
+        }];
+        for category in [
+            ProgressTraceCategory::Tool,
+            ProgressTraceCategory::Edit,
+            ProgressTraceCategory::Waiting,
+            ProgressTraceCategory::Network,
+            ProgressTraceCategory::Prefill,
+            ProgressTraceCategory::Reasoning,
+            ProgressTraceCategory::Gen,
+        ] {
+            let swatch_style =
+                progress_trace_style_for_category(&self.progress_trace_styles, category).to_style();
+            items.push(SelectionItem {
+                name: progress_trace_category_label(category).to_string(),
+                name_prefix: Some(Span::styled("▮ ", swatch_style)),
+                description: Some(progress_trace_style_description(
+                    category,
+                    &self.progress_trace_styles,
+                )),
+                ..Default::default()
+            });
+        }
+        self.show_selection_view(SelectionViewParams {
+            title: Some("Progress Legend".to_string()),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            initial_selected_idx: Some(1),
+            ..Default::default()
+        });
+    }
+
+    pub(crate) fn open_progress_legend_mode_picker(&mut self) {
+        let mut items = Vec::new();
+        for mode in [
+            ProgressLegendMode::Off,
+            ProgressLegendMode::Auto,
+            ProgressLegendMode::Always,
+        ] {
+            items.push(SelectionItem {
+                name: mode.to_string(),
+                description: Some(format!("Set progress legend mode to '{mode}'.")),
+                is_current: self.progress_legend_mode == mode,
+                actions: vec![Box::new(move |tx| {
+                    tx.send(AppEvent::SetProgressLegendMode { mode });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            });
+        }
+
+        self.show_selection_view(SelectionViewParams {
+            title: Some("Progress legend mode".to_string()),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            ..Default::default()
+        });
+    }
+
+    fn default_status_line_items() -> Vec<StatusLineItem> {
+        vec![
+            StatusLineItem::ModelWithReasoning,
+            StatusLineItem::ContextRemaining,
+            StatusLineItem::CurrentDir,
+            StatusLineItem::GitBranch,
+        ]
+    }
+
+    fn default_status_line_item_ids() -> Vec<String> {
+        Self::default_status_line_items()
+            .into_iter()
+            .map(|item| item.to_string())
+            .collect()
     }
 
     /// Parses configured status-line ids into known items and collects unknown ids.
@@ -4102,7 +6194,7 @@ impl ChatWidget {
         let mut invalid_seen = HashSet::new();
         let mut items = Vec::new();
         let Some(config_items) = self.config.tui_status_line.as_ref() else {
-            return (items, invalid);
+            return (Self::default_status_line_items(), invalid);
         };
         for id in config_items {
             match id.parse::<StatusLineItem>() {
@@ -4181,6 +6273,14 @@ impl ChatWidget {
         });
     }
 
+    fn status_line_model_display_name(&self) -> &str {
+        self.model_display_name()
+    }
+
+    fn status_line_reasoning_effort(&self) -> Option<ReasoningEffortConfig> {
+        self.effective_reasoning_effort()
+    }
+
     /// Resolves a display string for one configured status-line item.
     ///
     /// Returning `None` means "omit this item for now", not "configuration error". Callers rely on
@@ -4188,11 +6288,11 @@ impl ChatWidget {
     /// git metadata.
     fn status_line_value_for_item(&self, item: &StatusLineItem) -> Option<String> {
         match item {
-            StatusLineItem::ModelName => Some(self.model_display_name().to_string()),
+            StatusLineItem::ModelName => Some(self.status_line_model_display_name().to_string()),
             StatusLineItem::ModelWithReasoning => {
                 let label =
-                    Self::status_line_reasoning_effort_label(self.effective_reasoning_effort());
-                Some(format!("{} {label}", self.model_display_name()))
+                    Self::status_line_reasoning_effort_label(self.status_line_reasoning_effort());
+                Some(format!("{} {label}", self.status_line_model_display_name()))
             }
             StatusLineItem::CurrentDir => {
                 Some(format_directory_display(self.status_line_cwd(), None))
@@ -4622,10 +6722,7 @@ impl ChatWidget {
     }
 
     pub(crate) fn open_model_popup_with_presets(&mut self, presets: Vec<ModelPreset>) {
-        let presets: Vec<ModelPreset> = presets
-            .into_iter()
-            .filter(|preset| preset.show_in_picker)
-            .collect();
+        let presets = Self::picker_visible_model_presets(presets);
 
         let current_model = self.current_model();
         let current_label = presets
@@ -4704,6 +6801,42 @@ impl ChatWidget {
 
     fn is_auto_model(model: &str) -> bool {
         model.starts_with("codex-auto-")
+    }
+
+    fn picker_visible_model_presets(presets: Vec<ModelPreset>) -> Vec<ModelPreset> {
+        presets
+            .into_iter()
+            .filter(|preset| preset.show_in_picker)
+            .collect()
+    }
+
+    fn model_shortcut_choices(current_model: &str, presets: Vec<ModelPreset>) -> Vec<ModelPreset> {
+        let (mut auto_presets, other_presets): (Vec<ModelPreset>, Vec<ModelPreset>) =
+            Self::picker_visible_model_presets(presets)
+                .into_iter()
+                .partition(|preset| Self::is_auto_model(&preset.model));
+
+        auto_presets.sort_by_key(|preset| Self::auto_model_order(&preset.model));
+        if auto_presets.is_empty() {
+            return other_presets;
+        }
+
+        if auto_presets
+            .iter()
+            .any(|preset| preset.model.as_str() == current_model)
+        {
+            return auto_presets;
+        }
+
+        let current_preset = other_presets
+            .iter()
+            .find(|preset| preset.model.as_str() == current_model)
+            .cloned();
+        if let Some(current_preset) = current_preset {
+            auto_presets.insert(0, current_preset);
+        }
+
+        auto_presets
     }
 
     fn auto_model_order(model: &str) -> usize {
@@ -5984,6 +8117,10 @@ impl ChatWidget {
     fn refresh_model_display(&mut self) {
         let effective = self.effective_collaboration_mode();
         self.session_header.set_model(effective.model());
+        self.bottom_pane
+            .set_session_model(effective.model().to_string());
+        self.bottom_pane
+            .set_session_reasoning_effort(self.effective_reasoning_effort());
         // Keep composer paste affordances aligned with the currently effective model.
         self.sync_image_paste_enabled();
     }
@@ -6051,6 +8188,94 @@ impl ChatWidget {
         ) {
             self.set_collaboration_mask(next_mask);
         }
+    }
+
+    fn cycle_model_shortcut(&mut self, direction: isize) {
+        let current_model = self.current_model().to_string();
+        let presets: Vec<ModelPreset> = match self.models_manager.try_list_models(&self.config) {
+            Ok(models) => models,
+            Err(_) => {
+                self.add_info_message(
+                    "Models are being updated; please try again in a moment.".to_string(),
+                    None,
+                );
+                return;
+            }
+        };
+
+        let choices = Self::model_shortcut_choices(&current_model, presets);
+
+        if choices.len() <= 1 {
+            return;
+        }
+
+        let next_idx = if let Some(current_idx) = choices
+            .iter()
+            .position(|preset| preset.model == current_model)
+        {
+            let len = choices.len() as isize;
+            (current_idx as isize + direction).rem_euclid(len) as usize
+        } else if direction >= 0 {
+            0
+        } else {
+            choices.len() - 1
+        };
+
+        let next = choices[next_idx].clone();
+        self.apply_model_and_effort(next.model.to_string(), Some(next.default_reasoning_effort));
+    }
+
+    fn cycle_reasoning_effort_shortcut(&mut self, direction: isize) {
+        let model_slug = self.current_model().to_string();
+        let current_effort = self.effective_reasoning_effort();
+
+        let presets = match self.models_manager.try_list_models(&self.config) {
+            Ok(presets) => presets,
+            Err(_) => {
+                self.add_info_message(
+                    "Models are being updated; please try again in a moment.".to_string(),
+                    None,
+                );
+                return;
+            }
+        };
+
+        let Some(preset) = Self::picker_visible_model_presets(presets)
+            .into_iter()
+            .find(|preset| preset.model == model_slug)
+        else {
+            self.add_info_message(
+                format!("Model '{model_slug}' is not available right now."),
+                None,
+            );
+            return;
+        };
+
+        let default_effort = preset.default_reasoning_effort;
+        let mut supported: HashSet<ReasoningEffortConfig> = preset
+            .supported_reasoning_efforts
+            .into_iter()
+            .map(|option| option.effort)
+            .collect();
+        supported.insert(default_effort);
+
+        let choices: Vec<ReasoningEffortConfig> = ReasoningEffortConfig::iter()
+            .filter(|effort| *effort != ReasoningEffortConfig::None && supported.contains(effort))
+            .collect();
+
+        if choices.len() <= 1 {
+            return;
+        }
+
+        let current_idx = current_effort
+            .and_then(|effort| choices.iter().position(|choice| *choice == effort))
+            .or_else(|| choices.iter().position(|choice| *choice == default_effort))
+            .unwrap_or(0);
+
+        let len = choices.len() as isize;
+        let next_idx = (current_idx as isize + direction).rem_euclid(len) as usize;
+        let next_effort = Some(choices[next_idx]);
+        self.apply_model_and_effort(model_slug, next_effort);
     }
 
     /// Update the active collaboration mask.
@@ -6135,20 +8360,6 @@ impl ChatWidget {
     pub(crate) fn add_error_message(&mut self, message: String) {
         self.add_to_history(history_cell::new_error_event(message));
         self.request_redraw();
-    }
-
-    fn rename_confirmation_cell(name: &str, thread_id: Option<ThreadId>) -> PlainHistoryCell {
-        let resume_cmd = codex_core::util::resume_command(Some(name), thread_id)
-            .unwrap_or_else(|| format!("codex resume {name}"));
-        let name = name.to_string();
-        let line = vec![
-            "• ".into(),
-            "Thread renamed to ".into(),
-            name.cyan(),
-            ", to resume this thread run ".into(),
-            resume_cmd.cyan(),
-        ];
-        PlainHistoryCell::new(vec![line.into()])
     }
 
     pub(crate) fn add_mcp_output(&mut self) {
@@ -6837,6 +9048,314 @@ const PLACEHOLDERS: [&str; 8] = [
     "Use /skills to list available skills",
 ];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CopyableRole {
+    Response,
+    User,
+}
+
+impl CopyableRole {
+    fn label(self) -> &'static str {
+        match self {
+            CopyableRole::Response => "Response",
+            CopyableRole::User => "User",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CopyableMessage {
+    role: CopyableRole,
+    text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodeBlockScope {
+    LastResponse,
+    AllResponses,
+}
+
+impl CodeBlockScope {
+    fn label(self) -> &'static str {
+        match self {
+            CodeBlockScope::LastResponse => "Last response",
+            CodeBlockScope::AllResponses => "All responses",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            CodeBlockScope::LastResponse => "Show blocks from the latest response only.",
+            CodeBlockScope::AllResponses => "Show blocks from all responses in this chat.",
+        }
+    }
+
+    fn toggle(self) -> Self {
+        match self {
+            CodeBlockScope::LastResponse => CodeBlockScope::AllResponses,
+            CodeBlockScope::AllResponses => CodeBlockScope::LastResponse,
+        }
+    }
+}
+
+impl From<CopyCodeBlockScope> for CodeBlockScope {
+    fn from(value: CopyCodeBlockScope) -> Self {
+        match value {
+            CopyCodeBlockScope::LastResponse => CodeBlockScope::LastResponse,
+            CopyCodeBlockScope::AllResponses => CodeBlockScope::AllResponses,
+        }
+    }
+}
+
+impl From<CodeBlockScope> for CopyCodeBlockScope {
+    fn from(value: CodeBlockScope) -> Self {
+        match value {
+            CodeBlockScope::LastResponse => CopyCodeBlockScope::LastResponse,
+            CodeBlockScope::AllResponses => CopyCodeBlockScope::AllResponses,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MessageFilter {
+    Responses,
+    User,
+    Both,
+}
+
+impl MessageFilter {
+    fn label(self) -> &'static str {
+        match self {
+            MessageFilter::Responses => "Responses",
+            MessageFilter::User => "User messages",
+            MessageFilter::Both => "Responses + user messages",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            MessageFilter::Responses => "Only assistant responses",
+            MessageFilter::User => "Only your messages",
+            MessageFilter::Both => "Both response and user messages",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            MessageFilter::Responses => MessageFilter::User,
+            MessageFilter::User => MessageFilter::Both,
+            MessageFilter::Both => MessageFilter::Responses,
+        }
+    }
+
+    fn includes(self, role: CopyableRole) -> bool {
+        match self {
+            MessageFilter::Responses => role == CopyableRole::Response,
+            MessageFilter::User => role == CopyableRole::User,
+            MessageFilter::Both => true,
+        }
+    }
+}
+
+impl From<CopyMessageFilter> for MessageFilter {
+    fn from(value: CopyMessageFilter) -> Self {
+        match value {
+            CopyMessageFilter::Responses => MessageFilter::Responses,
+            CopyMessageFilter::User => MessageFilter::User,
+            CopyMessageFilter::Both => MessageFilter::Both,
+        }
+    }
+}
+
+impl From<MessageFilter> for CopyMessageFilter {
+    fn from(value: MessageFilter) -> Self {
+        match value {
+            MessageFilter::Responses => CopyMessageFilter::Responses,
+            MessageFilter::User => CopyMessageFilter::User,
+            MessageFilter::Both => CopyMessageFilter::Both,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CopyCodeBlockCandidate {
+    id: String,
+    label: String,
+    preview: String,
+    search_value: String,
+    content: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CopyMessageCandidate {
+    id: String,
+    label: String,
+    preview: String,
+    search_value: String,
+    content: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CopyCodeUiState {
+    scope: CodeBlockScope,
+    ui_mode: CopyUiMode,
+    multi_select: bool,
+    selected_id: Option<String>,
+    selected_ids: BTreeSet<String>,
+}
+
+impl CopyCodeUiState {
+    fn new(scope: CodeBlockScope, ui_mode: CopyUiMode) -> Self {
+        Self {
+            scope,
+            ui_mode,
+            multi_select: false,
+            selected_id: None,
+            selected_ids: BTreeSet::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CopyMessageUiState {
+    filter: MessageFilter,
+    ui_mode: CopyUiMode,
+    multi_select: bool,
+    selected_id: Option<String>,
+    selected_ids: BTreeSet<String>,
+}
+
+impl CopyMessageUiState {
+    fn new(filter: MessageFilter, ui_mode: CopyUiMode) -> Self {
+        Self {
+            filter,
+            ui_mode,
+            multi_select: false,
+            selected_id: None,
+            selected_ids: BTreeSet::new(),
+        }
+    }
+}
+
+fn copy_ui_mode_label(mode: CopyUiMode) -> &'static str {
+    match mode {
+        CopyUiMode::Picker => "picker",
+        CopyUiMode::Navigator => "navigator",
+    }
+}
+
+fn selected_index_for_candidates<T>(
+    top_rows: usize,
+    candidates: &[T],
+    selected_id: Option<&str>,
+) -> Option<usize>
+where
+    T: CopyCandidateId,
+{
+    selected_id.and_then(|id| {
+        candidates
+            .iter()
+            .position(|candidate| candidate.candidate_id() == id)
+            .map(|idx| top_rows + idx)
+    })
+}
+
+trait CopyCandidateId {
+    fn candidate_id(&self) -> &str;
+}
+
+impl CopyCandidateId for CopyCodeBlockCandidate {
+    fn candidate_id(&self) -> &str {
+        &self.id
+    }
+}
+
+impl CopyCandidateId for CopyMessageCandidate {
+    fn candidate_id(&self) -> &str {
+        &self.id
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FencedCodeBlock {
+    language: Option<String>,
+    content: String,
+}
+
+fn first_non_empty_preview(content: &str) -> String {
+    let snippet = content
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    if snippet.is_empty() {
+        "(empty)".to_string()
+    } else {
+        truncate_text(snippet, 80)
+    }
+}
+
+fn extract_fenced_code_blocks(markdown: &str) -> Vec<FencedCodeBlock> {
+    #[derive(Debug)]
+    struct OpenFence {
+        fence_char: char,
+        fence_len: usize,
+        language: Option<String>,
+        content_lines: Vec<String>,
+    }
+
+    fn parse_fence(line: &str) -> Option<(char, usize, &str)> {
+        let trimmed = line.trim_start();
+        let fence_char = match trimmed.chars().next() {
+            Some('`') => '`',
+            Some('~') => '~',
+            _ => return None,
+        };
+        let fence_len = trimmed.chars().take_while(|ch| *ch == fence_char).count();
+        if fence_len < 3 {
+            return None;
+        }
+        Some((fence_char, fence_len, trimmed[fence_len..].trim()))
+    }
+
+    let mut blocks = Vec::new();
+    let mut open: Option<OpenFence> = None;
+
+    for line in markdown.lines() {
+        if let Some(state) = open.as_mut() {
+            let trimmed = line.trim_start();
+            let close_len = trimmed
+                .chars()
+                .take_while(|ch| *ch == state.fence_char)
+                .count();
+            if close_len >= state.fence_len && trimmed[close_len..].trim().is_empty() {
+                if let Some(state) = open.take() {
+                    blocks.push(FencedCodeBlock {
+                        language: state.language,
+                        content: state.content_lines.join("\n"),
+                    });
+                }
+                continue;
+            }
+            state.content_lines.push(line.to_string());
+            continue;
+        }
+
+        let Some((fence_char, fence_len, rest)) = parse_fence(line) else {
+            continue;
+        };
+        let language = rest.split_whitespace().next().map(ToString::to_string);
+        open = Some(OpenFence {
+            fence_char,
+            fence_len,
+            language,
+            content_lines: Vec::new(),
+        });
+    }
+
+    blocks
+}
+
 // Extract the first bold (Markdown) element in the form **...** from `s`.
 // Returns the inner text if found; otherwise `None`.
 fn extract_first_bold(s: &str) -> Option<String> {
@@ -6865,6 +9384,312 @@ fn extract_first_bold(s: &str) -> Option<String> {
         i += 1;
     }
     None
+}
+
+#[derive(Debug, Default)]
+struct ParsedExportArgs {
+    format: Option<ChatExportFormat>,
+    overrides: ExportOverrides,
+}
+
+#[derive(Debug)]
+struct ExportDestination {
+    path: PathBuf,
+    format: ChatExportFormat,
+}
+
+#[derive(Debug)]
+enum ExportPathSpec {
+    File(PathBuf),
+    Dir(PathBuf),
+}
+
+fn parse_export_args(args: &str, cwd: &Path) -> Result<ParsedExportArgs, String> {
+    let mut parsed = ParsedExportArgs::default();
+    if args.trim().is_empty() {
+        return Ok(parsed);
+    }
+
+    let tokens =
+        shlex::split(args).ok_or_else(|| "Could not parse /export arguments.".to_string())?;
+    let mut positional: Option<String> = None;
+    let mut idx = 0usize;
+
+    while idx < tokens.len() {
+        let token = &tokens[idx];
+        if token == "--" {
+            if idx + 1 >= tokens.len() {
+                return Err("Expected a path after --.".to_string());
+            }
+            if tokens.len() - idx > 2 {
+                return Err(format!(
+                    "Unexpected /export arguments: {}",
+                    tokens[idx + 2..].join(" ")
+                ));
+            }
+            positional = Some(tokens[idx + 1].clone());
+            break;
+        }
+
+        let next_value =
+            |idx: &mut usize, tokens: &[String], flag: &str| -> Result<String, String> {
+                *idx += 1;
+                if *idx >= tokens.len() {
+                    return Err(format!("Expected a value after {flag}."));
+                }
+                Ok(tokens[*idx].clone())
+            };
+
+        match token.as_str() {
+            "-f" | "--format" => {
+                let value = next_value(&mut idx, &tokens, token)?;
+                parsed.format = Some(parse_export_format(&value)?);
+            }
+            "--json" => {
+                parsed.format = Some(ChatExportFormat::Json);
+            }
+            "--markdown" | "--md" => {
+                parsed.format = Some(ChatExportFormat::Markdown);
+            }
+            "-o" | "--output" => {
+                let value = next_value(&mut idx, &tokens, token)?;
+                parsed.overrides.output_path = Some(resolve_input_path(cwd, &value));
+            }
+            "-C" | "--dir" => {
+                let value = next_value(&mut idx, &tokens, token)?;
+                parsed.overrides.output_dir = Some(resolve_input_path(cwd, &value));
+            }
+            "--name" => {
+                let value = next_value(&mut idx, &tokens, token)?;
+                parsed.overrides.name = Some(value);
+            }
+            _ if token.starts_with('-') => {
+                return Err(format!("Unknown /export flag: {token}"));
+            }
+            _ => {
+                if positional.is_some() {
+                    return Err("Provide only one export path.".to_string());
+                }
+                positional = Some(token.clone());
+            }
+        }
+
+        idx += 1;
+    }
+
+    if parsed.overrides.output_path.is_some() && parsed.overrides.output_dir.is_some() {
+        return Err("Use either --output or --dir, not both.".to_string());
+    }
+
+    if let Some(positional) = positional {
+        if parsed.overrides.output_path.is_some() || parsed.overrides.output_dir.is_some() {
+            return Err("Provide only one export path (flag or positional).".to_string());
+        }
+        match classify_export_path(&positional, cwd) {
+            ExportPathSpec::File(path) => parsed.overrides.output_path = Some(path),
+            ExportPathSpec::Dir(path) => parsed.overrides.output_dir = Some(path),
+        }
+    }
+
+    Ok(parsed)
+}
+
+fn parse_export_format(value: &str) -> Result<ChatExportFormat, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "md" | "markdown" => Ok(ChatExportFormat::Markdown),
+        "json" => Ok(ChatExportFormat::Json),
+        _ => Err(format!(
+            "Unknown export format: {value} (expected md or json)."
+        )),
+    }
+}
+
+fn export_overrides_from_path_input(value: &str, cwd: &Path) -> ExportOverrides {
+    match classify_export_path(value, cwd) {
+        ExportPathSpec::File(path) => ExportOverrides {
+            output_path: Some(path),
+            ..Default::default()
+        },
+        ExportPathSpec::Dir(path) => ExportOverrides {
+            output_dir: Some(path),
+            ..Default::default()
+        },
+    }
+}
+
+fn classify_export_path(value: &str, cwd: &Path) -> ExportPathSpec {
+    let path = resolve_input_path(cwd, value);
+    let trailing_separator = value.ends_with(std::path::MAIN_SEPARATOR)
+        || (std::path::MAIN_SEPARATOR != '/' && value.ends_with('/'))
+        || (std::path::MAIN_SEPARATOR != '\\' && value.ends_with('\\'));
+    if trailing_separator || path.is_dir() {
+        ExportPathSpec::Dir(path)
+    } else {
+        ExportPathSpec::File(path)
+    }
+}
+
+fn resolve_input_path(cwd: &Path, value: &str) -> PathBuf {
+    let trimmed = value.trim();
+    let path = if let Some(rest) = trimmed.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            home.join(rest)
+        } else {
+            PathBuf::from(trimmed)
+        }
+    } else {
+        PathBuf::from(trimmed)
+    };
+    if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    }
+}
+
+fn resolve_export_destination(
+    rollout_path: &Path,
+    format_override: Option<ChatExportFormat>,
+    overrides: &ExportOverrides,
+) -> Result<ExportDestination, String> {
+    let mut format = format_override
+        .or_else(|| {
+            overrides
+                .output_path
+                .as_deref()
+                .and_then(format_from_extension)
+        })
+        .unwrap_or(ChatExportFormat::Markdown);
+
+    if let Some(mut path) = overrides.output_path.clone() {
+        if path.is_dir() {
+            return Err(format!("Export path is a directory: {}", path.display()));
+        }
+        if path.extension().is_none() {
+            path.set_extension(format.extension());
+        } else if let Some(from_ext) = format_from_extension(&path) {
+            format = from_ext;
+        }
+        return Ok(ExportDestination { path, format });
+    }
+
+    let output_dir = overrides
+        .output_dir
+        .clone()
+        .or_else(|| rollout_path.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."));
+    if output_dir.is_file() {
+        return Err(format!(
+            "Export directory is a file: {}",
+            output_dir.display()
+        ));
+    }
+
+    let export_name = if let Some(name) = overrides.name.as_deref() {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Err("Export name cannot be empty.".to_string());
+        }
+        trimmed.to_string()
+    } else {
+        default_export_name(rollout_path)?
+    };
+
+    if export_name.contains(std::path::MAIN_SEPARATOR) || export_name.contains('/') {
+        return Err("Export name must not contain path separators.".to_string());
+    }
+
+    let mut path = output_dir.join(export_name);
+    path.set_extension(format.extension());
+
+    Ok(ExportDestination { path, format })
+}
+
+fn default_export_name(rollout_path: &Path) -> Result<String, String> {
+    let stem = rollout_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(str::trim)
+        .filter(|stem| !stem.is_empty())
+        .ok_or_else(|| "Failed to derive export name from rollout path.".to_string())?;
+    Ok(stem.to_string())
+}
+
+fn format_from_extension(path: &Path) -> Option<ChatExportFormat> {
+    let ext = path.extension()?.to_str()?;
+    match ext.to_ascii_lowercase().as_str() {
+        "md" | "markdown" => Some(ChatExportFormat::Markdown),
+        "json" => Some(ChatExportFormat::Json),
+        _ => None,
+    }
+}
+
+fn diff_view_override_from_args(args: &str, default_view: DiffView) -> Result<DiffView, String> {
+    if args.trim().is_empty() {
+        return Ok(default_view);
+    }
+
+    let Some(tokens) = shlex::split(args) else {
+        return Err("Failed to parse /diff arguments.".to_string());
+    };
+
+    if tokens.is_empty() {
+        return Ok(default_view);
+    }
+
+    let mut view_override = None;
+    let mut args_iter = tokens.iter();
+    while let Some(arg) = args_iter.next() {
+        if let Some(value) = arg.strip_prefix("--view=") {
+            view_override = Some(parse_diff_view_value(value)?);
+            continue;
+        }
+
+        match arg.as_str() {
+            "--pretty" => view_override = Some(DiffView::Pretty),
+            "--line" => view_override = Some(DiffView::Line),
+            "--inline" => view_override = Some(DiffView::Inline),
+            "--side-by-side" => view_override = Some(DiffView::SideBySide),
+            "--view" => {
+                let Some(value) = args_iter.next() else {
+                    return Err(
+                        "Expected a value after --view (pretty, line, inline, or side-by-side)."
+                            .to_string(),
+                    );
+                };
+                view_override = Some(parse_diff_view_value(value)?);
+            }
+            _ if arg.starts_with('-') => {
+                return Err(format!("Unknown /diff flag: {arg}"));
+            }
+            _ => {
+                return Err(format!("Unexpected /diff argument: {arg}"));
+            }
+        }
+    }
+
+    Ok(view_override.unwrap_or(default_view))
+}
+
+fn parse_diff_view_value(value: &str) -> Result<DiffView, String> {
+    match value {
+        "pretty" => Ok(DiffView::Pretty),
+        "line" => Ok(DiffView::Line),
+        "inline" => Ok(DiffView::Inline),
+        "side-by-side" | "side_by_side" | "side" => Ok(DiffView::SideBySide),
+        _ => Err(format!(
+            "Invalid /diff view '{value}'. Use 'pretty', 'line', 'inline', or 'side-by-side'."
+        )),
+    }
+}
+
+fn parse_progress_legend_mode(value: &str) -> Result<ProgressLegendMode, String> {
+    match value.trim() {
+        "off" => Ok(ProgressLegendMode::Off),
+        "auto" => Ok(ProgressLegendMode::Auto),
+        "always" => Ok(ProgressLegendMode::Always),
+        _ => Err("Invalid /legend-mode value. Use 'off', 'auto', or 'always'.".to_string()),
+    }
 }
 
 async fn fetch_rate_limits(base_url: String, auth: CodexAuth) -> Option<RateLimitSnapshot> {

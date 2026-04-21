@@ -22,14 +22,20 @@ use crate::bottom_pane::queued_user_messages::QueuedUserMessages;
 use crate::bottom_pane::unified_exec_footer::UnifiedExecFooter;
 use crate::key_hint;
 use crate::key_hint::KeyBinding;
+use crate::keybindings::Keybindings;
+use crate::progress_trace_style::ProgressTraceStyles;
 use crate::render::renderable::FlexRenderable;
 use crate::render::renderable::Renderable;
 use crate::render::renderable::RenderableItem;
 use crate::tui::FrameRequester;
 use bottom_pane_view::BottomPaneView;
+use codex_core::config::types::ProgressLegendMode;
 use codex_core::features::Features;
 use codex_core::skills::model::SkillMetadata;
 use codex_file_search::FileMatch;
+use codex_protocol::openai_models::ReasoningEffort;
+use codex_protocol::protocol::ProgressTraceCategory;
+use codex_protocol::protocol::ProgressTraceState;
 use codex_protocol::request_user_input::RequestUserInputEvent;
 use codex_protocol::user_input::TextElement;
 use crossterm::event::KeyCode;
@@ -81,12 +87,15 @@ pub(crate) use status_line_setup::StatusLineItem;
 pub(crate) use status_line_setup::StatusLineSetupView;
 mod paste_burst;
 pub mod popup_consts;
+mod queue_popup;
 mod queued_user_messages;
 mod scroll_state;
 mod selection_popup_common;
 mod textarea;
 mod unified_exec_footer;
 pub(crate) use feedback_view::FeedbackNoteView;
+pub(crate) use queue_popup::QueuePopup;
+pub(crate) use queue_popup::QueuePopupItem;
 
 /// How long the "press again to quit" hint stays visible.
 ///
@@ -148,9 +157,12 @@ pub(crate) struct BottomPane {
     is_task_running: bool,
     esc_backtrack_hint: bool,
     animations_enabled: bool,
+    progress_legend_mode: ProgressLegendMode,
+    progress_trace_styles: ProgressTraceStyles,
 
     /// Inline status indicator shown above the composer while a task is running.
     status: Option<StatusIndicatorWidget>,
+    progress_trace_backlog: Vec<(ProgressTraceCategory, ProgressTraceState, Option<String>)>,
     /// Unified exec session summary shown above the composer.
     unified_exec_footer: UnifiedExecFooter,
     /// Queued user messages to show above the composer while a turn is running.
@@ -167,6 +179,8 @@ pub(crate) struct BottomPaneParams {
     pub(crate) placeholder_text: String,
     pub(crate) disable_paste_burst: bool,
     pub(crate) animations_enabled: bool,
+    pub(crate) progress_legend_mode: ProgressLegendMode,
+    pub(crate) progress_trace_styles: ProgressTraceStyles,
     pub(crate) skills: Option<Vec<SkillMetadata>>,
 }
 
@@ -180,6 +194,8 @@ impl BottomPane {
             placeholder_text,
             disable_paste_burst,
             animations_enabled,
+            progress_legend_mode,
+            progress_trace_styles,
             skills,
         } = params;
         let mut composer = ChatComposer::new(
@@ -201,10 +217,13 @@ impl BottomPane {
             disable_paste_burst,
             is_task_running: false,
             status: None,
+            progress_trace_backlog: Vec::new(),
             unified_exec_footer: UnifiedExecFooter::new(),
             queued_user_messages: QueuedUserMessages::new(),
             esc_backtrack_hint: false,
             animations_enabled,
+            progress_legend_mode,
+            progress_trace_styles,
             context_window_percent: None,
             context_window_used_tokens: None,
         }
@@ -268,6 +287,25 @@ impl BottomPane {
     pub fn set_personality_command_enabled(&mut self, enabled: bool) {
         self.composer.set_personality_command_enabled(enabled);
         self.request_redraw();
+    }
+
+    fn refresh_queued_user_message_hints(&mut self) -> bool {
+        let queue_edit_active = self
+            .queued_user_messages
+            .messages
+            .iter()
+            .any(|message| message.starts_with("✎ "));
+        let show_send_next_hint = !self.is_task_running
+            && !self.composer.popup_active()
+            && !queue_edit_active
+            && !self.queued_user_messages.messages.is_empty();
+
+        if self.queued_user_messages.show_send_next_hint != show_send_next_hint {
+            self.queued_user_messages.show_send_next_hint = show_send_next_hint;
+            return true;
+        }
+
+        false
     }
 
     pub fn status_widget(&self) -> Option<&StatusIndicatorWidget> {
@@ -352,7 +390,8 @@ impl BottomPane {
                 return InputResult::None;
             }
             let (input_result, needs_redraw) = self.composer.handle_key_event(key_event);
-            if needs_redraw {
+            let hints_changed = self.refresh_queued_user_message_hints();
+            if needs_redraw || hints_changed {
                 self.request_redraw();
             }
             if self.composer.is_in_paste_burst() {
@@ -481,6 +520,10 @@ impl BottomPane {
         self.composer.local_images()
     }
 
+    pub(crate) fn composer_mention_paths(&self) -> HashMap<String, String> {
+        self.composer.mention_paths()
+    }
+
     #[cfg(test)]
     pub(crate) fn composer_local_image_paths(&self) -> Vec<PathBuf> {
         self.composer.local_image_paths()
@@ -507,6 +550,54 @@ impl BottomPane {
         if let Some(status) = self.status.as_mut() {
             status.update_header(header);
             status.update_details(details);
+            self.request_redraw();
+        }
+    }
+
+    pub(crate) fn set_active_model(&mut self, model: Option<String>) {
+        if let Some(status) = self.status.as_mut() {
+            status.set_active_model(model);
+            self.request_redraw();
+        }
+    }
+
+    pub(crate) fn set_active_reasoning_effort(&mut self, effort: Option<ReasoningEffort>) {
+        if let Some(status) = self.status.as_mut() {
+            status.set_active_reasoning_effort(effort);
+            self.request_redraw();
+        }
+    }
+
+    pub(crate) fn set_progress_legend_mode(&mut self, mode: ProgressLegendMode) {
+        self.progress_legend_mode = mode;
+        if let Some(status) = self.status.as_mut() {
+            status.set_legend_mode(mode);
+            self.request_redraw();
+        }
+    }
+
+    pub(crate) fn record_progress_trace(
+        &mut self,
+        category: ProgressTraceCategory,
+        state: ProgressTraceState,
+        label: Option<String>,
+    ) {
+        if let Some(status) = self.status.as_mut() {
+            status.record_progress_trace(category, state, label.clone());
+            self.request_redraw();
+        }
+        self.progress_trace_backlog.push((category, state, label));
+        const MAX_PROGRESS_TRACE_BACKLOG: usize = 128;
+        if self.progress_trace_backlog.len() > MAX_PROGRESS_TRACE_BACKLOG {
+            let remove_count = self.progress_trace_backlog.len() - MAX_PROGRESS_TRACE_BACKLOG;
+            self.progress_trace_backlog.drain(0..remove_count);
+        }
+    }
+
+    pub(crate) fn clear_progress_trace(&mut self) {
+        self.progress_trace_backlog.clear();
+        if let Some(status) = self.status.as_mut() {
+            status.clear_progress_trace();
             self.request_redraw();
         }
     }
@@ -577,6 +668,7 @@ impl BottomPane {
         let was_running = self.is_task_running;
         self.is_task_running = running;
         self.composer.set_task_running(running);
+        let hints_changed = self.refresh_queued_user_message_hints();
 
         if running {
             if !was_running {
@@ -585,16 +677,50 @@ impl BottomPane {
                         self.app_event_tx.clone(),
                         self.frame_requester.clone(),
                         self.animations_enabled,
+                        self.progress_legend_mode,
+                        self.progress_trace_styles,
                     ));
+                    if let Some(status) = self.status.as_mut() {
+                        status.set_task_running(running);
+                        for (category, state, label) in &self.progress_trace_backlog {
+                            status.record_progress_trace(*category, *state, label.clone());
+                        }
+                    }
                 }
                 if let Some(status) = self.status.as_mut() {
                     status.set_interrupt_hint_visible(true);
+                    status.set_task_running(running);
+                }
+                self.request_redraw();
+            } else if hints_changed {
+                if let Some(status) = self.status.as_mut() {
+                    status.set_task_running(running);
                 }
                 self.request_redraw();
             }
         } else {
             // Hide the status indicator when a task completes, but keep other modal views.
             self.hide_status_indicator();
+            if hints_changed {
+                self.request_redraw();
+            }
+        }
+    }
+
+    pub(crate) fn set_session_model(&mut self, model: String) {
+        if self.composer.set_session_model(model) {
+            self.request_redraw();
+        }
+    }
+
+    pub(crate) fn set_keybindings(&mut self, keybindings: Keybindings) {
+        self.composer.set_keybindings(keybindings);
+        self.request_redraw();
+    }
+
+    pub(crate) fn set_session_reasoning_effort(&mut self, effort: Option<ReasoningEffort>) {
+        if self.composer.set_session_reasoning_effort(effort) {
+            self.request_redraw();
         }
     }
 
@@ -611,7 +737,15 @@ impl BottomPane {
                 self.app_event_tx.clone(),
                 self.frame_requester.clone(),
                 self.animations_enabled,
+                self.progress_legend_mode,
+                self.progress_trace_styles,
             ));
+            if let Some(status) = self.status.as_mut() {
+                status.set_task_running(self.is_task_running);
+                for (category, state, label) in &self.progress_trace_backlog {
+                    status.record_progress_trace(*category, *state, label.clone());
+                }
+            }
             self.request_redraw();
         }
     }
@@ -645,6 +779,7 @@ impl BottomPane {
     /// Update the queued messages preview shown above the composer.
     pub(crate) fn set_queued_user_messages(&mut self, queued: Vec<String>) {
         self.queued_user_messages.messages = queued;
+        self.refresh_queued_user_message_hints();
         self.request_redraw();
     }
 
@@ -946,6 +1081,8 @@ mod tests {
             placeholder_text: "Ask Codex to do anything".to_string(),
             disable_paste_burst: false,
             animations_enabled: true,
+            progress_legend_mode: ProgressLegendMode::Off,
+            progress_trace_styles: ProgressTraceStyles::default(),
             skills: Some(Vec::new()),
         });
         pane.push_approval_request(exec_request(), &features);
@@ -969,6 +1106,8 @@ mod tests {
             placeholder_text: "Ask Codex to do anything".to_string(),
             disable_paste_burst: false,
             animations_enabled: true,
+            progress_legend_mode: ProgressLegendMode::Off,
+            progress_trace_styles: ProgressTraceStyles::default(),
             skills: Some(Vec::new()),
         });
 
@@ -1003,6 +1142,8 @@ mod tests {
             placeholder_text: "Ask Codex to do anything".to_string(),
             disable_paste_burst: false,
             animations_enabled: true,
+            progress_legend_mode: ProgressLegendMode::Off,
+            progress_trace_styles: ProgressTraceStyles::default(),
             skills: Some(Vec::new()),
         });
 
@@ -1070,6 +1211,8 @@ mod tests {
             placeholder_text: "Ask Codex to do anything".to_string(),
             disable_paste_burst: false,
             animations_enabled: true,
+            progress_legend_mode: ProgressLegendMode::Off,
+            progress_trace_styles: ProgressTraceStyles::default(),
             skills: Some(Vec::new()),
         });
 
@@ -1097,6 +1240,8 @@ mod tests {
             placeholder_text: "Ask Codex to do anything".to_string(),
             disable_paste_burst: false,
             animations_enabled: true,
+            progress_legend_mode: ProgressLegendMode::Off,
+            progress_trace_styles: ProgressTraceStyles::default(),
             skills: Some(Vec::new()),
         });
 
@@ -1128,6 +1273,8 @@ mod tests {
             placeholder_text: "Ask Codex to do anything".to_string(),
             disable_paste_burst: false,
             animations_enabled: true,
+            progress_legend_mode: ProgressLegendMode::Off,
+            progress_trace_styles: ProgressTraceStyles::default(),
             skills: Some(Vec::new()),
         });
 
@@ -1151,6 +1298,8 @@ mod tests {
             placeholder_text: "Ask Codex to do anything".to_string(),
             disable_paste_burst: false,
             animations_enabled: true,
+            progress_legend_mode: ProgressLegendMode::Off,
+            progress_trace_styles: ProgressTraceStyles::default(),
             skills: Some(Vec::new()),
         });
 
@@ -1182,6 +1331,8 @@ mod tests {
             placeholder_text: "Ask Codex to do anything".to_string(),
             disable_paste_burst: false,
             animations_enabled: true,
+            progress_legend_mode: ProgressLegendMode::Off,
+            progress_trace_styles: ProgressTraceStyles::default(),
             skills: Some(Vec::new()),
         });
 
@@ -1210,6 +1361,8 @@ mod tests {
             placeholder_text: "Ask Codex to do anything".to_string(),
             disable_paste_burst: false,
             animations_enabled: true,
+            progress_legend_mode: ProgressLegendMode::Off,
+            progress_trace_styles: ProgressTraceStyles::default(),
             skills: Some(Vec::new()),
         });
 
@@ -1237,6 +1390,8 @@ mod tests {
             placeholder_text: "Ask Codex to do anything".to_string(),
             disable_paste_burst: false,
             animations_enabled: true,
+            progress_legend_mode: ProgressLegendMode::Off,
+            progress_trace_styles: ProgressTraceStyles::default(),
             skills: Some(vec![SkillMetadata {
                 name: "test-skill".to_string(),
                 description: "test skill".to_string(),
@@ -1283,6 +1438,8 @@ mod tests {
             placeholder_text: "Ask Codex to do anything".to_string(),
             disable_paste_burst: false,
             animations_enabled: true,
+            progress_legend_mode: ProgressLegendMode::Off,
+            progress_trace_styles: ProgressTraceStyles::default(),
             skills: Some(Vec::new()),
         });
 
@@ -1318,6 +1475,8 @@ mod tests {
             placeholder_text: "Ask Codex to do anything".to_string(),
             disable_paste_burst: false,
             animations_enabled: true,
+            progress_legend_mode: ProgressLegendMode::Off,
+            progress_trace_styles: ProgressTraceStyles::default(),
             skills: Some(Vec::new()),
         });
 
@@ -1374,6 +1533,8 @@ mod tests {
             placeholder_text: "Ask Codex to do anything".to_string(),
             disable_paste_burst: false,
             animations_enabled: true,
+            progress_legend_mode: ProgressLegendMode::Off,
+            progress_trace_styles: ProgressTraceStyles::default(),
             skills: Some(Vec::new()),
         });
 

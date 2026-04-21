@@ -266,11 +266,11 @@ impl Session {
         let session = Arc::clone(self);
         let turn_context = Arc::clone(&turn_context);
         tokio::spawn(async move {
-            let title_result =
-                crate::chat_title::generate_chat_title(session.as_ref(), turn_context.as_ref())
+            let thread_name_result =
+                crate::thread_name::generate_thread_name(session.as_ref(), turn_context.as_ref())
                     .await;
-            let title = match title_result {
-                Ok(title) => title,
+            let thread_name = match thread_name_result {
+                Ok(thread_name) => thread_name,
                 Err(err) => {
                     session
                         .send_event(
@@ -285,12 +285,12 @@ impl Session {
                 }
             };
 
-            let Some(title) = title else {
+            let Some(thread_name) = thread_name else {
                 session
                     .send_event(
                         turn_context.as_ref(),
                         EventMsg::Error(ErrorEvent {
-                            message: "Auto-rename failed: empty title.".to_string(),
+                            message: "Auto-rename failed: empty thread name.".to_string(),
                             codex_error_info: Some(CodexErrorInfo::Other),
                         }),
                     )
@@ -298,7 +298,7 @@ impl Session {
                 return;
             };
 
-            if let Err(err) = session.set_thread_name(title.clone()).await {
+            if let Err(err) = session.set_thread_name(thread_name.clone()).await {
                 session
                     .send_event(
                         turn_context.as_ref(),
@@ -316,7 +316,7 @@ impl Session {
                     turn_context.as_ref(),
                     EventMsg::ThreadNameUpdated(ThreadNameUpdatedEvent {
                         thread_id: session.conversation_id,
-                        thread_name: Some(title),
+                        thread_name: Some(thread_name),
                     }),
                 )
                 .await;

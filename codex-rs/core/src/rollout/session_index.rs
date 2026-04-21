@@ -41,12 +41,15 @@ pub async fn append_thread_name(
     use time::OffsetDateTime;
     use time::format_description::well_known::Rfc3339;
 
+    let Some(name) = crate::util::normalize_thread_name(name) else {
+        return Err(std::io::Error::other("thread name cannot be empty"));
+    };
     let updated_at = OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .unwrap_or_else(|_| "unknown".to_string());
     let entry = SessionIndexEntry {
         id: thread_id,
-        thread_name: name.to_string(),
+        thread_name: name,
         updated_at,
     };
     append_session_index_entry(codex_home, &entry).await
@@ -84,7 +87,7 @@ pub async fn find_thread_name_by_id(
     let entry = tokio::task::spawn_blocking(move || scan_index_from_end_by_id(&path, &id))
         .await
         .map_err(std::io::Error::other)??;
-    Ok(entry.map(|entry| entry.thread_name))
+    Ok(entry.and_then(|entry| crate::util::normalize_thread_name(entry.thread_name.as_str())))
 }
 
 /// Find a display label for a thread id.
@@ -125,9 +128,11 @@ pub async fn find_thread_names_by_ids(
         let Ok(entry) = serde_json::from_str::<SessionIndexEntry>(trimmed) else {
             continue;
         };
-        let name = entry.thread_name.trim();
-        if !name.is_empty() && thread_ids.contains(&entry.id) {
-            names.insert(entry.id, name.to_string());
+        if !thread_ids.contains(&entry.id) {
+            continue;
+        }
+        if let Some(name) = crate::util::normalize_thread_name(entry.thread_name.as_str()) {
+            names.insert(entry.id, name);
         }
     }
 
@@ -161,14 +166,13 @@ pub async fn find_thread_id_by_name(
     codex_home: &Path,
     name: &str,
 ) -> std::io::Result<Option<ThreadId>> {
-    if name.trim().is_empty() {
+    let Some(name) = crate::util::normalize_thread_name(name) else {
         return Ok(None);
-    }
+    };
     let path = session_index_path(codex_home);
     if !path.exists() {
         return Ok(None);
     }
-    let name = name.to_string();
     let entry = tokio::task::spawn_blocking(move || scan_index_from_end_by_name(&path, &name))
         .await
         .map_err(std::io::Error::other)??;
@@ -187,10 +191,10 @@ pub async fn find_thread_path_by_name_str(
     super::list::find_thread_path_by_id_str(codex_home, &thread_id.to_string()).await
 }
 
-/// Compute the next fork number for a parent thread id.
+/// Compute the next fork number for a thread's fork lineage.
 ///
-/// Fork numbering is based on the number of recorded sessions (active + archived)
-/// whose session metadata contains `forked_from_id == parent_id`.
+/// Fork numbering is based on the number of recorded sessions (active + archived) whose fork
+/// ancestry ultimately traces back to the same lineage root as `parent_id`.
 pub async fn next_fork_number_for_parent(
     codex_home: &Path,
     parent_id: &ThreadId,
@@ -198,10 +202,29 @@ pub async fn next_fork_number_for_parent(
     let codex_home = codex_home.to_path_buf();
     let parent_id = *parent_id;
     tokio::task::spawn_blocking(move || {
-        let active = count_forks_in_root(codex_home.join(super::SESSIONS_SUBDIR), parent_id)?;
-        let archived =
-            count_forks_in_root(codex_home.join(super::ARCHIVED_SESSIONS_SUBDIR), parent_id)?;
-        Ok(active.saturating_add(archived).saturating_add(1))
+        let mut forked_from_by_id: HashMap<ThreadId, Option<ThreadId>> = HashMap::new();
+        collect_forked_from_by_id(
+            codex_home.join(super::SESSIONS_SUBDIR),
+            &mut forked_from_by_id,
+        )?;
+        collect_forked_from_by_id(
+            codex_home.join(super::ARCHIVED_SESSIONS_SUBDIR),
+            &mut forked_from_by_id,
+        )?;
+
+        let mut lineage_root_by_id: HashMap<ThreadId, ThreadId> = HashMap::new();
+        let lineage_root =
+            fork_lineage_root(parent_id, &forked_from_by_id, &mut lineage_root_by_id);
+
+        let mut count = 0usize;
+        for thread_id in forked_from_by_id.keys().copied() {
+            let root = fork_lineage_root(thread_id, &forked_from_by_id, &mut lineage_root_by_id);
+            if root == lineage_root && thread_id != lineage_root {
+                count = count.saturating_add(1);
+            }
+        }
+
+        Ok(count.saturating_add(1))
     })
     .await
     .map_err(std::io::Error::other)?
@@ -211,13 +234,15 @@ fn session_index_path(codex_home: &Path) -> PathBuf {
     codex_home.join(SESSION_INDEX_FILE)
 }
 
-fn count_forks_in_root(root: PathBuf, parent_id: ThreadId) -> std::io::Result<usize> {
+fn collect_forked_from_by_id(
+    root: PathBuf,
+    forked_from_by_id: &mut HashMap<ThreadId, Option<ThreadId>>,
+) -> std::io::Result<()> {
     if !root.exists() {
-        return Ok(0);
+        return Ok(());
     }
 
     let mut stack = vec![root];
-    let mut count = 0usize;
     while let Some(dir) = stack.pop() {
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
@@ -238,16 +263,16 @@ fn count_forks_in_root(root: PathBuf, parent_id: ThreadId) -> std::io::Result<us
                 continue;
             }
 
-            if rollout_is_fork_of(path.as_path(), parent_id)? {
-                count = count.saturating_add(1);
+            if let Some((thread_id, forked_from_id)) = read_rollout_fork_parent(path.as_path())? {
+                forked_from_by_id.insert(thread_id, forked_from_id);
             }
         }
     }
 
-    Ok(count)
+    Ok(())
 }
 
-fn rollout_is_fork_of(path: &Path, parent_id: ThreadId) -> std::io::Result<bool> {
+fn read_rollout_fork_parent(path: &Path) -> std::io::Result<Option<(ThreadId, Option<ThreadId>)>> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
     for line in reader.lines() {
@@ -259,15 +284,51 @@ fn rollout_is_fork_of(path: &Path, parent_id: ThreadId) -> std::io::Result<bool>
         let Ok(rollout_line) =
             serde_json::from_str::<codex_protocol::protocol::RolloutLine>(trimmed)
         else {
-            return Ok(false);
+            return Ok(None);
         };
-        return Ok(matches!(
-            rollout_line.item,
-            RolloutItem::SessionMeta(meta_line) if meta_line.meta.forked_from_id == Some(parent_id)
-        ));
+        return match rollout_line.item {
+            RolloutItem::SessionMeta(meta_line) => {
+                Ok(Some((meta_line.meta.id, meta_line.meta.forked_from_id)))
+            }
+            _ => Ok(None),
+        };
     }
 
-    Ok(false)
+    Ok(None)
+}
+
+fn fork_lineage_root(
+    thread_id: ThreadId,
+    forked_from_by_id: &HashMap<ThreadId, Option<ThreadId>>,
+    lineage_root_by_id: &mut HashMap<ThreadId, ThreadId>,
+) -> ThreadId {
+    if let Some(root) = lineage_root_by_id.get(&thread_id) {
+        return *root;
+    }
+
+    let mut chain = Vec::new();
+    let mut current = thread_id;
+    loop {
+        if let Some(root) = lineage_root_by_id.get(&current) {
+            current = *root;
+            break;
+        }
+        let Some(parent_id) = forked_from_by_id.get(&current).copied().flatten() else {
+            break;
+        };
+        if chain.contains(&current) {
+            break;
+        }
+        chain.push(current);
+        current = parent_id;
+    }
+
+    let root = current;
+    for id in chain {
+        lineage_root_by_id.insert(id, root);
+    }
+    lineage_root_by_id.insert(root, root);
+    root
 }
 
 async fn find_rollout_path_by_id(
@@ -336,7 +397,9 @@ fn scan_index_from_end_by_name(
     path: &Path,
     name: &str,
 ) -> std::io::Result<Option<SessionIndexEntry>> {
-    scan_index_from_end(path, |entry| entry.thread_name == name)
+    scan_index_from_end(path, |entry| {
+        crate::util::normalize_thread_name(entry.thread_name.as_str()).as_deref() == Some(name)
+    })
 }
 
 fn scan_index_from_end<F>(
@@ -671,6 +734,32 @@ mod tests {
 
         let next = next_fork_number_for_parent(temp.path(), &parent_id).await?;
         assert_eq!(next, 4);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn next_fork_number_for_parent_counts_nested_forks() -> std::io::Result<()> {
+        let temp = TempDir::new()?;
+        let root_id = ThreadId::new();
+        let first_fork = ThreadId::new();
+        let nested_fork = ThreadId::new();
+
+        write_rollout_with_parent(temp.path(), super::super::SESSIONS_SUBDIR, root_id, None)?;
+        write_rollout_with_parent(
+            temp.path(),
+            super::super::SESSIONS_SUBDIR,
+            first_fork,
+            Some(root_id),
+        )?;
+        write_rollout_with_parent(
+            temp.path(),
+            super::super::SESSIONS_SUBDIR,
+            nested_fork,
+            Some(first_fork),
+        )?;
+
+        let next = next_fork_number_for_parent(temp.path(), &first_fork).await?;
+        assert_eq!(next, 3);
         Ok(())
     }
 }

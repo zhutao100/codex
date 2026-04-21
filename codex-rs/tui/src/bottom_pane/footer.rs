@@ -34,10 +34,13 @@
 //! `FooterProps` mapping.
 use crate::key_hint;
 use crate::key_hint::KeyBinding;
+use crate::keybindings::Keybindings;
 use crate::render::line_utils::prefix_lines;
 use crate::status::format_tokens_compact;
 use crate::ui_consts::FOOTER_INDENT_COLS;
+use codex_protocol::openai_models::ReasoningEffort;
 use crossterm::event::KeyCode;
+use crossterm::event::KeyModifiers;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Stylize;
@@ -68,6 +71,9 @@ pub(crate) struct FooterProps {
     pub(crate) quit_shortcut_key: KeyBinding,
     pub(crate) context_window_percent: Option<i64>,
     pub(crate) context_window_used_tokens: Option<i64>,
+    pub(crate) model: String,
+    pub(crate) reasoning_effort: Option<ReasoningEffort>,
+    pub(crate) keybindings: Keybindings,
     pub(crate) status_line_value: Option<Line<'static>>,
     pub(crate) status_line_enabled: bool,
 }
@@ -564,18 +570,20 @@ fn footer_from_props_lines(
     show_queue_hint: bool,
 ) -> Vec<Line<'static>> {
     // If status line content is present, show it for base modes.
-    if props.status_line_enabled
-        && let Some(status_line) = &props.status_line_value
+    if let Some(status_line) = effective_status_line_line(props)
         && matches!(
             props.mode,
             FooterMode::ComposerEmpty | FooterMode::ComposerHasDraft
         )
     {
-        return vec![status_line.clone().dim()];
+        return vec![status_line.dim()];
     }
     match props.mode {
         FooterMode::QuitShortcutReminder => {
-            vec![quit_shortcut_reminder_line(props.quit_shortcut_key)]
+            vec![quit_shortcut_reminder_line(
+                props.quit_shortcut_key,
+                props.is_task_running,
+            )]
         }
         FooterMode::ComposerEmpty => {
             let state = LeftSideState {
@@ -594,6 +602,9 @@ fn footer_from_props_lines(
                 esc_backtrack_hint: props.esc_backtrack_hint,
                 is_wsl: props.is_wsl,
                 collaboration_modes_enabled: props.collaboration_modes_enabled,
+                model: props.model.clone(),
+                reasoning_effort: props.reasoning_effort,
+                keybindings: props.keybindings.clone(),
             };
             shortcut_overlay_lines(state)
         }
@@ -610,6 +621,31 @@ fn footer_from_props_lines(
             vec![left_side_line(collaboration_mode_indicator, state)]
         }
     }
+}
+
+pub(crate) fn effective_status_line_line(props: &FooterProps) -> Option<Line<'static>> {
+    if !props.status_line_enabled {
+        return None;
+    }
+
+    if let Some(line) = &props.status_line_value
+        && line.width() > 0
+    {
+        return Some(line.clone());
+    }
+
+    let model = props.model.trim();
+    if model.is_empty() {
+        return None;
+    }
+
+    let mut line = Line::from(vec![model.to_string().into()]);
+    if let Some(label) = thinking_label_for(model, props.reasoning_effort).or_else(|| {
+        (!model.starts_with("codex-auto-") && props.reasoning_effort.is_none()).then_some("default")
+    }) {
+        line.push_span(format!(" (reasoning {label})").dim());
+    }
+    Some(line)
 }
 
 pub(crate) fn footer_line_width(
@@ -651,28 +687,36 @@ fn footer_hint_items_line(items: &[(String, String)]) -> Line<'static> {
     Line::from(spans)
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct ShortcutsState {
     use_shift_enter_hint: bool,
     esc_backtrack_hint: bool,
     is_wsl: bool,
     collaboration_modes_enabled: bool,
+    model: String,
+    reasoning_effort: Option<ReasoningEffort>,
+    keybindings: Keybindings,
 }
 
-fn quit_shortcut_reminder_line(key: KeyBinding) -> Line<'static> {
-    Line::from(vec![key.into(), " again to quit".into()]).dim()
+fn quit_shortcut_reminder_line(key: KeyBinding, is_task_running: bool) -> Line<'static> {
+    let action = if is_task_running { "interrupt" } else { "quit" };
+    Line::from(vec![key.into(), format!(" again to {action}").into()]).dim()
 }
 
 fn esc_hint_line(esc_backtrack_hint: bool) -> Line<'static> {
     let esc = key_hint::plain(KeyCode::Esc);
     if esc_backtrack_hint {
-        Line::from(vec![esc.into(), " again to edit previous message".into()]).dim()
+        Line::from(vec![
+            esc.into(),
+            " again to edit or branch previous message".into(),
+        ])
+        .dim()
     } else {
         Line::from(vec![
             esc.into(),
             " ".into(),
             esc.into(),
-            " to edit previous message".into(),
+            " to edit or branch previous message".into(),
         ])
         .dim()
     }
@@ -681,10 +725,58 @@ fn esc_hint_line(esc_backtrack_hint: bool) -> Line<'static> {
 fn shortcut_overlay_lines(state: ShortcutsState) -> Vec<Line<'static>> {
     let mut commands = Line::from("");
     let mut shell_commands = Line::from("");
-    let mut newline = Line::from("");
+    let newline_key = state
+        .keybindings
+        .newline
+        .first()
+        .copied()
+        .unwrap_or_else(|| key_hint::shift(KeyCode::Enter));
+    let newline = Line::from(vec![newline_key.into(), " for newline".into()]);
+    let mut change_model = Line::from("");
+    let mut change_thinking = Line::from("");
+    let mut current_model = Line::from("");
     let mut queue_message_tab = Line::from("");
     let mut file_paths = Line::from("");
-    let mut paste_image = Line::from("");
+    let paste_key = state
+        .keybindings
+        .paste
+        .first()
+        .copied()
+        .unwrap_or_else(|| key_hint::ctrl(KeyCode::Char('v')));
+    let paste_image = Line::from(vec![paste_key.into(), " to paste from clipboard".into()]);
+    let copy_last_output_key = state
+        .keybindings
+        .copy_last_output
+        .first()
+        .copied()
+        .unwrap_or_else(|| key_hint::ctrl(KeyCode::Char('r')));
+    let copy_last_output = Line::from(vec![
+        copy_last_output_key.into(),
+        " to copy last output".into(),
+    ]);
+    let copy_code_block_key = state
+        .keybindings
+        .copy_code_block
+        .first()
+        .copied()
+        .unwrap_or_else(|| {
+            KeyBinding::new(
+                KeyCode::Char('b'),
+                KeyModifiers::CONTROL.union(KeyModifiers::SHIFT),
+            )
+        });
+    let copy_code_block = Line::from(vec![
+        copy_code_block_key.into(),
+        " to copy code block".into(),
+    ]);
+
+    let copy_prompt_key = state
+        .keybindings
+        .copy_prompt
+        .first()
+        .copied()
+        .unwrap_or_else(|| key_hint::alt(KeyCode::Char('c')));
+    let copy_prompt = Line::from(vec![copy_prompt_key.into(), " to copy prompt".into()]);
     let mut external_editor = Line::from("");
     let mut edit_previous = Line::from("");
     let mut quit = Line::from("");
@@ -692,14 +784,17 @@ fn shortcut_overlay_lines(state: ShortcutsState) -> Vec<Line<'static>> {
     let mut change_mode = Line::from("");
 
     for descriptor in SHORTCUTS {
-        if let Some(text) = descriptor.overlay_entry(state) {
+        if let Some(text) = descriptor.overlay_entry(&state) {
             match descriptor.id {
                 ShortcutId::Commands => commands = text,
                 ShortcutId::ShellCommands => shell_commands = text,
-                ShortcutId::InsertNewline => newline = text,
+                ShortcutId::InsertNewline => {}
+                ShortcutId::ChangeModel => change_model = text,
+                ShortcutId::ChangeThinking => change_thinking = text,
+                ShortcutId::CurrentModel => current_model = text,
                 ShortcutId::QueueMessageTab => queue_message_tab = text,
                 ShortcutId::FilePaths => file_paths = text,
-                ShortcutId::PasteImage => paste_image = text,
+                ShortcutId::PasteImage => {}
                 ShortcutId::ExternalEditor => external_editor = text,
                 ShortcutId::EditPrevious => edit_previous = text,
                 ShortcutId::Quit => quit = text,
@@ -713,9 +808,15 @@ fn shortcut_overlay_lines(state: ShortcutsState) -> Vec<Line<'static>> {
         commands,
         shell_commands,
         newline,
+        change_model,
+        change_thinking,
+        current_model,
         queue_message_tab,
         file_paths,
         paste_image,
+        copy_last_output,
+        copy_code_block,
+        copy_prompt,
         external_editor,
         edit_previous,
         quit,
@@ -776,6 +877,22 @@ fn build_columns(entries: Vec<Line<'static>>) -> Vec<Line<'static>> {
         .collect()
 }
 
+fn thinking_label_for(model: &str, effort: Option<ReasoningEffort>) -> Option<&'static str> {
+    if model.starts_with("codex-auto-") {
+        return None;
+    }
+
+    match effort {
+        Some(ReasoningEffort::None) => Some("none"),
+        Some(ReasoningEffort::Minimal) => Some("minimal"),
+        Some(ReasoningEffort::Low) => Some("low"),
+        Some(ReasoningEffort::Medium) => Some("medium"),
+        Some(ReasoningEffort::High) => Some("high"),
+        Some(ReasoningEffort::XHigh) => Some("extra-high"),
+        None => None,
+    }
+}
+
 pub(crate) fn context_window_line(percent: Option<i64>, used_tokens: Option<i64>) -> Line<'static> {
     if let Some(percent) = percent {
         let percent = percent.clamp(0, 100);
@@ -795,6 +912,9 @@ enum ShortcutId {
     Commands,
     ShellCommands,
     InsertNewline,
+    ChangeModel,
+    ChangeThinking,
+    CurrentModel,
     QueueMessageTab,
     FilePaths,
     PasteImage,
@@ -812,7 +932,7 @@ struct ShortcutBinding {
 }
 
 impl ShortcutBinding {
-    fn matches(&self, state: ShortcutsState) -> bool {
+    fn matches(&self, state: &ShortcutsState) -> bool {
         self.condition.matches(state)
     }
 }
@@ -824,16 +944,18 @@ enum DisplayCondition {
     WhenNotShiftEnterHint,
     WhenUnderWSL,
     WhenCollaborationModesEnabled,
+    WhenModelSet,
 }
 
 impl DisplayCondition {
-    fn matches(self, state: ShortcutsState) -> bool {
+    fn matches(self, state: &ShortcutsState) -> bool {
         match self {
             DisplayCondition::Always => true,
             DisplayCondition::WhenShiftEnterHint => state.use_shift_enter_hint,
             DisplayCondition::WhenNotShiftEnterHint => !state.use_shift_enter_hint,
             DisplayCondition::WhenUnderWSL => state.is_wsl,
             DisplayCondition::WhenCollaborationModesEnabled => state.collaboration_modes_enabled,
+            DisplayCondition::WhenModelSet => !state.model.trim().is_empty(),
         }
     }
 }
@@ -846,23 +968,33 @@ struct ShortcutDescriptor {
 }
 
 impl ShortcutDescriptor {
-    fn binding_for(&self, state: ShortcutsState) -> Option<&'static ShortcutBinding> {
+    fn binding_for(&self, state: &ShortcutsState) -> Option<&'static ShortcutBinding> {
         self.bindings.iter().find(|binding| binding.matches(state))
     }
 
-    fn overlay_entry(&self, state: ShortcutsState) -> Option<Line<'static>> {
+    fn overlay_entry(&self, state: &ShortcutsState) -> Option<Line<'static>> {
         let binding = self.binding_for(state)?;
-        let mut line = Line::from(vec![self.prefix.into(), binding.key.into()]);
+        let mut line = if self.id == ShortcutId::CurrentModel {
+            Line::from(self.prefix)
+        } else {
+            Line::from(vec![self.prefix.into(), binding.key.into()])
+        };
         match self.id {
             ShortcutId::EditPrevious => {
                 if state.esc_backtrack_hint {
-                    line.push_span(" again to edit previous message");
+                    line.push_span(" again to edit or branch previous message");
                 } else {
                     line.extend(vec![
                         " ".into(),
                         key_hint::plain(KeyCode::Esc).into(),
-                        " to edit previous message".into(),
+                        " to edit or branch previous message".into(),
                     ]);
+                }
+            }
+            ShortcutId::CurrentModel => {
+                line.push_span(state.model.clone());
+                if let Some(label) = thinking_label_for(&state.model, state.reasoning_effort) {
+                    line.push_span(format!(" (reasoning {label})").dim());
                 }
             }
             _ => line.push_span(self.label),
@@ -904,6 +1036,39 @@ const SHORTCUTS: &[ShortcutDescriptor] = &[
         ],
         prefix: "",
         label: " for newline",
+    },
+    ShortcutDescriptor {
+        id: ShortcutId::ChangeModel,
+        bindings: &[ShortcutBinding {
+            key: KeyBinding::new(
+                KeyCode::Left,
+                KeyModifiers::CONTROL.union(KeyModifiers::SHIFT),
+            ),
+            condition: DisplayCondition::Always,
+        }],
+        prefix: "",
+        label: " / Ctrl+Shift+→ to change model",
+    },
+    ShortcutDescriptor {
+        id: ShortcutId::ChangeThinking,
+        bindings: &[ShortcutBinding {
+            key: KeyBinding::new(
+                KeyCode::Up,
+                KeyModifiers::CONTROL.union(KeyModifiers::SHIFT),
+            ),
+            condition: DisplayCondition::Always,
+        }],
+        prefix: "",
+        label: " / Ctrl+Shift+↓ to change thinking",
+    },
+    ShortcutDescriptor {
+        id: ShortcutId::CurrentModel,
+        bindings: &[ShortcutBinding {
+            key: KeyBinding::new(KeyCode::Null, KeyModifiers::NONE),
+            condition: DisplayCondition::WhenModelSet,
+        }],
+        prefix: "Current model: ",
+        label: "",
     },
     ShortcutDescriptor {
         id: ShortcutId::QueueMessageTab,
@@ -997,6 +1162,11 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::Backend;
     use ratatui::backend::TestBackend;
+    use std::collections::HashMap;
+
+    fn default_keybindings(use_shift_enter_hint: bool) -> Keybindings {
+        Keybindings::from_config(&HashMap::new(), use_shift_enter_hint, false)
+    }
 
     fn snapshot_footer(name: &str, props: FooterProps) {
         snapshot_footer_with_mode_indicator(name, 80, &props, None);
@@ -1032,16 +1202,16 @@ mod tests {
                     collaboration_mode_indicator
                 };
                 let available_width = area.width.saturating_sub(FOOTER_INDENT_COLS as u16) as usize;
+                let status_line =
+                    effective_status_line_line(props).map(ratatui::prelude::Stylize::dim);
                 let mut truncated_status_line = if props.status_line_enabled
                     && matches!(
                         props.mode,
                         FooterMode::ComposerEmpty | FooterMode::ComposerHasDraft
                     ) {
-                    props
-                        .status_line_value
-                        .as_ref()
-                        .map(|line| line.clone().dim())
-                        .map(|line| truncate_line_with_ellipsis_if_overflow(line, available_width))
+                    status_line.as_ref().map(|line| {
+                        truncate_line_with_ellipsis_if_overflow(line.clone(), available_width)
+                    })
                 } else {
                     None
                 };
@@ -1081,13 +1251,9 @@ mod tests {
                 if props.status_line_enabled
                     && let Some(max_left) = max_left_width_for_right(area, right_width)
                     && left_width > max_left
-                    && let Some(line) = props
-                        .status_line_value
-                        .as_ref()
-                        .map(|line| line.clone().dim())
-                        .map(|line| {
-                            truncate_line_with_ellipsis_if_overflow(line, max_left as usize)
-                        })
+                    && let Some(line) = status_line.as_ref().map(|line| {
+                        truncate_line_with_ellipsis_if_overflow(line.clone(), max_left as usize)
+                    })
                 {
                     left_width = line.width() as u16;
                     truncated_status_line = Some(line);
@@ -1195,6 +1361,9 @@ mod tests {
                 quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
                 context_window_percent: None,
                 context_window_used_tokens: None,
+                model: String::new(),
+                reasoning_effort: None,
+                keybindings: default_keybindings(true),
                 status_line_value: None,
                 status_line_enabled: false,
             },
@@ -1213,6 +1382,9 @@ mod tests {
                 quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
                 context_window_percent: None,
                 context_window_used_tokens: None,
+                model: String::new(),
+                reasoning_effort: None,
+                keybindings: default_keybindings(false),
                 status_line_value: None,
                 status_line_enabled: false,
             },
@@ -1231,6 +1403,9 @@ mod tests {
                 quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
                 context_window_percent: None,
                 context_window_used_tokens: None,
+                model: String::new(),
+                reasoning_effort: None,
+                keybindings: default_keybindings(false),
                 status_line_value: None,
                 status_line_enabled: false,
             },
@@ -1249,6 +1424,9 @@ mod tests {
                 quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
                 context_window_percent: None,
                 context_window_used_tokens: None,
+                model: String::new(),
+                reasoning_effort: None,
+                keybindings: default_keybindings(false),
                 status_line_value: None,
                 status_line_enabled: false,
             },
@@ -1267,6 +1445,9 @@ mod tests {
                 quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
                 context_window_percent: None,
                 context_window_used_tokens: None,
+                model: String::new(),
+                reasoning_effort: None,
+                keybindings: default_keybindings(false),
                 status_line_value: None,
                 status_line_enabled: false,
             },
@@ -1285,6 +1466,9 @@ mod tests {
                 quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
                 context_window_percent: None,
                 context_window_used_tokens: None,
+                model: String::new(),
+                reasoning_effort: None,
+                keybindings: default_keybindings(false),
                 status_line_value: None,
                 status_line_enabled: false,
             },
@@ -1303,6 +1487,9 @@ mod tests {
                 quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
                 context_window_percent: None,
                 context_window_used_tokens: None,
+                model: String::new(),
+                reasoning_effort: None,
+                keybindings: default_keybindings(false),
                 status_line_value: None,
                 status_line_enabled: false,
             },
@@ -1321,6 +1508,9 @@ mod tests {
                 quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
                 context_window_percent: Some(72),
                 context_window_used_tokens: None,
+                model: String::new(),
+                reasoning_effort: None,
+                keybindings: default_keybindings(false),
                 status_line_value: None,
                 status_line_enabled: false,
             },
@@ -1339,6 +1529,9 @@ mod tests {
                 quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
                 context_window_percent: None,
                 context_window_used_tokens: Some(123_456),
+                model: String::new(),
+                reasoning_effort: None,
+                keybindings: default_keybindings(false),
                 status_line_value: None,
                 status_line_enabled: false,
             },
@@ -1357,6 +1550,9 @@ mod tests {
                 quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
                 context_window_percent: None,
                 context_window_used_tokens: None,
+                model: String::new(),
+                reasoning_effort: None,
+                keybindings: default_keybindings(false),
                 status_line_value: None,
                 status_line_enabled: false,
             },
@@ -1375,6 +1571,9 @@ mod tests {
                 quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
                 context_window_percent: None,
                 context_window_used_tokens: None,
+                model: String::new(),
+                reasoning_effort: None,
+                keybindings: default_keybindings(false),
                 status_line_value: None,
                 status_line_enabled: false,
             },
@@ -1391,6 +1590,9 @@ mod tests {
             quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
             context_window_percent: None,
             context_window_used_tokens: None,
+            model: String::new(),
+            reasoning_effort: None,
+            keybindings: default_keybindings(false),
             status_line_value: None,
             status_line_enabled: false,
         };
@@ -1420,6 +1622,9 @@ mod tests {
             quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
             context_window_percent: None,
             context_window_used_tokens: None,
+            model: String::new(),
+            reasoning_effort: None,
+            keybindings: default_keybindings(false),
             status_line_value: None,
             status_line_enabled: false,
         };
@@ -1442,6 +1647,9 @@ mod tests {
             quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
             context_window_percent: None,
             context_window_used_tokens: None,
+            model: String::new(),
+            reasoning_effort: None,
+            keybindings: default_keybindings(false),
             status_line_value: Some(Line::from("Status line content".to_string())),
             status_line_enabled: true,
         };
@@ -1459,6 +1667,9 @@ mod tests {
             quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
             context_window_percent: Some(50),
             context_window_used_tokens: None,
+            model: String::new(),
+            reasoning_effort: None,
+            keybindings: default_keybindings(false),
             status_line_value: None, // command timed out / empty
             status_line_enabled: true,
         };
@@ -1481,6 +1692,9 @@ mod tests {
             quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
             context_window_percent: Some(50),
             context_window_used_tokens: None,
+            model: String::new(),
+            reasoning_effort: None,
+            keybindings: default_keybindings(false),
             status_line_value: None,
             status_line_enabled: false,
         };
@@ -1503,6 +1717,9 @@ mod tests {
             quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
             context_window_percent: Some(50),
             context_window_used_tokens: None,
+            model: String::new(),
+            reasoning_effort: None,
+            keybindings: default_keybindings(false),
             status_line_value: None,
             status_line_enabled: true,
         };
@@ -1521,11 +1738,39 @@ mod tests {
             use_shift_enter_hint: false,
             is_task_running: false,
             steer_enabled: false,
+            collaboration_modes_enabled: false,
+            is_wsl: false,
+            quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
+            context_window_percent: Some(50),
+            context_window_used_tokens: None,
+            model: "gpt-5.2-codex".to_string(),
+            reasoning_effort: None,
+            keybindings: default_keybindings(false),
+            status_line_value: None,
+            status_line_enabled: true,
+        };
+
+        snapshot_footer_with_mode_indicator(
+            "footer_status_line_enabled_model_fallback",
+            120,
+            &props,
+            None,
+        );
+
+        let props = FooterProps {
+            mode: FooterMode::ComposerEmpty,
+            esc_backtrack_hint: false,
+            use_shift_enter_hint: false,
+            is_task_running: false,
+            steer_enabled: false,
             collaboration_modes_enabled: true,
             is_wsl: false,
             quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
             context_window_percent: Some(50),
             context_window_used_tokens: None,
+            model: String::new(),
+            reasoning_effort: None,
+            keybindings: default_keybindings(false),
             status_line_value: Some(Line::from(
                 "Status line content that should truncate before the mode indicator".to_string(),
             )),
@@ -1553,6 +1798,9 @@ mod tests {
             quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
             context_window_percent: Some(50),
             context_window_used_tokens: None,
+            model: String::new(),
+            reasoning_effort: None,
+            keybindings: default_keybindings(false),
             status_line_value: Some(Line::from(
                 "Status line content that is definitely too long to fit alongside the mode label"
                     .to_string(),
@@ -1602,11 +1850,14 @@ mod tests {
         };
 
         let actual_key = descriptor
-            .binding_for(ShortcutsState {
+            .binding_for(&ShortcutsState {
                 use_shift_enter_hint: false,
                 esc_backtrack_hint: false,
                 is_wsl,
                 collaboration_modes_enabled: false,
+                model: String::new(),
+                reasoning_effort: None,
+                keybindings: default_keybindings(false),
             })
             .expect("shortcut binding")
             .key;

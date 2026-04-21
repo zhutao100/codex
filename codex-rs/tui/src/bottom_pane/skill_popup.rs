@@ -97,6 +97,7 @@ impl SkillPopup {
                 let name = truncate_text(&mention.display_name, 21);
                 let description = mention.description.clone().unwrap_or_default();
                 GenericDisplayRow {
+                    name_prefix: None,
                     name,
                     match_indices: indices,
                     display_shortcut: None,
