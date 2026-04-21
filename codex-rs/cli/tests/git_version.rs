@@ -73,7 +73,7 @@ version = "{version}"
 
             if let Some(tag) = max_tag(points_at_head) {
                 Scenario::ExactTag { tag }
-            } else if let Some(next) = min_tag(contains_head.clone()) {
+            } else if let Some(next) = min_tag(contains_head) {
                 let baseline = max_tag_before(&merged_into_head, &next.version);
                 let behind = count_commits("HEAD", &next.name).unwrap_or(0);
                 Scenario::ContainedInNext {
@@ -81,7 +81,7 @@ version = "{version}"
                     next,
                     behind,
                 }
-            } else if let Some(baseline) = max_tag(merged_into_head.clone()) {
+            } else if let Some(baseline) = max_tag(merged_into_head) {
                 let ahead = count_commits(&baseline.name, "HEAD").unwrap_or(0);
                 Scenario::PostLatestTag { baseline, ahead }
             } else if let Some((common, closest_next)) =
