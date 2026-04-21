@@ -13,6 +13,7 @@ use chrono::Utc;
 use codex_app_server_protocol::Account;
 use codex_app_server_protocol::AccountLoginCompletedNotification;
 use codex_app_server_protocol::AccountUpdatedNotification;
+use codex_app_server_protocol::ActiveTurnSummary;
 use codex_app_server_protocol::AddConversationListenerParams;
 use codex_app_server_protocol::AddConversationSubscriptionResponse;
 use codex_app_server_protocol::AppsListParams;
@@ -132,6 +133,8 @@ use codex_app_server_protocol::ThreadStartedNotification;
 use codex_app_server_protocol::ThreadUnarchiveParams;
 use codex_app_server_protocol::ThreadUnarchiveResponse;
 use codex_app_server_protocol::Turn;
+use codex_app_server_protocol::TurnActiveParams;
+use codex_app_server_protocol::TurnActiveResponse;
 use codex_app_server_protocol::TurnError;
 use codex_app_server_protocol::TurnInterruptParams;
 use codex_app_server_protocol::TurnStartParams;
@@ -533,6 +536,10 @@ impl CodexMessageProcessor {
             }
             ClientRequest::TurnInterrupt { request_id, params } => {
                 self.turn_interrupt(to_connection_request_id(request_id), params)
+                    .await;
+            }
+            ClientRequest::TurnActive { request_id, params } => {
+                self.turn_active(to_connection_request_id(request_id), params)
                     .await;
             }
             ClientRequest::ReviewStart { request_id, params } => {
@@ -4572,8 +4579,10 @@ impl CodexMessageProcessor {
 
         match turn_id {
             Ok(turn_id) => {
+                let model = Some(thread.config_snapshot().await.model);
                 let turn = Turn {
                     id: turn_id.clone(),
+                    model,
                     items: vec![],
                     error: None,
                     status: TurnStatus::InProgress,
@@ -4602,6 +4611,27 @@ impl CodexMessageProcessor {
         }
     }
 
+    async fn turn_active(&self, request_id: ConnectionRequestId, _: TurnActiveParams) {
+        let thread_ids = self.thread_manager.list_thread_ids().await;
+        let mut data = Vec::new();
+
+        for thread_id in thread_ids {
+            let Ok(thread) = self.thread_manager.get_thread(thread_id).await else {
+                continue;
+            };
+
+            for turn_id in thread.active_turn_ids().await {
+                data.push(ActiveTurnSummary {
+                    thread_id: thread_id.to_string(),
+                    turn_id,
+                });
+            }
+        }
+
+        let response = TurnActiveResponse { data };
+        self.outgoing.send_response(request_id, response).await;
+    }
+
     fn build_review_turn(turn_id: String, display_text: &str) -> Turn {
         let items = if display_text.is_empty() {
             Vec::new()
@@ -4618,6 +4648,7 @@ impl CodexMessageProcessor {
 
         Turn {
             id: turn_id,
+            model: None,
             items,
             error: None,
             status: TurnStatus::InProgress,
@@ -5445,6 +5476,7 @@ async fn summary_from_thread_list_item(
             preview: it.first_user_message.unwrap_or_default(),
             timestamp,
             updated_at,
+            model: None,
             model_provider,
             cwd,
             cli_version,
@@ -5515,6 +5547,7 @@ fn summary_from_state_db_metadata(
         preview,
         timestamp: Some(timestamp),
         updated_at: Some(updated_at),
+        model: None,
         model_provider,
         cwd,
         cli_version,
@@ -5583,6 +5616,7 @@ pub(crate) async fn read_summary_from_rollout(
         updated_at,
         path: path.to_path_buf(),
         preview: String::new(),
+        model: None,
         model_provider,
         cwd: session_meta.cwd,
         cli_version: session_meta.cli_version,
@@ -5649,6 +5683,7 @@ fn extract_conversation_summary(
         updated_at,
         path,
         preview: preview.to_string(),
+        model: None,
         model_provider,
         cwd: session_meta.cwd.clone(),
         cli_version: session_meta.cli_version.clone(),
@@ -5690,6 +5725,7 @@ fn build_ephemeral_thread(thread_id: ThreadId, config_snapshot: &ThreadConfigSna
     Thread {
         id: thread_id.to_string(),
         preview: String::new(),
+        model: Some(config_snapshot.model.clone()),
         model_provider: config_snapshot.model_provider_id.clone(),
         created_at: now,
         updated_at: now,
@@ -5709,6 +5745,7 @@ pub(crate) fn summary_to_thread(summary: ConversationSummary) -> Thread {
         preview,
         timestamp,
         updated_at,
+        model,
         model_provider,
         cwd,
         cli_version,
@@ -5727,6 +5764,7 @@ pub(crate) fn summary_to_thread(summary: ConversationSummary) -> Thread {
     Thread {
         id: conversation_id.to_string(),
         preview,
+        model,
         model_provider,
         created_at: created_at.map(|dt| dt.timestamp()).unwrap_or(0),
         updated_at: updated_at.map(|dt| dt.timestamp()).unwrap_or(0),
@@ -5821,6 +5859,7 @@ mod tests {
             updated_at: timestamp,
             path,
             preview: "Count to 5".to_string(),
+            model: None,
             model_provider: "test-provider".to_string(),
             cwd: PathBuf::from("/"),
             cli_version: "0.0.0".to_string(),
@@ -5877,6 +5916,7 @@ mod tests {
             updated_at: Some("2025-09-05T16:53:11Z".to_string()),
             path: path.clone(),
             preview: String::new(),
+            model: None,
             model_provider: "fallback".to_string(),
             cwd: PathBuf::new(),
             cli_version: String::new(),

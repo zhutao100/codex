@@ -3750,7 +3750,8 @@ impl ChatWidget {
             | EventMsg::PlanDelta(_)
             | EventMsg::AgentReasoningDelta(_)
             | EventMsg::TerminalInteraction(_)
-            | EventMsg::ExecCommandOutputDelta(_) => {}
+            | EventMsg::ExecCommandOutputDelta(_)
+            | EventMsg::ProgressTrace(_) => {}
             _ => {
                 tracing::trace!("handle_codex_event: {:?}", msg);
             }
@@ -3896,6 +3897,7 @@ impl ChatWidget {
             | EventMsg::AgentMessageContentDelta(_)
             | EventMsg::ReasoningContentDelta(_)
             | EventMsg::ReasoningRawContentDelta(_)
+            | EventMsg::ProgressTrace(_)
             | EventMsg::DynamicToolCallRequest(_) => {}
             EventMsg::ItemCompleted(event) => {
                 if let codex_protocol::items::TurnItem::Plan(plan_item) = event.item {

@@ -2694,6 +2694,9 @@
       ],
       "type": "object"
     },
+    "TurnActiveParams": {
+      "type": "object"
+    },
     "TurnInterruptParams": {
       "properties": {
         "threadId": {
@@ -3533,6 +3536,30 @@
         "params"
       ],
       "title": "Turn/interruptRequest",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "enum": [
+            "turn/active"
+          ],
+          "title": "Turn/activeRequestMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/TurnActiveParams"
+        }
+      },
+      "required": [
+        "id",
+        "method",
+        "params"
+      ],
+      "title": "Turn/activeRequest",
       "type": "object"
     },
     {

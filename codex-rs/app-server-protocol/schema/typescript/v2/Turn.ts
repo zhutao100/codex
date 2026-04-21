@@ -7,6 +7,10 @@ import type { TurnStatus } from "./TurnStatus";
 
 export type Turn = { id: string, 
 /**
+ * Model slug used for this turn, when known.
+ */
+model: string | null, 
+/**
  * Only populated on a `thread/resume` or `thread/fork` response.
  * For all other responses and notifications returning a Turn,
  * the items field will be an empty list.

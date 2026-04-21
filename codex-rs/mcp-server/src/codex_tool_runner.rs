@@ -346,6 +346,7 @@ async fn run_codex_tool_session_inner(
                     | EventMsg::ItemStarted(_)
                     | EventMsg::ItemCompleted(_)
                     | EventMsg::AgentMessageContentDelta(_)
+                    | EventMsg::ProgressTrace(_)
                     | EventMsg::ReasoningContentDelta(_)
                     | EventMsg::ReasoningRawContentDelta(_)
                     | EventMsg::SkillsUpdateAvailable

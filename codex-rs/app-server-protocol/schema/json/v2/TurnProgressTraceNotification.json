@@ -1,0 +1,52 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "ProgressTraceCategory": {
+      "enum": [
+        "tool",
+        "edit",
+        "waiting",
+        "network",
+        "prefill",
+        "reasoning",
+        "gen"
+      ],
+      "type": "string"
+    },
+    "ProgressTraceState": {
+      "enum": [
+        "started",
+        "completed"
+      ],
+      "type": "string"
+    }
+  },
+  "properties": {
+    "category": {
+      "$ref": "#/definitions/ProgressTraceCategory"
+    },
+    "label": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "state": {
+      "$ref": "#/definitions/ProgressTraceState"
+    },
+    "threadId": {
+      "type": "string"
+    },
+    "turnId": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "category",
+    "state",
+    "threadId",
+    "turnId"
+  ],
+  "title": "TurnProgressTraceNotification",
+  "type": "object"
+}

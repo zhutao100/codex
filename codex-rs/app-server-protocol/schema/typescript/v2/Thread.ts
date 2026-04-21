@@ -11,6 +11,10 @@ export type Thread = { id: string,
  */
 preview: string, 
 /**
+ * Model slug used for this thread, when known.
+ */
+model: string | null, 
+/**
  * Model provider used for this thread (for example, 'openai').
  */
 modelProvider: string, 

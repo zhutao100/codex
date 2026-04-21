@@ -256,6 +256,10 @@ client_request_definitions! {
         params: v2::TurnInterruptParams,
         response: v2::TurnInterruptResponse,
     },
+    TurnActive => "turn/active" {
+        params: v2::TurnActiveParams,
+        response: v2::TurnActiveResponse,
+    },
     ReviewStart => "review/start" {
         params: v2::ReviewStartParams,
         response: v2::ReviewStartResponse,
@@ -699,6 +703,7 @@ server_notification_definitions! {
     TurnCompleted => "turn/completed" (v2::TurnCompletedNotification),
     TurnDiffUpdated => "turn/diff/updated" (v2::TurnDiffUpdatedNotification),
     TurnPlanUpdated => "turn/plan/updated" (v2::TurnPlanUpdatedNotification),
+    TurnProgressTrace => "turn/progressTrace" (v2::TurnProgressTraceNotification),
     ItemStarted => "item/started" (v2::ItemStartedNotification),
     ItemCompleted => "item/completed" (v2::ItemCompletedNotification),
     /// This event is internal-only. Used by Codex Cloud.
@@ -821,6 +826,32 @@ mod tests {
         assert_eq!(
             json!({
                 "method": "initialized",
+            }),
+            serde_json::to_value(&notification)?,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn serialize_turn_progress_trace_notification() -> Result<()> {
+        let notification =
+            ServerNotification::TurnProgressTrace(v2::TurnProgressTraceNotification {
+                thread_id: "thread-123".to_string(),
+                turn_id: "turn-456".to_string(),
+                category: v2::ProgressTraceCategory::Tool,
+                state: v2::ProgressTraceState::Started,
+                label: Some("running tool call".to_string()),
+            });
+        assert_eq!(
+            json!({
+                "method": "turn/progressTrace",
+                "params": {
+                    "threadId": "thread-123",
+                    "turnId": "turn-456",
+                    "category": "tool",
+                    "state": "started",
+                    "label": "running tool call"
+                }
             }),
             serde_json::to_value(&notification)?,
         );

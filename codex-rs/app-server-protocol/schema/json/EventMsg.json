@@ -2419,6 +2419,50 @@
           "type": "object"
         },
         {
+          "properties": {
+            "category": {
+              "$ref": "#/definitions/ProgressTraceCategory"
+            },
+            "label": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "source": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "state": {
+              "$ref": "#/definitions/ProgressTraceState"
+            },
+            "thread_id": {
+              "$ref": "#/definitions/ThreadId"
+            },
+            "turn_id": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "progress_trace"
+              ],
+              "title": "ProgressTraceEventMsgType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "category",
+            "state",
+            "thread_id",
+            "turn_id",
+            "type"
+          ],
+          "title": "ProgressTraceEventMsg",
+          "type": "object"
+        },
+        {
           "description": "Collab interaction: agent spawn begin.",
           "properties": {
             "call_id": {
@@ -3329,6 +3373,25 @@
         "enterprise",
         "edu",
         "unknown"
+      ],
+      "type": "string"
+    },
+    "ProgressTraceCategory": {
+      "enum": [
+        "tool",
+        "edit",
+        "waiting",
+        "network",
+        "prefill",
+        "reasoning",
+        "gen"
+      ],
+      "type": "string"
+    },
+    "ProgressTraceState": {
+      "enum": [
+        "started",
+        "completed"
       ],
       "type": "string"
     },
@@ -7016,6 +7079,50 @@
         "type"
       ],
       "title": "ReasoningRawContentDeltaEventMsg",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "category": {
+          "$ref": "#/definitions/ProgressTraceCategory"
+        },
+        "label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "$ref": "#/definitions/ProgressTraceState"
+        },
+        "thread_id": {
+          "$ref": "#/definitions/ThreadId"
+        },
+        "turn_id": {
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "progress_trace"
+          ],
+          "title": "ProgressTraceEventMsgType",
+          "type": "string"
+        }
+      },
+      "required": [
+        "category",
+        "state",
+        "thread_id",
+        "turn_id",
+        "type"
+      ],
+      "title": "ProgressTraceEventMsg",
       "type": "object"
     },
     {

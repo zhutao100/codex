@@ -30,6 +30,8 @@ use codex_protocol::protocol::AskForApproval as CoreAskForApproval;
 use codex_protocol::protocol::CodexErrorInfo as CoreCodexErrorInfo;
 use codex_protocol::protocol::CreditsSnapshot as CoreCreditsSnapshot;
 use codex_protocol::protocol::NetworkAccess as CoreNetworkAccess;
+use codex_protocol::protocol::ProgressTraceCategory as CoreProgressTraceCategory;
+use codex_protocol::protocol::ProgressTraceState as CoreProgressTraceState;
 use codex_protocol::protocol::RateLimitSnapshot as CoreRateLimitSnapshot;
 use codex_protocol::protocol::RateLimitWindow as CoreRateLimitWindow;
 use codex_protocol::protocol::SessionSource as CoreSessionSource;
@@ -1587,6 +1589,26 @@ pub struct ThreadReadResponse {
     pub thread: Thread,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct TurnActiveParams {}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ActiveTurnSummary {
+    pub thread_id: String,
+    pub turn_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct TurnActiveResponse {
+    pub data: Vec<ActiveTurnSummary>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
@@ -1836,6 +1858,8 @@ pub struct Thread {
     pub id: String,
     /// Usually the first user message in the thread, if available.
     pub preview: String,
+    /// Model slug used for this thread, when known.
+    pub model: Option<String>,
     /// Model provider used for this thread (for example, 'openai').
     pub model_provider: String,
     /// Unix timestamp (in seconds) when the thread was created.
@@ -1931,6 +1955,8 @@ impl From<CoreTokenUsage> for TokenUsageBreakdown {
 #[ts(export_to = "v2/")]
 pub struct Turn {
     pub id: String,
+    /// Model slug used for this turn, when known.
+    pub model: Option<String>,
     /// Only populated on a `thread/resume` or `thread/fork` response.
     /// For all other responses and notifications returning a Turn,
     /// the items field will be an empty list.
@@ -2638,6 +2664,36 @@ impl From<CorePlanStepStatus> for TurnPlanStepStatus {
             CorePlanStepStatus::Completed => Self::Completed,
         }
     }
+}
+
+v2_enum_from_core! {
+    pub enum ProgressTraceCategory from CoreProgressTraceCategory {
+        Tool,
+        Edit,
+        Waiting,
+        Network,
+        Prefill,
+        Reasoning,
+        Gen
+    }
+}
+
+v2_enum_from_core! {
+    pub enum ProgressTraceState from CoreProgressTraceState {
+        Started,
+        Completed
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct TurnProgressTraceNotification {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub category: ProgressTraceCategory,
+    pub state: ProgressTraceState,
+    pub label: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]

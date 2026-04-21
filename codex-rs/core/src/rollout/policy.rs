@@ -101,6 +101,7 @@ pub(crate) fn should_persist_event_msg(ev: &EventMsg) -> bool {
         | EventMsg::PlanDelta(_)
         | EventMsg::ReasoningContentDelta(_)
         | EventMsg::ReasoningRawContentDelta(_)
+        | EventMsg::ProgressTrace(_)
         | EventMsg::SkillsUpdateAvailable
         | EventMsg::CollabAgentSpawnBegin(_)
         | EventMsg::CollabAgentSpawnEnd(_)

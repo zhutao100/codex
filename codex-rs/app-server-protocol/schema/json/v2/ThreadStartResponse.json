@@ -723,6 +723,13 @@
         "id": {
           "type": "string"
         },
+        "model": {
+          "description": "Model slug used for this thread, when known.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "modelProvider": {
           "description": "Model provider used for this thread (for example, 'openai').",
           "type": "string"
@@ -1269,6 +1276,13 @@
             "$ref": "#/definitions/ThreadItem"
           },
           "type": "array"
+        },
+        "model": {
+          "description": "Model slug used for this turn, when known.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "status": {
           "$ref": "#/definitions/TurnStatus"

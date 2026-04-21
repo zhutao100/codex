@@ -962,6 +962,13 @@
           },
           "type": "array"
         },
+        "model": {
+          "description": "Model slug used for this turn, when known.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "status": {
           "$ref": "#/definitions/TurnStatus"
         }

@@ -790,6 +790,7 @@ impl EventProcessor for EventProcessorWithHumanOutput {
             | EventMsg::PlanDelta(_)
             | EventMsg::ReasoningContentDelta(_)
             | EventMsg::ReasoningRawContentDelta(_)
+            | EventMsg::ProgressTrace(_)
             | EventMsg::SkillsUpdateAvailable
             | EventMsg::UndoCompleted(_)
             | EventMsg::UndoStarted(_)

@@ -45,6 +45,12 @@
             }
           ]
         },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "modelProvider": {
           "type": "string"
         },

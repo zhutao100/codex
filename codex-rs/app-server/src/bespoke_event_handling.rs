@@ -1206,6 +1206,7 @@ async fn emit_turn_completed_with_status(
         thread_id: conversation_id.to_string(),
         turn: Turn {
             id: event_turn_id,
+            model: None,
             items: vec![],
             error,
             status,

@@ -140,6 +140,7 @@ pub struct ConversationSummary {
     pub preview: String,
     pub timestamp: Option<String>,
     pub updated_at: Option<String>,
+    pub model: Option<String>,
     pub model_provider: String,
     pub cwd: PathBuf,
     pub cli_version: String,

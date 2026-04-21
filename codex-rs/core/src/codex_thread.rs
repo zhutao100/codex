@@ -73,4 +73,12 @@ impl CodexThread {
     pub async fn config_snapshot(&self) -> ThreadConfigSnapshot {
         self.codex.thread_config_snapshot().await
     }
+
+    pub async fn active_turn_ids(&self) -> Vec<String> {
+        let active = self.codex.session.active_turn.lock().await;
+        active
+            .as_ref()
+            .map(|turn| turn.tasks.keys().cloned().collect())
+            .unwrap_or_default()
+    }
 }

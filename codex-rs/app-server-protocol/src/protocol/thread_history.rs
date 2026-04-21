@@ -176,6 +176,7 @@ impl ThreadHistoryBuilder {
     fn new_turn(&mut self) -> PendingTurn {
         PendingTurn {
             id: self.next_turn_id(),
+            model: None,
             items: Vec::new(),
             error: None,
             status: TurnStatus::Completed,
@@ -234,6 +235,7 @@ impl ThreadHistoryBuilder {
 
 struct PendingTurn {
     id: String,
+    model: Option<String>,
     items: Vec<ThreadItem>,
     error: Option<TurnError>,
     status: TurnStatus,
@@ -243,6 +245,7 @@ impl From<PendingTurn> for Turn {
     fn from(value: PendingTurn) -> Self {
         Self {
             id: value.id,
+            model: value.model,
             items: value.items,
             error: value.error,
             status: value.status,
@@ -506,6 +509,7 @@ mod tests {
         let expected = vec![
             Turn {
                 id: "turn-1".into(),
+                model: None,
                 status: TurnStatus::Completed,
                 error: None,
                 items: vec![
@@ -524,6 +528,7 @@ mod tests {
             },
             Turn {
                 id: "turn-2".into(),
+                model: None,
                 status: TurnStatus::Completed,
                 error: None,
                 items: vec![
