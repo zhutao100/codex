@@ -5672,7 +5672,9 @@ mod tests {
         let exec_policy = ExecPolicyManager::default();
         let (agent_status_tx, _agent_status_rx) = watch::channel(AgentStatus::PendingInit);
         let model = ModelsManager::get_model_offline(config.model.as_deref());
-        let model_info = ModelsManager::construct_model_info_offline(model.as_str(), &config);
+        let model_info = models_manager
+            .get_model_info(model.as_str(), config.as_ref())
+            .await;
         let reasoning_effort = config.model_reasoning_effort;
         let collaboration_mode = CollaborationMode {
             mode: ModeKind::Default,
@@ -5705,10 +5707,12 @@ mod tests {
             dynamic_tools: Vec::new(),
         };
         let per_turn_config = Session::build_per_turn_config(&session_configuration);
-        let model_info = ModelsManager::construct_model_info_offline(
-            session_configuration.collaboration_mode.model(),
-            &per_turn_config,
-        );
+        let model_info = models_manager
+            .get_model_info(
+                session_configuration.collaboration_mode.model(),
+                &per_turn_config,
+            )
+            .await;
         let otel_manager = otel_manager(
             conversation_id,
             config.as_ref(),
@@ -5802,7 +5806,9 @@ mod tests {
         let exec_policy = ExecPolicyManager::default();
         let (agent_status_tx, _agent_status_rx) = watch::channel(AgentStatus::PendingInit);
         let model = ModelsManager::get_model_offline(config.model.as_deref());
-        let model_info = ModelsManager::construct_model_info_offline(model.as_str(), &config);
+        let model_info = models_manager
+            .get_model_info(model.as_str(), config.as_ref())
+            .await;
         let reasoning_effort = config.model_reasoning_effort;
         let collaboration_mode = CollaborationMode {
             mode: ModeKind::Default,
@@ -5835,10 +5841,12 @@ mod tests {
             dynamic_tools: Vec::new(),
         };
         let per_turn_config = Session::build_per_turn_config(&session_configuration);
-        let model_info = ModelsManager::construct_model_info_offline(
-            session_configuration.collaboration_mode.model(),
-            &per_turn_config,
-        );
+        let model_info = models_manager
+            .get_model_info(
+                session_configuration.collaboration_mode.model(),
+                &per_turn_config,
+            )
+            .await;
         let otel_manager = otel_manager(
             conversation_id,
             config.as_ref(),

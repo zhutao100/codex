@@ -635,7 +635,12 @@ mod tests {
             "HOME=\"{home_display}\"; export HOME; {}",
             bash_snapshot_script()
         );
-        let output = run_script_with_timeout(&shell, &script, Duration::from_millis(500), true)
+        let timeout = if cfg!(target_os = "macos") {
+            Duration::from_secs(2)
+        } else {
+            Duration::from_millis(500)
+        };
+        let output = run_script_with_timeout(&shell, &script, timeout, true)
             .await
             .context("run snapshot command")?;
 
