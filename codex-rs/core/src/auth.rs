@@ -757,6 +757,14 @@ impl AuthDotJson {
         if let Some(mode) = self.auth_mode {
             return mode;
         }
+
+        // Legacy auth.json payloads may omit auth_mode while still containing
+        // both ChatGPT tokens and an API key value. Prefer ChatGPT when token
+        // material exists so model availability aligns with ChatGPT sessions.
+        if self.tokens.is_some() {
+            return ApiAuthMode::Chatgpt;
+        }
+
         if self.openai_api_key.is_some() {
             return ApiAuthMode::ApiKey;
         }
@@ -1430,6 +1438,29 @@ mod tests {
         assert_eq!(auth.api_key(), Some("sk-test-key"));
 
         assert!(auth.get_token_data().is_err());
+    }
+
+    #[tokio::test]
+    #[serial(codex_api_key)]
+    async fn legacy_auth_with_tokens_and_api_key_prefers_chatgpt_mode() {
+        let codex_home = tempdir().unwrap();
+        let _jwt = write_auth_file(
+            AuthFileParams {
+                openai_api_key: Some("sk-test-key".to_string()),
+                chatgpt_plan_type: "pro".to_string(),
+                chatgpt_account_id: None,
+            },
+            codex_home.path(),
+        )
+        .expect("failed to write auth file");
+
+        let auth = super::load_auth(codex_home.path(), false, AuthCredentialsStoreMode::File)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(auth.auth_mode(), AuthMode::Chatgpt);
+        assert_eq!(auth.api_key(), None);
+        assert!(auth.get_token_data().is_ok());
     }
 
     #[test]
