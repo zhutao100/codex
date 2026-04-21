@@ -26,6 +26,10 @@ pub(crate) struct SessionState {
     pub(crate) initial_context_seeded: bool,
     /// Previous rollout model for one-shot model-switch handling on first turn after resume.
     pub(crate) pending_resume_previous_model: Option<String>,
+    /// Tracks whether automatic thread naming has already been attempted.
+    pub(crate) auto_rename_attempted: bool,
+    /// Tracks whether this session originated from a fork.
+    pub(crate) is_forked_session: bool,
 }
 
 impl SessionState {
@@ -41,6 +45,8 @@ impl SessionState {
             mcp_dependency_prompted: HashSet::new(),
             initial_context_seeded: false,
             pending_resume_previous_model: None,
+            auto_rename_attempted: false,
+            is_forked_session: false,
         }
     }
 
@@ -127,6 +133,22 @@ impl SessionState {
 
     pub(crate) fn dependency_env(&self) -> HashMap<String, String> {
         self.dependency_env.clone()
+    }
+
+    pub(crate) fn auto_rename_attempted(&self) -> bool {
+        self.auto_rename_attempted
+    }
+
+    pub(crate) fn mark_auto_rename_attempted(&mut self) {
+        self.auto_rename_attempted = true;
+    }
+
+    pub(crate) fn is_forked_session(&self) -> bool {
+        self.is_forked_session
+    }
+
+    pub(crate) fn set_is_forked_session(&mut self, is_forked_session: bool) {
+        self.is_forked_session = is_forked_session;
     }
 }
 

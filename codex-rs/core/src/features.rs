@@ -78,6 +78,8 @@ pub enum Feature {
     ShellTool,
 
     // Experimental
+    /// Automatically rename new threads based on the conversation content.
+    AutoRenameThread,
     /// Use the single unified PTY-backed exec tool.
     UnifiedExec,
     /// Include the freeform apply_patch tool.
@@ -409,6 +411,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         key: "shell_tool",
         stage: Stage::Stable,
         default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::AutoRenameThread,
+        key: "auto_rename_thread",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
     },
     FeatureSpec {
         id: Feature::UnifiedExec,

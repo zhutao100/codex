@@ -13,12 +13,11 @@ fn assert_has_single_default(models: &[ModelPreset]) {
     let default_count = models.iter().filter(|model| model.is_default).count();
     assert_eq!(default_count, 1, "expected exactly one default model");
 
-    let first_picker_index = models
-        .iter()
-        .position(|model| model.show_in_picker)
-        .expect("expected at least one picker model");
+    let Some(first_picker_model) = models.iter().find(|model| model.show_in_picker) else {
+        panic!("expected at least one picker model");
+    };
     assert!(
-        models[first_picker_index].is_default,
+        first_picker_model.is_default,
         "expected the first picker model to be the default",
     );
 }

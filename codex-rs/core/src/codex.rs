@@ -61,6 +61,9 @@ use codex_protocol::protocol::FileChange;
 use codex_protocol::protocol::HasLegacyEvent;
 use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::ItemStartedEvent;
+use codex_protocol::protocol::ProgressTraceCategory;
+use codex_protocol::protocol::ProgressTraceEvent;
+use codex_protocol::protocol::ProgressTraceState;
 use codex_protocol::protocol::RawResponseItemEvent;
 use codex_protocol::protocol::ReviewRequest;
 use codex_protocol::protocol::RolloutItem;
@@ -460,6 +463,14 @@ impl Codex {
 
     pub(crate) async fn agent_status(&self) -> AgentStatus {
         self.agent_status.borrow().clone()
+    }
+
+    pub(crate) async fn active_turn_id(&self) -> Option<String> {
+        let active = self.session.active_turn.lock().await;
+        active
+            .as_ref()
+            .and_then(|turn| turn.tasks.first())
+            .map(|(sub_id, _task)| sub_id.clone())
     }
 
     pub(crate) async fn thread_config_snapshot(&self) -> ThreadConfigSnapshot {
@@ -1001,7 +1012,7 @@ impl Session {
                 otel_manager.clone(),
             );
         }
-        let thread_name =
+        let mut thread_name =
             match session_index::find_thread_name_by_id(&config.codex_home, &conversation_id).await
             {
                 Ok(name) => name,
@@ -1010,8 +1021,48 @@ impl Session {
                     None
                 }
             };
+        if thread_name.is_none()
+            && let Some(parent_id) = forked_from_id
+        {
+            let parent_label = match session_index::find_thread_label_by_id(
+                &config.codex_home,
+                &parent_id,
+            )
+            .await
+            {
+                Ok(Some(label)) => label,
+                Ok(None) => "Untitled".to_string(),
+                Err(err) => {
+                    warn!("Failed to resolve parent thread label for forked session: {err}");
+                    "Untitled".to_string()
+                }
+            };
+            let fork_number =
+                match session_index::next_fork_number_for_parent(&config.codex_home, &parent_id)
+                    .await
+                {
+                    Ok(number) => number,
+                    Err(err) => {
+                        warn!("Failed to compute fork number for derived thread title: {err}");
+                        1
+                    }
+                };
+            let derived_name = format!("Fork {fork_number} of {parent_label}");
+            if !config.ephemeral
+                && let Err(err) = session_index::append_thread_name(
+                    &config.codex_home,
+                    conversation_id,
+                    &derived_name,
+                )
+                .await
+            {
+                warn!("Failed to write derived fork title to session index: {err}");
+            }
+            thread_name = Some(derived_name);
+        }
         session_configuration.thread_name = thread_name.clone();
-        let state = SessionState::new(session_configuration.clone());
+        let mut state = SessionState::new(session_configuration.clone());
+        state.set_is_forked_session(forked_from_id.is_some());
 
         let services = SessionServices {
             mcp_connection_manager: Arc::new(RwLock::new(McpConnectionManager::default())),
@@ -1137,6 +1188,41 @@ impl Session {
         {
             warn!("failed to flush rollout recorder: {e}");
         }
+    }
+
+    pub(crate) async fn set_thread_name(&self, name: String) -> std::io::Result<()> {
+        let Some(name) = crate::util::normalize_thread_name(&name) else {
+            return Err(std::io::Error::other("thread name cannot be empty"));
+        };
+
+        let persistence_enabled = {
+            let rollout = self.services.rollout.lock().await;
+            rollout.is_some()
+        };
+        if !persistence_enabled {
+            return Err(std::io::Error::other(
+                "session persistence is disabled; cannot rename thread",
+            ));
+        }
+
+        let codex_home = self.codex_home().await;
+        session_index::append_thread_name(&codex_home, self.conversation_id, &name).await?;
+
+        let mut state = self.state.lock().await;
+        state.session_configuration.thread_name = Some(name);
+        Ok(())
+    }
+
+    pub(crate) async fn prepare_auto_rename(&self) -> bool {
+        let mut state = self.state.lock().await;
+        if state.is_forked_session()
+            || state.session_configuration.thread_name.is_some()
+            || state.auto_rename_attempted()
+        {
+            return false;
+        }
+        state.mark_auto_rename_attempted();
+        true
     }
 
     fn next_internal_sub_id(&self) -> String {
@@ -1656,6 +1742,28 @@ impl Session {
         .await;
     }
 
+    pub(crate) async fn emit_progress_trace(
+        &self,
+        turn_context: &TurnContext,
+        category: ProgressTraceCategory,
+        state: ProgressTraceState,
+        label: Option<String>,
+        source: Option<&str>,
+    ) {
+        self.send_event(
+            turn_context,
+            EventMsg::ProgressTrace(ProgressTraceEvent {
+                thread_id: self.conversation_id,
+                turn_id: turn_context.sub_id.clone(),
+                category,
+                state,
+                label,
+                source: source.map(str::to_string),
+            }),
+        )
+        .await;
+    }
+
     /// Adds an execpolicy amendment to both the in-memory and on-disk policies so future
     /// commands can use the newly approved prefix.
     pub(crate) async fn persist_execpolicy_amendment(
@@ -1845,8 +1953,25 @@ impl Session {
             turn_id: turn_context.sub_id.clone(),
             questions: args.questions,
         });
+        self.emit_progress_trace(
+            turn_context,
+            ProgressTraceCategory::Waiting,
+            ProgressTraceState::Started,
+            Some("Waiting for user input".to_string()),
+            Some("request_user_input"),
+        )
+        .await;
         self.send_event(turn_context, event).await;
-        rx_response.await.ok()
+        let response = rx_response.await.ok();
+        self.emit_progress_trace(
+            turn_context,
+            ProgressTraceCategory::Waiting,
+            ProgressTraceState::Completed,
+            None,
+            Some("request_user_input"),
+        )
+        .await;
+        response
     }
 
     pub async fn notify_user_input_response(
@@ -2686,6 +2811,9 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
             Op::SetThreadName { name } => {
                 handlers::set_thread_name(&sess, sub.id.clone(), name).await;
             }
+            Op::AutoRenameThread => {
+                handlers::auto_rename_thread(&sess, sub.id.clone()).await;
+            }
             Op::RunUserShellCommand { command } => {
                 handlers::run_user_shell_command(
                     &sess,
@@ -2729,7 +2857,6 @@ mod handlers {
     use crate::mcp::collect_mcp_snapshot_from_manager;
     use crate::mcp::effective_mcp_servers;
     use crate::review_prompts::resolve_review_request;
-    use crate::rollout::session_index;
     use crate::tasks::CompactTask;
     use crate::tasks::RegularTask;
     use crate::tasks::UndoTask;
@@ -3261,7 +3388,7 @@ mod handlers {
     /// Persists the thread name in the session index, updates in-memory state, and emits
     /// a `ThreadNameUpdated` event on success.
     ///
-    /// This appends the name to `CODEX_HOME/sessions_index.jsonl` via `session_index::append_thread_name` for the
+    /// This appends the name to `CODEX_HOME/session_index.jsonl` via `session_index::append_thread_name` for the
     /// current `thread_id`, then updates `SessionConfiguration::thread_name`.
     ///
     /// Returns an error event if the name is empty or session persistence is disabled.
@@ -3278,26 +3405,7 @@ mod handlers {
             return;
         };
 
-        let persistence_enabled = {
-            let rollout = sess.services.rollout.lock().await;
-            rollout.is_some()
-        };
-        if !persistence_enabled {
-            let event = Event {
-                id: sub_id,
-                msg: EventMsg::Error(ErrorEvent {
-                    message: "Session persistence is disabled; cannot rename thread.".to_string(),
-                    codex_error_info: Some(CodexErrorInfo::Other),
-                }),
-            };
-            sess.send_event_raw(event).await;
-            return;
-        };
-
-        let codex_home = sess.codex_home().await;
-        if let Err(e) =
-            session_index::append_thread_name(&codex_home, sess.conversation_id, &name).await
-        {
+        if let Err(e) = sess.set_thread_name(name.clone()).await {
             let event = Event {
                 id: sub_id,
                 msg: EventMsg::Error(ErrorEvent {
@@ -3309,16 +3417,67 @@ mod handlers {
             return;
         }
 
-        {
-            let mut state = sess.state.lock().await;
-            state.session_configuration.thread_name = Some(name.clone());
-        }
-
         sess.send_event_raw(Event {
             id: sub_id,
             msg: EventMsg::ThreadNameUpdated(ThreadNameUpdatedEvent {
                 thread_id: sess.conversation_id,
                 thread_name: Some(name),
+            }),
+        })
+        .await;
+    }
+
+    pub async fn auto_rename_thread(sess: &Arc<Session>, sub_id: String) {
+        let turn_context = sess.new_default_turn_with_sub_id(sub_id.clone()).await;
+        let title = match crate::chat_title::generate_chat_title(
+            sess.as_ref(),
+            turn_context.as_ref(),
+        )
+        .await
+        {
+            Ok(title) => title,
+            Err(err) => {
+                sess.send_event_raw(Event {
+                    id: sub_id,
+                    msg: EventMsg::Error(ErrorEvent {
+                        message: format!("Auto-rename failed: {err}"),
+                        codex_error_info: Some(CodexErrorInfo::Other),
+                    }),
+                })
+                .await;
+                return;
+            }
+        };
+
+        let Some(title) = title else {
+            sess.send_event_raw(Event {
+                id: sub_id,
+                msg: EventMsg::Error(ErrorEvent {
+                    message: "Auto-rename failed: empty title.".to_string(),
+                    codex_error_info: Some(CodexErrorInfo::Other),
+                }),
+            })
+            .await;
+            return;
+        };
+
+        if let Err(err) = sess.set_thread_name(title.clone()).await {
+            sess.send_event_raw(Event {
+                id: sub_id,
+                msg: EventMsg::Error(ErrorEvent {
+                    message: format!("Auto-rename failed: {err}"),
+                    codex_error_info: Some(CodexErrorInfo::Other),
+                }),
+            })
+            .await;
+            return;
+        }
+
+        sess.send_event_raw(Event {
+            id: turn_context.sub_id.clone(),
+            msg: EventMsg::ThreadNameUpdated(ThreadNameUpdatedEvent {
+                thread_id: sess.conversation_id,
+                thread_name: Some(title),
             }),
         })
         .await;
@@ -4341,6 +4500,136 @@ impl PlanModeStreamState {
     }
 }
 
+#[derive(Default)]
+struct ProgressTraceStreamState {
+    saw_work_category: bool,
+    pending_prefill: bool,
+    prefill_open: bool,
+    reasoning_open: bool,
+    gen_open: bool,
+}
+
+impl ProgressTraceStreamState {
+    async fn mark_work_seen(&mut self, sess: &Session, turn_context: &TurnContext) {
+        if self.saw_work_category {
+            return;
+        }
+        self.saw_work_category = true;
+        if self.pending_prefill && !self.prefill_open {
+            sess.emit_progress_trace(
+                turn_context,
+                ProgressTraceCategory::Prefill,
+                ProgressTraceState::Started,
+                None,
+                Some("stream"),
+            )
+            .await;
+            self.prefill_open = true;
+        }
+    }
+
+    async fn on_text_delta(&mut self, sess: &Session, turn_context: &TurnContext) {
+        if self.saw_work_category {
+            if !self.gen_open {
+                sess.emit_progress_trace(
+                    turn_context,
+                    ProgressTraceCategory::Gen,
+                    ProgressTraceState::Started,
+                    None,
+                    Some("stream"),
+                )
+                .await;
+                self.gen_open = true;
+            }
+            return;
+        }
+        self.pending_prefill = true;
+    }
+
+    async fn on_reasoning_delta(&mut self, sess: &Session, turn_context: &TurnContext) {
+        if !self.reasoning_open {
+            sess.emit_progress_trace(
+                turn_context,
+                ProgressTraceCategory::Reasoning,
+                ProgressTraceState::Started,
+                None,
+                Some("stream"),
+            )
+            .await;
+            self.reasoning_open = true;
+        }
+    }
+
+    async fn on_reasoning_section_break(&mut self, sess: &Session, turn_context: &TurnContext) {
+        if self.reasoning_open {
+            sess.emit_progress_trace(
+                turn_context,
+                ProgressTraceCategory::Reasoning,
+                ProgressTraceState::Completed,
+                None,
+                Some("stream"),
+            )
+            .await;
+            self.reasoning_open = false;
+        }
+    }
+
+    async fn finalize(&mut self, sess: &Session, turn_context: &TurnContext) {
+        if self.reasoning_open {
+            sess.emit_progress_trace(
+                turn_context,
+                ProgressTraceCategory::Reasoning,
+                ProgressTraceState::Completed,
+                None,
+                Some("stream"),
+            )
+            .await;
+            self.reasoning_open = false;
+        }
+        if self.prefill_open {
+            sess.emit_progress_trace(
+                turn_context,
+                ProgressTraceCategory::Prefill,
+                ProgressTraceState::Completed,
+                None,
+                Some("stream"),
+            )
+            .await;
+            self.prefill_open = false;
+        }
+        if self.gen_open {
+            sess.emit_progress_trace(
+                turn_context,
+                ProgressTraceCategory::Gen,
+                ProgressTraceState::Completed,
+                None,
+                Some("stream"),
+            )
+            .await;
+            self.gen_open = false;
+        } else if self.pending_prefill && !self.saw_work_category {
+            // Conversational turns with no work are categorized as generation.
+            sess.emit_progress_trace(
+                turn_context,
+                ProgressTraceCategory::Gen,
+                ProgressTraceState::Started,
+                None,
+                Some("stream"),
+            )
+            .await;
+            sess.emit_progress_trace(
+                turn_context,
+                ProgressTraceCategory::Gen,
+                ProgressTraceState::Completed,
+                None,
+                Some("stream"),
+            )
+            .await;
+        }
+        self.pending_prefill = false;
+    }
+}
+
 impl ProposedPlanItemState {
     fn new(turn_id: &str) -> Self {
         Self {
@@ -4742,6 +5031,7 @@ async fn try_run_sampling_request(
     let mut should_emit_turn_diff = false;
     let plan_mode = turn_context.collaboration_mode.mode == ModeKind::Plan;
     let mut plan_mode_state = plan_mode.then(|| PlanModeStreamState::new(&turn_context.sub_id));
+    let mut progress_trace_state = ProgressTraceStreamState::default();
     let receiving_span = trace_span!("receiving_stream");
     let outcome: CodexResult<SamplingRequestResult> = loop {
         let handle_responses = trace_span!(
@@ -4780,6 +5070,19 @@ async fn try_run_sampling_request(
             ResponseEvent::Created => {}
             ResponseEvent::OutputItemDone(item) => {
                 let previously_active_item = active_item.take();
+                if matches!(previously_active_item, Some(TurnItem::WebSearch(_))) {
+                    progress_trace_state
+                        .mark_work_seen(&sess, &turn_context)
+                        .await;
+                    sess.emit_progress_trace(
+                        &turn_context,
+                        ProgressTraceCategory::Network,
+                        ProgressTraceState::Completed,
+                        None,
+                        Some("web_search"),
+                    )
+                    .await;
+                }
                 if let Some(state) = plan_mode_state.as_mut() {
                     if let Some(previous) = previously_active_item.as_ref() {
                         let item_id = previous.id();
@@ -4818,6 +5121,9 @@ async fn try_run_sampling_request(
                     .instrument(handle_responses)
                     .await?;
                 if let Some(tool_future) = output_result.tool_future {
+                    progress_trace_state
+                        .mark_work_seen(&sess, &turn_context)
+                        .await;
                     in_flight.push_back(tool_future);
                 }
                 if let Some(agent_message) = output_result.last_agent_message {
@@ -4827,6 +5133,19 @@ async fn try_run_sampling_request(
             }
             ResponseEvent::OutputItemAdded(item) => {
                 if let Some(turn_item) = handle_non_tool_response_item(&item, plan_mode).await {
+                    if matches!(turn_item, TurnItem::WebSearch(_)) {
+                        progress_trace_state
+                            .mark_work_seen(&sess, &turn_context)
+                            .await;
+                        sess.emit_progress_trace(
+                            &turn_context,
+                            ProgressTraceCategory::Network,
+                            ProgressTraceState::Started,
+                            None,
+                            Some("web_search"),
+                        )
+                        .await;
+                    }
                     if let Some(state) = plan_mode_state.as_mut()
                         && matches!(turn_item, TurnItem::AgentMessage(_))
                     {
@@ -4860,6 +5179,7 @@ async fn try_run_sampling_request(
                 response_id: _,
                 token_usage,
             } => {
+                progress_trace_state.finalize(&sess, &turn_context).await;
                 if let Some(state) = plan_mode_state.as_mut() {
                     flush_proposed_plan_segments_all(&sess, &turn_context, state).await;
                 }
@@ -4875,6 +5195,9 @@ async fn try_run_sampling_request(
                 });
             }
             ResponseEvent::OutputTextDelta(delta) => {
+                progress_trace_state
+                    .on_text_delta(&sess, &turn_context)
+                    .await;
                 // In review child threads, suppress assistant text deltas; the
                 // UI will show a selection popup from the final ReviewOutput.
                 if let Some(active) = active_item.as_ref() {
@@ -4905,6 +5228,9 @@ async fn try_run_sampling_request(
                 delta,
                 summary_index,
             } => {
+                progress_trace_state
+                    .on_reasoning_delta(&sess, &turn_context)
+                    .await;
                 if let Some(active) = active_item.as_ref() {
                     let event = ReasoningContentDeltaEvent {
                         thread_id: sess.conversation_id.to_string(),
@@ -4920,6 +5246,9 @@ async fn try_run_sampling_request(
                 }
             }
             ResponseEvent::ReasoningSummaryPartAdded { summary_index } => {
+                progress_trace_state
+                    .on_reasoning_section_break(&sess, &turn_context)
+                    .await;
                 if let Some(active) = active_item.as_ref() {
                     let event =
                         EventMsg::AgentReasoningSectionBreak(AgentReasoningSectionBreakEvent {
@@ -4935,6 +5264,9 @@ async fn try_run_sampling_request(
                 delta,
                 content_index,
             } => {
+                progress_trace_state
+                    .on_reasoning_delta(&sess, &turn_context)
+                    .await;
                 if let Some(active) = active_item.as_ref() {
                     let event = ReasoningRawContentDeltaEvent {
                         thread_id: sess.conversation_id.to_string(),
@@ -4952,6 +5284,7 @@ async fn try_run_sampling_request(
         }
     };
 
+    progress_trace_state.finalize(&sess, &turn_context).await;
     drain_in_flight(&mut in_flight, sess.clone(), turn_context.clone()).await?;
 
     if should_emit_turn_diff {
@@ -6273,7 +6606,8 @@ mod tests {
         .await
         .expect("inject pending input into active turn");
 
-        sess.on_task_finished(Arc::clone(&tc), None).await;
+        sess.on_task_finished(Arc::clone(&tc), None, TaskKind::Regular)
+            .await;
 
         let history = sess.clone_history().await;
         let expected = ResponseItem::Message {

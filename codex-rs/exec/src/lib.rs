@@ -626,7 +626,10 @@ async fn resolve_resume_path(
         }
     } else if let Some(id_str) = args.session_id.as_deref() {
         if Uuid::parse_str(id_str).is_ok() {
-            let path = find_thread_path_by_id_str(&config.codex_home, id_str).await?;
+            let path = match find_thread_path_by_id_str(&config.codex_home, id_str).await? {
+                Some(path) => Some(path),
+                None => find_thread_path_by_name_str(&config.codex_home, id_str).await?,
+            };
             Ok(path)
         } else {
             let path = find_thread_path_by_name_str(&config.codex_home, id_str).await?;

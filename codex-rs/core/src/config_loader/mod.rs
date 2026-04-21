@@ -67,6 +67,7 @@ const DEFAULT_REQUIREMENTS_TOML_FILE_UNIX: &str = "/etc/codex/requirements.toml"
 pub const SYSTEM_CONFIG_TOML_FILE_UNIX: &str = "/etc/codex/config.toml";
 
 const DEFAULT_PROJECT_ROOT_MARKERS: &[&str] = &[".git"];
+const VS_CODE_THEME_PREFIX: &str = "vscode:";
 
 /// To build up the set of admin-enforced constraints, we build up from multiple
 /// configuration layers in the following order, but a constraint defined in an
@@ -620,10 +621,43 @@ fn resolve_relative_paths_in_config_toml(
         )
     })?;
 
-    Ok(copy_shape_from_original(
-        &value_from_config_toml,
-        &resolved_value,
-    ))
+    let mut merged = copy_shape_from_original(&value_from_config_toml, &resolved_value);
+
+    normalize_vscode_theme_path_in_toml(&mut merged, base_dir)?;
+
+    Ok(merged)
+}
+
+fn normalize_vscode_theme_path_in_toml(value: &mut TomlValue, base_dir: &Path) -> io::Result<()> {
+    let Some(root) = value.as_table_mut() else {
+        return Ok(());
+    };
+
+    let Some(tui) = root.get_mut("tui").and_then(TomlValue::as_table_mut) else {
+        return Ok(());
+    };
+
+    let Some(TomlValue::String(theme)) = tui.get("syntax_highlight_theme") else {
+        return Ok(());
+    };
+    let theme = theme.clone();
+
+    let Some(theme_path) = theme.strip_prefix(VS_CODE_THEME_PREFIX) else {
+        return Ok(());
+    };
+
+    if theme_path.is_empty() {
+        return Ok(());
+    }
+
+    let resolved = AbsolutePathBuf::resolve_path_against_base(theme_path, base_dir)?;
+    let normalized = format!("{VS_CODE_THEME_PREFIX}{}", resolved.as_path().display());
+    tui.insert(
+        "syntax_highlight_theme".to_string(),
+        TomlValue::String(normalized),
+    );
+
+    Ok(())
 }
 
 /// Ensure that every field in `original` is present in the returned
@@ -859,6 +893,79 @@ foo = "xyzzy"
         );
         expected_toml_value.insert("foo".to_string(), TomlValue::String("xyzzy".to_string()));
         assert_eq!(normalized_toml_value, TomlValue::Table(expected_toml_value));
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_relative_paths_normalizes_vscode_theme_path() -> anyhow::Result<()> {
+        let tmp = tempdir()?;
+        let base_dir = tmp.path();
+        let contents = r#"
+[tui]
+syntax_highlight_theme = "vscode:./themes/dark-plus.json"
+"#;
+        let user_config: TomlValue = toml::from_str(contents)?;
+        let normalized_toml_value = resolve_relative_paths_in_config_toml(user_config, base_dir)?;
+        let theme = normalized_toml_value
+            .get("tui")
+            .and_then(|tui| tui.get("syntax_highlight_theme"))
+            .and_then(TomlValue::as_str)
+            .expect("normalized vscode theme");
+
+        let expected_path =
+            AbsolutePathBuf::resolve_path_against_base("./themes/dark-plus.json", base_dir)?;
+        assert_eq!(
+            theme,
+            format!(
+                "{VS_CODE_THEME_PREFIX}{}",
+                expected_path.as_path().display()
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_relative_paths_keeps_builtin_theme_name() -> anyhow::Result<()> {
+        let tmp = tempdir()?;
+        let base_dir = tmp.path();
+        let contents = r#"
+[tui]
+syntax_highlight_theme = "base16-ocean.dark"
+"#;
+        let user_config: TomlValue = toml::from_str(contents)?;
+        let normalized_toml_value = resolve_relative_paths_in_config_toml(user_config, base_dir)?;
+        let theme = normalized_toml_value
+            .get("tui")
+            .and_then(|tui| tui.get("syntax_highlight_theme"))
+            .and_then(TomlValue::as_str)
+            .expect("normalized built-in theme");
+
+        assert_eq!(theme, "base16-ocean.dark");
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_relative_paths_keeps_absolute_vscode_theme_path() -> anyhow::Result<()> {
+        let tmp = tempdir()?;
+        let base_dir = tmp.path();
+        let absolute = base_dir.join("themes").join("dark-plus.json");
+        let absolute = AbsolutePathBuf::from_absolute_path(absolute)?;
+        let contents = format!(
+            "[tui]\nsyntax_highlight_theme = \"vscode:{}\"\n",
+            absolute.as_path().display()
+        );
+        let user_config: TomlValue = toml::from_str(&contents)?;
+        let normalized_toml_value = resolve_relative_paths_in_config_toml(user_config, base_dir)?;
+        let theme = normalized_toml_value
+            .get("tui")
+            .and_then(|tui| tui.get("syntax_highlight_theme"))
+            .and_then(TomlValue::as_str)
+            .expect("normalized absolute vscode theme");
+
+        assert_eq!(
+            theme,
+            format!("{VS_CODE_THEME_PREFIX}{}", absolute.as_path().display())
+        );
         Ok(())
     }
 

@@ -21,8 +21,13 @@ use tracing::warn;
 use crate::AuthManager;
 use crate::codex::Session;
 use crate::codex::TurnContext;
+use crate::features::Feature;
 use crate::models_manager::manager::ModelsManager;
+use crate::protocol::CodexErrorInfo;
+use crate::protocol::ErrorEvent;
 use crate::protocol::EventMsg;
+use crate::protocol::SessionSource;
+use crate::protocol::ThreadNameUpdatedEvent;
 use crate::protocol::TurnAbortReason;
 use crate::protocol::TurnAbortedEvent;
 use crate::protocol::TurnCompleteEvent;
@@ -30,6 +35,7 @@ use crate::session_prefix::TURN_ABORTED_OPEN_TAG;
 use crate::state::ActiveTurn;
 use crate::state::RunningTask;
 use crate::state::TaskKind;
+use codex_protocol::config_types::ModeKind;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
@@ -151,7 +157,7 @@ impl Session {
                     if !task_cancellation_token.is_cancelled() {
                         // Emit completion uniformly from spawn site so all tasks share the same lifecycle.
                         let sess = session_ctx.clone_session();
-                        sess.on_task_finished(ctx_for_finish, last_agent_message)
+                        sess.on_task_finished(ctx_for_finish, last_agent_message, task_kind)
                             .await;
                     }
                     done_clone.notify_waiters();
@@ -188,6 +194,7 @@ impl Session {
         self: &Arc<Self>,
         turn_context: Arc<TurnContext>,
         last_agent_message: Option<String>,
+        task_kind: TaskKind,
     ) {
         let mut active = self.active_turn.lock().await;
         let mut pending_input = Vec::<ResponseInputItem>::new();
@@ -214,8 +221,106 @@ impl Session {
         if should_close_processes {
             self.close_unified_exec_processes().await;
         }
-        let event = EventMsg::TurnComplete(TurnCompleteEvent { last_agent_message });
+        let event = EventMsg::TurnComplete(TurnCompleteEvent {
+            last_agent_message: last_agent_message.clone(),
+        });
         self.send_event(turn_context.as_ref(), event).await;
+        self.maybe_auto_rename_thread(turn_context, last_agent_message, task_kind)
+            .await;
+    }
+
+    async fn maybe_auto_rename_thread(
+        self: &Arc<Self>,
+        turn_context: Arc<TurnContext>,
+        last_agent_message: Option<String>,
+        task_kind: TaskKind,
+    ) {
+        if !turn_context.features.enabled(Feature::AutoRenameThread) {
+            return;
+        }
+
+        if task_kind != TaskKind::Regular
+            || turn_context.collaboration_mode.mode != ModeKind::Default
+        {
+            return;
+        }
+
+        if !matches!(
+            turn_context.session_source,
+            SessionSource::Cli | SessionSource::VSCode
+        ) {
+            return;
+        }
+
+        let Some(message) = last_agent_message.as_ref() else {
+            return;
+        };
+        if message.trim().is_empty() {
+            return;
+        }
+
+        if !self.prepare_auto_rename().await {
+            return;
+        }
+
+        let session = Arc::clone(self);
+        let turn_context = Arc::clone(&turn_context);
+        tokio::spawn(async move {
+            let title_result =
+                crate::chat_title::generate_chat_title(session.as_ref(), turn_context.as_ref())
+                    .await;
+            let title = match title_result {
+                Ok(title) => title,
+                Err(err) => {
+                    session
+                        .send_event(
+                            turn_context.as_ref(),
+                            EventMsg::Error(ErrorEvent {
+                                message: format!("Auto-rename failed: {err}"),
+                                codex_error_info: Some(CodexErrorInfo::Other),
+                            }),
+                        )
+                        .await;
+                    return;
+                }
+            };
+
+            let Some(title) = title else {
+                session
+                    .send_event(
+                        turn_context.as_ref(),
+                        EventMsg::Error(ErrorEvent {
+                            message: "Auto-rename failed: empty title.".to_string(),
+                            codex_error_info: Some(CodexErrorInfo::Other),
+                        }),
+                    )
+                    .await;
+                return;
+            };
+
+            if let Err(err) = session.set_thread_name(title.clone()).await {
+                session
+                    .send_event(
+                        turn_context.as_ref(),
+                        EventMsg::Error(ErrorEvent {
+                            message: format!("Auto-rename failed: {err}"),
+                            codex_error_info: Some(CodexErrorInfo::Other),
+                        }),
+                    )
+                    .await;
+                return;
+            }
+
+            session
+                .send_event(
+                    turn_context.as_ref(),
+                    EventMsg::ThreadNameUpdated(ThreadNameUpdatedEvent {
+                        thread_id: session.conversation_id,
+                        thread_name: Some(title),
+                    }),
+                )
+                .await;
+        });
     }
 
     async fn register_new_active_task(&self, task: RunningTask) {

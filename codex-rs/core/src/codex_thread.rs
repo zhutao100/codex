@@ -58,6 +58,10 @@ impl CodexThread {
         self.codex.agent_status().await
     }
 
+    pub async fn active_turn_id(&self) -> Option<String> {
+        self.codex.active_turn_id().await
+    }
+
     pub(crate) fn subscribe_status(&self) -> watch::Receiver<AgentStatus> {
         self.codex.agent_status.clone()
     }

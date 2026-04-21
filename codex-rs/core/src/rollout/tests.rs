@@ -884,6 +884,58 @@ async fn test_list_threads_scans_past_head_for_user_event() {
 }
 
 #[tokio::test]
+async fn test_list_threads_uses_first_session_meta_thread_id() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path();
+
+    let uuid = Uuid::from_u128(199);
+    let ts = "2025-05-02T10-30-00";
+    write_session_file_with_delayed_user_event(home, ts, uuid, 3).unwrap();
+
+    let provider_filter = provider_vec(&[TEST_PROVIDER]);
+    let page = get_threads(
+        home,
+        10,
+        None,
+        ThreadSortKey::CreatedAt,
+        INTERACTIVE_SESSION_SOURCES,
+        Some(provider_filter.as_slice()),
+        TEST_PROVIDER,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].thread_id, Some(thread_id_from_uuid(uuid)));
+}
+
+#[tokio::test]
+async fn test_list_threads_uses_first_session_meta_thread_id_when_user_event_is_delayed() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path();
+
+    let uuid = Uuid::from_u128(299);
+    let ts = "2025-05-03T10-30-00";
+    write_session_file_with_delayed_user_event(home, ts, uuid, 12).unwrap();
+
+    let provider_filter = provider_vec(&[TEST_PROVIDER]);
+    let page = get_threads(
+        home,
+        10,
+        None,
+        ThreadSortKey::CreatedAt,
+        INTERACTIVE_SESSION_SOURCES,
+        Some(provider_filter.as_slice()),
+        TEST_PROVIDER,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].thread_id, Some(thread_id_from_uuid(uuid)));
+}
+
+#[tokio::test]
 async fn test_get_thread_contents() {
     let temp = TempDir::new().unwrap();
     let home = temp.path();

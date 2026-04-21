@@ -447,6 +447,88 @@ impl fmt::Display for NotificationMethod {
     }
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+#[derive(Default)]
+pub enum DiffView {
+    #[default]
+    Pretty,
+    Line,
+    Inline,
+    SideBySide,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProgressLegendMode {
+    #[default]
+    Off,
+    Auto,
+    Always,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum CopyUiMode {
+    #[default]
+    Picker,
+    Navigator,
+}
+
+fn default_syntax_highlight_theme() -> String {
+    "base16-ocean.dark".to_string()
+}
+
+impl fmt::Display for ProgressLegendMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = match self {
+            ProgressLegendMode::Off => "off",
+            ProgressLegendMode::Auto => "auto",
+            ProgressLegendMode::Always => "always",
+        };
+        write!(f, "{value}")
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, Default)]
+#[schemars(deny_unknown_fields)]
+pub struct ProgressTraceCategoryStyleConfig {
+    /// Optional color override for this category.
+    ///
+    /// Accepted values:
+    /// - ANSI names (for example `cyan`, `dark-gray`, `light-blue`, `default`)
+    /// - Hex values (for example `#3fa7ff`) that will be approximated to ANSI.
+    #[serde(default)]
+    pub color: Option<String>,
+
+    /// Optional dim override.
+    #[serde(default)]
+    pub dim: Option<bool>,
+
+    /// Optional bold override.
+    #[serde(default)]
+    pub bold: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, Default)]
+#[schemars(deny_unknown_fields)]
+pub struct ProgressTraceStyleConfig {
+    #[serde(default)]
+    pub tool: Option<ProgressTraceCategoryStyleConfig>,
+    #[serde(default)]
+    pub edit: Option<ProgressTraceCategoryStyleConfig>,
+    #[serde(default)]
+    pub waiting: Option<ProgressTraceCategoryStyleConfig>,
+    #[serde(default)]
+    pub network: Option<ProgressTraceCategoryStyleConfig>,
+    #[serde(default)]
+    pub prefill: Option<ProgressTraceCategoryStyleConfig>,
+    #[serde(default)]
+    pub reasoning: Option<ProgressTraceCategoryStyleConfig>,
+    #[serde(default, rename = "gen")]
+    pub r#gen: Option<ProgressTraceCategoryStyleConfig>,
+}
+
 /// Collection of settings that are specific to the TUI.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
 #[schemars(deny_unknown_fields)]
@@ -492,10 +574,64 @@ pub struct Tui {
     /// When set, the TUI renders the selected items as the status line.
     #[serde(default)]
     pub status_line: Option<Vec<String>>,
+
+    /// Controls when the progress timeline legend is shown in the status indicator.
+    ///
+    /// Defaults to `off`.
+    #[serde(default)]
+    pub progress_legend_mode: ProgressLegendMode,
+
+    /// Optional category-level style overrides for progress timeline bars.
+    #[serde(default)]
+    pub progress_trace_style: Option<ProgressTraceStyleConfig>,
+
+    /// Default UI for copy-code actions (`picker` or `navigator`).
+    ///
+    /// Defaults to `picker`.
+    #[serde(default)]
+    pub copy_code_ui_mode: CopyUiMode,
+
+    /// Default UI for copy-message actions (`picker` or `navigator`).
+    ///
+    /// Defaults to `picker`.
+    #[serde(default)]
+    pub copy_message_ui_mode: CopyUiMode,
+
+    /// Theme used for syntax highlighting in the TUI.
+    ///
+    /// Accepts either a built-in syntect theme name (for example
+    /// `base16-ocean.dark`) or `vscode:<path-to-theme.json>` for a VS Code
+    /// theme file.
+    ///
+    /// Defaults to `base16-ocean.dark`.
+    #[serde(default = "default_syntax_highlight_theme")]
+    pub syntax_highlight_theme: String,
+
+    /// Default diff format shown in the TUI.
+    ///
+    /// Defaults to `pretty`.
+    #[serde(default)]
+    pub diff_view: DiffView,
 }
 
 const fn default_true() -> bool {
     true
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[serde(untagged)]
+pub enum OneOrManyStrings {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl OneOrManyStrings {
+    pub fn into_vec(self) -> Vec<String> {
+        match self {
+            Self::One(value) => vec![value],
+            Self::Many(values) => values,
+        }
+    }
 }
 
 /// Settings for notices we display to users via the tui and app-server clients

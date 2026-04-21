@@ -1017,7 +1017,9 @@ async fn read_head_summary(path: &Path, head_limit: usize) -> io::Result<HeadTai
             RolloutItem::SessionMeta(session_meta_line) => {
                 summary.source = Some(session_meta_line.meta.source.clone());
                 summary.model_provider = session_meta_line.meta.model_provider.clone();
-                summary.thread_id = Some(session_meta_line.meta.id);
+                if summary.thread_id.is_none() {
+                    summary.thread_id = Some(session_meta_line.meta.id);
+                }
                 summary.cwd = Some(session_meta_line.meta.cwd.clone());
                 summary.git_branch = session_meta_line
                     .git

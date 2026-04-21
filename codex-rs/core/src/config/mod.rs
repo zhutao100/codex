@@ -1,7 +1,9 @@
 use crate::auth::AuthCredentialsStoreMode;
 use crate::config::edit::ConfigEdit;
 use crate::config::edit::ConfigEditsBuilder;
+use crate::config::types::CopyUiMode;
 use crate::config::types::DEFAULT_OTEL_ENVIRONMENT;
+use crate::config::types::DiffView;
 use crate::config::types::History;
 use crate::config::types::McpServerConfig;
 use crate::config::types::McpServerDisabledReason;
@@ -9,9 +11,12 @@ use crate::config::types::McpServerTransportConfig;
 use crate::config::types::Notice;
 use crate::config::types::NotificationMethod;
 use crate::config::types::Notifications;
+use crate::config::types::OneOrManyStrings;
 use crate::config::types::OtelConfig;
 use crate::config::types::OtelConfigToml;
 use crate::config::types::OtelExporterKind;
+use crate::config::types::ProgressLegendMode;
+use crate::config::types::ProgressTraceStyleConfig;
 use crate::config::types::SandboxWorkspaceWrite;
 use crate::config::types::ShellEnvironmentPolicy;
 use crate::config::types::ShellEnvironmentPolicyToml;
@@ -213,6 +218,9 @@ pub struct Config {
     /// Show startup tooltips in the TUI welcome screen.
     pub show_tooltips: bool,
 
+    /// Keybinding overrides loaded from `[keybindings]` in `config.toml`.
+    pub keybindings: HashMap<String, Vec<String>>,
+
     /// Start the TUI in the specified collaboration mode (plan/default).
     pub experimental_mode: Option<ModeKind>,
 
@@ -226,6 +234,27 @@ pub struct Config {
 
     /// Ordered list of status line item identifiers for the TUI.
     pub tui_status_line: Option<Vec<String>>,
+
+    /// Controls when the progress timeline legend is shown in the status indicator.
+    pub tui_progress_legend_mode: ProgressLegendMode,
+
+    /// Optional category-level style overrides for progress timeline bars.
+    pub tui_progress_trace_style: Option<ProgressTraceStyleConfig>,
+
+    /// Default UI for copy-code actions (`picker` or `navigator`).
+    pub tui_copy_code_ui_mode: CopyUiMode,
+
+    /// Default UI for copy-message actions (`picker` or `navigator`).
+    pub tui_copy_message_ui_mode: CopyUiMode,
+
+    /// Theme used for syntax highlighting in the TUI.
+    ///
+    /// Accepts either a built-in syntect theme name or
+    /// `vscode:<path-to-theme.json>`.
+    pub tui_syntax_highlight_theme: String,
+
+    /// Default diff format shown in the TUI.
+    pub diff_view: DiffView,
 
     /// The directory that should be treated as the current working directory
     /// for the session. All relative paths inside the business-logic layer are
@@ -912,6 +941,10 @@ pub struct ConfigToml {
 
     /// Collection of settings that are specific to the TUI.
     pub tui: Option<Tui>,
+
+    /// Keybinding overrides loaded from `[keybindings]` in `config.toml`.
+    #[serde(default)]
+    pub keybindings: HashMap<String, OneOrManyStrings>,
 
     /// When set to `true`, `AgentReasoning` events will be hidden from the
     /// UI/output. Defaults to `false`.
@@ -1709,6 +1742,11 @@ impl Config {
                 .unwrap_or_default(),
             animations: cfg.tui.as_ref().map(|t| t.animations).unwrap_or(true),
             show_tooltips: cfg.tui.as_ref().map(|t| t.show_tooltips).unwrap_or(true),
+            keybindings: cfg
+                .keybindings
+                .into_iter()
+                .map(|(key, value)| (key, value.into_vec()))
+                .collect(),
             experimental_mode: cfg.tui.as_ref().and_then(|t| t.experimental_mode),
             tui_alternate_screen: cfg
                 .tui
@@ -1716,6 +1754,31 @@ impl Config {
                 .map(|t| t.alternate_screen)
                 .unwrap_or_default(),
             tui_status_line: cfg.tui.as_ref().and_then(|t| t.status_line.clone()),
+            tui_progress_legend_mode: cfg
+                .tui
+                .as_ref()
+                .map(|t| t.progress_legend_mode)
+                .unwrap_or_default(),
+            tui_progress_trace_style: cfg
+                .tui
+                .as_ref()
+                .and_then(|t| t.progress_trace_style.clone()),
+            tui_copy_code_ui_mode: cfg
+                .tui
+                .as_ref()
+                .map(|t| t.copy_code_ui_mode)
+                .unwrap_or_default(),
+            tui_copy_message_ui_mode: cfg
+                .tui
+                .as_ref()
+                .map(|t| t.copy_message_ui_mode)
+                .unwrap_or_default(),
+            tui_syntax_highlight_theme: cfg
+                .tui
+                .as_ref()
+                .map(|t| t.syntax_highlight_theme.clone())
+                .unwrap_or_else(|| "base16-ocean.dark".to_string()),
+            diff_view: cfg.tui.as_ref().map(|t| t.diff_view).unwrap_or_default(),
             otel: {
                 let t: OtelConfigToml = cfg.otel.unwrap_or_default();
                 let log_user_prompt = t.log_user_prompt.unwrap_or(false);
@@ -1952,6 +2015,12 @@ persistence = "none"
                 experimental_mode: None,
                 alternate_screen: AltScreenMode::Auto,
                 status_line: None,
+                progress_legend_mode: ProgressLegendMode::Off,
+                progress_trace_style: None,
+                copy_code_ui_mode: CopyUiMode::Picker,
+                copy_message_ui_mode: CopyUiMode::Picker,
+                syntax_highlight_theme: "base16-ocean.dark".to_string(),
+                diff_view: DiffView::Pretty,
             }
         );
     }
@@ -3898,11 +3967,18 @@ model_verbosity = "high"
                 tui_notification_method: Default::default(),
                 animations: true,
                 show_tooltips: true,
+                keybindings: HashMap::new(),
                 experimental_mode: None,
                 analytics_enabled: Some(true),
                 feedback_enabled: true,
                 tui_alternate_screen: AltScreenMode::Auto,
                 tui_status_line: None,
+                tui_progress_legend_mode: ProgressLegendMode::Off,
+                tui_progress_trace_style: None,
+                tui_copy_code_ui_mode: CopyUiMode::Picker,
+                tui_copy_message_ui_mode: CopyUiMode::Picker,
+                tui_syntax_highlight_theme: "base16-ocean.dark".to_string(),
+                diff_view: DiffView::Pretty,
                 otel: OtelConfig::default(),
             },
             o3_profile_config
@@ -3985,11 +4061,18 @@ model_verbosity = "high"
             tui_notification_method: Default::default(),
             animations: true,
             show_tooltips: true,
+            keybindings: HashMap::new(),
             experimental_mode: None,
             analytics_enabled: Some(true),
             feedback_enabled: true,
             tui_alternate_screen: AltScreenMode::Auto,
             tui_status_line: None,
+            tui_progress_legend_mode: ProgressLegendMode::Off,
+            tui_progress_trace_style: None,
+            tui_copy_code_ui_mode: CopyUiMode::Picker,
+            tui_copy_message_ui_mode: CopyUiMode::Picker,
+            tui_syntax_highlight_theme: "base16-ocean.dark".to_string(),
+            diff_view: DiffView::Pretty,
             otel: OtelConfig::default(),
         };
 
@@ -4087,11 +4170,18 @@ model_verbosity = "high"
             tui_notification_method: Default::default(),
             animations: true,
             show_tooltips: true,
+            keybindings: HashMap::new(),
             experimental_mode: None,
             analytics_enabled: Some(false),
             feedback_enabled: true,
             tui_alternate_screen: AltScreenMode::Auto,
             tui_status_line: None,
+            tui_progress_legend_mode: ProgressLegendMode::Off,
+            tui_progress_trace_style: None,
+            tui_copy_code_ui_mode: CopyUiMode::Picker,
+            tui_copy_message_ui_mode: CopyUiMode::Picker,
+            tui_syntax_highlight_theme: "base16-ocean.dark".to_string(),
+            diff_view: DiffView::Pretty,
             otel: OtelConfig::default(),
         };
 
@@ -4175,11 +4265,18 @@ model_verbosity = "high"
             tui_notification_method: Default::default(),
             animations: true,
             show_tooltips: true,
+            keybindings: HashMap::new(),
             experimental_mode: None,
             analytics_enabled: Some(true),
             feedback_enabled: true,
             tui_alternate_screen: AltScreenMode::Auto,
             tui_status_line: None,
+            tui_progress_legend_mode: ProgressLegendMode::Off,
+            tui_progress_trace_style: None,
+            tui_copy_code_ui_mode: CopyUiMode::Picker,
+            tui_copy_message_ui_mode: CopyUiMode::Picker,
+            tui_syntax_highlight_theme: "base16-ocean.dark".to_string(),
+            diff_view: DiffView::Pretty,
             otel: OtelConfig::default(),
         };
 

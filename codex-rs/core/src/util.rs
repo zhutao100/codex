@@ -85,20 +85,34 @@ pub fn normalize_thread_name(name: &str) -> Option<String> {
     }
 }
 
-pub fn resume_command(thread_name: Option<&str>, thread_id: Option<ThreadId>) -> Option<String> {
-    let resume_target = thread_name
-        .filter(|name| !name.is_empty())
-        .map(str::to_string)
-        .or_else(|| thread_id.map(|thread_id| thread_id.to_string()));
-    resume_target.map(|target| {
-        let needs_double_dash = target.starts_with('-');
-        let escaped = shlex_join(&[target]);
-        if needs_double_dash {
-            format!("codex resume -- {escaped}")
-        } else {
-            format!("codex resume {escaped}")
+fn resume_command_for_target(target: String) -> String {
+    let needs_double_dash = target.starts_with('-');
+    let escaped = shlex_join(&[target]);
+    if needs_double_dash {
+        format!("codex resume -- {escaped}")
+    } else {
+        format!("codex resume {escaped}")
+    }
+}
+
+pub fn resume_commands(thread_name: Option<&str>, thread_id: Option<ThreadId>) -> Vec<String> {
+    let mut commands = Vec::new();
+    if let Some(name) = thread_name.filter(|name| !name.is_empty()) {
+        commands.push(resume_command_for_target(name.to_string()));
+    }
+
+    if let Some(thread_id) = thread_id {
+        let id_command = resume_command_for_target(thread_id.to_string());
+        if !commands.contains(&id_command) {
+            commands.push(id_command);
         }
-    })
+    }
+
+    commands
+}
+
+pub fn resume_command(thread_name: Option<&str>, thread_id: Option<ThreadId>) -> Option<String> {
+    resume_commands(thread_name, thread_id).into_iter().next()
 }
 
 #[cfg(test)]
@@ -182,5 +196,18 @@ mod tests {
 
         let command = resume_command(Some("quote'case"), None);
         assert_eq!(command, Some("codex resume \"quote'case\"".to_string()));
+    }
+
+    #[test]
+    fn resume_commands_include_name_and_id() {
+        let thread_id = ThreadId::from_string("123e4567-e89b-12d3-a456-426614174000").unwrap();
+        let commands = resume_commands(Some("my-thread"), Some(thread_id));
+        assert_eq!(
+            commands,
+            vec![
+                "codex resume my-thread".to_string(),
+                "codex resume 123e4567-e89b-12d3-a456-426614174000".to_string()
+            ]
+        );
     }
 }

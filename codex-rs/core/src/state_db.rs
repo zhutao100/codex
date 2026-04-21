@@ -341,6 +341,20 @@ pub async fn upsert_thread_memory(
     }
 }
 
+/// Delete a thread row and dependent metadata from SQLite.
+pub async fn delete_thread_metadata(
+    context: Option<&codex_state::StateRuntime>,
+    thread_id: ThreadId,
+    stage: &str,
+) {
+    let Some(ctx) = context else {
+        return;
+    };
+    if let Err(err) = ctx.delete_thread(thread_id).await {
+        warn!("state db delete_thread_metadata failed during {stage}: {err}");
+    }
+}
+
 /// Get the last N memories corresponding to a cwd using an exact path match.
 pub async fn get_last_n_thread_memories_for_cwd(
     context: Option<&codex_state::StateRuntime>,
