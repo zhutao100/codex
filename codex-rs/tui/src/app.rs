@@ -2822,25 +2822,25 @@ mod tests {
         let seen = BTreeMap::new();
         assert!(should_show_model_migration_prompt(
             "gpt-5",
-            "gpt-5.1",
+            "gpt-5.4",
             &seen,
             &all_model_presets()
         ));
         assert!(should_show_model_migration_prompt(
             "gpt-5-codex",
-            "gpt-5.1-codex",
+            "gpt-5.4",
             &seen,
             &all_model_presets()
         ));
         assert!(should_show_model_migration_prompt(
             "gpt-5-codex-mini",
-            "gpt-5.1-codex-mini",
+            "gpt-5.4-mini",
             &seen,
             &all_model_presets()
         ));
         assert!(should_show_model_migration_prompt(
             "gpt-5.1-codex",
-            "gpt-5.1-codex-max",
+            "gpt-5.4",
             &seen,
             &all_model_presets()
         ));
@@ -2855,16 +2855,16 @@ mod tests {
     #[tokio::test]
     async fn model_migration_prompt_respects_hide_flag_and_self_target() {
         let mut seen = BTreeMap::new();
-        seen.insert("gpt-5".to_string(), "gpt-5.1".to_string());
+        seen.insert("gpt-5".to_string(), "gpt-5.4".to_string());
         assert!(!should_show_model_migration_prompt(
             "gpt-5",
-            "gpt-5.1",
+            "gpt-5.4",
             &seen,
             &all_model_presets()
         ));
         assert!(!should_show_model_migration_prompt(
-            "gpt-5.1",
-            "gpt-5.1",
+            "gpt-5.4",
+            "gpt-5.4",
             &seen,
             &all_model_presets()
         ));

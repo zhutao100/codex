@@ -133,8 +133,8 @@ impl StatusLineItem {
     /// like in the status line before they confirm their selection.
     pub(crate) fn render(&self) -> &'static str {
         match self {
-            StatusLineItem::ModelName => "gpt-5.2-codex",
-            StatusLineItem::ModelWithReasoning => "gpt-5.2-codex medium",
+            StatusLineItem::ModelName => "gpt-5.4",
+            StatusLineItem::ModelWithReasoning => "gpt-5.4 medium",
             StatusLineItem::CurrentDir => "~/project/path",
             StatusLineItem::ProjectRoot => "~/project",
             StatusLineItem::GitBranch => "feat/awesome-feature",

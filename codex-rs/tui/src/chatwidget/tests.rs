@@ -2529,7 +2529,6 @@ async fn collab_slash_command_opens_picker_and_updates_mode() {
                     mode: ModeKind::Default,
                     ..
                 }),
-            personality: None,
             ..
         } => {}
         other => {
@@ -2547,7 +2546,6 @@ async fn collab_slash_command_opens_picker_and_updates_mode() {
                     mode: ModeKind::Default,
                     ..
                 }),
-            personality: None,
             ..
         } => {}
         other => {
@@ -2745,7 +2743,6 @@ async fn collab_mode_is_sent_after_enabling() {
                     mode: ModeKind::Default,
                     ..
                 }),
-            personality: None,
             ..
         } => {}
         other => {
@@ -2765,7 +2762,6 @@ async fn collab_mode_toggle_on_applies_default_preset() {
     match next_submit_op(&mut op_rx) {
         Op::UserTurn {
             collaboration_mode: None,
-            personality: None,
             ..
         } => {}
         other => panic!("expected Op::UserTurn without collaboration_mode, got {other:?}"),
@@ -2783,7 +2779,6 @@ async fn collab_mode_toggle_on_applies_default_preset() {
                     mode: ModeKind::Default,
                     ..
                 }),
-            personality: None,
             ..
         } => {}
         other => {
@@ -3675,11 +3670,11 @@ async fn feedback_upload_consent_popup_snapshot() {
 
 #[tokio::test]
 async fn reasoning_popup_escape_returns_to_model_popup() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.1-codex-max")).await;
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
     chat.thread_id = Some(ThreadId::new());
     chat.open_model_popup();
 
-    let preset = get_available_model(&chat, "gpt-5.1-codex-max");
+    let preset = get_available_model(&chat, "gpt-5.4");
     chat.open_reasoning_popup(preset);
 
     let before_escape = render_bottom_popup(&chat, 80);
