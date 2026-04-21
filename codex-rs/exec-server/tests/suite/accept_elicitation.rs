@@ -10,6 +10,7 @@ use anyhow::ensure;
 use codex_exec_server::ExecResult;
 use exec_server_test_support::InteractiveClient;
 use exec_server_test_support::create_transport;
+use exec_server_test_support::dotslash_available;
 use exec_server_test_support::notify_readable_sandbox;
 use exec_server_test_support::write_default_execpolicy;
 use maplit::hashset;
@@ -34,6 +35,11 @@ const USE_LOGIN_SHELL: bool = false;
 /// command should be run privileged outside the sandbox.
 #[tokio::test(flavor = "current_thread")]
 async fn accept_elicitation_for_prompt_rule() -> Result<()> {
+    if !dotslash_available() {
+        eprintln!("skipping: `dotslash` not found on PATH");
+        return Ok(());
+    }
+
     // Configure a stdio transport that will launch the MCP server using
     // $CODEX_HOME with an execpolicy that prompts for `git init` commands.
     let codex_home = TempDir::new()?;

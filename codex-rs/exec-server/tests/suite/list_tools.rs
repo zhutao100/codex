@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use exec_server_test_support::create_transport;
+use exec_server_test_support::dotslash_available;
 use pretty_assertions::assert_eq;
 use rmcp::ServiceExt;
 use rmcp::model::Tool;
@@ -15,6 +16,11 @@ use tempfile::TempDir;
 /// Verify the list_tools call to the MCP server returns the expected response.
 #[tokio::test(flavor = "current_thread")]
 async fn list_tools() -> Result<()> {
+    if !dotslash_available() {
+        eprintln!("skipping: `dotslash` not found on PATH");
+        return Ok(());
+    }
+
     let codex_home = TempDir::new()?;
     let policy_dir = codex_home.path().join("rules");
     fs::create_dir_all(&policy_dir)?;

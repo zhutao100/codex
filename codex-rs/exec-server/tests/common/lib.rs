@@ -26,6 +26,17 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use tokio::process::Command;
 
+pub fn dotslash_available() -> bool {
+    command_in_path("dotslash")
+}
+
+fn command_in_path(command: &str) -> bool {
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&paths).any(|dir| dir.join(command).is_file())
+}
+
 pub async fn create_transport<P>(
     codex_home: P,
     dotslash_cache: P,
@@ -33,6 +44,12 @@ pub async fn create_transport<P>(
 where
     P: AsRef<Path>,
 {
+    if !dotslash_available() {
+        anyhow::bail!(
+            "`dotslash` not found on PATH; install it to run exec-server integration tests"
+        );
+    }
+
     let mcp_executable = codex_utils_cargo_bin::cargo_bin("codex-exec-mcp-server")?;
     let execve_wrapper = codex_utils_cargo_bin::cargo_bin("codex-execve-wrapper")?;
 
