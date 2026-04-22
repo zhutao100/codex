@@ -46,7 +46,8 @@ pub(crate) fn get_tooltip(plan: Option<PlanType>) -> Option<String> {
             | Some(PlanType::Business)
             | Some(PlanType::Team)
             | Some(PlanType::Enterprise)
-            | Some(PlanType::Pro) => {
+            | Some(PlanType::Pro)
+            | Some(PlanType::ProLite) => {
                 return Some(PAID_TOOLTIP.to_string());
             }
             Some(PlanType::Go) | Some(PlanType::Free) => {

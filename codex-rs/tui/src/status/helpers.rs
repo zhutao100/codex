@@ -18,6 +18,14 @@ fn normalize_agents_display_path(path: &Path) -> String {
     dunce::simplified(path).display().to_string()
 }
 
+fn plan_type_display_name(plan_type: PlanType) -> String {
+    if plan_type == PlanType::ProLite {
+        "Pro Lite".to_string()
+    } else {
+        title_case(format!("{plan_type:?}").as_str())
+    }
+}
+
 fn global_agents_path(config: &Config) -> Option<PathBuf> {
     let candidate = config.codex_home.join(DEFAULT_PROJECT_DOC_FILENAME);
     match std::fs::symlink_metadata(&candidate) {
@@ -119,7 +127,7 @@ pub(crate) fn compose_account_display(
         CoreAuthMode::Chatgpt => {
             let email = auth.get_account_email();
             let plan = plan
-                .map(|plan_type| title_case(format!("{plan_type:?}").as_str()))
+                .map(plan_type_display_name)
                 .or_else(|| Some("Unknown".to_string()));
             Some(StatusAccountDisplay::ChatGpt { email, plan })
         }

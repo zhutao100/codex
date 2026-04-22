@@ -354,6 +354,7 @@ impl Client {
             crate::types::PlanType::Go => AccountPlanType::Go,
             crate::types::PlanType::Plus => AccountPlanType::Plus,
             crate::types::PlanType::Pro => AccountPlanType::Pro,
+            crate::types::PlanType::ProLite => AccountPlanType::ProLite,
             crate::types::PlanType::Team => AccountPlanType::Team,
             crate::types::PlanType::Business => AccountPlanType::Business,
             crate::types::PlanType::Enterprise => AccountPlanType::Enterprise,
@@ -361,7 +362,8 @@ impl Client {
             crate::types::PlanType::Guest
             | crate::types::PlanType::FreeWorkspace
             | crate::types::PlanType::Quorum
-            | crate::types::PlanType::K12 => AccountPlanType::Unknown,
+            | crate::types::PlanType::K12
+            | crate::types::PlanType::Unknown => AccountPlanType::Unknown,
         }
     }
 
@@ -372,5 +374,24 @@ impl Client {
 
         let seconds_i64 = i64::from(seconds);
         Some((seconds_i64 + 59) / 60)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Client;
+    use codex_protocol::account::PlanType as AccountPlanType;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn map_plan_type_supports_prolite_and_unknown() {
+        assert_eq!(
+            Client::map_plan_type(crate::types::PlanType::ProLite),
+            AccountPlanType::ProLite
+        );
+        assert_eq!(
+            Client::map_plan_type(crate::types::PlanType::Unknown),
+            AccountPlanType::Unknown
+        );
     }
 }
