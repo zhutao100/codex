@@ -156,7 +156,9 @@ fn roots_from_layer_stack<'a>(
                     host,
                 ));
 
-                if let Some(home_dir) = home_dir {
+                if let Some(home_dir) = home_dir
+                    && config_folder.as_path().starts_with(home_dir)
+                {
                     roots.push(HostSkillRoot::host(
                         home_dir.join(AGENTS_DIR_NAME).join(SKILLS_DIR_NAME),
                         SkillScope::User,
