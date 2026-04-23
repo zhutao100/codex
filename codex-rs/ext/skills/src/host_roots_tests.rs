@@ -326,6 +326,41 @@ fn layer_roots_preserve_scope_precedence_and_disabled_projects() {
     );
 }
 
+#[test]
+fn layer_roots_skip_home_agents_when_codex_home_is_outside_home() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let home_folder = absolute(temp_dir.path().join("home"));
+    let user_folder = absolute(temp_dir.path().join("isolated-codex"));
+    let system_folder = absolute(temp_dir.path().join("etc/codex"));
+    let config_stack = stack(vec![
+        ConfigLayerEntry::new(
+            ConfigLayerSource::System {
+                file: system_folder.join("config.toml"),
+            },
+            empty_config(),
+        ),
+        user_layer(&user_folder),
+    ]);
+
+    let roots = roots_from_layer_stack(
+        &config_stack,
+        Some(&home_folder),
+        Some(Arc::clone(&LOCAL_FS)),
+    )
+    .into_iter()
+    .map(|root| (root.scope, root.path))
+    .collect::<Vec<_>>();
+
+    assert_eq!(
+        roots,
+        vec![
+            (SkillScope::User, user_folder.join("skills")),
+            (SkillScope::System, user_folder.join("skills/.system")),
+            (SkillScope::Admin, system_folder.join("skills")),
+        ]
+    );
+}
+
 #[tokio::test]
 async fn plugin_roots_preserve_plugin_resolution_metadata() {
     let temp_dir = TempDir::new().expect("temp dir");
