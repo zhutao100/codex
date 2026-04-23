@@ -2655,10 +2655,11 @@ async fn skill_roots_include_admin_with_lowest_priority() {
     let codex_home = tempfile::tempdir().expect("tempdir");
     let cfg = make_config(&codex_home).await;
 
-    let scopes: Vec<SkillScope> = super::skill_roots(
+    let scopes: Vec<SkillScope> = super::skill_roots_with_home_dir(
         Some(Arc::clone(&LOCAL_FS)),
         &cfg.config_layer_stack,
         &cfg.cwd,
+        /*home_dir*/ None,
         Vec::new(),
         Vec::new(),
     )
@@ -2666,10 +2667,34 @@ async fn skill_roots_include_admin_with_lowest_priority() {
     .into_iter()
     .map(|root| root.scope)
     .collect();
-    let mut expected = vec![SkillScope::User, SkillScope::System];
-    if home_dir().is_some() {
-        expected.insert(1, SkillScope::User);
-    }
-    expected.push(SkillScope::Admin);
-    assert_eq!(scopes, expected);
+    assert_eq!(
+        scopes,
+        vec![SkillScope::User, SkillScope::System, SkillScope::Admin]
+    );
+}
+
+#[tokio::test]
+async fn skill_roots_skip_home_agents_when_codex_home_is_outside_home() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let codex_home = tempfile::tempdir().expect("tempdir");
+    let cfg = make_config(&codex_home).await;
+    let home_abs = home.path().abs();
+
+    let scopes: Vec<SkillScope> = super::skill_roots_with_home_dir(
+        Some(Arc::clone(&LOCAL_FS)),
+        &cfg.config_layer_stack,
+        &cfg.cwd,
+        Some(&home_abs),
+        Vec::new(),
+        Vec::new(),
+    )
+    .await
+    .into_iter()
+    .map(|root| root.scope)
+    .collect();
+
+    assert_eq!(
+        scopes,
+        vec![SkillScope::User, SkillScope::System, SkillScope::Admin]
+    );
 }
