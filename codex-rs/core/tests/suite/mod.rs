@@ -61,6 +61,7 @@ mod apply_patch_cli;
 #[cfg(not(target_os = "windows"))]
 mod approvals;
 mod auth_refresh;
+mod auto_rename_thread;
 mod cli_stream;
 mod client;
 mod client_websockets;
