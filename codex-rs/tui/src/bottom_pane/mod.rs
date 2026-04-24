@@ -377,15 +377,14 @@ impl BottomPane {
             InputResult::None
         } else {
             // If a task is running and a status line is visible, allow Esc to
-            // send an interrupt even while the composer has focus.
-            // When a popup is active, prefer dismissing it over interrupting the task.
+            // pause the turn even while the composer has focus.
+            // When a popup is active, prefer dismissing it over pausing the task.
             if key_event.code == KeyCode::Esc
                 && self.is_task_running
                 && !self.composer.popup_active()
                 && let Some(status) = &self.status
             {
-                // Send Op::Interrupt
-                status.interrupt();
+                status.pause_turn();
                 self.request_redraw();
                 return InputResult::None;
             }
@@ -1379,7 +1378,7 @@ mod tests {
     }
 
     #[test]
-    fn esc_with_skill_popup_does_not_interrupt_task() {
+    fn esc_with_skill_popup_does_not_pause_task() {
         let (tx_raw, mut rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx_raw);
         let mut pane = BottomPane::new(BottomPaneParams {
@@ -1405,7 +1404,7 @@ mod tests {
 
         pane.set_task_running(true);
 
-        // Repro: a running task + skill popup + Esc should dismiss the popup, not interrupt.
+        // Repro: a running task + skill popup + Esc should dismiss the popup, not pause.
         pane.insert_str("$");
         assert!(
             pane.composer.popup_active(),
@@ -1416,8 +1415,8 @@ mod tests {
 
         while let Ok(ev) = rx.try_recv() {
             assert!(
-                !matches!(ev, AppEvent::CodexOp(Op::Interrupt)),
-                "expected Esc to not send Op::Interrupt when dismissing skill popup"
+                !matches!(ev, AppEvent::CodexOp(Op::Pause)),
+                "expected Esc to not send Op::Pause when dismissing skill popup"
             );
         }
         assert!(
@@ -1427,7 +1426,7 @@ mod tests {
     }
 
     #[test]
-    fn esc_with_slash_command_popup_does_not_interrupt_task() {
+    fn esc_with_slash_command_popup_does_not_pause_task() {
         let (tx_raw, mut rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx_raw);
         let mut pane = BottomPane::new(BottomPaneParams {
@@ -1445,7 +1444,7 @@ mod tests {
 
         pane.set_task_running(true);
 
-        // Repro: a running task + slash-command popup + Esc should not interrupt the task.
+        // Repro: a running task + slash-command popup + Esc should not pause the task.
         pane.insert_str("/");
         assert!(
             pane.composer.popup_active(),
@@ -1456,15 +1455,15 @@ mod tests {
 
         while let Ok(ev) = rx.try_recv() {
             assert!(
-                !matches!(ev, AppEvent::CodexOp(Op::Interrupt)),
-                "expected Esc to not send Op::Interrupt while command popup is active"
+                !matches!(ev, AppEvent::CodexOp(Op::Pause)),
+                "expected Esc to not send Op::Pause while command popup is active"
             );
         }
         assert_eq!(pane.composer_text(), "/");
     }
 
     #[test]
-    fn esc_interrupts_running_task_when_no_popup() {
+    fn esc_pauses_running_task_when_no_popup() {
         let (tx_raw, mut rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx_raw);
         let mut pane = BottomPane::new(BottomPaneParams {
@@ -1485,8 +1484,8 @@ mod tests {
         pane.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
 
         assert!(
-            matches!(rx.try_recv(), Ok(AppEvent::CodexOp(Op::Interrupt))),
-            "expected Esc to send Op::Interrupt while a task is running"
+            matches!(rx.try_recv(), Ok(AppEvent::CodexOp(Op::Pause))),
+            "expected Esc to send Op::Pause while a task is running"
         );
     }
 

@@ -1327,6 +1327,7 @@
       "enum": [
         "completed",
         "interrupted",
+        "paused",
         "failed",
         "inProgress"
       ],

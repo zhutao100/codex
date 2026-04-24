@@ -58,6 +58,8 @@ pub(crate) fn should_persist_event_msg(ev: &EventMsg) -> bool {
         | EventMsg::Warning(_)
         | EventMsg::TurnStarted(_)
         | EventMsg::TurnComplete(_)
+        | EventMsg::TurnPaused(_)
+        | EventMsg::TurnContinued(_)
         | EventMsg::AgentMessageDelta(_)
         | EventMsg::AgentReasoningDelta(_)
         | EventMsg::AgentReasoningRawContentDelta(_)

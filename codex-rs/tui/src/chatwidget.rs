@@ -1683,6 +1683,15 @@ impl ChatWidget {
         self.request_redraw();
     }
 
+    fn on_paused_turn(&mut self) {
+        self.finalize_turn();
+        self.add_info_message(
+            "Conversation paused.".to_string(),
+            Some("Use `/continue` to resume this turn.".to_string()),
+        );
+        self.request_redraw();
+    }
+
     fn on_plan_update(&mut self, update: UpdatePlanArgs) {
         self.saw_plan_update_this_turn = true;
         self.add_to_history(history_cell::new_plan_update(update));
@@ -3347,6 +3356,23 @@ impl ChatWidget {
                 self.clear_token_usage();
                 self.app_event_tx.send(AppEvent::CodexOp(Op::Compact));
             }
+            SlashCommand::Pause => {
+                if self.bottom_pane.is_task_running() {
+                    self.submit_op(Op::Pause);
+                } else {
+                    self.add_info_message("No running turn to pause.".to_string(), None);
+                }
+            }
+            SlashCommand::Continue => {
+                if self.bottom_pane.is_task_running() {
+                    self.add_info_message(
+                        "A turn is already running.".to_string(),
+                        Some("Pause or interrupt it before continuing another turn.".to_string()),
+                    );
+                } else {
+                    self.submit_op(Op::Continue);
+                }
+            }
             SlashCommand::Review => {
                 self.open_review_popup();
             }
@@ -4388,6 +4414,8 @@ impl ChatWidget {
                     self.on_interrupted_turn(ev.reason);
                 }
             },
+            EventMsg::TurnPaused(_) => self.on_paused_turn(),
+            EventMsg::TurnContinued(_) => {}
             EventMsg::PlanUpdate(update) => self.on_plan_update(update),
             EventMsg::ExecApprovalRequest(ev) => {
                 // For replayed events, synthesize an empty id (these should not occur).
@@ -4471,7 +4499,6 @@ impl ChatWidget {
             | EventMsg::AgentMessageContentDelta(_)
             | EventMsg::ReasoningContentDelta(_)
             | EventMsg::ReasoningRawContentDelta(_)
-            | EventMsg::ProgressTrace(_)
             | EventMsg::DynamicToolCallRequest(_) => {}
             EventMsg::ItemCompleted(event) => {
                 if let codex_protocol::items::TurnItem::Plan(plan_item) = event.item {

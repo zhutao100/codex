@@ -606,6 +606,11 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                 }
                 return CodexStatus::InitiateShutdown;
             }
+            EventMsg::TurnPaused(_) => {
+                ts_msg!(self, "task paused");
+                return CodexStatus::InitiateShutdown;
+            }
+            EventMsg::TurnContinued(_) => {}
             EventMsg::ContextCompacted(_) => {
                 ts_msg!(self, "context compacted");
             }

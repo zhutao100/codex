@@ -293,6 +293,22 @@ async fn run_codex_tool_session_inner(
                             .remove(&request_id);
                         break;
                     }
+                    EventMsg::TurnPaused(_) => {
+                        let result = create_call_tool_result_with_thread_id(
+                            thread_id,
+                            "Codex task paused".to_string(),
+                            Some(true),
+                        );
+                        outgoing.send_response(request_id.clone(), result).await;
+                        running_requests_id_to_codex_uuid
+                            .lock()
+                            .await
+                            .remove(&request_id);
+                        break;
+                    }
+                    EventMsg::TurnContinued(_) => {
+                        continue;
+                    }
                     EventMsg::SessionConfigured(_) => {
                         tracing::error!("unexpected SessionConfigured event");
                     }

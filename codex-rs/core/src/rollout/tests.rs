@@ -36,6 +36,12 @@ use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::TurnAbortReason;
+use codex_protocol::protocol::TurnAbortedEvent;
+use codex_protocol::protocol::TurnContinuationSource;
+use codex_protocol::protocol::TurnContinuedEvent;
+use codex_protocol::protocol::TurnPauseReason;
+use codex_protocol::protocol::TurnPausedEvent;
 use codex_protocol::protocol::UserMessageEvent;
 
 const NO_SOURCE_FILTER: &[SessionSource] = &[];
@@ -87,6 +93,159 @@ async fn insert_state_db_thread(
         .upsert_thread(&metadata)
         .await
         .expect("state db upsert should succeed");
+}
+
+fn rollout_json_line(item: RolloutItem) -> String {
+    serde_json::to_string(&RolloutLine {
+        timestamp: "2025-01-03T12-00-00".to_string(),
+        item,
+    })
+    .expect("rollout line should serialize")
+}
+
+#[test]
+fn custom_pause_continue_events_are_not_persisted() {
+    assert!(!crate::rollout::policy::should_persist_event_msg(
+        &EventMsg::TurnPaused(TurnPausedEvent {
+            turn_id: "turn-1".to_string(),
+            reason: TurnPauseReason::UserRequested,
+        })
+    ));
+    assert!(!crate::rollout::policy::should_persist_event_msg(
+        &EventMsg::TurnContinued(TurnContinuedEvent {
+            continued_from_turn_id: Some("turn-1".to_string()),
+            source: TurnContinuationSource::Paused,
+        })
+    ));
+}
+
+#[tokio::test]
+async fn load_rollout_items_ignores_custom_pause_continue_events() -> Result<()> {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("rollout.jsonl");
+    let conversation_id = ThreadId::from_string(&Uuid::from_u128(8).to_string())?;
+    let lines = [
+        rollout_json_line(RolloutItem::SessionMeta(SessionMetaLine {
+            meta: SessionMeta {
+                id: conversation_id,
+                forked_from_id: None,
+                timestamp: "2025-01-03T12-00-00".to_string(),
+                cwd: ".".into(),
+                originator: "test_originator".into(),
+                cli_version: "test_version".into(),
+                source: SessionSource::Cli,
+                model_provider: Some(TEST_PROVIDER.to_string()),
+                base_instructions: None,
+                dynamic_tools: None,
+            },
+            git: None,
+        })),
+        rollout_json_line(RolloutItem::EventMsg(EventMsg::TurnPaused(
+            TurnPausedEvent {
+                turn_id: "turn-1".to_string(),
+                reason: TurnPauseReason::UserRequested,
+            },
+        ))),
+        rollout_json_line(RolloutItem::EventMsg(EventMsg::TurnContinued(
+            TurnContinuedEvent {
+                continued_from_turn_id: Some("turn-1".to_string()),
+                source: TurnContinuationSource::Paused,
+            },
+        ))),
+        rollout_json_line(RolloutItem::ResponseItem(ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "continue".to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        })),
+    ];
+    fs::write(&path, format!("{}\n", lines.join("\n")))?;
+
+    let (items, _thread_id, parse_errors) = RolloutRecorder::load_rollout_items(&path).await?;
+
+    assert_eq!(parse_errors, 0);
+    assert_eq!(items.len(), 2);
+    assert!(items.iter().all(|item| !matches!(
+        item,
+        RolloutItem::EventMsg(EventMsg::TurnPaused(_) | EventMsg::TurnContinued(_))
+    )));
+    Ok(())
+}
+
+#[tokio::test]
+async fn clean_for_continue_removes_abort_custom_and_dangling_records() -> Result<()> {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("rollout.jsonl");
+    let conversation_id = ThreadId::from_string(&Uuid::from_u128(7).to_string())?;
+    let lines = [
+        rollout_json_line(RolloutItem::SessionMeta(SessionMetaLine {
+            meta: SessionMeta {
+                id: conversation_id,
+                forked_from_id: None,
+                timestamp: "2025-01-03T12-00-00".to_string(),
+                cwd: ".".into(),
+                originator: "test_originator".into(),
+                cli_version: "test_version".into(),
+                source: SessionSource::Cli,
+                model_provider: Some(TEST_PROVIDER.to_string()),
+                base_instructions: None,
+                dynamic_tools: None,
+            },
+            git: None,
+        })),
+        rollout_json_line(RolloutItem::ResponseItem(ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "run command".to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        })),
+        rollout_json_line(RolloutItem::ResponseItem(ResponseItem::FunctionCall {
+            id: None,
+            name: "shell".to_string(),
+            arguments: "{}".to_string(),
+            call_id: "call-1".to_string(),
+        })),
+        rollout_json_line(RolloutItem::ResponseItem(ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "<turn_aborted>\ninterrupted\n</turn_aborted>".to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        })),
+        rollout_json_line(RolloutItem::EventMsg(EventMsg::TurnAborted(
+            TurnAbortedEvent {
+                reason: TurnAbortReason::Interrupted,
+            },
+        ))),
+        rollout_json_line(RolloutItem::EventMsg(EventMsg::TurnPaused(
+            TurnPausedEvent {
+                turn_id: "turn-1".to_string(),
+                reason: TurnPauseReason::UserRequested,
+            },
+        ))),
+        "{broken".to_string(),
+    ];
+    fs::write(&path, format!("{}\n", lines.join("\n")))?;
+
+    assert!(RolloutRecorder::clean_for_continue(&path, true).await?);
+
+    let cleaned = fs::read_to_string(&path)?;
+    assert!(!cleaned.contains("turn_aborted"));
+    assert!(!cleaned.contains("turn_paused"));
+    assert!(!cleaned.contains("function_call"));
+    assert!(!cleaned.contains("{broken"));
+    let (items, _thread_id, parse_errors) = RolloutRecorder::load_rollout_items(&path).await?;
+    assert_eq!(parse_errors, 0);
+    assert_eq!(items.len(), 2);
+    Ok(())
 }
 
 #[tokio::test]

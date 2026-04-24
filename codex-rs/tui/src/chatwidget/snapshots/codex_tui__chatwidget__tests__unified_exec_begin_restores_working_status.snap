@@ -1,9 +1,10 @@
 ---
 source: tui/src/chatwidget/tests.rs
+assertion_line: 1892
 expression: terminal.backend()
 ---
 "                                                                                "
-"• Working (0s • esc to interrupt)                                               "
+"• Working (0s • esc to pause)                                                   "
 "  1 background terminal running · /ps to view                                   "
 "                                                                                "
 "                                                                                "

@@ -9,6 +9,7 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::ThreadRolledBackEvent;
 use codex_protocol::protocol::TurnAbortedEvent;
+use codex_protocol::protocol::TurnPausedEvent;
 use codex_protocol::protocol::UserMessageEvent;
 
 /// Convert persisted [`EventMsg`] entries into a sequence of [`Turn`] values.
@@ -63,6 +64,8 @@ impl ThreadHistoryBuilder {
             EventMsg::ThreadRolledBack(payload) => self.handle_thread_rollback(payload),
             EventMsg::UndoCompleted(_) => {}
             EventMsg::TurnAborted(payload) => self.handle_turn_aborted(payload),
+            EventMsg::TurnPaused(payload) => self.handle_turn_paused(payload),
+            EventMsg::TurnContinued(_) => {}
             _ => {}
         }
     }
@@ -145,6 +148,13 @@ impl ThreadHistoryBuilder {
             return;
         };
         turn.status = TurnStatus::Interrupted;
+    }
+
+    fn handle_turn_paused(&mut self, _payload: &TurnPausedEvent) {
+        let Some(turn) = self.current_turn.as_mut() else {
+            return;
+        };
+        turn.status = TurnStatus::Paused;
     }
 
     fn handle_thread_rollback(&mut self, payload: &ThreadRolledBackEvent) {
@@ -262,6 +272,8 @@ mod tests {
     use codex_protocol::protocol::ThreadRolledBackEvent;
     use codex_protocol::protocol::TurnAbortReason;
     use codex_protocol::protocol::TurnAbortedEvent;
+    use codex_protocol::protocol::TurnPauseReason;
+    use codex_protocol::protocol::TurnPausedEvent;
     use codex_protocol::protocol::UserMessageEvent;
     use pretty_assertions::assert_eq;
 
@@ -469,6 +481,50 @@ mod tests {
                 id: "item-4".into(),
                 text: "Second attempt complete.".into(),
             }
+        );
+    }
+
+    #[test]
+    fn marks_turn_as_paused_when_paused() {
+        let events = vec![
+            EventMsg::UserMessage(UserMessageEvent {
+                message: "Please keep working".into(),
+                images: None,
+                text_elements: Vec::new(),
+                local_images: Vec::new(),
+            }),
+            EventMsg::AgentReasoning(AgentReasoningEvent {
+                text: "thinking".into(),
+            }),
+            EventMsg::TurnPaused(TurnPausedEvent {
+                turn_id: "turn-1".into(),
+                reason: TurnPauseReason::UserRequested,
+            }),
+        ];
+
+        let turns = build_turns_from_event_msgs(&events);
+        assert_eq!(
+            turns,
+            vec![Turn {
+                id: "turn-1".into(),
+                model: None,
+                items: vec![
+                    ThreadItem::UserMessage {
+                        id: "item-1".into(),
+                        content: vec![UserInput::Text {
+                            text: "Please keep working".into(),
+                            text_elements: Vec::new(),
+                        }],
+                    },
+                    ThreadItem::Reasoning {
+                        id: "item-2".into(),
+                        summary: vec!["thinking".into()],
+                        content: Vec::new(),
+                    },
+                ],
+                error: None,
+                status: TurnStatus::Paused,
+            }]
         );
     }
 

@@ -1,4 +1,5 @@
 mod compact;
+mod continue_task;
 mod ghost_snapshot;
 mod regular;
 mod review;
@@ -25,14 +26,19 @@ use crate::features::Feature;
 use crate::models_manager::manager::ModelsManager;
 use crate::protocol::CodexErrorInfo;
 use crate::protocol::ErrorEvent;
+use crate::protocol::Event;
 use crate::protocol::EventMsg;
 use crate::protocol::SessionSource;
 use crate::protocol::ThreadNameUpdatedEvent;
 use crate::protocol::TurnAbortReason;
 use crate::protocol::TurnAbortedEvent;
 use crate::protocol::TurnCompleteEvent;
+use crate::protocol::TurnContinuationSource;
+use crate::protocol::TurnPauseReason;
+use crate::protocol::TurnPausedEvent;
 use crate::session_prefix::TURN_ABORTED_OPEN_TAG;
 use crate::state::ActiveTurn;
+use crate::state::PendingContinuation;
 use crate::state::RunningTask;
 use crate::state::TaskKind;
 use codex_protocol::config_types::ModeKind;
@@ -43,6 +49,7 @@ use codex_protocol::protocol::RolloutItem;
 use codex_protocol::user_input::UserInput;
 
 pub(crate) use compact::CompactTask;
+pub(crate) use continue_task::ContinueTask;
 pub(crate) use ghost_snapshot::GhostSnapshotTask;
 pub(crate) use regular::RegularTask;
 pub(crate) use review::ReviewTask;
@@ -53,6 +60,12 @@ pub(crate) use user_shell::execute_user_shell_command;
 
 const GRACEFULL_INTERRUPTION_TIMEOUT_MS: u64 = 100;
 const TURN_ABORTED_INTERRUPTED_GUIDANCE: &str = "The user interrupted the previous turn on purpose. If any tools/commands were aborted, they may have partially executed; verify current state before retrying.";
+
+#[derive(Clone, Debug)]
+enum TaskStopReason {
+    Abort(TurnAbortReason),
+    Pause(TurnPauseReason),
+}
 
 /// Thin wrapper that exposes the parts of [`Session`] task runners need.
 #[derive(Clone)]
@@ -184,6 +197,14 @@ impl Session {
     }
 
     pub async fn abort_all_tasks(self: &Arc<Self>, reason: TurnAbortReason) {
+        self.stop_all_tasks(TaskStopReason::Abort(reason)).await;
+    }
+
+    pub async fn pause_all_tasks(self: &Arc<Self>, reason: TurnPauseReason) {
+        self.stop_all_tasks(TaskStopReason::Pause(reason)).await;
+    }
+
+    async fn stop_all_tasks(self: &Arc<Self>, reason: TaskStopReason) {
         for task in self.take_all_running_tasks().await {
             self.handle_task_abort(task, reason.clone()).await;
         }
@@ -221,6 +242,7 @@ impl Session {
         if should_close_processes {
             self.close_unified_exec_processes().await;
         }
+        self.clear_pending_continuation().await;
         let event = EventMsg::TurnComplete(TurnCompleteEvent {
             last_agent_message: last_agent_message.clone(),
         });
@@ -349,7 +371,7 @@ impl Session {
             .await;
     }
 
-    async fn handle_task_abort(self: &Arc<Self>, task: RunningTask, reason: TurnAbortReason) {
+    async fn handle_task_abort(self: &Arc<Self>, task: RunningTask, reason: TaskStopReason) {
         let sub_id = task.turn_context.sub_id.clone();
         if task.cancellation_token.is_cancelled() {
             return;
@@ -374,29 +396,59 @@ impl Session {
             .abort(session_ctx, Arc::clone(&task.turn_context))
             .await;
 
-        if reason == TurnAbortReason::Interrupted {
-            let marker = ResponseItem::Message {
-                id: None,
-                role: "user".to_string(),
-                content: vec![ContentItem::InputText {
-                    text: format!(
-                        "{TURN_ABORTED_OPEN_TAG}\n{TURN_ABORTED_INTERRUPTED_GUIDANCE}\n</turn_aborted>"
-                    ),
-                }],
-                end_turn: None,
-                phase: None,
-            };
-            self.record_into_history(std::slice::from_ref(&marker), task.turn_context.as_ref())
+        match reason {
+            TaskStopReason::Abort(TurnAbortReason::Interrupted) => {
+                self.set_pending_continuation(Some(PendingContinuation {
+                    source: TurnContinuationSource::Interrupted,
+                    continued_from_turn_id: Some(sub_id.clone()),
+                }))
                 .await;
-            self.persist_rollout_items(&[RolloutItem::ResponseItem(marker)])
-                .await;
-            // Ensure the marker is durably visible before emitting TurnAborted: some clients
-            // synchronously re-read the rollout on receipt of the abort event.
-            self.flush_rollout().await;
-        }
 
-        let event = EventMsg::TurnAborted(TurnAbortedEvent { reason });
-        self.send_event(task.turn_context.as_ref(), event).await;
+                let marker = ResponseItem::Message {
+                    id: None,
+                    role: "user".to_string(),
+                    content: vec![ContentItem::InputText {
+                        text: format!(
+                            "{TURN_ABORTED_OPEN_TAG}\n{TURN_ABORTED_INTERRUPTED_GUIDANCE}\n</turn_aborted>"
+                        ),
+                    }],
+                    end_turn: None,
+                    phase: None,
+                };
+                self.record_into_history(std::slice::from_ref(&marker), task.turn_context.as_ref())
+                    .await;
+                self.persist_rollout_items(&[RolloutItem::ResponseItem(marker)])
+                    .await;
+                // Ensure the marker is durably visible before emitting TurnAborted: some clients
+                // synchronously re-read the rollout on receipt of the abort event.
+                self.flush_rollout().await;
+
+                let event = EventMsg::TurnAborted(TurnAbortedEvent {
+                    reason: TurnAbortReason::Interrupted,
+                });
+                self.send_event(task.turn_context.as_ref(), event).await;
+            }
+            TaskStopReason::Abort(reason) => {
+                self.clear_pending_continuation().await;
+                let event = EventMsg::TurnAborted(TurnAbortedEvent { reason });
+                self.send_event(task.turn_context.as_ref(), event).await;
+            }
+            TaskStopReason::Pause(reason) => {
+                self.set_pending_continuation(Some(PendingContinuation {
+                    source: TurnContinuationSource::Paused,
+                    continued_from_turn_id: Some(sub_id.clone()),
+                }))
+                .await;
+                self.send_event_raw_flushed(Event {
+                    id: sub_id.clone(),
+                    msg: EventMsg::TurnPaused(TurnPausedEvent {
+                        turn_id: sub_id,
+                        reason,
+                    }),
+                })
+                .await;
+            }
+        }
     }
 }
 

@@ -2712,6 +2712,56 @@
           "type": "object"
         },
         {
+          "properties": {
+            "reason": {
+              "$ref": "#/definitions/TurnPauseReason"
+            },
+            "turn_id": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "turn_paused"
+              ],
+              "title": "TurnPausedEventMsgType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "reason",
+            "turn_id",
+            "type"
+          ],
+          "title": "TurnPausedEventMsg",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "continued_from_turn_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "source": {
+              "$ref": "#/definitions/TurnContinuationSource"
+            },
+            "type": {
+              "enum": [
+                "turn_continued"
+              ],
+              "title": "TurnContinuedEventMsgType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "source",
+            "type"
+          ],
+          "title": "TurnContinuedEventMsg",
+          "type": "object"
+        },
+        {
           "description": "Notification that the agent is shutting down.",
           "properties": {
             "type": {
@@ -6705,6 +6755,13 @@
       ],
       "type": "object"
     },
+    "TurnContinuationSource": {
+      "enum": [
+        "paused",
+        "interrupted"
+      ],
+      "type": "string"
+    },
     "TurnDiffUpdatedNotification": {
       "description": "Notification that the turn-level unified diff has changed. Contains the latest aggregated diff across all file changes in the turn.",
       "properties": {
@@ -6917,6 +6974,12 @@
         }
       ]
     },
+    "TurnPauseReason": {
+      "enum": [
+        "user_requested"
+      ],
+      "type": "string"
+    },
     "TurnPlanStep": {
       "properties": {
         "status": {
@@ -7016,6 +7079,7 @@
       "enum": [
         "completed",
         "interrupted",
+        "paused",
         "failed",
         "inProgress"
       ],

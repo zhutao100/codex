@@ -91,6 +91,15 @@ pub enum Op {
     /// This server sends [`EventMsg::TurnAborted`] in response.
     Interrupt,
 
+    /// Pause the current task so it can be continued later without adding a
+    /// new user turn.
+    /// This server sends [`EventMsg::TurnPaused`] in response.
+    Pause,
+
+    /// Continue the most recent paused or interrupted task without recording a
+    /// new user input message.
+    Continue,
+
     /// Legacy user input.
     ///
     /// Prefer [`Op::UserTurn`] so the caller provides full turn context
@@ -848,6 +857,10 @@ pub enum EventMsg {
     PlanUpdate(UpdatePlanArgs),
 
     TurnAborted(TurnAbortedEvent),
+
+    TurnPaused(TurnPausedEvent),
+
+    TurnContinued(TurnContinuedEvent),
 
     /// Notification that the agent is shutting down.
     ShutdownComplete,
@@ -2429,6 +2442,34 @@ pub enum TurnAbortReason {
     Interrupted,
     Replaced,
     ReviewEnded,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
+pub struct TurnPausedEvent {
+    pub turn_id: String,
+    pub reason: TurnPauseReason,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+pub enum TurnPauseReason {
+    UserRequested,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
+pub struct TurnContinuedEvent {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub continued_from_turn_id: Option<String>,
+    pub source: TurnContinuationSource,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+pub enum TurnContinuationSource {
+    Paused,
+    Interrupted,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]

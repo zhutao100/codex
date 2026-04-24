@@ -1995,6 +1995,7 @@ pub struct ErrorNotification {
 pub enum TurnStatus {
     Completed,
     Interrupted,
+    Paused,
     Failed,
     InProgress,
 }

@@ -30,6 +30,8 @@ pub enum SlashCommand {
     Fork,
     Init,
     Compact,
+    Pause,
+    Continue,
     Plan,
     Collab,
     Agent,
@@ -68,6 +70,8 @@ impl SlashCommand {
             SlashCommand::Init => "create an AGENTS.md file with instructions for Codex",
             SlashCommand::Compact => "summarize conversation to prevent hitting the context limit",
             SlashCommand::Review => "review my current changes and find issues",
+            SlashCommand::Pause => "pause the current turn so it can be continued later",
+            SlashCommand::Continue => "continue the paused or interrupted turn",
             SlashCommand::Rename => "rename the current thread",
             SlashCommand::Export => "export this chat",
             SlashCommand::Resume => "resume a saved chat",
@@ -148,6 +152,8 @@ impl SlashCommand {
             | SlashCommand::Plan
             | SlashCommand::Logout => false,
             SlashCommand::Diff
+            | SlashCommand::Pause
+            | SlashCommand::Continue
             | SlashCommand::Copy
             | SlashCommand::Rename
             | SlashCommand::Mention

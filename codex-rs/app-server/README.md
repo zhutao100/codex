@@ -53,7 +53,7 @@ Use the thread APIs to create, list, or archive conversations. Drive a conversat
 - Start (or resume) a thread: Call `thread/start` to open a fresh conversation. The response returns the thread object and you’ll also get a `thread/started` notification. If you’re continuing an existing conversation, call `thread/resume` with its ID instead. If you want to branch from an existing conversation, call `thread/fork` to create a new thread id with copied history.
 - Begin a turn: To send user input, call `turn/start` with the target `threadId` and the user's input. Optional fields let you override model, cwd, sandbox policy, etc. This immediately returns the new turn object and triggers a `turn/started` notification.
 - Stream events: After `turn/start`, keep reading JSON-RPC notifications on stdout. You’ll see `item/started`, `item/completed`, deltas like `item/agentMessage/delta`, tool progress, etc. These represent streaming model output plus any side effects (commands, tool calls, reasoning notes).
-- Finish the turn: When the model is done (or the turn is interrupted via making the `turn/interrupt` call), the server sends `turn/completed` with the final turn state and token usage.
+- Finish the turn: When the model is done, interrupted, paused, or failed, the server sends `turn/completed` with the final turn state and token usage.
 
 ## Initialization
 
@@ -465,7 +465,7 @@ Event notifications are the server-initiated event stream for thread lifecycles,
 The app-server streams JSON-RPC notifications while a turn is running. Each turn starts with `turn/started` (initial `turn`) and ends with `turn/completed` (final `turn` status). Token usage events stream separately via `thread/tokenUsage/updated`. Clients subscribe to the events they care about, rendering each item incrementally as updates arrive. The per-item lifecycle is always: `item/started` → zero or more item-specific deltas → `item/completed`.
 
 - `turn/started` — `{ turn }` with the turn id, optional `model`, empty `items`, and `status: "inProgress"`.
-- `turn/completed` — `{ turn }` where `turn.status` is `completed`, `interrupted`, or `failed`; failures carry `{ error: { message, codexErrorInfo?, additionalDetails? } }`. `turn.model` is included when known.
+- `turn/completed` — `{ turn }` where `turn.status` is `completed`, `interrupted`, `paused`, or `failed`; failures carry `{ error: { message, codexErrorInfo?, additionalDetails? } }`. `turn.model` is included when known.
 - `turn/diff/updated` — `{ threadId, turnId, diff }` represents the up-to-date snapshot of the turn-level unified diff, emitted after every FileChange item. `diff` is the latest aggregated unified diff across every file change in the turn. UIs can render this to show the full "what changed" view without stitching individual `fileChange` items.
 - `turn/plan/updated` — `{ turnId, explanation?, plan }` whenever the agent shares or changes its plan; each `plan` entry is `{ step, status }` with `status` in `pending`, `inProgress`, or `completed`.
 - `turn/progressTrace` — `{ threadId, turnId, category, state, label }` for terminal-style progress tracing. `category` is one of `tool`, `edit`, `waiting`, `network`, `prefill`, `reasoning`, or `gen`, and `state` is `started` or `completed`. `label` may be null when no detail text is available.

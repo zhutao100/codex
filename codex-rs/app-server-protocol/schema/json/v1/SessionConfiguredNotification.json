@@ -2134,6 +2134,56 @@
           "type": "object"
         },
         {
+          "properties": {
+            "reason": {
+              "$ref": "#/definitions/TurnPauseReason"
+            },
+            "turn_id": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "turn_paused"
+              ],
+              "title": "TurnPausedEventMsgType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "reason",
+            "turn_id",
+            "type"
+          ],
+          "title": "TurnPausedEventMsg",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "continued_from_turn_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "source": {
+              "$ref": "#/definitions/TurnContinuationSource"
+            },
+            "type": {
+              "enum": [
+                "turn_continued"
+              ],
+              "title": "TurnContinuedEventMsgType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "source",
+            "type"
+          ],
+          "title": "TurnContinuedEventMsg",
+          "type": "object"
+        },
+        {
           "description": "Notification that the agent is shutting down.",
           "properties": {
             "type": {
@@ -4719,6 +4769,13 @@
       ],
       "type": "string"
     },
+    "TurnContinuationSource": {
+      "enum": [
+        "paused",
+        "interrupted"
+      ],
+      "type": "string"
+    },
     "TurnItem": {
       "oneOf": [
         {
@@ -4882,6 +4939,12 @@
           "type": "object"
         }
       ]
+    },
+    "TurnPauseReason": {
+      "enum": [
+        "user_requested"
+      ],
+      "type": "string"
     },
     "UserInput": {
       "description": "User input",

@@ -145,7 +145,7 @@ async fn process_review_events(
                     .map(parse_review_output_event);
                 return out;
             }
-            EventMsg::TurnAborted(_) => {
+            EventMsg::TurnAborted(_) | EventMsg::TurnPaused(_) => {
                 // Cancellation or abort: consumer will finalize with None.
                 return None;
             }

@@ -140,6 +140,16 @@ pub(crate) async fn apply_bespoke_event_handling(
             )
             .await;
         }
+        EventMsg::TurnPaused(_ev) => {
+            handle_turn_paused(
+                conversation_id,
+                event_turn_id,
+                &outgoing,
+                &turn_summary_store,
+            )
+            .await;
+        }
+        EventMsg::TurnContinued(_ev) => {}
         EventMsg::ApplyPatchApprovalRequest(ApplyPatchApprovalRequestEvent {
             call_id,
             turn_id,
@@ -1402,6 +1412,31 @@ async fn handle_turn_interrupted(
         conversation_id,
         event_turn_id,
         TurnStatus::Interrupted,
+        None,
+        turn_summary.active_turn_model,
+        outgoing,
+    )
+    .await;
+}
+
+async fn handle_turn_paused(
+    conversation_id: ThreadId,
+    event_turn_id: String,
+    outgoing: &OutgoingMessageSender,
+    turn_summary_store: &TurnSummaryStore,
+) {
+    let turn_summary = find_and_remove_turn_summary(conversation_id, turn_summary_store).await;
+    if let Some(active_turn_id) = turn_summary.active_turn_id
+        && active_turn_id != event_turn_id
+    {
+        warn!(
+            "received pause for non-active turn {event_turn_id} in thread {conversation_id}; active summary turn is {active_turn_id}"
+        );
+    }
+    emit_turn_completed_with_status(
+        conversation_id,
+        event_turn_id,
+        TurnStatus::Paused,
         None,
         turn_summary.active_turn_model,
         outgoing,

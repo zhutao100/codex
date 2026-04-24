@@ -154,7 +154,7 @@ mod imp {
                             .push(Self::token_usage_notification(info, thread_id, turn_id));
                     }
                 }
-                EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_) => {
+                EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_) | EventMsg::TurnPaused(_) => {
                     notifications.extend(self.complete_turn(normalize_turn_id(event_turn_id)));
                 }
                 EventMsg::Error(error) => {

@@ -1,9 +1,10 @@
 ---
 source: tui/src/chatwidget/tests.rs
+assertion_line: 1853
 expression: terminal.backend()
 ---
 "                                                                                "
-"• Working (0s • esc to interrupt)                                               "
+"• Working (0s • esc to pause)                                                   "
 "                                                                                "
 "                                                                                "
 "› Ask Codex to do anything                                                      "

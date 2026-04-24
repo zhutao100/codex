@@ -35,11 +35,16 @@ use super::list::get_threads_in_root;
 use super::metadata;
 use super::policy::is_persisted_response_item;
 use crate::config::Config;
+use crate::context_manager::is_user_turn_boundary;
 use crate::default_client::originator;
 use crate::git_info::collect_git_info;
 use crate::path_utils;
+use crate::protocol::EventMsg;
+use crate::session_prefix::TURN_ABORTED_OPEN_TAG;
 use crate::state_db;
 use crate::state_db::StateDbHandle;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::ResumedHistory;
 use codex_protocol::protocol::RolloutItem;
@@ -47,6 +52,7 @@ use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::TurnAbortReason;
 use codex_state::ThreadMetadataBuilder;
 
 /// Records all [`ResponseItem`]s for a session and flushes them to disk after
@@ -454,8 +460,11 @@ impl RolloutRecorder {
                     RolloutItem::TurnContext(item) => {
                         items.push(RolloutItem::TurnContext(item));
                     }
-                    RolloutItem::EventMsg(_ev) => {
-                        items.push(RolloutItem::EventMsg(_ev));
+                    RolloutItem::EventMsg(ev) => {
+                        if is_custom_control_event(&ev) {
+                            continue;
+                        }
+                        items.push(RolloutItem::EventMsg(ev));
                     }
                 },
                 Err(e) => {
@@ -472,6 +481,73 @@ impl RolloutRecorder {
             parse_errors,
         );
         Ok((items, thread_id, parse_errors))
+    }
+
+    /// Remove rollout records that make an interrupted turn visible to future readers.
+    ///
+    /// This is best-effort cleanup for `/continue`: if the user continues from an interrupted
+    /// turn, the prompt should look as if the interruption never happened. The live in-memory
+    /// history is cleaned separately; this method keeps the JSONL compatible with vanilla
+    /// branches and removes trailing interrupt markers from disk.
+    pub(crate) async fn clean_for_continue(
+        path: &Path,
+        remove_interrupted_abort: bool,
+    ) -> std::io::Result<bool> {
+        let text = tokio::fs::read_to_string(path).await?;
+        let mut kept_lines = Vec::new();
+        let mut changed = false;
+
+        for line in text.lines() {
+            if line.trim().is_empty() {
+                changed = true;
+                continue;
+            }
+
+            match serde_json::from_str::<RolloutLine>(line) {
+                Ok(rollout_line) => {
+                    if matches!(
+                        &rollout_line.item,
+                        RolloutItem::EventMsg(ev) if is_custom_control_event(ev)
+                    ) {
+                        changed = true;
+                        continue;
+                    }
+                    kept_lines.push((line.to_string(), rollout_line.item));
+                }
+                Err(e) => {
+                    warn!("dropping unparsable rollout line while cleaning continuation: {e}");
+                    changed = true;
+                }
+            }
+        }
+
+        while let Some((_line, item)) = kept_lines.last() {
+            if remove_interrupted_abort && is_interrupted_abort_signal(item) {
+                kept_lines.pop();
+                changed = true;
+            } else {
+                break;
+            }
+        }
+
+        if let Some(index) = first_dangling_tool_call_line_index(&kept_lines) {
+            kept_lines.truncate(index);
+            changed = true;
+        }
+
+        if changed {
+            let mut cleaned = kept_lines
+                .into_iter()
+                .map(|(line, _item)| line)
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !cleaned.is_empty() {
+                cleaned.push('\n');
+            }
+            tokio::fs::write(path, cleaned).await?;
+        }
+
+        Ok(changed)
     }
 
     pub async fn get_rollout_history(path: &Path) -> std::io::Result<InitialHistory> {
@@ -675,6 +751,70 @@ impl JsonlWriter {
         self.file.flush().await?;
         Ok(())
     }
+}
+
+fn is_custom_control_event(ev: &EventMsg) -> bool {
+    matches!(ev, EventMsg::TurnPaused(_) | EventMsg::TurnContinued(_))
+}
+
+fn is_interrupted_abort_signal(item: &RolloutItem) -> bool {
+    match item {
+        RolloutItem::EventMsg(EventMsg::TurnAborted(ev)) => {
+            ev.reason == TurnAbortReason::Interrupted
+        }
+        RolloutItem::ResponseItem(item) => is_turn_aborted_interrupted_marker(item),
+        _ => false,
+    }
+}
+
+fn first_dangling_tool_call_line_index(lines: &[(String, RolloutItem)]) -> Option<usize> {
+    let last_user_line_index = lines.iter().rposition(|(_line, item)| {
+        matches!(item, RolloutItem::ResponseItem(response_item) if is_user_turn_boundary(response_item))
+    })?;
+
+    let mut open_calls: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut first_incomplete_local_shell: Option<usize> = None;
+    for (line_index, (_line, item)) in lines.iter().enumerate().skip(last_user_line_index + 1) {
+        match item {
+            RolloutItem::ResponseItem(ResponseItem::FunctionCall { call_id, .. })
+            | RolloutItem::ResponseItem(ResponseItem::CustomToolCall { call_id, .. }) => {
+                open_calls.entry(call_id.clone()).or_insert(line_index);
+            }
+            RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput { call_id, .. })
+            | RolloutItem::ResponseItem(ResponseItem::CustomToolCallOutput { call_id, .. }) => {
+                open_calls.remove(call_id);
+            }
+            RolloutItem::ResponseItem(ResponseItem::LocalShellCall { status, .. })
+                if !matches!(status, codex_protocol::models::LocalShellStatus::Completed) =>
+            {
+                first_incomplete_local_shell = Some(
+                    first_incomplete_local_shell
+                        .map_or(line_index, |current| current.min(line_index)),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    open_calls
+        .values()
+        .copied()
+        .chain(first_incomplete_local_shell)
+        .min()
+}
+
+fn is_turn_aborted_interrupted_marker(item: &ResponseItem) -> bool {
+    let ResponseItem::Message { role, content, .. } = item else {
+        return false;
+    };
+
+    role == "user"
+        && content.iter().any(|content_item| {
+            matches!(
+                content_item,
+                ContentItem::InputText { text } if text.starts_with(TURN_ABORTED_OPEN_TAG)
+            )
+        })
 }
 
 impl From<codex_state::ThreadsPage> for ThreadsPage {

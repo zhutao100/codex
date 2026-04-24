@@ -173,12 +173,15 @@ use crate::protocol::Submission;
 use crate::protocol::TokenCountEvent;
 use crate::protocol::TokenUsage;
 use crate::protocol::TokenUsageInfo;
+use crate::protocol::TurnContinuationSource;
+use crate::protocol::TurnContinuedEvent;
 use crate::protocol::TurnDiffEvent;
 use crate::protocol::WarningEvent;
 use crate::rollout::RolloutRecorder;
 use crate::rollout::RolloutRecorderParams;
 use crate::rollout::map_session_init_error;
 use crate::rollout::metadata;
+use crate::session_prefix::TURN_ABORTED_OPEN_TAG;
 use crate::shell;
 use crate::shell_snapshot::ShellSnapshot;
 use crate::skills::SkillError;
@@ -193,6 +196,7 @@ use crate::skills::injection::app_id_from_path;
 use crate::skills::injection::tool_kind_for_path;
 use crate::skills::resolve_skill_dependencies_for_turn;
 use crate::state::ActiveTurn;
+use crate::state::PendingContinuation;
 use crate::state::SessionServices;
 use crate::state::SessionState;
 use crate::state_db;
@@ -1296,9 +1300,15 @@ impl Session {
                 let reconstructed_history = self
                     .reconstruct_history_from_rollout(&turn_context, &rollout_items)
                     .await;
+                let pending_continuation =
+                    Self::pending_continuation_from_rollout(&rollout_items, &reconstructed_history);
                 if !reconstructed_history.is_empty() {
                     self.record_into_history(&reconstructed_history, &turn_context)
                         .await;
+                }
+                {
+                    let mut state = self.state.lock().await;
+                    state.pending_continuation = pending_continuation;
                 }
 
                 // Seed usage info from the recorded rollout so UIs can show token counts
@@ -1317,9 +1327,15 @@ impl Session {
                 let reconstructed_history = self
                     .reconstruct_history_from_rollout(&turn_context, &rollout_items)
                     .await;
+                let pending_continuation =
+                    Self::pending_continuation_from_rollout(&rollout_items, &reconstructed_history);
                 if !reconstructed_history.is_empty() {
                     self.record_into_history(&reconstructed_history, &turn_context)
                         .await;
+                }
+                {
+                    let mut state = self.state.lock().await;
+                    state.pending_continuation = pending_continuation;
                 }
 
                 // Seed usage info from the recorded rollout so UIs can show token counts
@@ -1367,6 +1383,43 @@ impl Session {
         rollout_items.iter().rev().find_map(|item| match item {
             RolloutItem::EventMsg(EventMsg::TokenCount(ev)) => ev.info.clone(),
             _ => None,
+        })
+    }
+
+    fn pending_continuation_from_rollout(
+        rollout_items: &[RolloutItem],
+        reconstructed_history: &[ResponseItem],
+    ) -> Option<PendingContinuation> {
+        let mut pending_event: Option<PendingContinuation> = None;
+
+        for item in rollout_items {
+            match item {
+                RolloutItem::EventMsg(EventMsg::TurnAborted(ev))
+                    if ev.reason == TurnAbortReason::Interrupted =>
+                {
+                    pending_event = Some(PendingContinuation {
+                        source: TurnContinuationSource::Interrupted,
+                        continued_from_turn_id: None,
+                    });
+                }
+                RolloutItem::EventMsg(EventMsg::ThreadRolledBack(_))
+                | RolloutItem::EventMsg(EventMsg::UserMessage(_)) => {
+                    pending_event = None;
+                }
+                RolloutItem::ResponseItem(response_item)
+                    if is_user_turn_boundary_response_item(response_item) =>
+                {
+                    pending_event = None;
+                }
+                _ => {}
+            }
+        }
+
+        pending_event.or_else(|| {
+            history_needs_continuation(reconstructed_history).then_some(PendingContinuation {
+                source: TurnContinuationSource::Interrupted,
+                continued_from_turn_id: None,
+            })
         })
     }
 
@@ -2583,6 +2636,65 @@ impl Session {
         }
     }
 
+    pub async fn pause_task(self: &Arc<Self>) {
+        info!("pause received: pause current task, if any");
+        let has_active_turn = { self.active_turn.lock().await.is_some() };
+        if has_active_turn {
+            self.pause_all_tasks(crate::protocol::TurnPauseReason::UserRequested)
+                .await;
+        } else {
+            self.cancel_mcp_startup().await;
+        }
+    }
+
+    async fn take_pending_continuation(&self) -> Option<PendingContinuation> {
+        let mut state = self.state.lock().await;
+        state.pending_continuation.take()
+    }
+
+    pub(crate) async fn set_pending_continuation(
+        &self,
+        pending_continuation: Option<PendingContinuation>,
+    ) {
+        let mut state = self.state.lock().await;
+        state.pending_continuation = pending_continuation;
+    }
+
+    pub(crate) async fn clear_pending_continuation(&self) {
+        self.set_pending_continuation(None).await;
+    }
+
+    async fn prepare_history_for_continuation(&self, remove_interrupted_abort: bool) {
+        let mut state = self.state.lock().await;
+        let mut items = state.history.raw_items().to_vec();
+        let mut changed = false;
+        if remove_interrupted_abort {
+            changed |= remove_trailing_turn_aborted_marker(&mut items);
+        }
+        changed |= trim_incomplete_continuation_tail(&mut items);
+        if changed {
+            state.replace_history(items);
+        }
+    }
+
+    async fn clean_rollout_for_continuation(&self, remove_interrupted_abort: bool) {
+        self.flush_rollout().await;
+        let rollout_path = {
+            let guard = self.services.rollout.lock().await;
+            guard
+                .as_ref()
+                .map(|recorder| recorder.rollout_path().to_path_buf())
+        };
+        let Some(rollout_path) = rollout_path else {
+            return;
+        };
+        if let Err(err) =
+            RolloutRecorder::clean_for_continue(&rollout_path, remove_interrupted_abort).await
+        {
+            warn!("failed to clean rollout before continuation: {err}");
+        }
+    }
+
     pub(crate) fn hooks(&self) -> &Hooks {
         &self.services.hooks
     }
@@ -2712,6 +2824,12 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
         match sub.op.clone() {
             Op::Interrupt => {
                 handlers::interrupt(&sess).await;
+            }
+            Op::Pause => {
+                handlers::pause(&sess).await;
+            }
+            Op::Continue => {
+                handlers::continue_last(&sess, sub.id.clone(), &mut previous_context).await;
             }
             Op::OverrideTurnContext {
                 cwd,
@@ -2860,6 +2978,7 @@ mod handlers {
     use crate::mcp::effective_mcp_servers;
     use crate::review_prompts::resolve_review_request;
     use crate::tasks::CompactTask;
+    use crate::tasks::ContinueTask;
     use crate::tasks::RegularTask;
     use crate::tasks::UndoTask;
     use crate::tasks::UserShellCommandMode;
@@ -2902,6 +3021,49 @@ mod handlers {
 
     pub async fn interrupt(sess: &Arc<Session>) {
         sess.interrupt_task().await;
+    }
+
+    pub async fn pause(sess: &Arc<Session>) {
+        sess.pause_task().await;
+    }
+
+    pub async fn continue_last(
+        sess: &Arc<Session>,
+        sub_id: String,
+        previous_context: &mut Option<Arc<TurnContext>>,
+    ) {
+        if sess.active_turn.lock().await.is_some() {
+            sess.send_event_raw(Event {
+                id: sub_id,
+                msg: EventMsg::Error(ErrorEvent {
+                    message: "Cannot continue while a task is already running.".to_string(),
+                    codex_error_info: Some(CodexErrorInfo::BadRequest),
+                }),
+            })
+            .await;
+            return;
+        }
+
+        let Some(checkpoint) = sess.take_pending_continuation().await else {
+            sess.send_event_raw(Event {
+                id: sub_id,
+                msg: EventMsg::Error(ErrorEvent {
+                    message: "There is no paused or interrupted turn to continue.".to_string(),
+                    codex_error_info: Some(CodexErrorInfo::BadRequest),
+                }),
+            })
+            .await;
+            return;
+        };
+
+        let turn_context = sess.new_default_turn_with_sub_id(sub_id).await;
+        sess.spawn_task(
+            Arc::clone(&turn_context),
+            Vec::new(),
+            ContinueTask::new(checkpoint),
+        )
+        .await;
+        *previous_context = Some(turn_context);
     }
 
     pub async fn override_turn_context(
@@ -2985,6 +3147,7 @@ mod handlers {
 
         // Attempt to inject input into current task
         if let Err(items) = sess.inject_input(items).await {
+            sess.clear_pending_continuation().await;
             sess.seed_initial_context_if_needed(&current_context).await;
             let resumed_model = sess.take_pending_resume_previous_model().await;
             let update_items = sess.build_settings_update_items(
@@ -3789,6 +3952,32 @@ pub(crate) async fn run_turn(
         return None;
     }
 
+    run_turn_inner(sess, turn_context, input, None, cancellation_token).await
+}
+
+pub(crate) async fn continue_turn(
+    sess: Arc<Session>,
+    turn_context: Arc<TurnContext>,
+    checkpoint: PendingContinuation,
+    cancellation_token: CancellationToken,
+) -> Option<String> {
+    run_turn_inner(
+        sess,
+        turn_context,
+        Vec::new(),
+        Some(checkpoint),
+        cancellation_token,
+    )
+    .await
+}
+
+async fn run_turn_inner(
+    sess: Arc<Session>,
+    turn_context: Arc<TurnContext>,
+    input: Vec<UserInput>,
+    continuation: Option<PendingContinuation>,
+    cancellation_token: CancellationToken,
+) -> Option<String> {
     let model_info = turn_context.model_info.clone();
     let auto_compact_limit = model_info.auto_compact_token_limit().unwrap_or(i64::MAX);
     let total_usage_tokens = sess.get_total_token_usage().await;
@@ -3798,160 +3987,180 @@ pub(crate) async fn run_turn(
         collaboration_mode_kind: turn_context.collaboration_mode.mode,
     });
     sess.send_event(&turn_context, event).await;
-    if total_usage_tokens >= auto_compact_limit {
-        if turn_context.final_output_json_schema.is_some() {
-            run_auto_compact(&sess, &turn_context, None).await;
-        } else {
-            inject_pre_compact_work_notes_request(&sess, &turn_context).await;
 
-            let mut attempts: u8 = 0;
-            let explicit_app_paths: Vec<String> = Vec::new();
-            let skill_name_counts_lower: HashMap<String, usize> = HashMap::new();
-            let turn_diff_tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
-            let turn_metadata_header = turn_context.resolve_turn_metadata_header().await;
-            let mut client_session = sess.services.model_client.new_session();
+    let (explicit_app_paths, skill_name_counts_lower) = if let Some(checkpoint) = continuation {
+        let remove_interrupted_abort = checkpoint.source == TurnContinuationSource::Interrupted;
+        sess.prepare_history_for_continuation(remove_interrupted_abort)
+            .await;
+        sess.clean_rollout_for_continuation(remove_interrupted_abort)
+            .await;
+        sess.send_event_raw_flushed(Event {
+            id: turn_context.sub_id.clone(),
+            msg: EventMsg::TurnContinued(TurnContinuedEvent {
+                continued_from_turn_id: checkpoint.continued_from_turn_id,
+                source: checkpoint.source,
+            }),
+        })
+        .await;
+        (Vec::new(), HashMap::new())
+    } else {
+        if total_usage_tokens >= auto_compact_limit {
+            if turn_context.final_output_json_schema.is_some() {
+                run_auto_compact(&sess, &turn_context, None).await;
+            } else {
+                inject_pre_compact_work_notes_request(&sess, &turn_context).await;
 
-            loop {
-                let sampling_request_input: Vec<ResponseItem> =
-                    { sess.clone_history().await.for_prompt() };
-                let tool_selection = SamplingRequestToolSelection {
-                    explicit_app_paths: &explicit_app_paths,
-                    skill_name_counts_lower: &skill_name_counts_lower,
-                };
+                let mut attempts: u8 = 0;
+                let explicit_app_paths: Vec<String> = Vec::new();
+                let skill_name_counts_lower: HashMap<String, usize> = HashMap::new();
+                let turn_diff_tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+                let turn_metadata_header = turn_context.resolve_turn_metadata_header().await;
+                let mut client_session = sess.services.model_client.new_session();
 
-                match run_sampling_request(
-                    Arc::clone(&sess),
-                    Arc::clone(&turn_context),
-                    Arc::clone(&turn_diff_tracker),
-                    &mut client_session,
-                    turn_metadata_header.as_deref(),
-                    sampling_request_input,
-                    tool_selection,
-                    ToolCallExecutionMode::RejectAll {
-                        reason: AUTO_COMPACT_WORK_NOTES_TOOL_REJECT_REASON,
-                    },
-                    cancellation_token.child_token(),
-                )
-                .await
-                {
-                    Ok(output) => {
-                        if let Some(notes) = output.last_agent_message
-                            && is_auto_compact_work_notes_message(&notes)
-                        {
-                            run_auto_compact(&sess, &turn_context, Some(notes)).await;
-                            break;
-                        }
+                loop {
+                    let sampling_request_input: Vec<ResponseItem> =
+                        { sess.clone_history().await.for_prompt() };
+                    let tool_selection = SamplingRequestToolSelection {
+                        explicit_app_paths: &explicit_app_paths,
+                        skill_name_counts_lower: &skill_name_counts_lower,
+                    };
 
-                        attempts += 1;
-                        if attempts >= AUTO_COMPACT_WORK_NOTES_CAPTURE_MAX_ATTEMPTS {
+                    match run_sampling_request(
+                        Arc::clone(&sess),
+                        Arc::clone(&turn_context),
+                        Arc::clone(&turn_diff_tracker),
+                        &mut client_session,
+                        turn_metadata_header.as_deref(),
+                        sampling_request_input,
+                        tool_selection,
+                        ToolCallExecutionMode::RejectAll {
+                            reason: AUTO_COMPACT_WORK_NOTES_TOOL_REJECT_REASON,
+                        },
+                        cancellation_token.child_token(),
+                    )
+                    .await
+                    {
+                        Ok(output) => {
+                            if let Some(notes) = output.last_agent_message
+                                && is_auto_compact_work_notes_message(&notes)
+                            {
+                                run_auto_compact(&sess, &turn_context, Some(notes)).await;
+                                break;
+                            }
+
+                            attempts += 1;
+                            if attempts >= AUTO_COMPACT_WORK_NOTES_CAPTURE_MAX_ATTEMPTS {
+                                info!(
+                                    "Work-notes capture yielded no notes; compacting without notes after {attempts} attempts"
+                                );
+                                run_auto_compact(&sess, &turn_context, None).await;
+                                break;
+                            }
+
                             info!(
-                                "Work-notes capture yielded no notes; compacting without notes after {attempts} attempts"
+                                "Work-notes capture yielded no notes; retrying capture ({attempts}/{AUTO_COMPACT_WORK_NOTES_CAPTURE_MAX_ATTEMPTS})"
+                            );
+                        }
+                        Err(e) => {
+                            info!(
+                                "Work-notes capture failed during pre-turn compaction; compacting without notes: {e:#}"
                             );
                             run_auto_compact(&sess, &turn_context, None).await;
                             break;
                         }
-
-                        info!(
-                            "Work-notes capture yielded no notes; retrying capture ({attempts}/{AUTO_COMPACT_WORK_NOTES_CAPTURE_MAX_ATTEMPTS})"
-                        );
-                    }
-                    Err(e) => {
-                        info!(
-                            "Work-notes capture failed during pre-turn compaction; compacting without notes: {e:#}"
-                        );
-                        run_auto_compact(&sess, &turn_context, None).await;
-                        break;
                     }
                 }
             }
         }
-    }
 
-    let skills_outcome = Some(
-        sess.services
-            .skills_manager
-            .skills_for_cwd(&turn_context.cwd, false)
-            .await,
-    );
+        let skills_outcome = Some(
+            sess.services
+                .skills_manager
+                .skills_for_cwd(&turn_context.cwd, false)
+                .await,
+        );
 
-    let (skill_name_counts, skill_name_counts_lower) = skills_outcome.as_ref().map_or_else(
-        || (HashMap::new(), HashMap::new()),
-        |outcome| build_skill_name_counts(&outcome.skills, &outcome.disabled_paths),
-    );
-    let connector_slug_counts = if turn_context.config.features.enabled(Feature::Apps) {
-        let mcp_tools = match sess
-            .services
-            .mcp_connection_manager
-            .read()
-            .await
-            .list_all_tools()
-            .or_cancel(&cancellation_token)
-            .await
-        {
-            Ok(mcp_tools) => mcp_tools,
-            Err(_) => return None,
+        let (skill_name_counts, skill_name_counts_lower) = skills_outcome.as_ref().map_or_else(
+            || (HashMap::new(), HashMap::new()),
+            |outcome| build_skill_name_counts(&outcome.skills, &outcome.disabled_paths),
+        );
+        let connector_slug_counts = if turn_context.config.features.enabled(Feature::Apps) {
+            let mcp_tools = match sess
+                .services
+                .mcp_connection_manager
+                .read()
+                .await
+                .list_all_tools()
+                .or_cancel(&cancellation_token)
+                .await
+            {
+                Ok(mcp_tools) => mcp_tools,
+                Err(_) => return None,
+            };
+            let connectors = connectors::accessible_connectors_from_mcp_tools(&mcp_tools);
+            build_connector_slug_counts(&connectors)
+        } else {
+            HashMap::new()
         };
-        let connectors = connectors::accessible_connectors_from_mcp_tools(&mcp_tools);
-        build_connector_slug_counts(&connectors)
-    } else {
-        HashMap::new()
-    };
-    let mentioned_skills = skills_outcome.as_ref().map_or_else(Vec::new, |outcome| {
-        collect_explicit_skill_mentions(
-            &input,
-            &outcome.skills,
-            &outcome.disabled_paths,
-            &skill_name_counts,
-            &connector_slug_counts,
+        let mentioned_skills = skills_outcome.as_ref().map_or_else(Vec::new, |outcome| {
+            collect_explicit_skill_mentions(
+                &input,
+                &outcome.skills,
+                &outcome.disabled_paths,
+                &skill_name_counts,
+                &connector_slug_counts,
+            )
+        });
+        let explicit_app_paths = collect_explicit_app_paths(&input);
+
+        let config = turn_context.config.clone();
+        if config
+            .features
+            .enabled(Feature::SkillEnvVarDependencyPrompt)
+        {
+            let env_var_dependencies = collect_env_var_dependencies(&mentioned_skills);
+            resolve_skill_dependencies_for_turn(&sess, &turn_context, &env_var_dependencies).await;
+        }
+
+        maybe_prompt_and_install_mcp_dependencies(
+            sess.as_ref(),
+            turn_context.as_ref(),
+            &cancellation_token,
+            &mentioned_skills,
         )
-    });
-    let explicit_app_paths = collect_explicit_app_paths(&input);
-
-    let config = turn_context.config.clone();
-    if config
-        .features
-        .enabled(Feature::SkillEnvVarDependencyPrompt)
-    {
-        let env_var_dependencies = collect_env_var_dependencies(&mentioned_skills);
-        resolve_skill_dependencies_for_turn(&sess, &turn_context, &env_var_dependencies).await;
-    }
-
-    maybe_prompt_and_install_mcp_dependencies(
-        sess.as_ref(),
-        turn_context.as_ref(),
-        &cancellation_token,
-        &mentioned_skills,
-    )
-    .await;
-
-    let otel_manager = turn_context.otel_manager.clone();
-    let thread_id = sess.conversation_id.to_string();
-    let tracking = build_track_events_context(turn_context.model_info.slug.clone(), thread_id);
-    let SkillInjections {
-        items: skill_items,
-        warnings: skill_warnings,
-    } = build_skill_injections(
-        &mentioned_skills,
-        Some(&otel_manager),
-        &sess.services.analytics_events_client,
-        tracking.clone(),
-    )
-    .await;
-
-    for message in skill_warnings {
-        sess.send_event(&turn_context, EventMsg::Warning(WarningEvent { message }))
-            .await;
-    }
-
-    let initial_input_for_turn: ResponseInputItem = ResponseInputItem::from(input.clone());
-    let response_item: ResponseItem = initial_input_for_turn.clone().into();
-    sess.record_user_prompt_and_emit_turn_item(turn_context.as_ref(), &input, response_item)
         .await;
 
-    if !skill_items.is_empty() {
-        sess.record_conversation_items(&turn_context, &skill_items)
+        let otel_manager = turn_context.otel_manager.clone();
+        let thread_id = sess.conversation_id.to_string();
+        let tracking = build_track_events_context(turn_context.model_info.slug.clone(), thread_id);
+        let SkillInjections {
+            items: skill_items,
+            warnings: skill_warnings,
+        } = build_skill_injections(
+            &mentioned_skills,
+            Some(&otel_manager),
+            &sess.services.analytics_events_client,
+            tracking.clone(),
+        )
+        .await;
+
+        for message in skill_warnings {
+            sess.send_event(&turn_context, EventMsg::Warning(WarningEvent { message }))
+                .await;
+        }
+
+        let initial_input_for_turn: ResponseInputItem = ResponseInputItem::from(input.clone());
+        let response_item: ResponseItem = initial_input_for_turn.clone().into();
+        sess.record_user_prompt_and_emit_turn_item(turn_context.as_ref(), &input, response_item)
             .await;
-    }
+
+        if !skill_items.is_empty() {
+            sess.record_conversation_items(&turn_context, &skill_items)
+                .await;
+        }
+
+        (explicit_app_paths, skill_name_counts_lower)
+    };
 
     sess.maybe_start_ghost_snapshot(Arc::clone(&turn_context), cancellation_token.child_token())
         .await;
@@ -4182,6 +4391,113 @@ async fn run_auto_compact(
         )
         .await;
     }
+}
+
+fn history_needs_continuation(history: &[ResponseItem]) -> bool {
+    let Some(last_user_index) = history
+        .iter()
+        .rposition(is_user_turn_boundary_response_item)
+    else {
+        return false;
+    };
+
+    let tail = &history[last_user_index + 1..];
+    if tail.is_empty() || first_dangling_tool_call_index(tail).is_some() {
+        return true;
+    }
+
+    match tail.last() {
+        Some(ResponseItem::Message { role, .. }) if role == "assistant" => false,
+        Some(ResponseItem::Message { .. }) => true,
+        Some(
+            ResponseItem::Reasoning { .. }
+            | ResponseItem::LocalShellCall { .. }
+            | ResponseItem::FunctionCall { .. }
+            | ResponseItem::FunctionCallOutput { .. }
+            | ResponseItem::CustomToolCall { .. }
+            | ResponseItem::CustomToolCallOutput { .. }
+            | ResponseItem::WebSearchCall { .. },
+        ) => true,
+        Some(_) => !tail.iter().any(|item| {
+            matches!(
+                item,
+                ResponseItem::Message { role, .. } if role == "assistant"
+            )
+        }),
+        None => true,
+    }
+}
+
+fn is_user_turn_boundary_response_item(item: &ResponseItem) -> bool {
+    crate::context_manager::is_user_turn_boundary(item)
+}
+
+fn remove_trailing_turn_aborted_marker(items: &mut Vec<ResponseItem>) -> bool {
+    if items.last().is_some_and(is_turn_aborted_interrupted_marker) {
+        items.pop();
+        true
+    } else {
+        false
+    }
+}
+
+fn trim_incomplete_continuation_tail(items: &mut Vec<ResponseItem>) -> bool {
+    let Some(last_user_index) = items.iter().rposition(is_user_turn_boundary_response_item) else {
+        return false;
+    };
+
+    let tail = &items[last_user_index + 1..];
+    let Some(relative_index) = first_dangling_tool_call_index(tail) else {
+        return false;
+    };
+
+    items.truncate(last_user_index + 1 + relative_index);
+    true
+}
+
+fn first_dangling_tool_call_index(items: &[ResponseItem]) -> Option<usize> {
+    let mut open_calls: HashMap<String, usize> = HashMap::new();
+    let mut first_incomplete_local_shell: Option<usize> = None;
+
+    for (index, item) in items.iter().enumerate() {
+        match item {
+            ResponseItem::FunctionCall { call_id, .. }
+            | ResponseItem::CustomToolCall { call_id, .. } => {
+                open_calls.entry(call_id.clone()).or_insert(index);
+            }
+            ResponseItem::FunctionCallOutput { call_id, .. }
+            | ResponseItem::CustomToolCallOutput { call_id, .. } => {
+                open_calls.remove(call_id);
+            }
+            ResponseItem::LocalShellCall { status, .. }
+                if !matches!(status, codex_protocol::models::LocalShellStatus::Completed) =>
+            {
+                first_incomplete_local_shell =
+                    Some(first_incomplete_local_shell.map_or(index, |current| current.min(index)));
+            }
+            _ => {}
+        }
+    }
+
+    open_calls
+        .values()
+        .copied()
+        .chain(first_incomplete_local_shell)
+        .min()
+}
+
+fn is_turn_aborted_interrupted_marker(item: &ResponseItem) -> bool {
+    let ResponseItem::Message { role, content, .. } = item else {
+        return false;
+    };
+
+    role == "user"
+        && content.iter().any(|content_item| {
+            matches!(
+                content_item,
+                ContentItem::InputText { text } if text.starts_with(TURN_ABORTED_OPEN_TAG)
+            )
+        })
 }
 
 fn filter_connectors_for_input(
@@ -5395,6 +5711,18 @@ mod tests {
         }
     }
 
+    fn assistant_message(text: &str) -> ResponseItem {
+        ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: text.to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        }
+    }
+
     fn make_connector(id: &str, name: &str) -> AppInfo {
         AppInfo {
             id: id.to_string(),
@@ -5508,6 +5836,82 @@ mod tests {
 
         let history = session.state.lock().await.clone_history();
         assert_eq!(expected, history.raw_items());
+    }
+
+    #[test]
+    fn pending_continuation_from_rollout_uses_incomplete_history_without_pause_event() {
+        let original_user = user_message("original request");
+        let rollout_items = vec![RolloutItem::ResponseItem(original_user.clone())];
+        let reconstructed_history = vec![original_user];
+
+        assert_eq!(
+            Some(PendingContinuation {
+                source: TurnContinuationSource::Interrupted,
+                continued_from_turn_id: None,
+            }),
+            Session::pending_continuation_from_rollout(&rollout_items, &reconstructed_history)
+        );
+    }
+
+    #[test]
+    fn pending_continuation_from_rollout_ignores_custom_pause_event() {
+        let original_user = user_message("original request");
+        let later_user = user_message("new request");
+        let later_assistant = assistant_message("new response");
+        let rollout_items = vec![
+            RolloutItem::ResponseItem(original_user.clone()),
+            RolloutItem::EventMsg(EventMsg::TurnPaused(crate::protocol::TurnPausedEvent {
+                turn_id: "turn-1".to_string(),
+                reason: crate::protocol::TurnPauseReason::UserRequested,
+            })),
+            RolloutItem::ResponseItem(later_user.clone()),
+            RolloutItem::ResponseItem(later_assistant.clone()),
+        ];
+        let reconstructed_history = vec![original_user, later_user, later_assistant];
+
+        assert_eq!(
+            None,
+            Session::pending_continuation_from_rollout(&rollout_items, &reconstructed_history)
+        );
+    }
+
+    #[test]
+    fn history_needs_continuation_after_tool_output_without_final_message() {
+        let history = vec![
+            user_message("run a tool"),
+            assistant_message("I will check."),
+            ResponseItem::FunctionCallOutput {
+                call_id: "call-1".to_string(),
+                output: codex_protocol::models::FunctionCallOutputPayload::from_text(
+                    "tool result".to_string(),
+                ),
+            },
+        ];
+
+        assert!(history_needs_continuation(&history));
+    }
+
+    #[test]
+    fn trims_dangling_tool_call_before_continuation() {
+        let mut history = vec![
+            user_message("run a tool"),
+            assistant_message("I will check."),
+            ResponseItem::FunctionCall {
+                id: None,
+                name: "shell".to_string(),
+                arguments: "{}".to_string(),
+                call_id: "call-1".to_string(),
+            },
+        ];
+
+        assert!(trim_incomplete_continuation_tail(&mut history));
+        assert_eq!(
+            history,
+            vec![
+                user_message("run a tool"),
+                assistant_message("I will check.")
+            ]
+        );
     }
 
     #[tokio::test]

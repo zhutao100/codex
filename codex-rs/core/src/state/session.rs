@@ -9,7 +9,14 @@ use crate::context_manager::ContextManager;
 use crate::protocol::RateLimitSnapshot;
 use crate::protocol::TokenUsage;
 use crate::protocol::TokenUsageInfo;
+use crate::protocol::TurnContinuationSource;
 use crate::truncate::TruncationPolicy;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PendingContinuation {
+    pub(crate) source: TurnContinuationSource,
+    pub(crate) continued_from_turn_id: Option<String>,
+}
 
 /// Persistent, session-scoped state previously stored directly on `Session`.
 pub(crate) struct SessionState {
@@ -26,6 +33,8 @@ pub(crate) struct SessionState {
     pub(crate) initial_context_seeded: bool,
     /// Previous rollout model for one-shot model-switch handling on first turn after resume.
     pub(crate) pending_resume_previous_model: Option<String>,
+    /// Most recent paused/interrupted turn that can be continued without a new user input.
+    pub(crate) pending_continuation: Option<PendingContinuation>,
     /// Tracks whether automatic thread naming has already been attempted.
     pub(crate) auto_rename_attempted: bool,
     /// Tracks whether this session originated from a fork.
@@ -45,6 +54,7 @@ impl SessionState {
             mcp_dependency_prompted: HashSet::new(),
             initial_context_seeded: false,
             pending_resume_previous_model: None,
+            pending_continuation: None,
             auto_rename_attempted: false,
             is_forked_session: false,
         }

@@ -102,8 +102,8 @@ impl StatusIndicatorWidget {
         }
     }
 
-    pub(crate) fn interrupt(&self) {
-        self.app_event_tx.send(AppEvent::CodexOp(Op::Interrupt));
+    pub(crate) fn pause_turn(&self) {
+        self.app_event_tx.send(AppEvent::CodexOp(Op::Pause));
     }
 
     /// Update the animated header label (left of the brackets).
@@ -326,7 +326,7 @@ impl Renderable for StatusIndicatorWidget {
             spans.extend(vec![
                 format!("({pretty_elapsed} • ").dim(),
                 key_hint::plain(KeyCode::Esc).into(),
-                " to interrupt)".dim(),
+                " to pause)".dim(),
             ]);
         } else {
             spans.push(format!("({pretty_elapsed})").dim());

@@ -239,3 +239,240 @@ async fn interrupt_persists_turn_aborted_marker_in_next_request() {
         "expected <turn_aborted> marker in follow-up request"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pause_then_continue_does_not_add_user_marker() {
+    let command = "sleep 60";
+    let call_id = "call-pause-continue";
+
+    let args = json!({
+        "command": command,
+        "timeout_ms": 60_000
+    })
+    .to_string();
+    let first_body = sse(vec![
+        ev_response_created("resp-pause"),
+        ev_function_call(call_id, "shell_command", &args),
+        ev_completed("resp-pause"),
+    ]);
+    let continue_body = sse(vec![
+        ev_response_created("resp-continued"),
+        ev_completed("resp-continued"),
+    ]);
+
+    let server = start_mock_server().await;
+    let response_mock = mount_sse_sequence(&server, vec![first_body, continue_body]).await;
+
+    let fixture = test_codex()
+        .with_model("gpt-5.1")
+        .build(&server)
+        .await
+        .unwrap();
+    let codex = Arc::clone(&fixture.codex);
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "start pauseable work".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await
+        .unwrap();
+
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::ExecCommandBegin(_))).await;
+    tokio::time::sleep(Duration::from_secs_f32(0.1)).await;
+    codex.submit(Op::Pause).await.unwrap();
+
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnPaused(_))).await;
+
+    codex.submit(Op::Continue).await.unwrap();
+
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnContinued(_))).await;
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let requests = response_mock.requests();
+    assert_eq!(requests.len(), 2, "expected two calls to the responses API");
+
+    let continue_request = &requests[1];
+    let user_texts = continue_request.message_input_texts("user");
+    assert!(
+        user_texts
+            .iter()
+            .any(|text| text.contains("start pauseable work")),
+        "expected original user request to remain in continuation request"
+    );
+    assert!(
+        user_texts
+            .iter()
+            .all(|text| !text.contains("<turn_aborted>")),
+        "pause continuation should not include an interruption marker"
+    );
+    assert!(
+        user_texts
+            .iter()
+            .all(|text| !matches!(text.trim(), "continue" | "/continue")),
+        "continue should not be recorded as a user message"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interrupt_then_continue_removes_turn_aborted_marker() {
+    let command = "sleep 60";
+    let call_id = "call-interrupt-continue";
+
+    let args = json!({
+        "command": command,
+        "timeout_ms": 60_000
+    })
+    .to_string();
+    let first_body = sse(vec![
+        ev_response_created("resp-interrupt"),
+        ev_function_call(call_id, "shell_command", &args),
+        ev_completed("resp-interrupt"),
+    ]);
+    let continue_body = sse(vec![
+        ev_response_created("resp-interrupt-continued"),
+        ev_completed("resp-interrupt-continued"),
+    ]);
+
+    let server = start_mock_server().await;
+    let response_mock = mount_sse_sequence(&server, vec![first_body, continue_body]).await;
+
+    let fixture = test_codex()
+        .with_model("gpt-5.1")
+        .build(&server)
+        .await
+        .unwrap();
+    let codex = Arc::clone(&fixture.codex);
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "start interruptable work".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await
+        .unwrap();
+
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::ExecCommandBegin(_))).await;
+    tokio::time::sleep(Duration::from_secs_f32(0.1)).await;
+    codex.submit(Op::Interrupt).await.unwrap();
+
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnAborted(_))).await;
+
+    codex.submit(Op::Continue).await.unwrap();
+
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnContinued(_))).await;
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let requests = response_mock.requests();
+    assert_eq!(requests.len(), 2, "expected two calls to the responses API");
+
+    let continue_request = &requests[1];
+    let user_texts = continue_request.message_input_texts("user");
+    assert!(
+        user_texts
+            .iter()
+            .any(|text| text.contains("start interruptable work")),
+        "expected original user request to remain in continuation request"
+    );
+    assert!(
+        user_texts
+            .iter()
+            .all(|text| !text.contains("<turn_aborted>")),
+        "continue should remove the interruption marker from the next request"
+    );
+    assert!(
+        user_texts
+            .iter()
+            .all(|text| !matches!(text.trim(), "continue" | "/continue")),
+        "continue should not be recorded as a user message"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resumed_paused_turn_can_continue_without_user_input() {
+    let command = "sleep 60";
+    let call_id = "call-resume-paused";
+
+    let args = json!({
+        "command": command,
+        "timeout_ms": 60_000
+    })
+    .to_string();
+    let first_body = sse(vec![
+        ev_response_created("resp-resume-pause"),
+        ev_function_call(call_id, "shell_command", &args),
+        ev_completed("resp-resume-pause"),
+    ]);
+    let continue_body = sse(vec![
+        ev_response_created("resp-resumed-continue"),
+        ev_completed("resp-resumed-continue"),
+    ]);
+
+    let server = start_mock_server().await;
+    let response_mock = mount_sse_sequence(&server, vec![first_body, continue_body]).await;
+
+    let mut builder = test_codex().with_model("gpt-5.1");
+    let initial = builder.build(&server).await.unwrap();
+    let codex = Arc::clone(&initial.codex);
+    let home = initial.home.clone();
+    let rollout_path = initial
+        .session_configured
+        .rollout_path
+        .clone()
+        .expect("rollout path");
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "start resumable paused work".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await
+        .unwrap();
+
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::ExecCommandBegin(_))).await;
+    tokio::time::sleep(Duration::from_secs_f32(0.1)).await;
+    codex.submit(Op::Pause).await.unwrap();
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnPaused(_))).await;
+
+    let resumed = builder.resume(&server, home, rollout_path).await.unwrap();
+    resumed.codex.submit(Op::Continue).await.unwrap();
+
+    wait_for_event(&resumed.codex, |ev| {
+        matches!(ev, EventMsg::TurnContinued(_))
+    })
+    .await;
+    wait_for_event(&resumed.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let requests = response_mock.requests();
+    assert_eq!(requests.len(), 2, "expected two calls to the responses API");
+
+    let continue_request = &requests[1];
+    let user_texts = continue_request.message_input_texts("user");
+    assert!(
+        user_texts
+            .iter()
+            .any(|text| text.contains("start resumable paused work")),
+        "expected original user request to remain after resume"
+    );
+    assert!(
+        user_texts
+            .iter()
+            .all(|text| !text.contains("<turn_aborted>")),
+        "resumed pause continuation should not include an interruption marker"
+    );
+    assert!(
+        user_texts
+            .iter()
+            .all(|text| !matches!(text.trim(), "continue" | "/continue")),
+        "resume continue should not be recorded as a user message"
+    );
+}

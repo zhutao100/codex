@@ -1,9 +1,10 @@
 ---
 source: tui/src/chatwidget/tests.rs
+assertion_line: 4746
 expression: terminal.backend()
 ---
 "                                                                                "
-"• Analyzing · gpt-5.4 (reasoning default) · (0s • esc to interrupt)             "
+"• Analyzing · gpt-5.4 (reasoning default) · (0s • esc to pause)                 "
 "                                                                                "
 "                                                                                "
 "› Ask Codex to do anything                                                      "
