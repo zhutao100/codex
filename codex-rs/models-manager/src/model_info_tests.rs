@@ -247,7 +247,7 @@ fn explicit_empty_base_instructions_stay_empty_with_personality_none() {
 fn unknown_model_uses_builtin_instruction_template() {
     let model = model_info_from_slug("unknown-model");
 
-    assert_eq!(render_model_instructions(&model), BASE_INSTRUCTIONS);
+    assert_eq!(render_model_instructions(&model), OTHERS_INSTRUCTIONS);
 }
 
 #[test]

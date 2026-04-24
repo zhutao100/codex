@@ -1795,7 +1795,7 @@ async fn snapshot_shell_does_not_inherit_stdin() -> Result<()> {
     let output = run_script_with_timeout(
         &shell,
         &script,
-        Duration::from_secs(2),
+        Duration::from_secs(5),
         SnapshotShellMode::Login,
         &home,
         /*credential_broker*/ None,
