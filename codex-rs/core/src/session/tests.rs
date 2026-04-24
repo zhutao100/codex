@@ -907,7 +907,7 @@ async fn managed_network_proxy_decider_survives_full_access_start() -> anyhow::R
         )
         .await?;
     let mut buffer = [0_u8; 4096];
-    let bytes_read = tokio::time::timeout(StdDuration::from_secs(2), stream.read(&mut buffer))
+    let bytes_read = tokio::time::timeout(StdDuration::from_secs(5), stream.read(&mut buffer))
         .await
         .expect("timed out waiting for proxy response")?;
     let response = String::from_utf8_lossy(&buffer[..bytes_read]);

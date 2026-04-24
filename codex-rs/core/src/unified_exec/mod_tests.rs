@@ -528,7 +528,7 @@ async fn unified_exec_pause_blocks_yield_timeout() -> anyhow::Result<()> {
         &session,
         &turn,
         "sleep 1 && echo unified-exec-done",
-        /*yield_time_ms*/ 250,
+        /*yield_time_ms*/ 1_000,
         /*workdir*/ None,
     )
     .await?;

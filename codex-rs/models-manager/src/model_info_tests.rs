@@ -1,6 +1,8 @@
 use super::*;
 use crate::ModelsManagerConfig;
 use codex_protocol::openai_models::ApprovalMessages;
+use codex_protocol::openai_models::ModelInstructionsVariables;
+use codex_protocol::openai_models::ModelMessages;
 use pretty_assertions::assert_eq;
 
 #[test]

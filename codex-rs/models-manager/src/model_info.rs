@@ -1,9 +1,10 @@
 use codex_protocol::config_types::ReasoningSummary;
+use codex_protocol::openai_models::ApplyPatchToolType;
 use codex_protocol::openai_models::ConfigShellToolType;
 use codex_protocol::openai_models::ModelInfo;
-use codex_protocol::openai_models::ModelInstructionsVariables;
-use codex_protocol::openai_models::ModelMessages;
 use codex_protocol::openai_models::ModelVisibility;
+use codex_protocol::openai_models::ReasoningEffort;
+use codex_protocol::openai_models::ReasoningEffortPreset;
 use codex_protocol::openai_models::TruncationMode;
 use codex_protocol::openai_models::TruncationPolicyConfig;
 use codex_protocol::openai_models::WebSearchToolType;
@@ -11,14 +12,11 @@ use codex_protocol::openai_models::default_input_modalities;
 
 use crate::config::ModelsManagerConfig;
 use codex_utils_output_truncation::approx_bytes_for_tokens;
-use tracing::warn;
 
 pub const BASE_INSTRUCTIONS: &str = include_str!("../prompt.md");
-const DEFAULT_PERSONALITY_HEADER: &str = "You are Codex, a coding agent based on GPT-5. You and the user share the same workspace and collaborate to achieve the user's goals.";
-const LOCAL_FRIENDLY_TEMPLATE: &str =
-    "You optimize for team morale and being a supportive teammate as much as code quality.";
-const LOCAL_PRAGMATIC_TEMPLATE: &str = "You are a deeply pragmatic, effective software engineer.";
-const PERSONALITY_PLACEHOLDER: &str = "{{ personality }}";
+const OTHERS_INSTRUCTIONS: &str = include_str!("../others_prompt.md");
+
+pub(crate) const CONTEXT_WINDOW_164K: i64 = 163_840;
 
 pub fn with_config_overrides(mut model: ModelInfo, config: &ModelsManagerConfig) -> ModelInfo {
     if let Some(context_window) = config.model_context_window {
@@ -69,14 +67,13 @@ fn clear_instruction_messages(model: &mut ModelInfo) {
 
 /// Build a minimal fallback model descriptor for missing/unknown slugs.
 pub fn model_info_from_slug(slug: &str) -> ModelInfo {
-    warn!("Unknown model {slug} is used. This will use fallback model metadata.");
     ModelInfo {
         slug: slug.to_string(),
         display_name: slug.to_string(),
         description: None,
-        default_reasoning_level: None,
-        supported_reasoning_levels: Vec::new(),
-        shell_type: ConfigShellToolType::Default,
+        default_reasoning_level: Some(ReasoningEffort::Medium),
+        supported_reasoning_levels: supported_reasoning_level_low_medium_high(),
+        shell_type: ConfigShellToolType::ShellCommand,
         visibility: ModelVisibility::None,
         supported_in_api: true,
         priority: 99,
@@ -85,20 +82,20 @@ pub fn model_info_from_slug(slug: &str) -> ModelInfo {
         default_service_tier: None,
         availability_nux: None,
         upgrade: None,
-        base_instructions: BASE_INSTRUCTIONS.to_string(),
-        model_messages: local_personality_messages_for_slug(slug),
+        base_instructions: OTHERS_INSTRUCTIONS.to_string(),
+        model_messages: None,
         include_skills_usage_instructions: false,
         default_reasoning_summary: ReasoningSummary::Auto,
         support_verbosity: false,
         default_verbosity: None,
-        apply_patch_tool_type: None,
+        apply_patch_tool_type: Some(ApplyPatchToolType::Freeform),
         web_search_tool_type: WebSearchToolType::Text,
-        truncation_policy: TruncationPolicyConfig::bytes(/*limit*/ 10_000),
-        supports_parallel_tool_calls: false,
+        truncation_policy: TruncationPolicyConfig::bytes(10_000),
+        supports_parallel_tool_calls: true,
         supports_image_detail_original: false,
-        context_window: Some(272_000),
-        max_context_window: Some(272_000),
-        auto_compact_token_limit: None,
+        context_window: Some(CONTEXT_WINDOW_164K),
+        max_context_window: Some(CONTEXT_WINDOW_164K),
+        auto_compact_token_limit: Some(CONTEXT_WINDOW_164K * 2 / 3),
         comp_hash: None,
         effective_context_window_percent: 95,
         experimental_supported_tools: Vec::new(),
@@ -112,21 +109,21 @@ pub fn model_info_from_slug(slug: &str) -> ModelInfo {
     }
 }
 
-fn local_personality_messages_for_slug(slug: &str) -> Option<ModelMessages> {
-    match slug {
-        "gpt-5.2-codex" | "exp-codex-personality" => Some(ModelMessages {
-            instructions_template: Some(format!(
-                "{DEFAULT_PERSONALITY_HEADER}\n\n{PERSONALITY_PLACEHOLDER}\n\n{BASE_INSTRUCTIONS}"
-            )),
-            instructions_variables: Some(ModelInstructionsVariables {
-                personality_default: Some(String::new()),
-                personality_friendly: Some(LOCAL_FRIENDLY_TEMPLATE.to_string()),
-                personality_pragmatic: Some(LOCAL_PRAGMATIC_TEMPLATE.to_string()),
-            }),
-            approvals: None,
-        }),
-        _ => None,
-    }
+fn supported_reasoning_level_low_medium_high() -> Vec<ReasoningEffortPreset> {
+    vec![
+        ReasoningEffortPreset {
+            effort: ReasoningEffort::Low,
+            description: "Fast responses with lighter reasoning".to_string(),
+        },
+        ReasoningEffortPreset {
+            effort: ReasoningEffort::Medium,
+            description: "Balances speed and reasoning depth for everyday tasks".to_string(),
+        },
+        ReasoningEffortPreset {
+            effort: ReasoningEffort::High,
+            description: "Greater reasoning depth for complex problems".to_string(),
+        },
+    ]
 }
 
 #[cfg(test)]

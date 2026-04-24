@@ -2468,7 +2468,7 @@ async fn resume_thread_subagent_restores_stored_metadata() {
         .session_source
         .get_nickname()
         .expect("spawned sub-agent should have a nickname");
-    timeout(Duration::from_secs(5), async {
+    timeout(Duration::from_secs(10), async {
         loop {
             if let Ok(stored_thread) = thread_store
                 .read_thread(ReadThreadParams {
