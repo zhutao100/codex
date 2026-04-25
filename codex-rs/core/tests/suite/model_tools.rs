@@ -71,9 +71,6 @@ async fn model_selects_expected_tools() {
         expected_default_tools(
             "local_shell",
             &[
-                "list_mcp_resources",
-                "list_mcp_resource_templates",
-                "read_mcp_resource",
                 "update_plan",
                 "request_user_input",
                 "web_search",
@@ -89,9 +86,6 @@ async fn model_selects_expected_tools() {
         expected_default_tools(
             "shell_command",
             &[
-                "list_mcp_resources",
-                "list_mcp_resource_templates",
-                "read_mcp_resource",
                 "update_plan",
                 "request_user_input",
                 "apply_patch",
@@ -108,9 +102,6 @@ async fn model_selects_expected_tools() {
         expected_default_tools(
             "shell_command",
             &[
-                "list_mcp_resources",
-                "list_mcp_resource_templates",
-                "read_mcp_resource",
                 "update_plan",
                 "request_user_input",
                 "apply_patch",
@@ -127,9 +118,6 @@ async fn model_selects_expected_tools() {
         expected_default_tools(
             "shell",
             &[
-                "list_mcp_resources",
-                "list_mcp_resource_templates",
-                "read_mcp_resource",
                 "update_plan",
                 "request_user_input",
                 "web_search",
@@ -145,9 +133,6 @@ async fn model_selects_expected_tools() {
         expected_default_tools(
             "shell_command",
             &[
-                "list_mcp_resources",
-                "list_mcp_resource_templates",
-                "read_mcp_resource",
                 "update_plan",
                 "request_user_input",
                 "apply_patch",
@@ -163,9 +148,6 @@ async fn model_selects_expected_tools() {
         vec![
             "exec_command".to_string(),
             "write_stdin".to_string(),
-            "list_mcp_resources".to_string(),
-            "list_mcp_resource_templates".to_string(),
-            "read_mcp_resource".to_string(),
             "update_plan".to_string(),
             "request_user_input".to_string(),
             "apply_patch".to_string(),

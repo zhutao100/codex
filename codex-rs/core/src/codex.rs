@@ -4619,14 +4619,13 @@ async fn run_sampling_request(
     tool_execution_mode: ToolCallExecutionMode,
     cancellation_token: CancellationToken,
 ) -> CodexResult<SamplingRequestResult> {
-    let mut mcp_tools = sess
-        .services
-        .mcp_connection_manager
-        .read()
-        .await
+    let mcp_connection_manager = sess.services.mcp_connection_manager.read().await;
+    let has_mcp_servers = mcp_connection_manager.has_servers();
+    let mut mcp_tools = mcp_connection_manager
         .list_all_tools()
         .or_cancel(&cancellation_token)
         .await?;
+    drop(mcp_connection_manager);
     let connectors_for_tools = if turn_context.config.features.enabled(Feature::Apps) {
         let connectors = connectors::accessible_connectors_from_mcp_tools(&mcp_tools);
         Some(filter_connectors_for_input(
@@ -4643,12 +4642,12 @@ async fn run_sampling_request(
     }
     let router = Arc::new(ToolRouter::from_config(
         &turn_context.tools_config,
-        Some(
+        has_mcp_servers.then(|| {
             mcp_tools
                 .into_iter()
                 .map(|(name, tool)| (name, tool.tool))
-                .collect(),
-        ),
+                .collect()
+        }),
         turn_context.dynamic_tools.as_slice(),
     ));
 
