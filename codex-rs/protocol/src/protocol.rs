@@ -17,6 +17,7 @@ use crate::config_types::CollaborationMode;
 use crate::config_types::ModeKind;
 use crate::config_types::Personality;
 use crate::config_types::ReasoningSummary as ReasoningSummaryConfig;
+use crate::config_types::ServiceTier;
 use crate::config_types::WindowsSandboxLevel;
 use crate::custom_prompts::CustomPrompt;
 use crate::dynamic_tools::DynamicToolCallRequest;
@@ -149,6 +150,10 @@ pub enum Op {
         /// Optional personality override for this turn.
         #[serde(skip_serializing_if = "Option::is_none")]
         personality: Option<Personality>,
+
+        /// Optional service tier override for this turn.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        service_tier: Option<ServiceTier>,
     },
 
     /// Override parts of the persistent turn context for subsequent turns.
@@ -198,6 +203,10 @@ pub enum Op {
         /// Updated personality preference.
         #[serde(skip_serializing_if = "Option::is_none")]
         personality: Option<Personality>,
+
+        /// Updated service tier preference.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        service_tier: Option<ServiceTier>,
     },
 
     /// Approve a command execution
@@ -2341,6 +2350,10 @@ pub struct SessionConfiguredEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffortConfig>,
 
+    /// Effective service tier used for Responses requests in this session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<ServiceTier>,
+
     /// Identifier of the history log file (inode on Unix, 0 otherwise).
     pub history_log_id: u64,
 
@@ -2742,6 +2755,22 @@ mod tests {
     }
 
     #[test]
+    fn override_turn_context_omits_service_tier_as_none() -> Result<()> {
+        let op: Op = serde_json::from_value(json!({
+            "type": "override_turn_context"
+        }))?;
+
+        match op {
+            Op::OverrideTurnContext { service_tier, .. } => {
+                assert_eq!(service_tier, None);
+            }
+            other => panic!("expected OverrideTurnContext, got {other:?}"),
+        }
+
+        Ok(())
+    }
+
+    #[test]
     fn user_message_event_serializes_empty_metadata_vectors() -> Result<()> {
         let event = UserMessageEvent {
             message: "hello".to_string(),
@@ -2785,6 +2814,7 @@ mod tests {
                 history_entry_count: 0,
                 initial_messages: None,
                 rollout_path: Some(rollout_file.path().to_path_buf()),
+                service_tier: None,
             }),
         };
 

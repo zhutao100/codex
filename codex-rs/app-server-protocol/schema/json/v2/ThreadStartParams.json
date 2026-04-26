@@ -42,6 +42,14 @@
         "danger-full-access"
       ],
       "type": "string"
+    },
+    "ServiceTier": {
+      "description": "Controls the service tier requested from the Responses API.",
+      "enum": [
+        "fast",
+        "flex"
+      ],
+      "type": "string"
     }
   },
   "properties": {
@@ -117,6 +125,16 @@
       "anyOf": [
         {
           "$ref": "#/definitions/SandboxMode"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "serviceTier": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ServiceTier"
         },
         {
           "type": "null"

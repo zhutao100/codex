@@ -43,6 +43,7 @@ use codex_core::protocol_config_types::ReasoningSummary;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Personality;
+use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::Settings;
 use codex_protocol::openai_models::ReasoningEffort;
 use core_test_support::responses;
@@ -483,6 +484,136 @@ async fn turn_start_accepts_personality_override_v2() -> Result<()> {
             .iter()
             .any(|text| text.contains("<personality_spec>")),
         "expected personality update message in developer input, got {developer_texts:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn turn_start_service_tier_override_is_sticky_v2() -> Result<()> {
+    let server = responses::start_mock_server().await;
+    let sse1 = responses::sse(vec![
+        responses::ev_response_created("resp-1"),
+        responses::ev_assistant_message("msg-1", "Done"),
+        responses::ev_completed("resp-1"),
+    ]);
+    let sse2 = responses::sse(vec![
+        responses::ev_response_created("resp-2"),
+        responses::ev_assistant_message("msg-2", "Done again"),
+        responses::ev_completed("resp-2"),
+    ]);
+    let sse3 = responses::sse(vec![
+        responses::ev_response_created("resp-3"),
+        responses::ev_assistant_message("msg-3", "Still done"),
+        responses::ev_completed("resp-3"),
+    ]);
+    let response_mock = responses::mount_sse_sequence(&server, vec![sse1, sse2, sse3]).await;
+
+    let codex_home = TempDir::new()?;
+    create_openai_named_config_toml(codex_home.path(), &server.uri())?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let thread_req = mcp
+        .send_thread_start_request(ThreadStartParams {
+            model: Some("mock-model".to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let thread_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(thread_req)),
+    )
+    .await??;
+    let ThreadStartResponse {
+        thread,
+        service_tier,
+        ..
+    } = to_response::<ThreadStartResponse>(thread_resp)?;
+    assert_eq!(service_tier, None);
+
+    let first_turn_req = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id.clone(),
+            input: vec![V2UserInput::Text {
+                text: "Default tier".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(first_turn_req)),
+    )
+    .await??;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+
+    let second_turn_req = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id.clone(),
+            input: vec![V2UserInput::Text {
+                text: "Fast tier".to_string(),
+                text_elements: Vec::new(),
+            }],
+            service_tier: Some(ServiceTier::Fast),
+            ..Default::default()
+        })
+        .await?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(second_turn_req)),
+    )
+    .await??;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+
+    let third_turn_req = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id,
+            input: vec![V2UserInput::Text {
+                text: "Follow up".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(third_turn_req)),
+    )
+    .await??;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+
+    let requests = response_mock.requests();
+    assert_eq!(requests.len(), 3);
+    let tiers = requests
+        .into_iter()
+        .map(|request| {
+            request.body_json()["service_tier"]
+                .as_str()
+                .map(ToString::to_string)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        tiers,
+        vec![
+            None,
+            Some("priority".to_string()),
+            Some("priority".to_string())
+        ]
     );
 
     Ok(())
@@ -1126,6 +1257,7 @@ async fn turn_start_updates_sandbox_and_cwd_between_turns_v2() -> Result<()> {
             personality: None,
             output_schema: None,
             collaboration_mode: None,
+            service_tier: None,
         })
         .await?;
     timeout(
@@ -1157,6 +1289,7 @@ async fn turn_start_updates_sandbox_and_cwd_between_turns_v2() -> Result<()> {
             personality: None,
             output_schema: None,
             collaboration_mode: None,
+            service_tier: None,
         })
         .await?;
     timeout(
@@ -1915,6 +2048,29 @@ model_provider = "mock_provider"
 
 [model_providers.mock_provider]
 name = "Mock provider for test"
+base_url = "{server_uri}/v1"
+wire_api = "responses"
+request_max_retries = 0
+stream_max_retries = 0
+"#
+        ),
+    )
+}
+
+fn create_openai_named_config_toml(codex_home: &Path, server_uri: &str) -> std::io::Result<()> {
+    let config_toml = codex_home.join("config.toml");
+    std::fs::write(
+        config_toml,
+        format!(
+            r#"
+model = "mock-model"
+approval_policy = "never"
+sandbox_mode = "read-only"
+
+model_provider = "mock_provider"
+
+[model_providers.mock_provider]
+name = "OpenAI"
 base_url = "{server_uri}/v1"
 wire_api = "responses"
 request_max_retries = 0

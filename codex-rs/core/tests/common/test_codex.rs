@@ -295,6 +295,7 @@ impl TestCodex {
                 summary: ReasoningSummary::Auto,
                 collaboration_mode: None,
                 personality: None,
+                service_tier: None,
             })
             .await?;
 

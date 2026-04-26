@@ -5,6 +5,7 @@ import type { AskForApproval } from "./AskForApproval";
 import type { EventMsg } from "./EventMsg";
 import type { ReasoningEffort } from "./ReasoningEffort";
 import type { SandboxPolicy } from "./SandboxPolicy";
+import type { ServiceTier } from "./ServiceTier";
 import type { ThreadId } from "./ThreadId";
 
 export type SessionConfiguredEvent = { session_id: ThreadId, forked_from_id: ThreadId | null, 
@@ -33,6 +34,10 @@ cwd: string,
  * The effort the model is putting into reasoning about the user's request.
  */
 reasoning_effort: ReasoningEffort | null, 
+/**
+ * Effective service tier used for Responses requests in this session.
+ */
+service_tier: ServiceTier | null, 
 /**
  * Identifier of the history log file (inode on Unix, 0 otherwise).
  */

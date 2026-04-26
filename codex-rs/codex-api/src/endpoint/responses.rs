@@ -32,6 +32,7 @@ pub struct ResponsesClient<T: HttpTransport, A: AuthProvider> {
 pub struct ResponsesOptions {
     pub reasoning: Option<Reasoning>,
     pub include: Vec<String>,
+    pub service_tier: Option<String>,
     pub prompt_cache_key: Option<String>,
     pub text: Option<TextControls>,
     pub store_override: Option<bool>,
@@ -85,6 +86,7 @@ impl<T: HttpTransport, A: AuthProvider> ResponsesClient<T, A> {
         let ResponsesOptions {
             reasoning,
             include,
+            service_tier,
             prompt_cache_key,
             text,
             store_override,
@@ -100,6 +102,7 @@ impl<T: HttpTransport, A: AuthProvider> ResponsesClient<T, A> {
             .parallel_tool_calls(prompt.parallel_tool_calls)
             .reasoning(reasoning)
             .include(include)
+            .service_tier(service_tier)
             .prompt_cache_key(prompt_cache_key)
             .text(text)
             .conversation(conversation_id)

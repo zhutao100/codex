@@ -70,6 +70,7 @@ use codex_protocol::account::PlanType;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Personality;
+use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::Settings;
 use codex_protocol::items::PlanItem;
 use codex_protocol::items::TurnItem;
@@ -161,6 +162,7 @@ async fn resumed_initial_messages_render_history() {
             }),
         ]),
         rollout_path: Some(rollout_file.path().to_path_buf()),
+        service_tier: None,
     };
 
     chat.handle_codex_event(Event {
@@ -223,6 +225,7 @@ async fn replayed_user_message_preserves_text_elements_and_local_images() {
             local_images: local_images.clone(),
         })]),
         rollout_path: Some(rollout_file.path().to_path_buf()),
+        service_tier: None,
     };
 
     chat.handle_codex_event(Event {
@@ -335,6 +338,7 @@ async fn submission_preserves_text_elements_and_local_images() {
         history_entry_count: 0,
         initial_messages: None,
         rollout_path: Some(rollout_file.path().to_path_buf()),
+        service_tier: None,
     };
     chat.handle_codex_event(Event {
         id: "initial".into(),
@@ -1247,6 +1251,35 @@ async fn submit_user_message_with_mode_sets_coding_collaboration_mode() {
         other => {
             panic!("expected Op::UserTurn with default collab mode, got {other:?}")
         }
+    }
+}
+
+#[tokio::test]
+async fn submit_user_message_omits_unconfigured_service_tier() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(None).await;
+    chat.thread_id = Some(ThreadId::new());
+
+    chat.submit_user_message("hello".to_string().into());
+
+    match next_submit_op(&mut op_rx) {
+        Op::UserTurn { service_tier, .. } => assert_eq!(service_tier, None),
+        other => panic!("expected Op::UserTurn, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn submit_user_message_carries_configured_service_tier() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.config.service_tier = Some(ServiceTier::Fast);
+
+    chat.submit_user_message("hello".to_string().into());
+
+    match next_submit_op(&mut op_rx) {
+        Op::UserTurn { service_tier, .. } => {
+            assert_eq!(service_tier, Some(ServiceTier::Fast));
+        }
+        other => panic!("expected Op::UserTurn, got {other:?}"),
     }
 }
 
@@ -2741,6 +2774,7 @@ async fn plan_slash_command_with_args_submits_prompt_in_plan_mode() {
         history_entry_count: 0,
         initial_messages: None,
         rollout_path: None,
+        service_tier: None,
     };
     chat.handle_codex_event(Event {
         id: "configured".into(),

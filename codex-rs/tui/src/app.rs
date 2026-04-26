@@ -2215,6 +2215,7 @@ impl App {
                                         summary: None,
                                         collaboration_mode: None,
                                         personality: None,
+                                        service_tier: None,
                                     },
                                 ));
                                 self.app_event_tx.send(
@@ -2237,6 +2238,7 @@ impl App {
                                         summary: None,
                                         collaboration_mode: None,
                                         personality: None,
+                                        service_tier: None,
                                     },
                                 ));
                                 self.app_event_tx
@@ -2464,6 +2466,7 @@ impl App {
                                 summary: None,
                                 collaboration_mode: None,
                                 personality: None,
+                                service_tier: None,
                             }));
                     }
                 }
@@ -2771,6 +2774,7 @@ impl App {
                 history_entry_count: 0,
                 initial_messages: None,
                 rollout_path: thread.rollout_path(),
+                service_tier: None,
             }),
         };
         let channel =
@@ -3508,6 +3512,7 @@ mod tests {
                 history_entry_count: 0,
                 initial_messages: None,
                 rollout_path: Some(PathBuf::new()),
+                service_tier: None,
             };
             Arc::new(new_session_info(
                 app.chat_widget.config_ref(),
@@ -3562,6 +3567,7 @@ mod tests {
                 history_entry_count: 0,
                 initial_messages: None,
                 rollout_path: Some(PathBuf::new()),
+                service_tier: None,
             }),
         });
 
@@ -3608,6 +3614,7 @@ mod tests {
             history_entry_count: 0,
             initial_messages: None,
             rollout_path: Some(PathBuf::new()),
+            service_tier: None,
         };
 
         app.chat_widget.handle_codex_event(Event {

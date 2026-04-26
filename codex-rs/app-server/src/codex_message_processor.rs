@@ -1784,6 +1784,7 @@ impl CodexMessageProcessor {
             mock_experimental_field: _mock_experimental_field,
             experimental_raw_events,
             personality,
+            service_tier,
             ephemeral,
         } = params;
         let mut typesafe_overrides = self.build_thread_config_overrides(
@@ -1795,6 +1796,7 @@ impl CodexMessageProcessor {
             base_instructions,
             developer_instructions,
             personality,
+            service_tier,
         );
         typesafe_overrides.ephemeral = ephemeral;
 
@@ -1892,6 +1894,7 @@ impl CodexMessageProcessor {
                     approval_policy: config_snapshot.approval_policy.into(),
                     sandbox: config_snapshot.sandbox_policy.into(),
                     reasoning_effort: config_snapshot.reasoning_effort,
+                    service_tier: config_snapshot.service_tier,
                 };
 
                 // Auto-attach a thread listener when starting a thread.
@@ -1940,6 +1943,7 @@ impl CodexMessageProcessor {
         base_instructions: Option<String>,
         developer_instructions: Option<String>,
         personality: Option<Personality>,
+        service_tier: Option<codex_protocol::config_types::ServiceTier>,
     ) -> ConfigOverrides {
         ConfigOverrides {
             model,
@@ -1952,6 +1956,7 @@ impl CodexMessageProcessor {
             base_instructions,
             developer_instructions,
             personality,
+            service_tier,
             ..Default::default()
         }
     }
@@ -2564,6 +2569,7 @@ impl CodexMessageProcessor {
             base_instructions,
             developer_instructions,
             personality,
+            service_tier,
         } = params;
 
         let thread_history = if let Some(history) = history {
@@ -2650,6 +2656,7 @@ impl CodexMessageProcessor {
             base_instructions,
             developer_instructions,
             personality,
+            service_tier,
         );
 
         // Derive a Config using the same logic as new conversation, honoring overrides if provided.
@@ -2690,6 +2697,7 @@ impl CodexMessageProcessor {
                 let SessionConfiguredEvent {
                     rollout_path,
                     initial_messages,
+                    service_tier,
                     ..
                 } = session_configured;
                 let Some(rollout_path) = rollout_path else {
@@ -2744,6 +2752,7 @@ impl CodexMessageProcessor {
                     approval_policy: session_configured.approval_policy.into(),
                     sandbox: session_configured.sandbox_policy.into(),
                     reasoning_effort: session_configured.reasoning_effort,
+                    service_tier,
                 };
 
                 self.outgoing.send_response(request_id, response).await;
@@ -2771,6 +2780,7 @@ impl CodexMessageProcessor {
             config: cli_overrides,
             base_instructions,
             developer_instructions,
+            service_tier,
         } = params;
 
         let (rollout_path, source_thread_id) = if let Some(path) = path {
@@ -2841,6 +2851,7 @@ impl CodexMessageProcessor {
             base_instructions,
             developer_instructions,
             None,
+            service_tier,
         );
         // Derive a Config using the same logic as new conversation, honoring overrides if provided.
         let cloud_requirements = self.current_cloud_requirements();
@@ -2899,6 +2910,7 @@ impl CodexMessageProcessor {
         let SessionConfiguredEvent {
             rollout_path,
             initial_messages,
+            service_tier,
             ..
         } = session_configured;
         let Some(rollout_path) = rollout_path else {
@@ -2953,6 +2965,7 @@ impl CodexMessageProcessor {
             approval_policy: session_configured.approval_policy.into(),
             sandbox: session_configured.sandbox_policy.into(),
             reasoning_effort: session_configured.reasoning_effort,
+            service_tier,
         };
 
         self.outgoing.send_response(request_id, response).await;
@@ -4299,6 +4312,7 @@ impl CodexMessageProcessor {
                 final_output_json_schema: output_schema,
                 collaboration_mode: None,
                 personality: None,
+                service_tier: None,
             })
             .await;
 
@@ -4568,7 +4582,8 @@ impl CodexMessageProcessor {
             || params.effort.is_some()
             || params.summary.is_some()
             || params.collaboration_mode.is_some()
-            || params.personality.is_some();
+            || params.personality.is_some()
+            || params.service_tier.is_some();
 
         // If any overrides are provided, update the session turn context first.
         if has_any_overrides {
@@ -4583,6 +4598,7 @@ impl CodexMessageProcessor {
                     summary: params.summary,
                     collaboration_mode: params.collaboration_mode,
                     personality: params.personality,
+                    service_tier: params.service_tier,
                 })
                 .await;
         }

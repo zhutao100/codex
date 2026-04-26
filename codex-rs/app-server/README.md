@@ -131,6 +131,7 @@ Start a fresh thread when you need a new Codex conversation.
     "approvalPolicy": "never",
     "sandbox": "workspaceWrite",
     "personality": "friendly",
+    "serviceTier": "fast",
     // Experimental: requires opt-in
     "dynamicTools": [
         {
@@ -159,6 +160,7 @@ Start a fresh thread when you need a new Codex conversation.
 ```
 
 Valid `personality` values are `"friendly"`, `"pragmatic"`, and `"none"`. When `"none"` is selected, the personality placeholder is replaced with an empty string.
+Valid `serviceTier` values are `"flex"` and `"fast"`. Omit the field to let the API use its default service tier; explicit `"fast"` is sent as OpenAI Responses `"priority"`.
 
 To continue a stored session, call `thread/resume` with the `thread.id` you previously recorded. The response shape matches `thread/start`, and no additional notifications are emitted. You can also pass the same configuration overrides supported by `thread/start`, such as `personality`:
 
@@ -277,7 +279,7 @@ Turns attach user input (text or images) to a thread and trigger Codex generatio
 - `{"type":"image","url":"https://…png"}`
 - `{"type":"localImage","path":"/tmp/screenshot.png"}`
 
-You can optionally specify config overrides on the new turn. If specified, these settings become the default for subsequent turns on the same thread. `outputSchema` applies only to the current turn.
+You can optionally specify config overrides on the new turn. If specified, these settings become the default for subsequent turns on the same thread. `serviceTier` accepts `"flex"` or `"fast"` and is sticky like model/reasoning settings. `outputSchema` applies only to the current turn.
 
 ```json
 { "method": "turn/start", "id": 30, "params": {
@@ -295,6 +297,7 @@ You can optionally specify config overrides on the new turn. If specified, these
     "effort": "medium",
     "summary": "concise",
     "personality": "friendly",
+    "serviceTier": "fast",
     // Optional JSON Schema to constrain the final assistant message for this turn.
     "outputSchema": {
         "type": "object",

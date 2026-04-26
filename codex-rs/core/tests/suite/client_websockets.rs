@@ -208,6 +208,7 @@ async fn responses_websocket_emits_reasoning_included_event() {
             harness.effort,
             harness.summary,
             None,
+            None,
         )
         .await
         .expect("websocket stream failed");
@@ -277,6 +278,7 @@ async fn responses_websocket_emits_rate_limit_events() {
             &harness.otel_manager,
             harness.effort,
             harness.summary,
+            None,
             None,
         )
         .await
@@ -649,6 +651,7 @@ async fn stream_until_complete(
             &harness.otel_manager,
             harness.effort,
             harness.summary,
+            None,
             None,
         )
         .await

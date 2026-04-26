@@ -49,6 +49,7 @@ use codex_otel::OtelManager;
 
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
+use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::Verbosity as VerbosityConfig;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
@@ -372,6 +373,7 @@ impl ModelClientSession {
         model_info: &ModelInfo,
         effort: Option<ReasoningEffortConfig>,
         summary: ReasoningSummaryConfig,
+        service_tier: Option<ServiceTier>,
         turn_metadata_header: Option<&str>,
         compression: Compression,
     ) -> ApiResponsesOptions {
@@ -419,6 +421,7 @@ impl ModelClientSession {
         ApiResponsesOptions {
             reasoning,
             include,
+            service_tier: service_tier_for_wire(&self.client.state.provider, service_tier),
             prompt_cache_key: Some(conversation_id.clone()),
             text,
             store_override: None,
@@ -484,6 +487,7 @@ impl ModelClientSession {
         let ApiResponsesOptions {
             reasoning,
             include,
+            service_tier,
             prompt_cache_key,
             text,
             store_override,
@@ -503,6 +507,7 @@ impl ModelClientSession {
             store,
             stream: true,
             include: include.clone(),
+            service_tier: service_tier.clone(),
             prompt_cache_key: prompt_cache_key.clone(),
             text: text.clone(),
         };
@@ -615,6 +620,7 @@ impl ModelClientSession {
         otel_manager: &OtelManager,
         effort: Option<ReasoningEffortConfig>,
         summary: ReasoningSummaryConfig,
+        service_tier: Option<ServiceTier>,
         turn_metadata_header: Option<&str>,
     ) -> Result<ResponseStream> {
         if let Some(path) = &*CODEX_RS_SSE_FIXTURE {
@@ -657,6 +663,7 @@ impl ModelClientSession {
                 model_info,
                 effort,
                 summary,
+                service_tier,
                 turn_metadata_header,
                 compression,
             );
@@ -691,6 +698,7 @@ impl ModelClientSession {
         otel_manager: &OtelManager,
         effort: Option<ReasoningEffortConfig>,
         summary: ReasoningSummaryConfig,
+        service_tier: Option<ServiceTier>,
         turn_metadata_header: Option<&str>,
     ) -> Result<ResponseStream> {
         let auth_manager = self.client.state.auth_manager.clone();
@@ -717,6 +725,7 @@ impl ModelClientSession {
                 model_info,
                 effort,
                 summary,
+                service_tier,
                 turn_metadata_header,
                 compression,
             );
@@ -790,6 +799,7 @@ impl ModelClientSession {
         otel_manager: &OtelManager,
         effort: Option<ReasoningEffortConfig>,
         summary: ReasoningSummaryConfig,
+        service_tier: Option<ServiceTier>,
         turn_metadata_header: Option<&str>,
     ) -> Result<ResponseStream> {
         let wire_api = self.client.state.provider.wire_api;
@@ -805,6 +815,7 @@ impl ModelClientSession {
                         otel_manager,
                         effort,
                         summary,
+                        service_tier,
                         turn_metadata_header,
                     )
                     .await
@@ -815,6 +826,7 @@ impl ModelClientSession {
                         otel_manager,
                         effort,
                         summary,
+                        service_tier,
                         turn_metadata_header,
                     )
                     .await
@@ -887,6 +899,20 @@ fn build_responses_headers(
         headers.insert(X_CODEX_TURN_METADATA_HEADER, header_value.clone());
     }
     headers
+}
+
+fn service_tier_for_wire(
+    provider: &ModelProviderInfo,
+    service_tier: Option<ServiceTier>,
+) -> Option<String> {
+    if !provider.is_openai() {
+        return None;
+    }
+
+    service_tier.map(|service_tier| match service_tier {
+        ServiceTier::Fast => "priority".to_string(),
+        ServiceTier::Flex => "flex".to_string(),
+    })
 }
 
 fn map_response_stream<S>(
@@ -1046,5 +1072,33 @@ impl WebsocketTelemetry for ApiTelemetry {
         duration: Duration,
     ) {
         self.otel_manager.record_websocket_event(result, duration);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model_provider_info::OLLAMA_OSS_PROVIDER_ID;
+    use crate::model_provider_info::built_in_model_providers;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn service_tier_for_wire_maps_only_openai_provider() {
+        let providers = built_in_model_providers();
+        let openai = providers.get("openai").expect("openai provider");
+        let ollama = providers
+            .get(OLLAMA_OSS_PROVIDER_ID)
+            .expect("ollama provider");
+
+        assert_eq!(
+            service_tier_for_wire(openai, Some(ServiceTier::Flex)),
+            Some("flex".to_string())
+        );
+        assert_eq!(
+            service_tier_for_wire(openai, Some(ServiceTier::Fast)),
+            Some("priority".to_string())
+        );
+        assert_eq!(service_tier_for_wire(openai, None), None);
+        assert_eq!(service_tier_for_wire(ollama, Some(ServiceTier::Flex)), None);
     }
 }

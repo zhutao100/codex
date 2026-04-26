@@ -68,6 +68,7 @@ async fn submit_skill_turn(test: &TestCodex, skill_path: PathBuf, prompt: &str) 
             summary: ReasoningSummary::Auto,
             collaboration_mode: None,
             personality: None,
+            service_tier: None,
         })
         .await?;
 

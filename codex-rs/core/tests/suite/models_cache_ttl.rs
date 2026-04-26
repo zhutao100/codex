@@ -104,6 +104,7 @@ async fn renews_cache_ttl_on_matching_models_etag() -> Result<()> {
             summary: ReasoningSummary::Auto,
             collaboration_mode: None,
             personality: None,
+            service_tier: None,
         })
         .await?;
 

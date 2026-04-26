@@ -87,6 +87,7 @@ async fn codex_returns_json_result(model: String) -> anyhow::Result<()> {
             summary: ReasoningSummary::Auto,
             collaboration_mode: None,
             personality: None,
+            service_tier: None,
         })
         .await?;
 

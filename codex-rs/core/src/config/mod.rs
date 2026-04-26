@@ -58,6 +58,7 @@ use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::SandboxMode;
+use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::TrustLevel;
 use codex_protocol::config_types::Verbosity;
 use codex_protocol::config_types::WebSearchMode;
@@ -137,6 +138,9 @@ pub struct Config {
 
     /// Optional local metadata/instruction overlays for bundled, remote, or custom models.
     pub model_overlay: Option<ModelOverlay>,
+
+    /// Optional service tier for OpenAI Responses requests.
+    pub service_tier: Option<ServiceTier>,
 
     /// Key into the model_providers map that specifies which provider to use.
     pub model_provider_id: String,
@@ -850,6 +854,9 @@ pub struct ConfigToml {
     /// Optional local metadata/instruction overlays for bundled, remote, or custom models.
     pub model_overlay: Option<ModelOverlayToml>,
 
+    /// Service tier for OpenAI Responses requests.
+    pub service_tier: Option<ServiceTier>,
+
     /// Default approval policy for executing commands.
     pub approval_policy: Option<AskForApproval>,
 
@@ -1264,6 +1271,7 @@ pub struct ConfigOverrides {
     pub model: Option<String>,
     pub review_model: Option<String>,
     pub cwd: Option<PathBuf>,
+    pub service_tier: Option<ServiceTier>,
     pub approval_policy: Option<AskForApproval>,
     pub sandbox_mode: Option<SandboxMode>,
     pub model_provider: Option<String>,
@@ -1371,6 +1379,7 @@ impl Config {
             model,
             review_model: override_review_model,
             cwd,
+            service_tier,
             approval_policy: approval_policy_override,
             sandbox_mode,
             model_provider,
@@ -1614,6 +1623,10 @@ impl Config {
 
         let review_model = override_review_model.or(cfg.review_model);
 
+        let service_tier = service_tier
+            .or(config_profile.service_tier)
+            .or(cfg.service_tier);
+
         let check_for_update_on_startup = cfg.check_for_update_on_startup.unwrap_or(true);
 
         let log_dir = cfg
@@ -1652,6 +1665,7 @@ impl Config {
             model_context_window: cfg.model_context_window,
             model_auto_compact_token_limit: cfg.model_auto_compact_token_limit,
             model_overlay,
+            service_tier,
             model_provider_id,
             model_provider,
             cwd: resolved_cwd,
@@ -3910,6 +3924,72 @@ model = "gpt-5.1-codex"
         Ok(())
     }
 
+    #[test]
+    fn service_tier_defaults_to_unspecified() -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+
+        let config = Config::load_from_base_config_with_overrides(
+            ConfigToml::default(),
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )?;
+
+        assert_eq!(config.service_tier, None);
+        Ok(())
+    }
+
+    #[test]
+    fn service_tier_uses_config_precedence() -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+        let global_config = Config::load_from_base_config_with_overrides(
+            ConfigToml {
+                service_tier: Some(ServiceTier::Fast),
+                ..Default::default()
+            },
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )?;
+        assert_eq!(global_config.service_tier, Some(ServiceTier::Fast));
+
+        let cfg: ConfigToml = toml::from_str(
+            r#"
+service_tier = "fast"
+profile = "flex"
+
+[profiles.flex]
+service_tier = "flex"
+"#,
+        )
+        .expect("TOML deserialization should succeed");
+
+        let profile_config = Config::load_from_base_config_with_overrides(
+            cfg.clone(),
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )?;
+        assert_eq!(profile_config.service_tier, Some(ServiceTier::Flex));
+
+        let override_config = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides {
+                service_tier: Some(ServiceTier::Fast),
+                ..Default::default()
+            },
+            codex_home.path().to_path_buf(),
+        )?;
+        assert_eq!(override_config.service_tier, Some(ServiceTier::Fast));
+
+        Ok(())
+    }
+
+    #[test]
+    fn service_tier_rejects_invalid_values() {
+        let err = toml::from_str::<ConfigToml>(r#"service_tier = "standard""#)
+            .expect_err("invalid service tier should fail TOML deserialization");
+
+        assert!(err.to_string().contains("unknown variant"));
+    }
+
     fn create_test_fixture() -> std::io::Result<PrecedenceTestFixture> {
         let toml = r#"
 model = "o3"
@@ -4041,6 +4121,7 @@ model_verbosity = "high"
                 model_context_window: None,
                 model_auto_compact_token_limit: None,
                 model_overlay: None,
+                service_tier: None,
                 model_provider_id: "openai".to_string(),
                 model_provider: fixture.openai_provider.clone(),
                 approval_policy: Constrained::allow_any(AskForApproval::Never),
@@ -4136,6 +4217,7 @@ model_verbosity = "high"
             model_context_window: None,
             model_auto_compact_token_limit: None,
             model_overlay: None,
+            service_tier: None,
             model_provider_id: "openai-custom".to_string(),
             model_provider: fixture.openai_custom_provider.clone(),
             approval_policy: Constrained::allow_any(AskForApproval::UnlessTrusted),
@@ -4246,6 +4328,7 @@ model_verbosity = "high"
             model_context_window: None,
             model_auto_compact_token_limit: None,
             model_overlay: None,
+            service_tier: None,
             model_provider_id: "openai".to_string(),
             model_provider: fixture.openai_provider.clone(),
             approval_policy: Constrained::allow_any(AskForApproval::OnFailure),
@@ -4342,6 +4425,7 @@ model_verbosity = "high"
             model_context_window: None,
             model_auto_compact_token_limit: None,
             model_overlay: None,
+            service_tier: None,
             model_provider_id: "openai".to_string(),
             model_provider: fixture.openai_provider.clone(),
             approval_policy: Constrained::allow_any(AskForApproval::OnFailure),

@@ -246,6 +246,7 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         approval_policy: Some(AskForApproval::Never),
         sandbox_mode,
         cwd: resolved_cwd,
+        service_tier: None,
         model_provider: model_provider.clone(),
         codex_linux_sandbox_exe,
         base_instructions: None,
@@ -327,6 +328,7 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
     let default_sandbox_policy = config.sandbox_policy.get();
     let default_effort = config.model_reasoning_effort;
     let default_summary = config.model_reasoning_summary;
+    let default_service_tier = config.service_tier;
 
     // When --yolo (dangerously_bypass_approvals_and_sandbox) is set, also skip the git repo check
     // since the user is explicitly running in an externally sandboxed environment.
@@ -500,6 +502,7 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
                     final_output_json_schema: output_schema,
                     collaboration_mode: None,
                     personality: None,
+                    service_tier: default_service_tier,
                 })
                 .await?;
             info!("Sent prompt with event ID: {task_id}");

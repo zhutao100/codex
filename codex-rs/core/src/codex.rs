@@ -221,6 +221,7 @@ use codex_otel::TelemetryAuthMode;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
+use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::DeveloperInstructions;
@@ -371,6 +372,7 @@ impl Codex {
             provider: config.model_provider.clone(),
             collaboration_mode,
             model_reasoning_summary: config.model_reasoning_summary,
+            service_tier: config.service_tier,
             developer_instructions: config.developer_instructions.clone(),
             user_instructions,
             personality: config.personality,
@@ -515,6 +517,7 @@ pub(crate) struct TurnContext {
     pub(crate) provider: ModelProviderInfo,
     pub(crate) reasoning_effort: Option<ReasoningEffortConfig>,
     pub(crate) reasoning_summary: ReasoningSummaryConfig,
+    pub(crate) service_tier: Option<ServiceTier>,
     pub(crate) session_source: SessionSource,
     /// The session's current working directory. All relative paths provided by
     /// the model as well as sandbox policies are resolved against this path
@@ -608,6 +611,7 @@ pub(crate) struct SessionConfiguration {
 
     collaboration_mode: CollaborationMode,
     model_reasoning_summary: ReasoningSummaryConfig,
+    service_tier: Option<ServiceTier>,
 
     /// Developer instructions that supplement the base instructions.
     developer_instructions: Option<String>,
@@ -684,6 +688,7 @@ impl SessionConfiguration {
             sandbox_policy: self.sandbox_policy.get().clone(),
             cwd: self.cwd.clone(),
             reasoning_effort: self.collaboration_mode.reasoning_effort(),
+            service_tier: self.service_tier,
             personality: self.personality,
             session_source: self.session_source.clone(),
         }
@@ -696,6 +701,9 @@ impl SessionConfiguration {
         }
         if let Some(summary) = updates.reasoning_summary {
             next_configuration.model_reasoning_summary = summary;
+        }
+        if let Some(service_tier) = updates.service_tier {
+            next_configuration.service_tier = Some(service_tier);
         }
         if let Some(personality) = updates.personality {
             next_configuration.personality = Some(personality);
@@ -724,6 +732,7 @@ pub(crate) struct SessionSettingsUpdate {
     pub(crate) windows_sandbox_level: Option<WindowsSandboxLevel>,
     pub(crate) collaboration_mode: Option<CollaborationMode>,
     pub(crate) reasoning_summary: Option<ReasoningSummaryConfig>,
+    pub(crate) service_tier: Option<ServiceTier>,
     pub(crate) final_output_json_schema: Option<Option<Value>>,
     pub(crate) personality: Option<Personality>,
 }
@@ -764,6 +773,7 @@ impl Session {
         per_turn_config.model_reasoning_effort =
             session_configuration.collaboration_mode.reasoning_effort();
         per_turn_config.model_reasoning_summary = session_configuration.model_reasoning_summary;
+        per_turn_config.service_tier = session_configuration.service_tier;
         per_turn_config.personality = session_configuration.personality;
         per_turn_config.web_search_mode = Some(resolve_web_search_mode_for_turn(
             per_turn_config.web_search_mode,
@@ -841,6 +851,7 @@ impl Session {
             provider: provider_for_context,
             reasoning_effort,
             reasoning_summary,
+            service_tier: session_configuration.service_tier,
             session_source,
             cwd,
             developer_instructions: session_configuration.developer_instructions.clone(),
@@ -1164,6 +1175,7 @@ impl Session {
                 sandbox_policy: session_configuration.sandbox_policy.get().clone(),
                 cwd: session_configuration.cwd.clone(),
                 reasoning_effort: session_configuration.collaboration_mode.reasoning_effort(),
+                service_tier: session_configuration.service_tier,
                 history_log_id,
                 history_entry_count,
                 initial_messages,
@@ -2887,6 +2899,7 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
                 summary,
                 collaboration_mode,
                 personality,
+                service_tier,
             } => {
                 let collaboration_mode = if let Some(collab_mode) = collaboration_mode {
                     collab_mode
@@ -2909,6 +2922,7 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
                         collaboration_mode: Some(collaboration_mode),
                         reasoning_summary: summary,
                         personality,
+                        service_tier,
                         ..Default::default()
                     },
                 )
@@ -3147,6 +3161,7 @@ mod handlers {
                 items,
                 collaboration_mode,
                 personality,
+                service_tier,
             } => {
                 let collaboration_mode = collaboration_mode.or_else(|| {
                     Some(CollaborationMode {
@@ -3169,6 +3184,7 @@ mod handlers {
                         reasoning_summary: Some(summary),
                         final_output_json_schema: Some(final_output_json_schema),
                         personality,
+                        service_tier,
                     },
                 )
             }
@@ -3821,6 +3837,7 @@ async fn spawn_review_thread(
     let otel_manager_for_context = otel_manager.clone();
     let reasoning_effort = per_turn_config.model_reasoning_effort;
     let reasoning_summary = per_turn_config.model_reasoning_summary;
+    let service_tier = per_turn_config.service_tier;
     let session_source = parent_turn_context.session_source.clone();
 
     let per_turn_config = Arc::new(per_turn_config);
@@ -3834,6 +3851,7 @@ async fn spawn_review_thread(
         provider: provider_for_context,
         reasoning_effort,
         reasoning_summary,
+        service_tier,
         session_source,
         tools_config,
         features: parent_turn_context.features.clone(),
@@ -5372,6 +5390,7 @@ async fn try_run_sampling_request(
             &turn_context.otel_manager,
             turn_context.reasoning_effort,
             turn_context.reasoning_summary,
+            turn_context.service_tier,
             turn_metadata_header,
         )
         .instrument(trace_span!("stream_request"))
@@ -6314,6 +6333,7 @@ mod tests {
             provider: config.model_provider.clone(),
             collaboration_mode,
             model_reasoning_summary: config.model_reasoning_summary,
+            service_tier: config.service_tier,
             developer_instructions: config.developer_instructions.clone(),
             user_instructions: config.user_instructions.clone(),
             personality: config.personality,
@@ -6397,6 +6417,7 @@ mod tests {
             provider: config.model_provider.clone(),
             collaboration_mode,
             model_reasoning_summary: config.model_reasoning_summary,
+            service_tier: config.service_tier,
             developer_instructions: config.developer_instructions.clone(),
             user_instructions: config.user_instructions.clone(),
             personality: config.personality,
@@ -6672,6 +6693,7 @@ mod tests {
             provider: config.model_provider.clone(),
             collaboration_mode,
             model_reasoning_summary: config.model_reasoning_summary,
+            service_tier: config.service_tier,
             developer_instructions: config.developer_instructions.clone(),
             user_instructions: config.user_instructions.clone(),
             personality: config.personality,
@@ -6808,6 +6830,7 @@ mod tests {
             provider: config.model_provider.clone(),
             collaboration_mode,
             model_reasoning_summary: config.model_reasoning_summary,
+            service_tier: config.service_tier,
             developer_instructions: config.developer_instructions.clone(),
             user_instructions: config.user_instructions.clone(),
             personality: config.personality,

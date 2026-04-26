@@ -913,6 +913,17 @@
               ],
               "description": "How to sandbox commands executed in the system"
             },
+            "service_tier": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ServiceTier"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Effective service tier used for Responses requests in this session."
+            },
             "session_id": {
               "$ref": "#/definitions/ThreadId"
             },
@@ -4440,6 +4451,14 @@
         }
       ]
     },
+    "ServiceTier": {
+      "description": "Controls the service tier requested from the Responses API.",
+      "enum": [
+        "fast",
+        "flex"
+      ],
+      "type": "string"
+    },
     "SkillDependencies": {
       "properties": {
         "tools": {
@@ -5639,6 +5658,17 @@
             }
           ],
           "description": "How to sandbox commands executed in the system"
+        },
+        "service_tier": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ServiceTier"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Effective service tier used for Responses requests in this session."
         },
         "session_id": {
           "$ref": "#/definitions/ThreadId"

@@ -5,6 +5,7 @@ use crate::protocol::Event;
 use crate::protocol::Op;
 use crate::protocol::Submission;
 use codex_protocol::config_types::Personality;
+use codex_protocol::config_types::ServiceTier;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::SandboxPolicy;
@@ -22,6 +23,7 @@ pub struct ThreadConfigSnapshot {
     pub sandbox_policy: SandboxPolicy,
     pub cwd: PathBuf,
     pub reasoning_effort: Option<ReasoningEffort>,
+    pub service_tier: Option<ServiceTier>,
     pub personality: Option<Personality>,
     pub session_source: SessionSource,
 }

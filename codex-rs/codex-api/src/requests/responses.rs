@@ -34,6 +34,7 @@ pub struct ResponsesRequestBuilder<'a> {
     parallel_tool_calls: bool,
     reasoning: Option<Reasoning>,
     include: Vec<String>,
+    service_tier: Option<String>,
     prompt_cache_key: Option<String>,
     text: Option<TextControls>,
     conversation_id: Option<String>,
@@ -70,6 +71,11 @@ impl<'a> ResponsesRequestBuilder<'a> {
 
     pub fn include(mut self, include: Vec<String>) -> Self {
         self.include = include;
+        self
+    }
+
+    pub fn service_tier(mut self, service_tier: Option<String>) -> Self {
+        self.service_tier = service_tier;
         self
     }
 
@@ -135,6 +141,7 @@ impl<'a> ResponsesRequestBuilder<'a> {
             store,
             stream: true,
             include: self.include,
+            service_tier: self.service_tier,
             prompt_cache_key: self.prompt_cache_key,
             text: self.text,
         };
@@ -258,6 +265,22 @@ mod tests {
         assert_eq!(
             request.headers.get("x-openai-subagent"),
             Some(&HeaderValue::from_static("review"))
+        );
+    }
+
+    #[test]
+    fn responses_request_serializes_service_tier_when_set() {
+        let provider = provider("openai", "https://api.openai.com/v1");
+        let input = Vec::new();
+
+        let request = ResponsesRequestBuilder::new("gpt-test", "inst", &input)
+            .service_tier(Some("priority".to_string()))
+            .build(&provider)
+            .expect("request");
+
+        assert_eq!(
+            request.body.get("service_tier"),
+            Some(&Value::String("priority".to_string()))
         );
     }
 }

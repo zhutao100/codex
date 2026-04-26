@@ -594,6 +594,14 @@
         }
       ]
     },
+    "ServiceTier": {
+      "description": "Controls the service tier requested from the Responses API.",
+      "enum": [
+        "fast",
+        "flex"
+      ],
+      "type": "string"
+    },
     "SessionSource": {
       "oneOf": [
         {
@@ -1580,6 +1588,16 @@
     },
     "sandbox": {
       "$ref": "#/definitions/SandboxPolicy"
+    },
+    "serviceTier": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ServiceTier"
+        },
+        {
+          "type": "null"
+        }
+      ]
     },
     "thread": {
       "$ref": "#/definitions/Thread"

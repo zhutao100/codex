@@ -146,6 +146,7 @@ async fn request_user_input_round_trip_for_mode(mode: ModeKind) -> anyhow::Resul
                 },
             }),
             personality: None,
+            service_tier: None,
         })
         .await?;
 
@@ -260,6 +261,7 @@ where
             summary: ReasoningSummary::Auto,
             collaboration_mode: Some(collaboration_mode),
             personality: None,
+            service_tier: None,
         })
         .await?;
 

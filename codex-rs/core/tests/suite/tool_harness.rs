@@ -92,6 +92,7 @@ async fn shell_tool_executes_command_and_streams_output() -> anyhow::Result<()> 
             summary: ReasoningSummary::Auto,
             collaboration_mode: None,
             personality: None,
+            service_tier: None,
         })
         .await?;
 
@@ -161,6 +162,7 @@ async fn update_plan_tool_emits_plan_update_event() -> anyhow::Result<()> {
             summary: ReasoningSummary::Auto,
             collaboration_mode: None,
             personality: None,
+            service_tier: None,
         })
         .await?;
 
@@ -240,6 +242,7 @@ async fn update_plan_tool_rejects_malformed_payload() -> anyhow::Result<()> {
             summary: ReasoningSummary::Auto,
             collaboration_mode: None,
             personality: None,
+            service_tier: None,
         })
         .await?;
 
@@ -331,6 +334,7 @@ async fn apply_patch_tool_executes_and_emits_patch_events() -> anyhow::Result<()
             summary: ReasoningSummary::Auto,
             collaboration_mode: None,
             personality: None,
+            service_tier: None,
         })
         .await?;
 
@@ -430,6 +434,7 @@ async fn apply_patch_reports_parse_diagnostics() -> anyhow::Result<()> {
             summary: ReasoningSummary::Auto,
             collaboration_mode: None,
             personality: None,
+            service_tier: None,
         })
         .await?;
 

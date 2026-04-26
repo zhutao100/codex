@@ -11,6 +11,7 @@ use codex_protocol::config_types::ForcedLoginMethod;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::SandboxMode as CoreSandboxMode;
+use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::Verbosity;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::items::AgentMessageContent as CoreAgentMessageContent;
@@ -361,6 +362,7 @@ pub struct ProfileV2 {
     pub model_reasoning_effort: Option<ReasoningEffort>,
     pub model_reasoning_summary: Option<ReasoningSummary>,
     pub model_verbosity: Option<Verbosity>,
+    pub service_tier: Option<ServiceTier>,
     pub web_search: Option<WebSearchMode>,
     pub chatgpt_base_url: Option<String>,
     #[serde(default, flatten)]
@@ -401,6 +403,7 @@ pub struct Config {
     pub model_reasoning_effort: Option<ReasoningEffort>,
     pub model_reasoning_summary: Option<ReasoningSummary>,
     pub model_verbosity: Option<Verbosity>,
+    pub service_tier: Option<ServiceTier>,
     pub analytics: Option<AnalyticsConfig>,
     #[serde(default, flatten)]
     pub additional: HashMap<String, JsonValue>,
@@ -1254,6 +1257,8 @@ pub struct ThreadStartParams {
     #[ts(optional = nullable)]
     pub personality: Option<Personality>,
     #[ts(optional = nullable)]
+    pub service_tier: Option<ServiceTier>,
+    #[ts(optional = nullable)]
     pub ephemeral: Option<bool>,
     #[experimental("thread/start.dynamicTools")]
     #[ts(optional = nullable)]
@@ -1299,6 +1304,7 @@ pub struct ThreadStartResponse {
     pub approval_policy: AskForApproval,
     pub sandbox: SandboxPolicy,
     pub reasoning_effort: Option<ReasoningEffort>,
+    pub service_tier: Option<ServiceTier>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq, JsonSchema, TS)]
@@ -1346,6 +1352,8 @@ pub struct ThreadResumeParams {
     pub developer_instructions: Option<String>,
     #[ts(optional = nullable)]
     pub personality: Option<Personality>,
+    #[ts(optional = nullable)]
+    pub service_tier: Option<ServiceTier>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -1359,6 +1367,7 @@ pub struct ThreadResumeResponse {
     pub approval_policy: AskForApproval,
     pub sandbox: SandboxPolicy,
     pub reasoning_effort: Option<ReasoningEffort>,
+    pub service_tier: Option<ServiceTier>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq, JsonSchema, TS)]
@@ -1396,6 +1405,8 @@ pub struct ThreadForkParams {
     pub base_instructions: Option<String>,
     #[ts(optional = nullable)]
     pub developer_instructions: Option<String>,
+    #[ts(optional = nullable)]
+    pub service_tier: Option<ServiceTier>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -1409,6 +1420,7 @@ pub struct ThreadForkResponse {
     pub approval_policy: AskForApproval,
     pub sandbox: SandboxPolicy,
     pub reasoning_effort: Option<ReasoningEffort>,
+    pub service_tier: Option<ServiceTier>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -2028,6 +2040,9 @@ pub struct TurnStartParams {
     /// Override the personality for this turn and subsequent turns.
     #[ts(optional = nullable)]
     pub personality: Option<Personality>,
+    /// Override the service tier for this turn and subsequent turns.
+    #[ts(optional = nullable)]
+    pub service_tier: Option<ServiceTier>,
     /// Optional JSON Schema used to constrain the final assistant message for this turn.
     #[ts(optional = nullable)]
     pub output_schema: Option<JsonValue>,

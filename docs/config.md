@@ -48,6 +48,14 @@ final_instruction_override_file = "~/.codex/model-overlays/private.md"
 
 For personality-enabled models, `base_instructions` is not always the effective runtime instruction source because `model_messages.instructions_template` can take precedence. Use `final_instruction_override` or `final_instruction_override_file` when you need the final system instructions to be replaced regardless of personality.
 
+## Service Tier
+
+`service_tier` controls the OpenAI Responses service tier. Supported values are `"flex"` and `"fast"`. If omitted, Codex leaves the request unspecified so the API uses its default tier. Explicit `"fast"` is sent to OpenAI Responses as `"priority"`.
+
+```toml
+service_tier = "fast"
+```
+
 ## Notices
 
 Codex stores "do not show again" flags for some UI prompts under the `[notice]` table.

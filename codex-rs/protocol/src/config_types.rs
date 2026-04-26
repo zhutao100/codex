@@ -49,6 +49,15 @@ pub enum Verbosity {
     High,
 }
 
+/// Controls the service tier requested from the Responses API.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Display, JsonSchema, TS)]
+#[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase")]
+pub enum ServiceTier {
+    Fast,
+    Flex,
+}
+
 #[derive(
     Deserialize, Debug, Clone, Copy, PartialEq, Default, Serialize, Display, JsonSchema, TS,
 )]
@@ -344,6 +353,18 @@ mod tests {
             let mode: ModeKind = serde_json::from_str(&json).expect("deserialize mode");
             assert_eq!(ModeKind::Default, mode);
         }
+    }
+
+    #[test]
+    fn service_tier_serializes_lowercase() {
+        assert_eq!(
+            serde_json::to_value(ServiceTier::Fast).expect("serialize fast"),
+            serde_json::json!("fast")
+        );
+        assert_eq!(
+            serde_json::to_value(ServiceTier::Flex).expect("serialize flex"),
+            serde_json::json!("flex")
+        );
     }
 
     #[test]

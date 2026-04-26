@@ -308,6 +308,7 @@ mod tests {
                 history_entry_count: 1000,
                 initial_messages: None,
                 rollout_path: Some(rollout_file.path().to_path_buf()),
+                service_tier: None,
             }),
         };
 
@@ -349,6 +350,7 @@ mod tests {
             history_entry_count: 1000,
             initial_messages: None,
             rollout_path: Some(rollout_file.path().to_path_buf()),
+            service_tier: None,
         };
         let event = Event {
             id: "1".to_string(),
@@ -414,6 +416,7 @@ mod tests {
             history_entry_count: 1000,
             initial_messages: None,
             rollout_path: Some(rollout_file.path().to_path_buf()),
+            service_tier: None,
         };
         let event = Event {
             id: "1".to_string(),

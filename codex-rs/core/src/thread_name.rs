@@ -181,6 +181,7 @@ async fn stream_thread_name(
             &otel_manager,
             Some(THREAD_NAME_REASONING_EFFORT),
             ReasoningSummaryConfig::None,
+            turn_context.service_tier,
             None,
         )
         .await?;
