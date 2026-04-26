@@ -2,8 +2,10 @@
 source: tui/src/app.rs
 expression: model_migration_copy_to_plain_text(&copy)
 ---
-**Codex just got an upgrade. Introducing gpt-5.4.**
+Codex just got an upgrade. Introducing gpt-5.4.
 
-Codex is now powered by gpt-5.4, our latest frontier agentic coding model.
+We recommend switching from legacy-test-model to gpt-5.4.
 
-You can continue using gpt-5.1-codex if you prefer.
+Latest frontier agentic coding model.
+
+You can continue using legacy-test-model if you prefer.

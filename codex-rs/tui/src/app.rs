@@ -3296,6 +3296,32 @@ mod tests {
         codex_core::models_manager::model_presets::all_model_presets().clone()
     }
 
+    fn model_presets_with_legacy_upgrade(model: &str, target: &str) -> Vec<ModelPreset> {
+        let mut presets = all_model_presets();
+        presets.push(ModelPreset {
+            id: model.to_string(),
+            model: model.to_string(),
+            display_name: model.to_string(),
+            description: "Legacy test model".to_string(),
+            default_reasoning_effort: ReasoningEffortConfig::Medium,
+            supported_reasoning_efforts: Vec::new(),
+            supports_personality: false,
+            is_default: false,
+            upgrade: Some(ModelUpgrade {
+                id: target.to_string(),
+                reasoning_effort_mapping: None,
+                migration_config_key: HIDE_GPT5_1_MIGRATION_PROMPT_CONFIG.to_string(),
+                model_link: None,
+                upgrade_copy: None,
+                migration_markdown: None,
+            }),
+            show_in_picker: false,
+            supported_in_api: false,
+            input_modalities: codex_protocol::openai_models::default_input_modalities(),
+        });
+        presets
+    }
+
     fn model_migration_copy_to_plain_text(
         copy: &crate::model_migration::ModelMigrationCopy,
     ) -> String {
@@ -3318,76 +3344,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn model_migration_prompt_only_shows_for_deprecated_models() {
+    async fn model_migration_prompt_only_shows_for_models_with_upgrades() {
         let seen = BTreeMap::new();
+        let available_models = model_presets_with_legacy_upgrade("legacy-test-model", "gpt-5.4");
+
         assert!(should_show_model_migration_prompt(
-            "gpt-5",
+            "legacy-test-model",
             "gpt-5.4",
             &seen,
-            &all_model_presets()
-        ));
-        assert!(should_show_model_migration_prompt(
-            "gpt-5-codex",
-            "gpt-5.4",
-            &seen,
-            &all_model_presets()
-        ));
-        assert!(should_show_model_migration_prompt(
-            "gpt-5-codex-mini",
-            "gpt-5.4-mini",
-            &seen,
-            &all_model_presets()
-        ));
-        assert!(should_show_model_migration_prompt(
-            "gpt-5.1-codex",
-            "gpt-5.4",
-            &seen,
-            &all_model_presets()
+            &available_models
         ));
         assert!(!should_show_model_migration_prompt(
-            "gpt-5.1-codex",
-            "gpt-5.1-codex",
+            "gpt-5.4",
+            "gpt-5.4",
             &seen,
-            &all_model_presets()
+            &available_models
         ));
     }
 
     #[tokio::test]
     async fn model_migration_prompt_respects_hide_flag_and_self_target() {
         let mut seen = BTreeMap::new();
-        seen.insert("gpt-5".to_string(), "gpt-5.4".to_string());
+        seen.insert("legacy-test-model".to_string(), "gpt-5.4".to_string());
+        let available_models = model_presets_with_legacy_upgrade("legacy-test-model", "gpt-5.4");
+
         assert!(!should_show_model_migration_prompt(
-            "gpt-5",
+            "legacy-test-model",
             "gpt-5.4",
             &seen,
-            &all_model_presets()
+            &available_models
         ));
         assert!(!should_show_model_migration_prompt(
             "gpt-5.4",
             "gpt-5.4",
             &seen,
-            &all_model_presets()
+            &available_models
         ));
     }
 
     #[tokio::test]
     async fn model_migration_prompt_skips_when_target_missing() {
-        let mut available = all_model_presets();
-        let mut current = available
+        let available = model_presets_with_legacy_upgrade("legacy-test-model", "missing-target");
+        let current = available
             .iter()
-            .find(|preset| preset.model == "gpt-5-codex")
-            .cloned()
+            .find(|preset| preset.model == "legacy-test-model")
             .expect("preset present");
-        current.upgrade = Some(ModelUpgrade {
-            id: "missing-target".to_string(),
-            reasoning_effort_mapping: None,
-            migration_config_key: HIDE_GPT5_1_MIGRATION_PROMPT_CONFIG.to_string(),
-            model_link: None,
-            upgrade_copy: None,
-            migration_markdown: None,
-        });
-        available.retain(|preset| preset.model != "gpt-5-codex");
-        available.push(current.clone());
 
         assert!(should_show_model_migration_prompt(
             &current.model,
@@ -3408,15 +3409,15 @@ mod tests {
             .await
             .expect("config");
 
-        let available_models = all_model_presets();
+        let available_models = model_presets_with_legacy_upgrade("legacy-test-model", "gpt-5.4");
         let current = available_models
             .iter()
-            .find(|preset| preset.model == "gpt-5.1-codex")
+            .find(|preset| preset.model == "legacy-test-model")
             .cloned()
-            .expect("gpt-5.1-codex preset present");
+            .expect("legacy preset present");
         assert!(
             !current.show_in_picker,
-            "expected gpt-5.1-codex to be hidden from picker for this test"
+            "expected legacy-test-model to be hidden from picker for this test"
         );
 
         let upgrade = current.upgrade.as_ref().expect("upgrade configured");
