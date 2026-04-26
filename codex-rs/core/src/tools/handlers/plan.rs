@@ -9,7 +9,6 @@ use crate::tools::context::ToolPayload;
 use crate::tools::registry::ToolHandler;
 use crate::tools::registry::ToolKind;
 use crate::tools::spec::JsonSchema;
-use async_trait::async_trait;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::plan_tool::UpdatePlanArgs;
@@ -61,7 +60,6 @@ At most one step can be in_progress at a time.
     })
 });
 
-#[async_trait]
 impl ToolHandler for PlanHandler {
     fn kind(&self) -> ToolKind {
         ToolKind::Function

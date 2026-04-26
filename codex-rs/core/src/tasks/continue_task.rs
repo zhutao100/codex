@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
 use crate::codex::Session;
@@ -22,7 +21,6 @@ impl ContinueTask {
     }
 }
 
-#[async_trait]
 impl SessionTask for ContinueTask {
     fn kind(&self) -> TaskKind {
         TaskKind::Regular

@@ -2,7 +2,6 @@ use codex_protocol::models::FunctionCallOutputBody;
 use std::path::Path;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use serde::Deserialize;
 use tokio::process::Command;
 use tokio::time::timeout;
@@ -36,7 +35,6 @@ struct GrepFilesArgs {
     limit: usize,
 }
 
-#[async_trait]
 impl ToolHandler for GrepFilesHandler {
     fn kind(&self) -> ToolKind {
         ToolKind::Function

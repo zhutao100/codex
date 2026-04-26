@@ -104,7 +104,7 @@ Concrete v0.98 session-task impls using `#[async_trait]`:
 - `core/src/tasks/review.rs`
 - `core/src/tasks/undo.rs`
 - `core/src/tasks/user_shell.rs`
-- test-only impls in `core/src/codex_tests.rs`, if present in the branch checkout.
+- test-only impls in `core/src/codex.rs`.
 
 The branch-specific `ContinueTask` must be migrated with the rest. Its existence does not change the adapter design; it only expands the implementation list and the pause/continue verification matrix.
 
@@ -128,7 +128,7 @@ Use multiple complementary views because each answers a different question:
 
 | Tool/command | Purpose | Use in this project |
 |---|---|---|
-| `cargo build --timings` | Crate-level critical path, parallelism, slow units, duplicate crate versions/features. | Run at workspace and `codex-core` focus levels to prove whether `codex-core` is the long pole. |
+| `cargo build --timings` | Crate-level critical path, parallelism, slow units, duplicate crate versions/features. | Run at workspace and `codex-core` focus levels to prove whether `codex-core` is the long pole. Current Cargo emits HTML under `target/cargo-timings/`; do not assume `--timings=json` is available. |
 | `cargo +nightly rustc -p codex-core --lib -- -Z time-passes -Z time-passes-format=json` | rustc pass-level wall time. | Match the upstream #16630/#16631 measurement style. |
 | `cargo +nightly rustc -p codex-core --lib -- -Z self-profile=...` + `measureme summarize` | Query-level and artifact-size attribution. | Confirm reductions in `evaluate_obligation`, `mir_borrowck`, and monomorphization rather than only process wall time. |
 | `cargo +nightly rustc -- -Zmacro-stats` | Procedural/declarative macro expansion cost. | Check whether `async_trait`, `serde`, `schemars`, `rmcp`, `clap`, and other macros remain compile-time bottlenecks after the native async refactor. |
@@ -162,26 +162,40 @@ Use multiple complementary views because each answers a different question:
 
 ### Phase 0: establish baseline
 
-Run all measurements from a clean but dependency-warm state:
+Run all measurements from a clean but dependency-warm state. The `-Z` output is
+written by rustc on stderr, so capture stderr as the artifact. If the shell
+resolves a non-rustup `cargo`/`rustc` first, put rustup proxies at the front of
+`PATH` and clear `RUSTC_WRAPPER` so `cargo +nightly` really invokes nightly
+rustc:
 
 ```bash
-cargo check -p codex-core --lib >/dev/null
+CODEX_SANDBOX_NETWORK_DISABLED=1 cargo check -p codex-core --lib >/dev/null
 cargo clean -p codex-core >/dev/null
-/usr/bin/time -p cargo +nightly rustc -p codex-core --lib -- \
+PATH="$HOME/.cargo/bin:$PATH" RUSTC_WRAPPER= \
+  CODEX_SANDBOX_NETWORK_DISABLED=1 \
+  /usr/bin/time -p cargo +nightly rustc -p codex-core --lib -- \
   -Z time-passes \
-  -Z time-passes-format=json >/tmp/codex-core-time-passes-baseline.jsonl
+  -Z time-passes-format=json \
+  >/tmp/codex-core-time-passes-baseline.stdout \
+  2>/tmp/codex-core-time-passes-baseline.stderr
 
 cargo clean -p codex-core >/dev/null
-cargo +nightly build -p codex-core --lib \
-  -Z unstable-options \
-  --timings=json >/tmp/codex-core-timings-baseline.jsonl
+PATH="$HOME/.cargo/bin:$PATH" RUSTC_WRAPPER= \
+  CODEX_SANDBOX_NETWORK_DISABLED=1 \
+  /usr/bin/time -p cargo +nightly build -p codex-core --lib --timings \
+  >/tmp/codex-core-timings-baseline.stdout \
+  2>/tmp/codex-core-timings-baseline.stderr
 ```
 
 Also capture:
 
 ```bash
-cargo tree -p codex-core -e features > /tmp/codex-core-features-baseline.txt
-cargo +nightly rustc -p codex-core --lib -- -Zmacro-stats > /tmp/codex-core-macro-stats-baseline.txt
+CODEX_SANDBOX_NETWORK_DISABLED=1 cargo tree -p codex-core -e features > /tmp/codex-core-features-baseline.txt
+PATH="$HOME/.cargo/bin:$PATH" RUSTC_WRAPPER= \
+  CODEX_SANDBOX_NETWORK_DISABLED=1 \
+  cargo +nightly rustc -p codex-core --lib -- -Zmacro-stats \
+  >/tmp/codex-core-macro-stats-baseline.stdout \
+  2>/tmp/codex-core-macro-stats-baseline.stderr
 ```
 
 Acceptance: baseline artifacts exist and clearly identify whether `codex-core` is the current long pole.
@@ -258,12 +272,16 @@ Implementation notes:
 Verification after Phase 1:
 
 ```bash
-cargo check -p codex-core --lib
-cargo test -p codex-core --test all --profile ci-test
+CODEX_SANDBOX_NETWORK_DISABLED=1 cargo check -p codex-core --lib
+CODEX_SANDBOX_NETWORK_DISABLED=1 cargo test -p codex-core --test all --profile ci-test
 cargo clean -p codex-core >/dev/null
-/usr/bin/time -p cargo +nightly rustc -p codex-core --lib -- \
+PATH="$HOME/.cargo/bin:$PATH" RUSTC_WRAPPER= \
+  CODEX_SANDBOX_NETWORK_DISABLED=1 \
+  /usr/bin/time -p cargo +nightly rustc -p codex-core --lib -- \
   -Z time-passes \
-  -Z time-passes-format=json >/tmp/codex-core-time-passes-toolhandler.jsonl
+  -Z time-passes-format=json \
+  >/tmp/codex-core-time-passes-toolhandler.stdout \
+  2>/tmp/codex-core-time-passes-toolhandler.stderr
 ```
 
 Acceptance:
@@ -370,20 +388,24 @@ Implementation notes:
 Verification after Phase 2:
 
 ```bash
-cargo check -p codex-core --lib
-cargo test -p codex-core --test all --profile ci-test
+CODEX_SANDBOX_NETWORK_DISABLED=1 cargo check -p codex-core --lib
+CODEX_SANDBOX_NETWORK_DISABLED=1 cargo test -p codex-core --test all --profile ci-test
 cargo clean -p codex-core >/dev/null
-/usr/bin/time -p cargo +nightly rustc -p codex-core --lib -- \
+PATH="$HOME/.cargo/bin:$PATH" RUSTC_WRAPPER= \
+  CODEX_SANDBOX_NETWORK_DISABLED=1 \
+  /usr/bin/time -p cargo +nightly rustc -p codex-core --lib -- \
   -Z time-passes \
-  -Z time-passes-format=json >/tmp/codex-core-time-passes-sessiontask.jsonl
+  -Z time-passes-format=json \
+  >/tmp/codex-core-time-passes-sessiontask.stdout \
+  2>/tmp/codex-core-time-passes-sessiontask.stderr
 ```
 
 Pause/continue targeted checks:
 
 ```bash
-cargo test -p codex-core --test all pause --profile ci-test
-cargo test -p codex-core --test all continue --profile ci-test
-cargo test -p codex-core --test all abort_tasks --profile ci-test
+CODEX_SANDBOX_NETWORK_DISABLED=1 cargo test -p codex-core --test all pause --profile ci-test
+CODEX_SANDBOX_NETWORK_DISABLED=1 cargo test -p codex-core --test all continue --profile ci-test
+CODEX_SANDBOX_NETWORK_DISABLED=1 cargo test -p codex-core --test all abort_tasks --profile ci-test
 ```
 
 Acceptance:
@@ -415,8 +437,8 @@ Do not change `[profile.release]` by default. The branch already trades release 
 Verification:
 
 ```bash
-cargo check -p codex-core --lib
-cargo build -p codex-cli --profile dev-small
+CODEX_SANDBOX_NETWORK_DISABLED=1 cargo check -p codex-core --lib
+CODEX_SANDBOX_NETWORK_DISABLED=1 cargo build -p codex-cli --profile dev-small
 ```
 
 Acceptance:
@@ -474,6 +496,42 @@ Treat these as follow-up tickets, not part of the minimal backport:
 3. Implement Phase 2 (`SessionTask`). Measure and test with pause/continue focus.
 4. Backport Phase 3 profile changes.
 5. Only then decide whether system skills or macro/dependency work is worth the churn.
+
+## Execution status
+
+Implemented and verified on the `custom-0.98.0` branch on 2026-04-26:
+
+- `ToolHandler` now uses native async/RPITIT for implementers and a private
+  boxed `AnyToolHandler` adapter only at `ToolRegistry` storage/dispatch.
+- `SessionTask` now uses native async/RPITIT for implementers and a private
+  boxed `AnySessionTask` adapter only at `RunningTask` storage/abort.
+- `ContinueTask` was migrated like the other session tasks; no pause/continue
+  special case was added.
+- Root `Cargo.toml` now includes `[profile.dev] debug = 1` and an opt-in
+  `[profile.dev-small]`.
+
+Measured package-clean `codex-core` rebuilds with dependencies warm:
+
+| Measurement | Baseline | Final | Change |
+|---|---:|---:|---:|
+| `rustc` `time-passes` total | 36.06s | 11.00s | 69.5% faster |
+| `cargo build --timings` target time | 36.28s | 10.59s | 70.8% faster |
+| `MIR_borrow_checking` | 14.13s | 1.42s | 90.0% faster |
+| `monomorphization_collector_graph_walk` | 12.55s | 1.70s | 86.5% faster |
+| `generate_crate_metadata` | 13.42s | 2.27s | 83.1% faster |
+
+Verification completed:
+
+```bash
+CODEX_SANDBOX_NETWORK_DISABLED=1 cargo check -p codex-core --lib --quiet
+CODEX_SANDBOX_NETWORK_DISABLED=1 cargo test -p codex-core --test all --profile ci-test --quiet
+CODEX_SANDBOX_NETWORK_DISABLED=1 cargo test -p codex-core --test all pause --profile ci-test --quiet
+CODEX_SANDBOX_NETWORK_DISABLED=1 cargo test -p codex-core --test all continue --profile ci-test --quiet
+CODEX_SANDBOX_NETWORK_DISABLED=1 cargo test -p codex-core --test all abort_tasks --profile ci-test --quiet
+CODEX_SANDBOX_NETWORK_DISABLED=1 cargo build -p codex-cli --profile dev-small --quiet
+CODEX_SANDBOX_NETWORK_DISABLED=1 just fix -p codex-core
+CODEX_SANDBOX_NETWORK_DISABLED=1 cargo test --all-features --quiet
+```
 
 ## Source/reference links
 

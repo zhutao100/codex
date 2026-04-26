@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use std::sync::Arc;
 
 use crate::function_tool::FunctionCallError;
@@ -12,7 +11,6 @@ use codex_protocol::models::ResponseInputItem;
 
 pub struct McpHandler;
 
-#[async_trait]
 impl ToolHandler for McpHandler {
     fn kind(&self) -> ToolKind {
         ToolKind::Mcp

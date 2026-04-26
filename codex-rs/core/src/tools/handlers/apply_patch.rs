@@ -27,7 +27,6 @@ use crate::tools::runtimes::apply_patch::ApplyPatchRuntime;
 use crate::tools::sandboxing::ToolCtx;
 use crate::tools::spec::ApplyPatchToolArgs;
 use crate::tools::spec::JsonSchema;
-use async_trait::async_trait;
 use codex_apply_patch::ApplyPatchAction;
 use codex_apply_patch::ApplyPatchFileChange;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -60,7 +59,6 @@ fn to_abs_path(cwd: &Path, path: &Path) -> Option<AbsolutePathBuf> {
     AbsolutePathBuf::resolve_path_against_base(path, cwd).ok()
 }
 
-#[async_trait]
 impl ToolHandler for ApplyPatchHandler {
     fn kind(&self) -> ToolKind {
         ToolKind::Function

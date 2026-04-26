@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use codex_protocol::models::FunctionCallOutputBody;
 
 use crate::function_tool::FunctionCallError;
@@ -47,7 +46,6 @@ pub(crate) fn request_user_input_tool_description() -> String {
 
 pub struct RequestUserInputHandler;
 
-#[async_trait]
 impl ToolHandler for RequestUserInputHandler {
     fn kind(&self) -> ToolKind {
         ToolKind::Function

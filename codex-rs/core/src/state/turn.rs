@@ -15,7 +15,7 @@ use tokio::sync::oneshot;
 
 use crate::codex::TurnContext;
 use crate::protocol::ReviewDecision;
-use crate::tasks::SessionTask;
+use crate::tasks::AnySessionTask;
 
 /// Metadata about the currently running turn.
 pub(crate) struct ActiveTurn {
@@ -42,7 +42,7 @@ pub(crate) enum TaskKind {
 pub(crate) struct RunningTask {
     pub(crate) done: Arc<Notify>,
     pub(crate) kind: TaskKind,
-    pub(crate) task: Arc<dyn SessionTask>,
+    pub(crate) task: Arc<dyn AnySessionTask>,
     pub(crate) cancellation_token: CancellationToken,
     pub(crate) handle: Arc<AbortOnDropHandle<()>>,
     pub(crate) turn_context: Arc<TurnContext>,

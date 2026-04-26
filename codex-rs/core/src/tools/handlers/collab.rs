@@ -12,7 +12,6 @@ use crate::tools::context::ToolPayload;
 use crate::tools::handlers::parse_arguments;
 use crate::tools::registry::ToolHandler;
 use crate::tools::registry::ToolKind;
-use async_trait::async_trait;
 use codex_protocol::ThreadId;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::FunctionCallOutputBody;
@@ -39,7 +38,6 @@ struct CloseAgentArgs {
     id: String,
 }
 
-#[async_trait]
 impl ToolHandler for CollabHandler {
     fn kind(&self) -> ToolKind {
         ToolKind::Function

@@ -6985,8 +6985,6 @@ mod tests {
         kind: TaskKind,
         listen_to_cancellation_token: bool,
     }
-
-    #[async_trait::async_trait]
     impl SessionTask for NeverEndingTask {
         fn kind(&self) -> TaskKind {
             self.kind

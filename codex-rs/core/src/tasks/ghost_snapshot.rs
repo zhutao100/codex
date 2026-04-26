@@ -4,7 +4,6 @@ use crate::protocol::WarningEvent;
 use crate::state::TaskKind;
 use crate::tasks::SessionTask;
 use crate::tasks::SessionTaskContext;
-use async_trait::async_trait;
 use codex_git::CreateGhostCommitOptions;
 use codex_git::GhostSnapshotReport;
 use codex_git::GitToolingError;
@@ -26,7 +25,6 @@ pub(crate) struct GhostSnapshotTask {
 
 const SNAPSHOT_WARNING_THRESHOLD: Duration = Duration::from_secs(240);
 
-#[async_trait]
 impl SessionTask for GhostSnapshotTask {
     fn kind(&self) -> TaskKind {
         TaskKind::Regular

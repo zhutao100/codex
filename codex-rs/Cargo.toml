@@ -304,6 +304,17 @@ unwrap_used = "deny"
 [workspace.metadata.cargo-shear]
 ignored = ["icu_provider", "openssl-sys", "codex-utils-readiness", "codex-secrets"]
 
+[profile.dev]
+# Keep line tables/backtraces while avoiding expensive full variable debug info
+# across local dev builds.
+debug = 1
+
+[profile.dev-small]
+inherits = "dev"
+opt-level = 0
+debug = 0
+strip = true
+
 [profile.release]
 lto = "fat"
 # Because we bundle some of these executables with the TypeScript CLI, we

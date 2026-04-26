@@ -7,7 +7,6 @@ use crate::protocol::UndoStartedEvent;
 use crate::state::TaskKind;
 use crate::tasks::SessionTask;
 use crate::tasks::SessionTaskContext;
-use async_trait::async_trait;
 use codex_git::RestoreGhostCommitOptions;
 use codex_git::restore_ghost_commit_with_options;
 use codex_protocol::models::ResponseItem;
@@ -25,7 +24,6 @@ impl UndoTask {
     }
 }
 
-#[async_trait]
 impl SessionTask for UndoTask {
     fn kind(&self) -> TaskKind {
         TaskKind::Regular
@@ -38,7 +36,7 @@ impl SessionTask for UndoTask {
         _input: Vec<UserInput>,
         cancellation_token: CancellationToken,
     ) -> Option<String> {
-        let _ = session
+        session
             .session
             .services
             .otel_manager

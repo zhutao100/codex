@@ -7,9 +7,9 @@ use crate::function_tool::FunctionCallError;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
-use async_trait::async_trait;
 use codex_protocol::models::ResponseInputItem;
 use codex_utils_readiness::Readiness;
+use futures::future::BoxFuture;
 use tracing::warn;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -18,7 +18,6 @@ pub enum ToolKind {
     Mcp,
 }
 
-#[async_trait]
 pub trait ToolHandler: Send + Sync {
     fn kind(&self) -> ToolKind;
 
@@ -34,30 +33,70 @@ pub trait ToolHandler: Send + Sync {
     /// user (through file system, OS operations, ...).
     /// This function must remains defensive and return `true` if a doubt exist on the
     /// exact effect of a ToolInvocation.
-    async fn is_mutating(&self, _invocation: &ToolInvocation) -> bool {
-        false
+    fn is_mutating(
+        &self,
+        _invocation: &ToolInvocation,
+    ) -> impl std::future::Future<Output = bool> + Send {
+        async { false }
     }
 
     /// Perform the actual [ToolInvocation] and returns a [ToolOutput] containing
     /// the final output to return to the model.
-    async fn handle(&self, invocation: ToolInvocation) -> Result<ToolOutput, FunctionCallError>;
+    fn handle(
+        &self,
+        invocation: ToolInvocation,
+    ) -> impl std::future::Future<Output = Result<ToolOutput, FunctionCallError>> + Send;
+}
+
+trait AnyToolHandler: Send + Sync {
+    fn matches_kind(&self, payload: &ToolPayload) -> bool;
+
+    fn is_mutating<'a>(&'a self, invocation: &'a ToolInvocation) -> BoxFuture<'a, bool>;
+
+    fn handle_any<'a>(
+        &'a self,
+        invocation: ToolInvocation,
+    ) -> BoxFuture<'a, Result<ToolOutput, FunctionCallError>>;
+}
+
+impl<T> AnyToolHandler for T
+where
+    T: ToolHandler,
+{
+    fn matches_kind(&self, payload: &ToolPayload) -> bool {
+        ToolHandler::matches_kind(self, payload)
+    }
+
+    fn is_mutating<'a>(&'a self, invocation: &'a ToolInvocation) -> BoxFuture<'a, bool> {
+        Box::pin(ToolHandler::is_mutating(self, invocation))
+    }
+
+    fn handle_any<'a>(
+        &'a self,
+        invocation: ToolInvocation,
+    ) -> BoxFuture<'a, Result<ToolOutput, FunctionCallError>> {
+        Box::pin(ToolHandler::handle(self, invocation))
+    }
 }
 
 pub struct ToolRegistry {
-    handlers: HashMap<String, Arc<dyn ToolHandler>>,
+    handlers: HashMap<String, Arc<dyn AnyToolHandler>>,
 }
 
 impl ToolRegistry {
-    pub fn new(handlers: HashMap<String, Arc<dyn ToolHandler>>) -> Self {
+    fn new(handlers: HashMap<String, Arc<dyn AnyToolHandler>>) -> Self {
         Self { handlers }
     }
 
-    pub fn handler(&self, name: &str) -> Option<Arc<dyn ToolHandler>> {
+    fn handler(&self, name: &str) -> Option<Arc<dyn AnyToolHandler>> {
         self.handlers.get(name).map(Arc::clone)
     }
 
     // TODO(jif) for dynamic tools.
-    // pub fn register(&mut self, name: impl Into<String>, handler: Arc<dyn ToolHandler>) {
+    // pub fn register<T>(&mut self, name: impl Into<String>, handler: Arc<T>)
+    // where
+    //     T: ToolHandler + 'static,
+    // {
     //     let name = name.into();
     //     if self.handlers.insert(name.clone(), handler).is_some() {
     //         warn!("overwriting handler for tool {name}");
@@ -121,7 +160,7 @@ impl ToolRegistry {
                             invocation.turn.tool_call_gate.wait_ready().await;
                             tracing::trace!("tool gate released");
                         }
-                        match handler.handle(invocation).await {
+                        match handler.handle_any(invocation).await {
                             Ok(output) => {
                                 let preview = output.log_preview();
                                 let success = output.success_for_logging();
@@ -165,7 +204,7 @@ impl ConfiguredToolSpec {
 }
 
 pub struct ToolRegistryBuilder {
-    handlers: HashMap<String, Arc<dyn ToolHandler>>,
+    handlers: HashMap<String, Arc<dyn AnyToolHandler>>,
     specs: Vec<ConfiguredToolSpec>,
 }
 
@@ -190,11 +229,14 @@ impl ToolRegistryBuilder {
             .push(ConfiguredToolSpec::new(spec, supports_parallel_tool_calls));
     }
 
-    pub fn register_handler(&mut self, name: impl Into<String>, handler: Arc<dyn ToolHandler>) {
+    pub fn register_handler<T>(&mut self, name: impl Into<String>, handler: Arc<T>)
+    where
+        T: ToolHandler + 'static,
+    {
         let name = name.into();
         if self
             .handlers
-            .insert(name.clone(), handler.clone())
+            .insert(name.clone(), handler as Arc<dyn AnyToolHandler>)
             .is_some()
         {
             warn!("overwriting handler for tool {name}");
@@ -202,10 +244,11 @@ impl ToolRegistryBuilder {
     }
 
     // TODO(jif) for dynamic tools.
-    // pub fn register_many<I>(&mut self, names: I, handler: Arc<dyn ToolHandler>)
+    // pub fn register_many<I, T>(&mut self, names: I, handler: Arc<T>)
     // where
     //     I: IntoIterator,
     //     I::Item: Into<String>,
+    //     T: ToolHandler + 'static,
     // {
     //     for name in names {
     //         let name = name.into();

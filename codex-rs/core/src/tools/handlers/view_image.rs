@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use codex_protocol::models::FunctionCallOutputBody;
 use serde::Deserialize;
 use tokio::fs;
@@ -23,7 +22,6 @@ struct ViewImageArgs {
     path: String,
 }
 
-#[async_trait]
 impl ToolHandler for ViewImageHandler {
     fn kind(&self) -> ToolKind {
         ToolKind::Function

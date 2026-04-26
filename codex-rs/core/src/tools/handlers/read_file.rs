@@ -2,7 +2,6 @@ use codex_protocol::models::FunctionCallOutputBody;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 
-use async_trait::async_trait;
 use codex_utils_string::take_bytes_at_char_boundary;
 use serde::Deserialize;
 
@@ -92,7 +91,6 @@ impl LineRecord {
     }
 }
 
-#[async_trait]
 impl ToolHandler for ReadFileHandler {
     fn kind(&self) -> ToolKind {
         ToolKind::Function

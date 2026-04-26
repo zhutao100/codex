@@ -3,7 +3,6 @@ use std::sync::Arc;
 use crate::codex::TurnContext;
 use crate::codex::run_turn;
 use crate::state::TaskKind;
-use async_trait::async_trait;
 use codex_protocol::user_input::UserInput;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
@@ -15,7 +14,6 @@ use super::SessionTaskContext;
 #[derive(Clone, Copy, Default)]
 pub(crate) struct RegularTask;
 
-#[async_trait]
 impl SessionTask for RegularTask {
     fn kind(&self) -> TaskKind {
         TaskKind::Regular
