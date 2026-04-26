@@ -15,6 +15,7 @@ use crate::models_manager::model_presets::builtin_model_presets;
 use codex_api::ModelsClient;
 use codex_api::ReqwestTransport;
 use codex_protocol::config_types::CollaborationModeMask;
+use codex_protocol::config_types::Personality;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ModelsResponse;
@@ -84,8 +85,8 @@ impl ModelsManager {
         {
             error!("failed to refresh available models: {err}");
         }
-        let remote_models = self.get_remote_models(config).await;
-        self.build_available_models(remote_models)
+        let remote_models = self.get_remote_models_for_picker(config).await;
+        self.build_available_models(Self::overlaid_candidates_for_picker(remote_models, config))
     }
 
     /// List collaboration mode presets.
@@ -99,8 +100,13 @@ impl ModelsManager {
     ///
     /// Returns an error if the internal lock cannot be acquired.
     pub fn try_list_models(&self, config: &Config) -> Result<Vec<ModelPreset>, TryLockError> {
-        let remote_models = self.try_get_remote_models(config)?;
-        Ok(self.build_available_models(remote_models))
+        let remote_models = self.try_get_remote_models_for_picker(config)?;
+        Ok(
+            self.build_available_models(Self::overlaid_candidates_for_picker(
+                remote_models,
+                config,
+            )),
+        )
     }
 
     // todo(aibrahim): should be visible to core only and sent on session_configured event
@@ -123,8 +129,9 @@ impl ModelsManager {
         {
             error!("failed to refresh available models: {err}");
         }
-        let remote_models = self.get_remote_models(config).await;
-        let available = self.build_available_models(remote_models);
+        let remote_models = self.get_remote_models_for_picker(config).await;
+        let available = self
+            .build_available_models(Self::overlaid_candidates_for_picker(remote_models, config));
         available
             .iter()
             .find(|model| model.is_default)
@@ -138,6 +145,38 @@ impl ModelsManager {
     pub async fn get_model_info(&self, model: &str, config: &Config) -> ModelInfo {
         let remote_models = self.remote_models.read().await;
         Self::construct_model_info_from_candidates(model, remote_models.as_slice(), config)
+    }
+
+    pub async fn get_final_instruction_override(
+        &self,
+        model: &str,
+        config: &Config,
+    ) -> Option<String> {
+        let overlay = config.model_overlay.as_ref()?;
+        let remote_models = self.remote_models.read().await;
+        let mut candidates = remote_models.clone();
+        for entry in &overlay.models {
+            if !candidates
+                .iter()
+                .any(|candidate| candidate.slug == entry.slug)
+            {
+                candidates.push(model_info::model_info_from_slug(&entry.slug));
+            }
+        }
+        let matched_slug = Self::find_model_match(model, &candidates)
+            .map(|candidate| candidate.slug)
+            .unwrap_or_else(|| model.to_string());
+        overlay.final_instruction_override_for_slug(&matched_slug)
+    }
+
+    pub(crate) fn effective_model_instructions(
+        model_info: &ModelInfo,
+        personality: Option<Personality>,
+        final_instruction_override: Option<&str>,
+    ) -> String {
+        final_instruction_override
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| model_info.get_model_instructions(personality))
     }
 
     fn find_model_by_longest_prefix(model: &str, candidates: &[ModelInfo]) -> Option<ModelInfo> {
@@ -183,8 +222,14 @@ impl ModelsManager {
     ) -> ModelInfo {
         // First use the normal longest-prefix match. If that misses, allow a narrowly scoped
         // retry for namespaced slugs like `custom/gpt-5.3-codex`.
-        let remote = Self::find_model_by_longest_prefix(model, candidates)
-            .or_else(|| Self::find_model_by_namespaced_suffix(model, candidates));
+        let overlaid_candidates;
+        let candidates = if let Some(overlay) = config.model_overlay.as_ref() {
+            overlaid_candidates = overlay.apply_to_candidates(candidates);
+            overlaid_candidates.as_slice()
+        } else {
+            candidates
+        };
+        let remote = Self::find_model_match(model, candidates);
         let model_info = if let Some(remote) = remote {
             ModelInfo {
                 slug: model.to_string(),
@@ -194,6 +239,11 @@ impl ModelsManager {
             model_info::model_info_from_slug(model)
         };
         model_info::with_config_overrides(model_info, config)
+    }
+
+    fn find_model_match(model: &str, candidates: &[ModelInfo]) -> Option<ModelInfo> {
+        Self::find_model_by_longest_prefix(model, candidates)
+            .or_else(|| Self::find_model_by_namespaced_suffix(model, candidates))
     }
 
     /// Refresh models if the provided ETag differs from the cached ETag.
@@ -340,6 +390,7 @@ impl ModelsManager {
         merged_presets
     }
 
+    #[cfg(test)]
     async fn get_remote_models(&self, config: &Config) -> Vec<ModelInfo> {
         if config.features.enabled(Feature::RemoteModels) {
             self.remote_models.read().await.clone()
@@ -348,11 +399,35 @@ impl ModelsManager {
         }
     }
 
-    fn try_get_remote_models(&self, config: &Config) -> Result<Vec<ModelInfo>, TryLockError> {
-        if config.features.enabled(Feature::RemoteModels) {
+    async fn get_remote_models_for_picker(&self, config: &Config) -> Vec<ModelInfo> {
+        if config.features.enabled(Feature::RemoteModels) || config.model_overlay.is_some() {
+            self.remote_models.read().await.clone()
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn try_get_remote_models_for_picker(
+        &self,
+        config: &Config,
+    ) -> Result<Vec<ModelInfo>, TryLockError> {
+        if config.features.enabled(Feature::RemoteModels) || config.model_overlay.is_some() {
             Ok(self.remote_models.try_read()?.clone())
         } else {
             Ok(Vec::new())
+        }
+    }
+
+    fn overlaid_candidates_for_picker(
+        remote_models: Vec<ModelInfo>,
+        config: &Config,
+    ) -> Vec<ModelInfo> {
+        match config.model_overlay.as_ref() {
+            Some(overlay) if config.features.enabled(Feature::RemoteModels) => {
+                overlay.apply_to_candidates(&remote_models)
+            }
+            Some(overlay) => overlay.apply_mentioned_to_candidates(&remote_models),
+            None => remote_models,
         }
     }
 
@@ -404,8 +479,14 @@ mod tests {
     use crate::CodexAuth;
     use crate::auth::AuthCredentialsStoreMode;
     use crate::config::ConfigBuilder;
+    use crate::config::test_config;
     use crate::features::Feature;
     use crate::model_provider_info::WireApi;
+    use crate::models_manager::overlay::ModelInfoPatch;
+    use crate::models_manager::overlay::ModelInstructionsVariablesPatch;
+    use crate::models_manager::overlay::ModelMessagesPatch;
+    use crate::models_manager::overlay::ModelOverlay;
+    use crate::models_manager::overlay::ModelOverlayEntry;
     use chrono::Utc;
     use codex_protocol::openai_models::ModelsResponse;
     use core_test_support::responses::mount_models_once;
@@ -809,6 +890,250 @@ mod tests {
         let available = manager.build_available_models(vec![hidden_model, visible_model]);
 
         assert_eq!(available, vec![expected_hidden, expected_visible]);
+    }
+
+    #[test]
+    fn construct_model_info_offline_applies_custom_overlay_to_fallback_model() {
+        let mut config = test_config();
+        config.model_overlay = Some(ModelOverlay {
+            models: vec![ModelOverlayEntry {
+                slug: "private-model".to_string(),
+                patch: ModelInfoPatch {
+                    context_window: Some(Some(1_048_576)),
+                    auto_compact_token_limit: Some(Some(950_000)),
+                    ..Default::default()
+                },
+                final_instruction_override: None,
+            }],
+            ..Default::default()
+        });
+
+        let model = ModelsManager::construct_model_info_offline("private-model", &config);
+
+        assert_eq!(model.slug, "private-model");
+        assert_eq!(model.display_name, "private-model");
+        assert_eq!(model.context_window, Some(1_048_576));
+        assert_eq!(model.auto_compact_token_limit, Some(950_000));
+    }
+
+    #[test]
+    fn construct_model_info_offline_applies_existing_model_field_overlay() {
+        let baseline = ModelsManager::construct_model_info_offline("gpt-5.4", &test_config());
+        let mut config = test_config();
+        config.model_overlay = Some(ModelOverlay {
+            models: vec![ModelOverlayEntry {
+                slug: "gpt-5.4".to_string(),
+                patch: ModelInfoPatch {
+                    context_window: Some(Some(1_000_000)),
+                    model_messages: Some(ModelMessagesPatch {
+                        instructions_variables: Some(ModelInstructionsVariablesPatch {
+                            personality_pragmatic: Some(
+                                "Use a patched pragmatic voice.".to_string(),
+                            ),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                final_instruction_override: None,
+            }],
+            ..Default::default()
+        });
+
+        let model = ModelsManager::construct_model_info_offline("gpt-5.4", &config);
+
+        assert_eq!(model.context_window, Some(1_000_000));
+        assert_eq!(model.display_name, baseline.display_name);
+        assert_eq!(
+            model
+                .model_messages
+                .as_ref()
+                .and_then(|messages| messages.instructions_variables.as_ref())
+                .and_then(|variables| variables.personality_pragmatic.as_deref()),
+            Some("Use a patched pragmatic voice.")
+        );
+        assert_eq!(
+            model
+                .model_messages
+                .as_ref()
+                .and_then(|messages| messages.instructions_variables.as_ref())
+                .and_then(|variables| variables.personality_friendly.as_deref()),
+            baseline
+                .model_messages
+                .as_ref()
+                .and_then(|messages| messages.instructions_variables.as_ref())
+                .and_then(|variables| variables.personality_friendly.as_deref())
+        );
+    }
+
+    #[test]
+    fn config_context_window_override_wins_over_overlay() {
+        let mut config = test_config();
+        config.model_context_window = Some(256_000);
+        config.model_overlay = Some(ModelOverlay {
+            cross_model: ModelInfoPatch {
+                context_window: Some(Some(1_000_000)),
+                ..Default::default()
+            },
+            models: vec![ModelOverlayEntry {
+                slug: "gpt-5.4".to_string(),
+                patch: ModelInfoPatch {
+                    context_window: Some(Some(512_000)),
+                    ..Default::default()
+                },
+                final_instruction_override: None,
+            }],
+            ..Default::default()
+        });
+
+        let model = ModelsManager::construct_model_info_offline("gpt-5.4", &config);
+
+        assert_eq!(model.context_window, Some(256_000));
+    }
+
+    #[tokio::test]
+    async fn final_instruction_override_uses_selected_candidate_not_partial_prefix() {
+        let codex_home = tempdir().expect("temp dir");
+        let auth_manager =
+            AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
+        let provider = provider_for("http://example.test".to_string());
+        let manager =
+            ModelsManager::with_provider(codex_home.path().to_path_buf(), auth_manager, provider);
+        let mut config = test_config();
+        config.model_overlay = Some(ModelOverlay {
+            models: vec![ModelOverlayEntry {
+                slug: "gpt-5.4".to_string(),
+                patch: ModelInfoPatch::default(),
+                final_instruction_override: Some("patched gpt-5.4".to_string()),
+            }],
+            final_instruction_override: Some("global final".to_string()),
+            ..Default::default()
+        });
+
+        let exact = manager
+            .get_final_instruction_override("custom/gpt-5.4", &config)
+            .await;
+        let adjacent = manager
+            .get_final_instruction_override("gpt-5.4-mini", &config)
+            .await;
+
+        assert_eq!(exact.as_deref(), Some("patched gpt-5.4"));
+        assert_eq!(adjacent.as_deref(), Some("global final"));
+    }
+
+    #[test]
+    fn effective_model_instructions_prefers_final_override() {
+        let config = test_config();
+        let model = ModelsManager::construct_model_info_offline("gpt-5.4", &config);
+
+        let instructions = ModelsManager::effective_model_instructions(
+            &model,
+            config.personality,
+            Some("final instructions"),
+        );
+
+        assert_eq!(instructions, "final instructions");
+    }
+
+    #[tokio::test]
+    async fn overlay_custom_model_can_be_listed_when_remote_models_disabled() {
+        let codex_home = tempdir().expect("temp dir");
+        let auth_manager =
+            AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
+        let provider = provider_for("http://example.test".to_string());
+        let manager =
+            ModelsManager::with_provider(codex_home.path().to_path_buf(), auth_manager, provider);
+        let mut config = test_config();
+        config.features.disable(Feature::RemoteModels);
+        config.model_overlay = Some(ModelOverlay {
+            models: vec![ModelOverlayEntry {
+                slug: "private-model".to_string(),
+                patch: ModelInfoPatch {
+                    display_name: Some("Private Model".to_string()),
+                    visibility: Some(codex_protocol::openai_models::ModelVisibility::List),
+                    priority: Some(0),
+                    ..Default::default()
+                },
+                final_instruction_override: None,
+            }],
+            ..Default::default()
+        });
+
+        let available = manager.list_models(&config, RefreshStrategy::Offline).await;
+        let private = available
+            .iter()
+            .find(|preset| preset.model == "private-model")
+            .expect("custom model should be listed");
+
+        assert_eq!(private.display_name, "Private Model");
+        assert!(private.show_in_picker);
+    }
+
+    #[tokio::test]
+    async fn overlay_custom_models_are_not_persisted_to_cache() {
+        let server = MockServer::start().await;
+        let remote_models = vec![remote_model("server-model", "Server Model", 1)];
+        let _models_mock = mount_models_once(
+            &server,
+            ModelsResponse {
+                models: remote_models,
+            },
+        )
+        .await;
+
+        let codex_home = tempdir().expect("temp dir");
+        let mut config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .build()
+            .await
+            .expect("load default test config");
+        config.features.enable(Feature::RemoteModels);
+        config.model_overlay = Some(ModelOverlay {
+            models: vec![ModelOverlayEntry {
+                slug: "private-model".to_string(),
+                patch: ModelInfoPatch {
+                    visibility: Some(codex_protocol::openai_models::ModelVisibility::List),
+                    ..Default::default()
+                },
+                final_instruction_override: None,
+            }],
+            ..Default::default()
+        });
+        let auth_manager =
+            AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+        let provider = provider_for(server.uri());
+        let manager =
+            ModelsManager::with_provider(codex_home.path().to_path_buf(), auth_manager, provider);
+
+        manager
+            .refresh_available_models(&config, RefreshStrategy::OnlineIfUncached)
+            .await
+            .expect("refresh succeeds");
+        let available = manager.list_models(&config, RefreshStrategy::Offline).await;
+        assert!(
+            available
+                .iter()
+                .any(|preset| preset.model == "private-model"),
+            "overlay model should appear after refresh"
+        );
+
+        let cache_path = codex_home.path().join(MODEL_CACHE_FILE);
+        let cache_json: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(cache_path).expect("cache should be written"),
+        )
+        .expect("cache should be JSON");
+        let cached_models = cache_json
+            .get("models")
+            .and_then(serde_json::Value::as_array)
+            .expect("cache should contain models");
+        assert!(
+            cached_models.iter().all(
+                |model| model.get("slug").and_then(serde_json::Value::as_str)
+                    != Some("private-model")
+            ),
+            "cache must not persist overlay-generated models"
+        );
     }
 
     #[test]

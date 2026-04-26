@@ -28,6 +28,26 @@ Codex can run a notification hook when the agent finishes a turn. See the config
 
 The generated JSON Schema for `config.toml` lives at `codex-rs/core/config.schema.json`.
 
+## Model Overlay
+
+`model_overlay` lets local config patch bundled or fetched model metadata, or add metadata for a custom model slug. It is local client config only; it does not edit `core/models.json` or `models_cache.json`.
+
+```toml
+model = "private-model"
+
+[model_overlay]
+context_window = 1048576
+auto_compact_token_limit = 950000
+
+[[model_overlay.models]]
+slug = "private-model"
+display_name = "Private Model"
+visibility = "list"
+final_instruction_override_file = "~/.codex/model-overlays/private.md"
+```
+
+For personality-enabled models, `base_instructions` is not always the effective runtime instruction source because `model_messages.instructions_template` can take precedence. Use `final_instruction_override` or `final_instruction_override_file` when you need the final system instructions to be replaced regardless of personality.
+
 ## Notices
 
 Codex stores "do not show again" flags for some UI prompts under the `[notice]` table.

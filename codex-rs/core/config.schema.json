@@ -55,6 +55,13 @@
       },
       "type": "object"
     },
+    "ApplyPatchToolType": {
+      "enum": [
+        "freeform",
+        "function"
+      ],
+      "type": "string"
+    },
     "AskForApproval": {
       "description": "Determines the conditions under which the user is consulted to approve running the command proposed by Codex.",
       "oneOf": [
@@ -307,6 +314,17 @@
       },
       "type": "object"
     },
+    "ConfigShellToolType": {
+      "description": "Shell execution capability for a model.",
+      "enum": [
+        "default",
+        "local",
+        "unified_exec",
+        "disabled",
+        "shell_command"
+      ],
+      "type": "string"
+    },
     "CopyUiMode": {
       "enum": [
         "picker",
@@ -402,6 +420,25 @@
         }
       ]
     },
+    "InputModality": {
+      "description": "Canonical user-input modality tags advertised by a model.",
+      "oneOf": [
+        {
+          "description": "Plain text turns and tool payloads.",
+          "enum": [
+            "text"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Image attachments included in user turns.",
+          "enum": [
+            "image"
+          ],
+          "type": "string"
+        }
+      ]
+    },
     "ModeKind": {
       "description": "Initial collaboration mode to use when the TUI starts.",
       "enum": [
@@ -409,6 +446,279 @@
         "default"
       ],
       "type": "string"
+    },
+    "ModelInfoUpgrade": {
+      "properties": {
+        "migration_markdown": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "migration_markdown",
+        "model"
+      ],
+      "type": "object"
+    },
+    "ModelInstructionsVariablesPatchToml": {
+      "additionalProperties": false,
+      "properties": {
+        "personality_default": {
+          "type": "string"
+        },
+        "personality_default_file": {
+          "$ref": "#/definitions/AbsolutePathBuf"
+        },
+        "personality_friendly": {
+          "type": "string"
+        },
+        "personality_friendly_file": {
+          "$ref": "#/definitions/AbsolutePathBuf"
+        },
+        "personality_pragmatic": {
+          "type": "string"
+        },
+        "personality_pragmatic_file": {
+          "$ref": "#/definitions/AbsolutePathBuf"
+        }
+      },
+      "type": "object"
+    },
+    "ModelMessagesPatchToml": {
+      "additionalProperties": false,
+      "properties": {
+        "instructions_template": {
+          "type": "string"
+        },
+        "instructions_template_file": {
+          "$ref": "#/definitions/AbsolutePathBuf"
+        },
+        "instructions_variables": {
+          "$ref": "#/definitions/ModelInstructionsVariablesPatchToml"
+        }
+      },
+      "type": "object"
+    },
+    "ModelOverlayEntryToml": {
+      "additionalProperties": false,
+      "properties": {
+        "apply_patch_tool_type": {
+          "$ref": "#/definitions/ApplyPatchToolType"
+        },
+        "auto_compact_token_limit": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "base_instructions": {
+          "type": "string"
+        },
+        "base_instructions_file": {
+          "$ref": "#/definitions/AbsolutePathBuf"
+        },
+        "clear_model_messages": {
+          "type": "boolean"
+        },
+        "context_window": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "default_reasoning_level": {
+          "$ref": "#/definitions/ReasoningEffort"
+        },
+        "default_verbosity": {
+          "$ref": "#/definitions/Verbosity"
+        },
+        "description": {
+          "type": "string"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "effective_context_window_percent": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "experimental_supported_tools": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "final_instruction_override": {
+          "type": "string"
+        },
+        "final_instruction_override_file": {
+          "$ref": "#/definitions/AbsolutePathBuf"
+        },
+        "input_modalities": {
+          "items": {
+            "$ref": "#/definitions/InputModality"
+          },
+          "type": "array"
+        },
+        "instructions_template": {
+          "type": "string"
+        },
+        "instructions_template_file": {
+          "$ref": "#/definitions/AbsolutePathBuf"
+        },
+        "model_messages": {
+          "$ref": "#/definitions/ModelMessagesPatchToml"
+        },
+        "priority": {
+          "format": "int32",
+          "type": "integer"
+        },
+        "shell_type": {
+          "$ref": "#/definitions/ConfigShellToolType"
+        },
+        "slug": {
+          "type": "string"
+        },
+        "support_verbosity": {
+          "type": "boolean"
+        },
+        "supported_in_api": {
+          "type": "boolean"
+        },
+        "supported_reasoning_levels": {
+          "items": {
+            "$ref": "#/definitions/ReasoningEffortPreset"
+          },
+          "type": "array"
+        },
+        "supports_parallel_tool_calls": {
+          "type": "boolean"
+        },
+        "supports_reasoning_summaries": {
+          "type": "boolean"
+        },
+        "truncation_policy": {
+          "$ref": "#/definitions/TruncationPolicyConfig"
+        },
+        "upgrade": {
+          "$ref": "#/definitions/ModelInfoUpgrade"
+        },
+        "visibility": {
+          "$ref": "#/definitions/ModelVisibility"
+        }
+      },
+      "required": [
+        "slug"
+      ],
+      "type": "object"
+    },
+    "ModelOverlayToml": {
+      "additionalProperties": false,
+      "properties": {
+        "apply_patch_tool_type": {
+          "$ref": "#/definitions/ApplyPatchToolType"
+        },
+        "auto_compact_token_limit": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "base_instructions": {
+          "type": "string"
+        },
+        "base_instructions_file": {
+          "$ref": "#/definitions/AbsolutePathBuf"
+        },
+        "clear_model_messages": {
+          "type": "boolean"
+        },
+        "context_window": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "default_reasoning_level": {
+          "$ref": "#/definitions/ReasoningEffort"
+        },
+        "default_verbosity": {
+          "$ref": "#/definitions/Verbosity"
+        },
+        "description": {
+          "type": "string"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "effective_context_window_percent": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "experimental_supported_tools": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "final_instruction_override": {
+          "type": "string"
+        },
+        "final_instruction_override_file": {
+          "$ref": "#/definitions/AbsolutePathBuf"
+        },
+        "input_modalities": {
+          "items": {
+            "$ref": "#/definitions/InputModality"
+          },
+          "type": "array"
+        },
+        "instructions_template": {
+          "type": "string"
+        },
+        "instructions_template_file": {
+          "$ref": "#/definitions/AbsolutePathBuf"
+        },
+        "model_messages": {
+          "$ref": "#/definitions/ModelMessagesPatchToml"
+        },
+        "models": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/ModelOverlayEntryToml"
+          },
+          "type": "array"
+        },
+        "priority": {
+          "format": "int32",
+          "type": "integer"
+        },
+        "shell_type": {
+          "$ref": "#/definitions/ConfigShellToolType"
+        },
+        "support_verbosity": {
+          "type": "boolean"
+        },
+        "supported_in_api": {
+          "type": "boolean"
+        },
+        "supported_reasoning_levels": {
+          "items": {
+            "$ref": "#/definitions/ReasoningEffortPreset"
+          },
+          "type": "array"
+        },
+        "supports_parallel_tool_calls": {
+          "type": "boolean"
+        },
+        "supports_reasoning_summaries": {
+          "type": "boolean"
+        },
+        "truncation_policy": {
+          "$ref": "#/definitions/TruncationPolicyConfig"
+        },
+        "upgrade": {
+          "$ref": "#/definitions/ModelInfoUpgrade"
+        },
+        "visibility": {
+          "$ref": "#/definitions/ModelVisibility"
+        }
+      },
+      "type": "object"
     },
     "ModelProviderInfo": {
       "additionalProperties": false,
@@ -497,6 +807,15 @@
         "name"
       ],
       "type": "object"
+    },
+    "ModelVisibility": {
+      "description": "Visibility of a model in the picker or APIs.",
+      "enum": [
+        "list",
+        "hide",
+        "none"
+      ],
+      "type": "string"
     },
     "Notice": {
       "description": "Settings for notices we display to users via the tui and app-server clients (primarily the Codex IDE extension). NOTE: these are different from notifications - notices are warnings, NUX screens, acknowledgements, etc.",
@@ -961,6 +1280,28 @@
       ],
       "type": "string"
     },
+    "ReasoningEffortPreset": {
+      "description": "A reasoning effort option that can be surfaced for a model.",
+      "properties": {
+        "description": {
+          "description": "Short human description shown next to the effort in UIs.",
+          "type": "string"
+        },
+        "effort": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ReasoningEffort"
+            }
+          ],
+          "description": "Effort level that the model supports."
+        }
+      },
+      "required": [
+        "description",
+        "effort"
+      ],
+      "type": "object"
+    },
     "ReasoningSummary": {
       "description": "A summary of the reasoning performed by the model. This can be useful for debugging and understanding the model's reasoning process. See https://platform.openai.com/docs/guides/reasoning?api-mode=responses#reasoning-summaries",
       "oneOf": [
@@ -1116,6 +1457,30 @@
           "type": "boolean"
         }
       },
+      "type": "object"
+    },
+    "TruncationMode": {
+      "description": "Server-provided truncation policy metadata for a model.",
+      "enum": [
+        "bytes",
+        "tokens"
+      ],
+      "type": "string"
+    },
+    "TruncationPolicyConfig": {
+      "properties": {
+        "limit": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "mode": {
+          "$ref": "#/definitions/TruncationMode"
+        }
+      },
+      "required": [
+        "limit",
+        "mode"
+      ],
       "type": "object"
     },
     "TrustLevel": {
@@ -1584,6 +1949,14 @@
         }
       ],
       "description": "Optional path to a file containing model instructions that will override the built-in instructions for the selected model. Users are STRONGLY DISCOURAGED from using this field, as deviating from the instructions sanctioned by Codex will likely degrade model performance."
+    },
+    "model_overlay": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/ModelOverlayToml"
+        }
+      ],
+      "description": "Optional local metadata/instruction overlays for bundled, remote, or custom models."
     },
     "model_provider": {
       "description": "Provider to use from the model_providers map.",

@@ -2,9 +2,16 @@
 
 ## Target Base
 
-This proposal targets the `f0d4740cf3b1f6a864fd1536b6615bb2e9badd12` v0.98 branch shape.
+This proposal was originally written against the `f0d4740cf3b1f6a864fd1536b6615bb2e9badd12` v0.98 branch shape and was validated for implementation on the `custom-0.98.0` branch at `ec279a530fbeebe7359669363349a27d36ab255c`.
 
 The design is intentionally scoped to local client behavior. It does not require server changes, wire API changes, or manual edits to `core/models.json` / `models_cache.json`.
+
+Validation outcome for the first implementation:
+
+- global `model_overlay` is supported;
+- profile-scoped `model_overlay` is intentionally not supported yet and remains rejected by the existing profile schema;
+- optional `ModelInfo` fields can be set by overlay fields, but generalized null/clear markers are still deferred;
+- `clear_model_messages = true` is the only first-class clear operation.
 
 ## Design Summary
 
@@ -512,13 +519,7 @@ Add to `Config`:
 pub model_overlay: Option<ModelOverlay>,
 ```
 
-Profile support can be deferred or included if low-friction:
-
-```rust
-pub model_overlay: Option<ModelOverlayToml>, // in ConfigProfile
-```
-
-Recommended minimal scope: global `model_overlay` first. Profile-scoped model overlays are useful, but they increase merge semantics and validation surface. If added now, use the existing profile precedence convention: profile overlay is merged over global overlay.
+The first implementation supports only global `model_overlay`. Profile-scoped model overlays are useful, but they increase merge semantics and validation surface. When added later, `ConfigProfile` can grow its own `model_overlay: Option<ModelOverlayToml>` field and use the existing profile precedence convention: profile overlay is merged over global overlay.
 
 ### File resolution timing
 
@@ -539,7 +540,7 @@ If profile overlays are implemented:
 3. Concatenate model entries by slug, with profile entries overriding same-slug global entries field-by-field.
 4. Per-model final overrides follow the same merge rule.
 
-If this is too much for the first patch, explicitly reject profile-level `model_overlay` and keep only global config.
+The first patch keeps profile-level `model_overlay` unsupported; `ConfigProfile` continues to deny unknown fields, so profile-level overlays fail config validation instead of being silently ignored.
 
 ## Implementation Plan
 

@@ -43,6 +43,8 @@ use crate::model_provider_info::ModelProviderInfo;
 use crate::model_provider_info::OLLAMA_CHAT_PROVIDER_REMOVED_ERROR;
 use crate::model_provider_info::OLLAMA_OSS_PROVIDER_ID;
 use crate::model_provider_info::built_in_model_providers;
+use crate::models_manager::overlay::ModelOverlay;
+use crate::models_manager::overlay::ModelOverlayToml;
 use crate::project_doc::DEFAULT_PROJECT_DOC_FILENAME;
 use crate::project_doc::LOCAL_PROJECT_DOC_FILENAME;
 use crate::protocol::AskForApproval;
@@ -132,6 +134,9 @@ pub struct Config {
 
     /// Token usage threshold triggering auto-compaction of conversation history.
     pub model_auto_compact_token_limit: Option<i64>,
+
+    /// Optional local metadata/instruction overlays for bundled, remote, or custom models.
+    pub model_overlay: Option<ModelOverlay>,
 
     /// Key into the model_providers map that specifies which provider to use.
     pub model_provider_id: String,
@@ -842,6 +847,9 @@ pub struct ConfigToml {
     /// Token usage threshold triggering auto-compaction of conversation history.
     pub model_auto_compact_token_limit: Option<i64>,
 
+    /// Optional local metadata/instruction overlays for bundled, remote, or custom models.
+    pub model_overlay: Option<ModelOverlayToml>,
+
     /// Default approval policy for executing commands.
     pub approval_policy: Option<AskForApproval>,
 
@@ -1480,6 +1488,11 @@ impl Config {
         let did_user_set_custom_approval_policy_or_sandbox_mode =
             approval_policy_was_explicit || sandbox_mode_was_explicit;
 
+        let model_overlay = cfg
+            .model_overlay
+            .map(ModelOverlayToml::resolve)
+            .transpose()?;
+
         let mut model_providers = built_in_model_providers();
         // Merge user-defined providers into the built-in list.
         for (key, provider) in cfg.model_providers.into_iter() {
@@ -1638,6 +1651,7 @@ impl Config {
             review_model,
             model_context_window: cfg.model_context_window,
             model_auto_compact_token_limit: cfg.model_auto_compact_token_limit,
+            model_overlay,
             model_provider_id,
             model_provider,
             cwd: resolved_cwd,
@@ -1993,6 +2007,119 @@ persistence = "none"
             }),
             history_no_persistence_cfg.history
         );
+    }
+
+    #[test]
+    fn model_overlay_loads_file_backed_instruction_fields() -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+        let base_path = codex_home.path().join("base.md");
+        let pragmatic_path = codex_home.path().join("pragmatic.md");
+        let final_path = codex_home.path().join("final.md");
+        std::fs::write(&base_path, "base instructions\n")?;
+        std::fs::write(&pragmatic_path, "pragmatic personality\n")?;
+        std::fs::write(&final_path, "final instructions\n")?;
+        let toml = format!(
+            r#"
+[model_overlay]
+context_window = 1000000
+final_instruction_override_file = "{}"
+
+[[model_overlay.models]]
+slug = "gpt-5.4"
+base_instructions_file = "{}"
+
+[model_overlay.models.model_messages.instructions_variables]
+personality_pragmatic_file = "{}"
+"#,
+            final_path.display(),
+            base_path.display(),
+            pragmatic_path.display(),
+        );
+        let root = toml::from_str::<TomlValue>(&toml).expect("valid TOML");
+        let cfg = deserialize_config_toml_with_base(root, codex_home.path())?;
+
+        let config = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )?;
+        let overlay = config.model_overlay.expect("model overlay should load");
+
+        assert_eq!(overlay.cross_model.context_window, Some(Some(1_000_000)));
+        assert_eq!(
+            overlay.final_instruction_override.as_deref(),
+            Some("final instructions\n")
+        );
+        assert_eq!(overlay.models.len(), 1);
+        assert_eq!(
+            overlay.models[0].patch.base_instructions.as_deref(),
+            Some("base instructions\n")
+        );
+        assert_eq!(
+            overlay.models[0]
+                .patch
+                .model_messages
+                .as_ref()
+                .and_then(|messages| messages.instructions_variables.as_ref())
+                .and_then(|variables| variables.personality_pragmatic.as_deref()),
+            Some("pragmatic personality\n")
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn model_overlay_rejects_inline_and_file_for_same_field() -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+        let base_path = codex_home.path().join("base.md");
+        std::fs::write(&base_path, "base instructions\n")?;
+        let toml = format!(
+            r#"
+[[model_overlay.models]]
+slug = "gpt-5.4"
+base_instructions = "inline"
+base_instructions_file = "{}"
+"#,
+            base_path.display(),
+        );
+        let root = toml::from_str::<TomlValue>(&toml).expect("valid TOML");
+        let cfg = deserialize_config_toml_with_base(root, codex_home.path())?;
+
+        let err = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )
+        .expect_err("duplicate inline/file should be rejected");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        Ok(())
+    }
+
+    #[test]
+    fn model_overlay_rejects_empty_instruction_file() -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+        let final_path = codex_home.path().join("final.md");
+        std::fs::write(&final_path, "  \n")?;
+        let toml = format!(
+            r#"
+[model_overlay]
+final_instruction_override_file = "{}"
+"#,
+            final_path.display(),
+        );
+        let root = toml::from_str::<TomlValue>(&toml).expect("valid TOML");
+        let cfg = deserialize_config_toml_with_base(root, codex_home.path())?;
+
+        let err = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )
+        .expect_err("empty file should be rejected");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        Ok(())
     }
 
     #[test]
@@ -3913,6 +4040,7 @@ model_verbosity = "high"
                 review_model: None,
                 model_context_window: None,
                 model_auto_compact_token_limit: None,
+                model_overlay: None,
                 model_provider_id: "openai".to_string(),
                 model_provider: fixture.openai_provider.clone(),
                 approval_policy: Constrained::allow_any(AskForApproval::Never),
@@ -4007,6 +4135,7 @@ model_verbosity = "high"
             review_model: None,
             model_context_window: None,
             model_auto_compact_token_limit: None,
+            model_overlay: None,
             model_provider_id: "openai-custom".to_string(),
             model_provider: fixture.openai_custom_provider.clone(),
             approval_policy: Constrained::allow_any(AskForApproval::UnlessTrusted),
@@ -4116,6 +4245,7 @@ model_verbosity = "high"
             review_model: None,
             model_context_window: None,
             model_auto_compact_token_limit: None,
+            model_overlay: None,
             model_provider_id: "openai".to_string(),
             model_provider: fixture.openai_provider.clone(),
             approval_policy: Constrained::allow_any(AskForApproval::OnFailure),
@@ -4211,6 +4341,7 @@ model_verbosity = "high"
             review_model: None,
             model_context_window: None,
             model_auto_compact_token_limit: None,
+            model_overlay: None,
             model_provider_id: "openai".to_string(),
             model_provider: fixture.openai_provider.clone(),
             approval_policy: Constrained::allow_any(AskForApproval::OnFailure),

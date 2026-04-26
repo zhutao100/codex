@@ -313,16 +313,16 @@ impl Codex {
             )
             .await;
 
-        // Resolve base instructions for the session. Priority order:
-        // 1. config.base_instructions override
-        // 2. conversation history => session_meta.base_instructions
-        // 3. base_intructions for current model
         let model_info = models_manager.get_model_info(model.as_str(), &config).await;
-        let base_instructions = config
-            .base_instructions
-            .clone()
-            .or_else(|| conversation_history.get_base_instructions().map(|s| s.text))
-            .unwrap_or_else(|| model_info.get_model_instructions(config.personality));
+        let final_instruction_override = models_manager
+            .get_final_instruction_override(model.as_str(), &config)
+            .await;
+        let base_instructions = resolve_session_base_instructions(
+            &config,
+            &model_info,
+            &conversation_history,
+            final_instruction_override.as_deref(),
+        );
 
         // Respect thread-start tools. When missing (resumed/forked threads), read from the db
         // first, then fall back to rollout-file tools.
@@ -525,6 +525,7 @@ pub(crate) struct TurnContext {
     pub(crate) user_instructions: Option<String>,
     pub(crate) collaboration_mode: CollaborationMode,
     pub(crate) personality: Option<Personality>,
+    pub(crate) final_instruction_override: Option<String>,
     pub(crate) approval_policy: AskForApproval,
     pub(crate) sandbox_policy: SandboxPolicy,
     pub(crate) windows_sandbox_level: WindowsSandboxLevel,
@@ -557,6 +558,14 @@ impl TurnContext {
         self.compact_prompt
             .as_deref()
             .unwrap_or(compact::SUMMARIZATION_PROMPT)
+    }
+
+    pub(crate) fn effective_model_instructions(&self) -> String {
+        ModelsManager::effective_model_instructions(
+            &self.model_info,
+            self.personality,
+            self.final_instruction_override.as_deref(),
+        )
     }
 
     async fn build_turn_metadata_header(&self) -> Option<String> {
@@ -639,6 +648,27 @@ pub(crate) struct SessionConfiguration {
     /// Source of the session (cli, vscode, exec, mcp, ...)
     session_source: SessionSource,
     dynamic_tools: Vec<DynamicToolSpec>,
+}
+
+fn resolve_session_base_instructions(
+    config: &Config,
+    model_info: &ModelInfo,
+    conversation_history: &InitialHistory,
+    final_instruction_override: Option<&str>,
+) -> String {
+    // Priority order:
+    // 1. config.base_instructions override
+    // 2. model_overlay final instruction override
+    // 3. conversation history => session_meta.base_instructions
+    // 4. base_instructions for current model
+    config
+        .base_instructions
+        .clone()
+        .or_else(|| final_instruction_override.map(ToOwned::to_owned))
+        .or_else(|| conversation_history.get_base_instructions().map(|s| s.text))
+        .unwrap_or_else(|| {
+            ModelsManager::effective_model_instructions(model_info, config.personality, None)
+        })
 }
 
 impl SessionConfiguration {
@@ -780,6 +810,7 @@ impl Session {
         session_configuration: &SessionConfiguration,
         per_turn_config: Config,
         model_info: ModelInfo,
+        final_instruction_override: Option<String>,
         sub_id: String,
     ) -> TurnContext {
         let reasoning_effort = session_configuration.collaboration_mode.reasoning_effort();
@@ -817,6 +848,7 @@ impl Session {
             user_instructions: session_configuration.user_instructions.clone(),
             collaboration_mode: session_configuration.collaboration_mode.clone(),
             personality: session_configuration.personality,
+            final_instruction_override,
             approval_policy: session_configuration.approval_policy.value(),
             sandbox_policy: session_configuration.sandbox_policy.get().clone(),
             windows_sandbox_level: session_configuration.windows_sandbox_level,
@@ -1524,6 +1556,14 @@ impl Session {
                 &per_turn_config,
             )
             .await;
+        let final_instruction_override = self
+            .services
+            .models_manager
+            .get_final_instruction_override(
+                session_configuration.collaboration_mode.model(),
+                &per_turn_config,
+            )
+            .await;
         let mut turn_context: TurnContext = Self::make_turn_context(
             Some(Arc::clone(&self.services.auth_manager)),
             &self.services.otel_manager,
@@ -1531,6 +1571,7 @@ impl Session {
             &session_configuration,
             per_turn_config,
             model_info,
+            final_instruction_override,
             sub_id,
         );
 
@@ -1621,6 +1662,9 @@ impl Session {
         if !self.features.enabled(Feature::Personality) {
             return None;
         }
+        if next.final_instruction_override.is_some() {
+            return None;
+        }
         let previous = previous?;
         if next.model_info.slug != previous.model_info.slug {
             return None;
@@ -1675,7 +1719,7 @@ impl Session {
             return None;
         }
 
-        let model_instructions = next.model_info.get_model_instructions(next.personality);
+        let model_instructions = next.effective_model_instructions();
         if model_instructions.is_empty() {
             return None;
         }
@@ -2272,6 +2316,7 @@ impl Session {
         }
         if self.features.enabled(Feature::Personality)
             && let Some(personality) = turn_context.personality
+            && turn_context.final_instruction_override.is_none()
         {
             let model_info = turn_context.model_info.clone();
             let has_baked_personality = model_info.supports_personality()
@@ -3798,6 +3843,7 @@ async fn spawn_review_thread(
         compact_prompt: parent_turn_context.compact_prompt.clone(),
         collaboration_mode: parent_turn_context.collaboration_mode.clone(),
         personality: parent_turn_context.personality,
+        final_instruction_override: None,
         approval_policy: parent_turn_context.approval_policy,
         sandbox_policy: parent_turn_context.sandbox_policy.clone(),
         windows_sandbox_level: parent_turn_context.windows_sandbox_level,
@@ -5773,6 +5819,48 @@ mod tests {
     }
 
     #[test]
+    fn session_base_instructions_use_overlay_final_before_history() {
+        let config = test_config();
+        let model_info = ModelsManager::construct_model_info_offline("gpt-5.4", &config);
+        let history = InitialHistory::Forked(vec![RolloutItem::SessionMeta(
+            codex_protocol::protocol::SessionMetaLine {
+                meta: codex_protocol::protocol::SessionMeta {
+                    base_instructions: Some(BaseInstructions {
+                        text: "history instructions".to_string(),
+                    }),
+                    ..Default::default()
+                },
+                git: None,
+            },
+        )]);
+
+        let resolved = resolve_session_base_instructions(
+            &config,
+            &model_info,
+            &history,
+            Some("overlay final instructions"),
+        );
+
+        assert_eq!(resolved, "overlay final instructions");
+    }
+
+    #[test]
+    fn session_base_instructions_keep_config_override_strongest() {
+        let mut config = test_config();
+        config.base_instructions = Some("config instructions".to_string());
+        let model_info = ModelsManager::construct_model_info_offline("gpt-5.4", &config);
+
+        let resolved = resolve_session_base_instructions(
+            &config,
+            &model_info,
+            &InitialHistory::New,
+            Some("overlay final instructions"),
+        );
+
+        assert_eq!(resolved, "config instructions");
+    }
+
+    #[test]
     fn filter_connectors_for_input_skips_duplicate_slug_mentions() {
         let connectors = vec![
             make_connector("one", "Foo Bar"),
@@ -6663,6 +6751,7 @@ mod tests {
             &session_configuration,
             per_turn_config,
             model_info,
+            None,
             "turn_id".to_string(),
         );
 
@@ -6798,6 +6887,7 @@ mod tests {
             &session_configuration,
             per_turn_config,
             model_info,
+            None,
             "turn_id".to_string(),
         ));
 
