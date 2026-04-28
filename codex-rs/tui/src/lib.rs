@@ -43,7 +43,6 @@ use codex_state::log_db;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use cwd_prompt::CwdPromptAction;
 use cwd_prompt::CwdSelection;
-use std::fs::OpenOptions;
 use std::path::Path;
 use std::path::PathBuf;
 use tracing::error;
@@ -82,6 +81,7 @@ pub mod insert_history;
 mod key_hint;
 mod keybindings;
 pub mod live_wrap;
+mod log_rotation;
 mod markdown;
 mod markdown_render;
 mod markdown_stream;
@@ -307,21 +307,7 @@ pub async fn run_main(
 
     let log_dir = codex_core::config::log_dir(&config)?;
     std::fs::create_dir_all(&log_dir)?;
-    // Open (or create) your log file, appending to it.
-    let mut log_file_opts = OpenOptions::new();
-    log_file_opts.create(true).append(true);
-
-    // Ensure the file is only readable and writable by the current user.
-    // Doing the equivalent to `chmod 600` on Windows is quite a bit more code
-    // and requires the Windows API crates, so we can reconsider that when
-    // Codex CLI is officially supported on Windows.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        log_file_opts.mode(0o600);
-    }
-
-    let log_file = log_file_opts.open(log_dir.join("codex-tui.log"))?;
+    let log_file = log_rotation::open_tui_log(&log_dir)?;
 
     // Wrap file in non‑blocking writer.
     let (non_blocking, _guard) = non_blocking(log_file);
