@@ -320,9 +320,18 @@ lto = "fat"
 # Because we bundle some of these executables with the TypeScript CLI, we
 # remove everything to make the binary as small as possible.
 strip = "symbols"
+split-debuginfo = "off"
 
 # See https://github.com/openai/codex/issues/1411 for details.
 codegen-units = 1
+
+[profile.release-fast]
+inherits = "release"
+# Keep optimized codegen, but avoid the expensive production link profile.
+lto = "thin"
+codegen-units = 16
+strip = "none"
+split-debuginfo = "off"
 
 [profile.ci-test]
 debug = 1         # Reduce debug symbol size
