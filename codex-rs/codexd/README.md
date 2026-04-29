@@ -66,10 +66,18 @@ Transport is an AF_UNIX stream socket. Each message is a single UTF-8 JSON objec
 Typical client flow:
 
 1. Connect to the socket.
-2. Request a snapshot:
-   - `{"id":1,"method":"codexd/snapshot","params":{}}`
-3. Subscribe using the snapshot sequence:
-   - `{"id":2,"method":"codexd/subscribe","params":{"afterSeq":<snapshot.seq>}}`
+2. Optionally request daemon protocol information:
+   - `{"id":1,"method":"codexd/hello","params":{}}`
+3. Request a snapshot:
+   - `{"id":2,"method":"codexd/snapshot","params":{}}`
+4. Subscribe using the snapshot sequence:
+   - `{"id":3,"method":"codexd/subscribe","params":{"afterSeq":<snapshot.seq>}}`
+
+`codexd/hello` returns:
+
+- `protocolVersion`
+- `capabilities`
+- current `seq`
 
 The `codexd/event` stream is sequenced:
 
@@ -107,7 +115,9 @@ Event `type` values:
 - `cwd` (string | null)
 - `displayName` (string | null)
 - `activeTurns` (array)
-  - `[{ "threadId": "...", "turnId": "..." }]`
+  - `threadId`
+  - `turnId`
+  - optional summary fields: `status`, `startedAt`, `model`, `latestLabel`
 
 The `notification` in `runtimeNotification` is a generic hub notification forwarded from runtimes. `codexd` only interprets `turn/started` and `turn/completed` to maintain `activeTurns` in snapshots; all other notifications are forwarded as-is.
 
@@ -117,6 +127,7 @@ Runtimes connect to the same socket and send:
 
 - `codexd/runtime/register` (claim a `runtimeId` for that connection)
 - `codexd/runtime/updateMetadata`
+- `codexd/runtime/updateState` (replace the runtime's active-turn summary after reconnect)
 - `codexd/runtime/event` (forward a hub notification)
 - `codexd/runtime/unregister` (optional; disconnect also unregisters claimed runtimes)
 

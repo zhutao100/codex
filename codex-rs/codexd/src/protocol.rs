@@ -15,6 +15,14 @@ pub struct HubNotification {
 pub struct ActiveTurnSnapshot {
     pub thread_id: String,
     pub turn_id: String,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub started_at: Option<i64>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub latest_label: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -38,6 +46,14 @@ pub struct RuntimeSnapshot {
 pub struct CodexdSnapshotResponse {
     pub seq: u64,
     pub runtimes: Vec<RuntimeSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexdHelloResponse {
+    pub protocol_version: u32,
+    pub capabilities: Vec<String>,
+    pub seq: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -79,6 +95,22 @@ pub struct RuntimeUpdateMetadataParams {
     pub cwd: Option<String>,
     #[serde(default)]
     pub display_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeUpdateStateParams {
+    pub runtime_id: String,
+    #[serde(default)]
+    pub pid: Option<u32>,
+    #[serde(default)]
+    pub session_source: Option<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub active_turns: Vec<ActiveTurnSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

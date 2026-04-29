@@ -211,6 +211,12 @@ Recommended state timestamps:
 8. Add pause/continue routing after core/app-server expose those operations.
 9. Evaluate optional persisted replay after state summaries prove insufficient.
 
+## Implemented Slice
+
+- `codexd/hello` reports protocol version, capabilities, and current sequence.
+- `codexd/runtime/updateState` lets producers replace the daemon's active-turn summary for a runtime.
+- App-server notification relay now includes additional status UI events such as diffs, deltas, account updates, compaction, and config warnings.
+
 ## Validation
 
 - `cargo test -p codex-codexd`.

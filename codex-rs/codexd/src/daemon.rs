@@ -1,6 +1,7 @@
 use crate::protocol::ActiveTurnSnapshot;
 use crate::protocol::CodexdEventEnvelope;
 use crate::protocol::CodexdEventPayload;
+use crate::protocol::CodexdHelloResponse;
 use crate::protocol::CodexdSnapshotResponse;
 use crate::protocol::CodexdSubscribeParams;
 use crate::protocol::CodexdSubscribeResponse;
@@ -10,6 +11,7 @@ use crate::protocol::RuntimeRegisterParams;
 use crate::protocol::RuntimeSnapshot;
 use crate::protocol::RuntimeUnregisterParams;
 use crate::protocol::RuntimeUpdateMetadataParams;
+use crate::protocol::RuntimeUpdateStateParams;
 use anyhow::Context;
 use serde::de::DeserializeOwned;
 use serde_json::Value as JsonValue;
@@ -32,13 +34,16 @@ use tracing::warn;
 
 const CODEXD_SUBSCRIBE_METHOD: &str = "codexd/subscribe";
 const CODEXD_SNAPSHOT_METHOD: &str = "codexd/snapshot";
+const CODEXD_HELLO_METHOD: &str = "codexd/hello";
 const CODEXD_EVENT_METHOD: &str = "codexd/event";
 const RUNTIME_EVENT_METHOD: &str = "codexd/runtime/event";
 const RUNTIME_REGISTER_METHOD: &str = "codexd/runtime/register";
 const RUNTIME_UNREGISTER_METHOD: &str = "codexd/runtime/unregister";
 const RUNTIME_UPDATE_METADATA_METHOD: &str = "codexd/runtime/updateMetadata";
+const RUNTIME_UPDATE_STATE_METHOD: &str = "codexd/runtime/updateState";
 const LAUNCHD_SOCKET_NAME: &str = "codexd";
 const MAX_RECENT_EVENTS: usize = 1024;
+const PROTOCOL_VERSION: u32 = 1;
 
 #[derive(Debug, Clone)]
 struct RuntimeState {
@@ -46,7 +51,7 @@ struct RuntimeState {
     session_source: Option<String>,
     cwd: Option<String>,
     display_name: Option<String>,
-    active_turns: BTreeMap<String, String>,
+    active_turns: BTreeMap<String, ActiveTurnSnapshot>,
 }
 
 impl RuntimeState {
@@ -76,11 +81,8 @@ impl RuntimeState {
     fn as_snapshot(&self, runtime_id: String) -> RuntimeSnapshot {
         let active_turns = self
             .active_turns
-            .iter()
-            .map(|(turn_id, thread_id)| ActiveTurnSnapshot {
-                thread_id: thread_id.clone(),
-                turn_id: turn_id.clone(),
-            })
+            .values()
+            .map(|turn| turn.clone())
             .collect();
 
         RuntimeSnapshot {
@@ -119,6 +121,14 @@ impl DaemonState {
         CodexdSnapshotResponse {
             seq: self.seq,
             runtimes,
+        }
+    }
+
+    fn hello(&self) -> CodexdHelloResponse {
+        CodexdHelloResponse {
+            protocol_version: PROTOCOL_VERSION,
+            capabilities: vec!["eventReplay".to_string(), "runtimeState".to_string()],
+            seq: self.seq,
         }
     }
 
@@ -197,6 +207,41 @@ impl DaemonState {
         self.broadcast_event(CodexdEventPayload::RuntimeUpsert { runtime: snapshot });
     }
 
+    fn update_runtime_state(&mut self, params: RuntimeUpdateStateParams) {
+        let runtime_id = params.runtime_id.clone();
+        let snapshot = {
+            let runtime = self
+                .runtimes
+                .entry(runtime_id.clone())
+                .or_insert_with(|| RuntimeState {
+                    pid: params.pid,
+                    session_source: params.session_source.clone(),
+                    cwd: params.cwd.clone(),
+                    display_name: params.display_name.clone(),
+                    active_turns: BTreeMap::new(),
+                });
+
+            runtime.pid = params.pid.or(runtime.pid);
+            runtime.session_source = params
+                .session_source
+                .clone()
+                .or_else(|| runtime.session_source.clone());
+            runtime.cwd = params.cwd.clone().or_else(|| runtime.cwd.clone());
+            runtime.display_name = params
+                .display_name
+                .clone()
+                .or_else(|| runtime.display_name.clone());
+            runtime.active_turns = params
+                .active_turns
+                .into_iter()
+                .map(|turn| (turn.turn_id.clone(), turn))
+                .collect();
+            runtime.as_snapshot(runtime_id)
+        };
+
+        self.broadcast_event(CodexdEventPayload::RuntimeUpsert { runtime: snapshot });
+    }
+
     fn apply_runtime_notification(&mut self, params: RuntimeEventParams) {
         let runtime = self
             .runtimes
@@ -210,7 +255,17 @@ impl DaemonState {
             });
 
         if let Some((thread_id, turn_id)) = parse_active_turn_started(&params.notification) {
-            runtime.active_turns.insert(turn_id, thread_id);
+            runtime.active_turns.insert(
+                turn_id.clone(),
+                ActiveTurnSnapshot {
+                    thread_id,
+                    turn_id,
+                    status: Some("inProgress".to_string()),
+                    started_at: None,
+                    model: parse_turn_model(&params.notification),
+                    latest_label: None,
+                },
+            );
         }
 
         if let Some(turn_id) = parse_active_turn_completed(&params.notification) {
@@ -260,37 +315,6 @@ impl DaemonState {
         for connection_id in dead_connections {
             self.subscribers.remove(&connection_id);
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn subscribe_replays_events_after_seq() {
-        let mut state = DaemonState::default();
-        state.broadcast_event(CodexdEventPayload::RuntimeRemoved {
-            runtime_id: "rt-1".to_string(),
-        });
-        state.broadcast_event(CodexdEventPayload::RuntimeRemoved {
-            runtime_id: "rt-2".to_string(),
-        });
-
-        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
-        let response = state
-            .add_subscriber(1, tx, Some(1))
-            .expect("subscribe should succeed");
-        assert_eq!(response, CodexdSubscribeResponse { seq: 2 });
-
-        let line = rx.try_recv().expect("expected replay event");
-        let value: JsonValue = serde_json::from_str(&line).expect("expected valid JSON");
-        assert_eq!(value["method"], CODEXD_EVENT_METHOD);
-        assert_eq!(value["params"]["seq"], 2);
-        assert_eq!(value["params"]["event"]["type"], "runtimeRemoved");
-        assert_eq!(value["params"]["event"]["runtimeId"], "rt-2");
-
-        assert!(rx.try_recv().is_err());
     }
 }
 
@@ -397,6 +421,7 @@ async fn handle_connection(
         let request_id = value.get("id").cloned();
 
         let result = match method.as_str() {
+            CODEXD_HELLO_METHOD => handle_hello_method(Arc::clone(&state)).await,
             CODEXD_SNAPSHOT_METHOD => handle_snapshot_method(Arc::clone(&state)).await,
             CODEXD_SUBSCRIBE_METHOD => {
                 handle_subscribe_method(
@@ -414,6 +439,14 @@ async fn handle_connection(
             }
             RUNTIME_UPDATE_METADATA_METHOD => {
                 handle_runtime_update_metadata_method(
+                    Arc::clone(&state),
+                    params,
+                    &mut owned_runtime_ids,
+                )
+                .await
+            }
+            RUNTIME_UPDATE_STATE_METHOD => {
+                handle_runtime_update_state_method(
                     Arc::clone(&state),
                     params,
                     &mut owned_runtime_ids,
@@ -473,6 +506,11 @@ async fn handle_snapshot_method(state: Arc<Mutex<DaemonState>>) -> Result<JsonVa
     serde_json::to_value(state.snapshot()).map_err(|err| err.to_string())
 }
 
+async fn handle_hello_method(state: Arc<Mutex<DaemonState>>) -> Result<JsonValue, String> {
+    let state = state.lock().await;
+    serde_json::to_value(state.hello()).map_err(|err| err.to_string())
+}
+
 async fn handle_subscribe_method(
     state: Arc<Mutex<DaemonState>>,
     connection_id: u64,
@@ -517,6 +555,20 @@ async fn handle_runtime_update_metadata_method(
     Ok(serde_json::json!({}))
 }
 
+async fn handle_runtime_update_state_method(
+    state: Arc<Mutex<DaemonState>>,
+    params: Option<JsonValue>,
+    owned_runtime_ids: &mut HashSet<String>,
+) -> Result<JsonValue, String> {
+    let params: RuntimeUpdateStateParams = deserialize_params(params)?;
+
+    owned_runtime_ids.insert(params.runtime_id.clone());
+
+    let mut state = state.lock().await;
+    state.update_runtime_state(params);
+    Ok(serde_json::json!({}))
+}
+
 async fn handle_runtime_event_method(
     state: Arc<Mutex<DaemonState>>,
     params: Option<JsonValue>,
@@ -556,6 +608,12 @@ fn parse_active_turn_started(notification: &HubNotification) -> Option<(String, 
     let turn_id = turn.get("id")?.as_str()?.to_string();
 
     Some((thread_id, turn_id))
+}
+
+fn parse_turn_model(notification: &HubNotification) -> Option<String> {
+    let params = notification.params.as_ref()?.as_object()?;
+    let turn = params.get("turn")?.as_object()?;
+    turn.get("model")?.as_str().map(ToString::to_string)
 }
 
 fn parse_active_turn_completed(notification: &HubNotification) -> Option<String> {
@@ -685,5 +743,109 @@ async fn launchd_listener() -> anyhow::Result<Option<UnixListener>> {
     #[cfg(not(target_os = "macos"))]
     {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subscribe_replays_events_after_seq() {
+        let mut state = DaemonState::default();
+        state.broadcast_event(CodexdEventPayload::RuntimeRemoved {
+            runtime_id: "rt-1".to_string(),
+        });
+        state.broadcast_event(CodexdEventPayload::RuntimeRemoved {
+            runtime_id: "rt-2".to_string(),
+        });
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        let response = state
+            .add_subscriber(1, tx, Some(1))
+            .expect("subscribe should succeed");
+        assert_eq!(response, CodexdSubscribeResponse { seq: 2 });
+
+        let line = rx.try_recv().expect("expected replay event");
+        let value: JsonValue = serde_json::from_str(&line).expect("expected valid JSON");
+        assert_eq!(value["method"], CODEXD_EVENT_METHOD);
+        assert_eq!(value["params"]["seq"], 2);
+        assert_eq!(value["params"]["event"]["type"], "runtimeRemoved");
+        assert_eq!(value["params"]["event"]["runtimeId"], "rt-2");
+
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn hello_reports_protocol_capabilities_and_seq() {
+        let mut state = DaemonState::default();
+        state.broadcast_event(CodexdEventPayload::RuntimeRemoved {
+            runtime_id: "rt-1".to_string(),
+        });
+
+        assert_eq!(
+            state.hello(),
+            CodexdHelloResponse {
+                protocol_version: PROTOCOL_VERSION,
+                capabilities: vec!["eventReplay".to_string(), "runtimeState".to_string()],
+                seq: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn update_state_replaces_active_turn_summary() {
+        let mut state = DaemonState::default();
+        state.update_runtime_state(RuntimeUpdateStateParams {
+            runtime_id: "rt-1".to_string(),
+            pid: Some(123),
+            session_source: Some("cli".to_string()),
+            cwd: Some("/tmp/work".to_string()),
+            display_name: Some("codex-tui".to_string()),
+            active_turns: vec![ActiveTurnSnapshot {
+                thread_id: "thread-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                status: Some("inProgress".to_string()),
+                started_at: Some(1_760_000_000),
+                model: Some("gpt-5-codex".to_string()),
+                latest_label: Some("Running tests".to_string()),
+            }],
+        });
+
+        state.update_runtime_state(RuntimeUpdateStateParams {
+            runtime_id: "rt-1".to_string(),
+            pid: None,
+            session_source: None,
+            cwd: None,
+            display_name: None,
+            active_turns: vec![ActiveTurnSnapshot {
+                thread_id: "thread-2".to_string(),
+                turn_id: "turn-2".to_string(),
+                status: Some("inProgress".to_string()),
+                started_at: None,
+                model: None,
+                latest_label: Some("Reading files".to_string()),
+            }],
+        });
+
+        let snapshot = state.snapshot();
+        assert_eq!(
+            snapshot.runtimes,
+            vec![RuntimeSnapshot {
+                runtime_id: "rt-1".to_string(),
+                pid: Some(123),
+                session_source: Some("cli".to_string()),
+                cwd: Some("/tmp/work".to_string()),
+                display_name: Some("codex-tui".to_string()),
+                active_turns: vec![ActiveTurnSnapshot {
+                    thread_id: "thread-2".to_string(),
+                    turn_id: "turn-2".to_string(),
+                    status: Some("inProgress".to_string()),
+                    started_at: None,
+                    model: None,
+                    latest_label: Some("Reading files".to_string()),
+                }],
+            }]
+        );
     }
 }
