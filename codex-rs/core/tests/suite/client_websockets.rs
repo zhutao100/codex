@@ -10,6 +10,7 @@ use codex_core::ResponseEvent;
 use codex_core::ResponseItem;
 use codex_core::WireApi;
 use codex_core::X_RESPONSESAPI_INCLUDE_TIMING_METRICS_HEADER;
+use codex_core::error::CodexErr;
 use codex_core::features::Feature;
 use codex_core::models_manager::manager::ModelsManager;
 use codex_core::protocol::SessionSource;
@@ -316,6 +317,76 @@ async fn responses_websocket_emits_rate_limit_events() {
     assert_eq!(credits.balance.as_deref(), Some("123"));
     assert_eq!(saw_models_etag.as_deref(), Some("etag-123"));
     assert!(saw_reasoning_included);
+
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_websocket_invalid_request_error_with_status_is_forwarded() {
+    skip_if_no_network!();
+
+    let invalid_request_error = json!({
+        "type": "error",
+        "status": 400,
+        "error": {
+            "type": "invalid_request_error",
+            "message": "Model does not support image inputs"
+        }
+    });
+
+    let server = start_websocket_server(vec![vec![vec![invalid_request_error]]]).await;
+    let harness = websocket_harness(&server).await;
+    let mut client_session = harness.client.new_session();
+    let prompt = prompt_with_input(vec![message_item("hello")]);
+
+    let err = stream_until_error(&mut client_session, &harness, &prompt).await;
+
+    match err {
+        CodexErr::InvalidRequest(message) => {
+            assert!(message.contains("Model does not support image inputs"));
+        }
+        other => panic!("unexpected websocket error: {other:?}"),
+    }
+
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_websocket_connection_limit_error_reconnects_and_completes() {
+    skip_if_no_network!();
+
+    let websocket_connection_limit_error = json!({
+        "type": "error",
+        "status": 400,
+        "error": {
+            "type": "invalid_request_error",
+            "code": "websocket_connection_limit_reached",
+            "message": "Responses websocket connection limit reached (60 minutes). Create a new websocket connection to continue."
+        }
+    });
+
+    let server = start_websocket_server(vec![
+        vec![vec![websocket_connection_limit_error]],
+        vec![vec![ev_response_created("resp-1"), ev_completed("resp-1")]],
+    ])
+    .await;
+    let harness = websocket_harness(&server).await;
+    let mut client_session = harness.client.new_session();
+    let prompt = prompt_with_input(vec![message_item("hello")]);
+
+    let err = stream_until_error(&mut client_session, &harness, &prompt).await;
+    match err {
+        CodexErr::Stream(message, None) => {
+            assert!(message.contains("Responses websocket connection limit reached"));
+        }
+        other => panic!("unexpected websocket error: {other:?}"),
+    }
+
+    stream_until_complete(&mut client_session, &harness, &prompt).await;
+
+    let connections = server.connections();
+    assert_eq!(connections.len(), 2);
+    assert_eq!(connections.iter().map(Vec::len).sum::<usize>(), 2);
 
     server.shutdown().await;
 }
@@ -662,4 +733,31 @@ async fn stream_until_complete(
             break;
         }
     }
+}
+
+async fn stream_until_error(
+    client_session: &mut ModelClientSession,
+    harness: &WebsocketTestHarness,
+    prompt: &Prompt,
+) -> CodexErr {
+    let mut stream = client_session
+        .stream(
+            prompt,
+            &harness.model_info,
+            &harness.otel_manager,
+            harness.effort,
+            harness.summary,
+            None,
+            None,
+        )
+        .await
+        .expect("websocket stream failed");
+
+    while let Some(event) = stream.next().await {
+        if let Err(err) = event {
+            return err;
+        }
+    }
+
+    panic!("expected websocket stream error");
 }

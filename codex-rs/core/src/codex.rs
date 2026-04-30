@@ -5559,6 +5559,7 @@ async fn try_run_sampling_request(
             ResponseEvent::Completed {
                 response_id: _,
                 token_usage,
+                end_turn,
             } => {
                 progress_trace_state.finalize(&sess, &turn_context).await;
                 if let Some(state) = plan_mode_state.as_mut() {
@@ -5568,6 +5569,9 @@ async fn try_run_sampling_request(
                     .await;
                 should_emit_turn_diff = true;
 
+                if let Some(false) = end_turn {
+                    needs_follow_up = true;
+                }
                 needs_follow_up |= sess.has_pending_input().await;
 
                 break Ok(SamplingRequestResult {

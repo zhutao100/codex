@@ -66,6 +66,7 @@ impl Stream for AggregatedStream {
                 Poll::Ready(Some(Ok(ResponseEvent::Completed {
                     response_id,
                     token_usage,
+                    end_turn,
                 }))) => {
                     let mut emitted_any = false;
 
@@ -102,6 +103,7 @@ impl Stream for AggregatedStream {
                         this.pending.push_back(ResponseEvent::Completed {
                             response_id: response_id.clone(),
                             token_usage: token_usage.clone(),
+                            end_turn,
                         });
                         if let Some(ev) = this.pending.pop_front() {
                             return Poll::Ready(Some(Ok(ev)));
@@ -111,6 +113,7 @@ impl Stream for AggregatedStream {
                     return Poll::Ready(Some(Ok(ResponseEvent::Completed {
                         response_id,
                         token_usage,
+                        end_turn,
                     })));
                 }
                 Poll::Ready(Some(Ok(ResponseEvent::Created))) => continue,

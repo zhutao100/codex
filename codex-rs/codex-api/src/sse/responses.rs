@@ -107,6 +107,8 @@ struct ResponseCompleted {
     id: String,
     #[serde(default)]
     usage: Option<ResponseCompletedUsage>,
+    #[serde(default)]
+    end_turn: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -252,6 +254,17 @@ pub fn process_responses_event(
                 "response.failed event received".into(),
             )));
         }
+        "response.incomplete" => {
+            let reason = event.response.as_ref().and_then(|response| {
+                response
+                    .get("incomplete_details")
+                    .and_then(|details| details.get("reason"))
+                    .and_then(Value::as_str)
+            });
+            let reason = reason.unwrap_or("unknown");
+            let message = format!("Incomplete response returned, reason: {reason}");
+            return Err(ResponsesEventError::Api(ApiError::Stream(message)));
+        }
         "response.completed" => {
             if let Some(resp_val) = event.response {
                 match serde_json::from_value::<ResponseCompleted>(resp_val) {
@@ -259,6 +272,7 @@ pub fn process_responses_event(
                         return Ok(Some(ResponseEvent::Completed {
                             response_id: resp.id,
                             token_usage: resp.usage.map(Into::into),
+                            end_turn: resp.end_turn,
                         }));
                     }
                     Err(err) => {
@@ -276,6 +290,7 @@ pub fn process_responses_event(
                         return Ok(Some(ResponseEvent::Completed {
                             response_id: resp.id.unwrap_or_default(),
                             token_usage: resp.usage.map(Into::into),
+                            end_turn: None,
                         }));
                     }
                     Err(err) => {
@@ -290,6 +305,7 @@ pub fn process_responses_event(
             return Ok(Some(ResponseEvent::Completed {
                 response_id: String::new(),
                 token_usage: None,
+                end_turn: None,
             }));
         }
         "response.output_item.added" => {
@@ -548,9 +564,11 @@ mod tests {
             Ok(ResponseEvent::Completed {
                 response_id,
                 token_usage,
+                end_turn,
             }) => {
                 assert_eq!(response_id, "resp1");
                 assert!(token_usage.is_none());
+                assert!(end_turn.is_none());
             }
             other => panic!("unexpected third event: {other:?}"),
         }
@@ -610,9 +628,11 @@ mod tests {
             Ok(ResponseEvent::Completed {
                 response_id,
                 token_usage,
+                end_turn,
             }) => {
                 assert_eq!(response_id, "");
                 assert!(token_usage.is_some());
+                assert!(end_turn.is_none());
             }
             other => panic!("unexpected event: {other:?}"),
         }
@@ -635,9 +655,68 @@ mod tests {
             Ok(ResponseEvent::Completed {
                 response_id,
                 token_usage,
+                end_turn,
             }) => {
                 assert_eq!(response_id, "");
                 assert!(token_usage.is_none());
+                assert!(end_turn.is_none());
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn response_completed_preserves_end_turn_false() {
+        let completed = json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp1",
+                "end_turn": false
+            }
+        })
+        .to_string();
+
+        let sse1 = format!("event: response.completed\ndata: {completed}\n\n");
+        let events = collect_events(&[sse1.as_bytes()]).await;
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            Ok(ResponseEvent::Completed {
+                response_id,
+                token_usage,
+                end_turn,
+            }) => {
+                assert_eq!(response_id, "resp1");
+                assert!(token_usage.is_none());
+                assert_eq!(*end_turn, Some(false));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn response_incomplete_is_stream_error() {
+        let incomplete = json!({
+            "type": "response.incomplete",
+            "response": {
+                "id": "resp1",
+                "incomplete_details": {
+                    "reason": "max_output_tokens"
+                }
+            }
+        })
+        .to_string();
+
+        let sse1 = format!("event: response.incomplete\ndata: {incomplete}\n\n");
+        let events = collect_events(&[sse1.as_bytes()]).await;
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            Err(ApiError::Stream(message)) => {
+                assert_eq!(
+                    message,
+                    "Incomplete response returned, reason: max_output_tokens"
+                );
             }
             other => panic!("unexpected event: {other:?}"),
         }
@@ -673,9 +752,11 @@ mod tests {
             Ok(ResponseEvent::Completed {
                 response_id,
                 token_usage,
+                end_turn,
             }) => {
                 assert_eq!(response_id, "resp1");
                 assert!(token_usage.is_none());
+                assert!(end_turn.is_none());
             }
             other => panic!("unexpected event: {other:?}"),
         }

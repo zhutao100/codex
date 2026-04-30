@@ -167,6 +167,11 @@ struct LastResponse {
     items_added: Vec<ResponseItem>,
 }
 
+enum WebsocketStreamOutcome {
+    Stream(ResponseStream),
+    FallbackToHttp,
+}
+
 impl ModelClient {
     #[allow(clippy::too_many_arguments)]
     /// Creates a new session-scoped `ModelClient`.
@@ -354,6 +359,7 @@ impl ModelClientSession {
     fn responses_websocket_enabled(&self) -> bool {
         self.client.state.provider.supports_websockets
             && self.client.state.enable_responses_websockets
+            && (*CODEX_RS_SSE_FIXTURE).is_none()
     }
 
     fn responses_websockets_v2_enabled(&self) -> bool {
@@ -700,7 +706,7 @@ impl ModelClientSession {
         summary: ReasoningSummaryConfig,
         service_tier: Option<ServiceTier>,
         turn_metadata_header: Option<&str>,
-    ) -> Result<ResponseStream> {
+    ) -> Result<WebsocketStreamOutcome> {
         let auth_manager = self.client.state.auth_manager.clone();
         let api_prompt = Self::build_responses_request(prompt)?;
 
@@ -745,6 +751,11 @@ impl ModelClientSession {
                     handle_unauthorized(unauthorized_transport, &mut auth_recovery).await?;
                     continue;
                 }
+                Err(ApiError::Transport(TransportError::Http { status, .. }))
+                    if status == StatusCode::UPGRADE_REQUIRED =>
+                {
+                    return Ok(WebsocketStreamOutcome::FallbackToHttp);
+                }
                 Err(err) => return Err(map_api_error(err)),
             };
 
@@ -764,7 +775,7 @@ impl ModelClientSession {
                 map_response_stream(stream_result, otel_manager.clone());
             self.websocket_last_response_rx = Some(last_response_rx);
 
-            return Ok(stream);
+            return Ok(WebsocketStreamOutcome::Stream(stream));
         }
     }
 
@@ -809,28 +820,35 @@ impl ModelClientSession {
                     self.responses_websocket_enabled() && !self.disable_websockets();
 
                 if websocket_enabled {
-                    self.stream_responses_websocket(
-                        prompt,
-                        model_info,
-                        otel_manager,
-                        effort,
-                        summary,
-                        service_tier,
-                        turn_metadata_header,
-                    )
-                    .await
-                } else {
-                    self.stream_responses_api(
-                        prompt,
-                        model_info,
-                        otel_manager,
-                        effort,
-                        summary,
-                        service_tier,
-                        turn_metadata_header,
-                    )
-                    .await
+                    match self
+                        .stream_responses_websocket(
+                            prompt,
+                            model_info,
+                            otel_manager,
+                            effort,
+                            summary,
+                            service_tier,
+                            turn_metadata_header,
+                        )
+                        .await?
+                    {
+                        WebsocketStreamOutcome::Stream(stream) => return Ok(stream),
+                        WebsocketStreamOutcome::FallbackToHttp => {
+                            self.try_switch_fallback_transport(otel_manager);
+                        }
+                    }
                 }
+
+                self.stream_responses_api(
+                    prompt,
+                    model_info,
+                    otel_manager,
+                    effort,
+                    summary,
+                    service_tier,
+                    turn_metadata_header,
+                )
+                .await
             }
         }
     }
@@ -948,6 +966,7 @@ where
                 Ok(ResponseEvent::Completed {
                     response_id,
                     token_usage,
+                    end_turn,
                 }) => {
                     if let Some(usage) = &token_usage {
                         otel_manager.sse_event_completed(
@@ -968,6 +987,7 @@ where
                         .send(Ok(ResponseEvent::Completed {
                             response_id,
                             token_usage,
+                            end_turn,
                         }))
                         .await
                         .is_err()
