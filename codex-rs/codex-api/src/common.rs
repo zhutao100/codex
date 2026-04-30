@@ -9,6 +9,7 @@ use futures::Stream;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::task::Context;
 use std::task::Poll;
@@ -176,6 +177,7 @@ pub struct ResponsesApiRequest<'a> {
 #[derive(Debug, Serialize, Clone, PartialEq)]
 pub struct ResponseCreateWsRequest {
     pub model: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub instructions: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub previous_response_id: Option<String>,
@@ -193,6 +195,10 @@ pub struct ResponseCreateWsRequest {
     pub prompt_cache_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<TextControls>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generate: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_metadata: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Serialize)]

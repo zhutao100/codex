@@ -12,6 +12,7 @@
 //! requests during that turn. It caches a Responses WebSocket connection (opened lazily) and
 //! stores per-turn state such as the `x-codex-turn-state` token used for sticky routing.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
@@ -30,7 +31,6 @@ use codex_api::MemoryTraceSummaryOutput as ApiMemoryTraceSummaryOutput;
 use codex_api::Prompt as ApiPrompt;
 use codex_api::RequestTelemetry;
 use codex_api::ReqwestTransport;
-use codex_api::ResponseAppendWsRequest;
 use codex_api::ResponseCreateWsRequest;
 use codex_api::ResponsesClient as ApiResponsesClient;
 use codex_api::ResponsesOptions as ApiResponsesOptions;
@@ -55,6 +55,7 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::SubAgentSource;
 use eventsource_stream::Event;
 use eventsource_stream::EventStreamError;
 use futures::StreamExt;
@@ -87,10 +88,11 @@ use crate::tools::spec::create_tools_json_for_responses_api;
 
 pub const X_CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
 pub const X_CODEX_TURN_METADATA_HEADER: &str = "x-codex-turn-metadata";
+pub const X_CODEX_PARENT_THREAD_ID_HEADER: &str = "x-codex-parent-thread-id";
+pub const X_OPENAI_SUBAGENT_HEADER: &str = "x-openai-subagent";
 pub const X_RESPONSESAPI_INCLUDE_TIMING_METRICS_HEADER: &str =
     "x-responsesapi-include-timing-metrics";
 const OPENAI_BETA_HEADER: &str = "OpenAI-Beta";
-const OPENAI_BETA_RESPONSES_WEBSOCKETS: &str = "responses_websockets=2026-02-04";
 const RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE: &str = "responses_websockets=2026-02-06";
 
 /// Session-scoped state shared by all [`ModelClient`] clones.
@@ -105,7 +107,6 @@ struct ModelClientState {
     session_source: SessionSource,
     model_verbosity: Option<VerbosityConfig>,
     enable_responses_websockets: bool,
-    enable_responses_websockets_v2: bool,
     enable_request_compression: bool,
     include_timing_metrics: bool,
     beta_features_header: Option<String>,
@@ -200,7 +201,6 @@ impl ModelClient {
                 session_source,
                 model_verbosity,
                 enable_responses_websockets,
-                enable_responses_websockets_v2,
                 enable_request_compression,
                 include_timing_metrics,
                 beta_features_header,
@@ -320,18 +320,40 @@ impl ModelClient {
 
     fn build_subagent_headers(&self) -> ApiHeaderMap {
         let mut extra_headers = ApiHeaderMap::new();
-        if let SessionSource::SubAgent(sub) = &self.state.session_source {
-            let subagent = match sub {
-                crate::protocol::SubAgentSource::Review => "review".to_string(),
-                crate::protocol::SubAgentSource::Compact => "compact".to_string(),
-                crate::protocol::SubAgentSource::ThreadSpawn { .. } => "collab_spawn".to_string(),
-                crate::protocol::SubAgentSource::Other(label) => label.clone(),
-            };
+        if let Some(subagent) = subagent_header_value(&self.state.session_source) {
             if let Ok(val) = HeaderValue::from_str(&subagent) {
-                extra_headers.insert("x-openai-subagent", val);
+                extra_headers.insert(X_OPENAI_SUBAGENT_HEADER, val);
+            }
+        }
+        if let Some(parent_thread_id) = parent_thread_id_header_value(&self.state.session_source) {
+            if let Ok(val) = HeaderValue::from_str(&parent_thread_id) {
+                extra_headers.insert(X_CODEX_PARENT_THREAD_ID_HEADER, val);
             }
         }
         extra_headers
+    }
+
+    fn build_ws_client_metadata(
+        &self,
+        turn_metadata_header: Option<&str>,
+    ) -> Option<HashMap<String, String>> {
+        let mut metadata = HashMap::new();
+        if let Some(turn_metadata_header) = turn_metadata_header {
+            metadata.insert(
+                X_CODEX_TURN_METADATA_HEADER.to_string(),
+                turn_metadata_header.to_string(),
+            );
+        }
+        if let Some(subagent) = subagent_header_value(&self.state.session_source) {
+            metadata.insert(X_OPENAI_SUBAGENT_HEADER.to_string(), subagent);
+        }
+        if let Some(parent_thread_id) = parent_thread_id_header_value(&self.state.session_source) {
+            metadata.insert(
+                X_CODEX_PARENT_THREAD_ID_HEADER.to_string(),
+                parent_thread_id,
+            );
+        }
+        (!metadata.is_empty()).then_some(metadata)
     }
 
     /// Builds request telemetry for unary API calls (e.g., Compact endpoint).
@@ -360,10 +382,6 @@ impl ModelClientSession {
         self.client.state.provider.supports_websockets
             && self.client.state.enable_responses_websockets
             && (*CODEX_RS_SSE_FIXTURE).is_none()
-    }
-
-    fn responses_websockets_v2_enabled(&self) -> bool {
-        self.client.state.enable_responses_websockets_v2
     }
 
     fn build_responses_request(prompt: &Prompt) -> Result<ApiPrompt> {
@@ -454,8 +472,12 @@ impl ModelClientSession {
         let previous_request = self.websocket_last_request.as_ref()?;
         let mut previous_without_input = previous_request.clone();
         previous_without_input.input.clear();
+        previous_without_input.generate = None;
+        previous_without_input.client_metadata = None;
         let mut request_without_input = request.clone();
         request_without_input.input.clear();
+        request_without_input.generate = None;
+        request_without_input.client_metadata = None;
         if previous_without_input != request_without_input {
             return None;
         }
@@ -516,42 +538,32 @@ impl ModelClientSession {
             service_tier: service_tier.clone(),
             prompt_cache_key: prompt_cache_key.clone(),
             text: text.clone(),
+            generate: None,
+            client_metadata: self
+                .client
+                .build_ws_client_metadata(turn_metadata_header_from_options(options)),
         };
 
-        let last_response = self.get_last_response();
-        let responses_websockets_v2_enabled = self.responses_websockets_v2_enabled();
-        if let Some(append_items) = self.get_incremental_items(
-            &payload,
-            last_response.as_ref(),
-            responses_websockets_v2_enabled,
-        ) {
-            if responses_websockets_v2_enabled
-                && let Some(previous_response_id) = last_response
-                    .as_ref()
-                    .map(|last_response| last_response.response_id.clone())
-                    .filter(|id| !id.is_empty())
-            {
-                return (
-                    ResponsesWsRequest::ResponseCreate(ResponseCreateWsRequest {
-                        previous_response_id: Some(previous_response_id),
-                        input: append_items,
-                        ..payload.clone()
-                    }),
-                    payload,
-                );
-            }
-
-            if !responses_websockets_v2_enabled {
-                return (
-                    ResponsesWsRequest::ResponseAppend(ResponseAppendWsRequest {
-                        input: append_items,
-                    }),
-                    payload,
-                );
-            }
+        let Some(last_response) = self.get_last_response() else {
+            return (ResponsesWsRequest::ResponseCreate(payload.clone()), payload);
+        };
+        let Some(incremental_items) =
+            self.get_incremental_items(&payload, Some(&last_response), true)
+        else {
+            return (ResponsesWsRequest::ResponseCreate(payload.clone()), payload);
+        };
+        if last_response.response_id.is_empty() {
+            return (ResponsesWsRequest::ResponseCreate(payload.clone()), payload);
         }
 
-        (ResponsesWsRequest::ResponseCreate(payload.clone()), payload)
+        (
+            ResponsesWsRequest::ResponseCreate(ResponseCreateWsRequest {
+                previous_response_id: Some(last_response.response_id),
+                input: incremental_items,
+                ..payload.clone()
+            }),
+            payload,
+        )
     }
 
     async fn websocket_connection(
@@ -571,14 +583,9 @@ impl ModelClientSession {
             self.websocket_last_response_rx = None;
             let mut headers = options.extra_headers.clone();
             headers.extend(build_conversation_headers(options.conversation_id.clone()));
-            let responses_websockets_beta_header = if self.responses_websockets_v2_enabled() {
-                RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE
-            } else {
-                OPENAI_BETA_RESPONSES_WEBSOCKETS
-            };
             headers.insert(
                 OPENAI_BETA_HEADER,
-                HeaderValue::from_static(responses_websockets_beta_header),
+                HeaderValue::from_static(RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE),
             );
             if self.client.state.include_timing_metrics {
                 headers.insert(
@@ -886,6 +893,35 @@ fn build_api_prompt(prompt: &Prompt, instructions: String, tools_json: Vec<Value
         parallel_tool_calls: prompt.parallel_tool_calls,
         output_schema: prompt.output_schema.clone(),
     }
+}
+
+fn turn_metadata_header_from_options(options: &ApiResponsesOptions) -> Option<&str> {
+    options
+        .extra_headers
+        .get(X_CODEX_TURN_METADATA_HEADER)
+        .and_then(|value| value.to_str().ok())
+}
+
+fn subagent_header_value(session_source: &SessionSource) -> Option<String> {
+    let SessionSource::SubAgent(subagent_source) = session_source else {
+        return None;
+    };
+    Some(match subagent_source {
+        SubAgentSource::Review => "review".to_string(),
+        SubAgentSource::Compact => "compact".to_string(),
+        SubAgentSource::ThreadSpawn { .. } => "collab_spawn".to_string(),
+        SubAgentSource::Other(label) => label.clone(),
+    })
+}
+
+fn parent_thread_id_header_value(session_source: &SessionSource) -> Option<String> {
+    let SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+        parent_thread_id, ..
+    }) = session_source
+    else {
+        return None;
+    };
+    Some(parent_thread_id.to_string())
 }
 
 /// Builds the extra headers attached to Responses API requests.
