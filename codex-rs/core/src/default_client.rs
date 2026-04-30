@@ -4,6 +4,7 @@ use codex_client::CodexHttpClient;
 pub use codex_client::CodexRequestBuilder;
 use reqwest::header::HeaderMap;
 use reqwest::header::HeaderValue;
+use reqwest::header::USER_AGENT;
 use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::sync::RwLock;
@@ -140,6 +141,30 @@ pub fn get_codex_user_agent() -> String {
     sanitize_user_agent(candidate, &prefix)
 }
 
+fn default_headers_without_user_agent() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert("originator", originator().header_value);
+    if let Ok(guard) = REQUIREMENTS_RESIDENCY.read()
+        && let Some(requirement) = guard.as_ref()
+        && !headers.contains_key(RESIDENCY_HEADER_NAME)
+    {
+        let value = match requirement {
+            ResidencyRequirement::Us => HeaderValue::from_static("us"),
+        };
+        headers.insert(RESIDENCY_HEADER_NAME, value);
+    }
+    headers
+}
+
+pub fn default_headers() -> HeaderMap {
+    let mut headers = default_headers_without_user_agent();
+    let ua = get_codex_user_agent();
+    if let Ok(value) = HeaderValue::from_str(&ua) {
+        headers.insert(USER_AGENT, value);
+    }
+    headers
+}
+
 /// Sanitize the user agent string.
 ///
 /// Invalid characters are replaced with an underscore.
@@ -179,17 +204,7 @@ pub fn create_client() -> CodexHttpClient {
 }
 
 pub fn build_reqwest_client() -> reqwest::Client {
-    let mut headers = HeaderMap::new();
-    headers.insert("originator", originator().header_value);
-    if let Ok(guard) = REQUIREMENTS_RESIDENCY.read()
-        && let Some(requirement) = guard.as_ref()
-        && !headers.contains_key(RESIDENCY_HEADER_NAME)
-    {
-        let value = match requirement {
-            ResidencyRequirement::Us => HeaderValue::from_static("us"),
-        };
-        headers.insert(RESIDENCY_HEADER_NAME, value);
-    }
+    let headers = default_headers_without_user_agent();
     let ua = get_codex_user_agent();
 
     let mut builder = reqwest::Client::builder()

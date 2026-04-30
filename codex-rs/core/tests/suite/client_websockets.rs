@@ -44,6 +44,8 @@ use tracing_test::traced_test;
 
 const MODEL: &str = "gpt-5.2-codex";
 const OPENAI_BETA_HEADER: &str = "OpenAI-Beta";
+const ORIGINATOR_HEADER: &str = "originator";
+const USER_AGENT_HEADER: &str = "user-agent";
 const WS_V2_BETA_HEADER_VALUE: &str = "responses_websockets=2026-02-06";
 
 struct WebsocketTestHarness {
@@ -83,6 +85,14 @@ async fn responses_websocket_streams_request() {
     assert_eq!(
         handshake.header(OPENAI_BETA_HEADER),
         Some(WS_V2_BETA_HEADER_VALUE.to_string())
+    );
+    assert_eq!(
+        handshake.header(ORIGINATOR_HEADER),
+        Some(codex_core::default_client::originator().value)
+    );
+    assert_eq!(
+        handshake.header(USER_AGENT_HEADER),
+        Some(codex_core::default_client::get_codex_user_agent())
     );
 
     server.shutdown().await;

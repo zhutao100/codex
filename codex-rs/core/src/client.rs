@@ -79,6 +79,7 @@ use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
 use crate::client_common::ResponseStream;
 use crate::default_client::build_reqwest_client;
+use crate::default_client::default_headers;
 use crate::error::CodexErr;
 use crate::error::Result;
 use crate::flags::CODEX_RS_SSE_FIXTURE;
@@ -94,6 +95,7 @@ pub const X_RESPONSESAPI_INCLUDE_TIMING_METRICS_HEADER: &str =
     "x-responsesapi-include-timing-metrics";
 const OPENAI_BETA_HEADER: &str = "OpenAI-Beta";
 const RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE: &str = "responses_websockets=2026-02-06";
+const DEFAULT_WEBSOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Session-scoped state shared by all [`ModelClient`] clones.
 ///
@@ -320,15 +322,15 @@ impl ModelClient {
 
     fn build_subagent_headers(&self) -> ApiHeaderMap {
         let mut extra_headers = ApiHeaderMap::new();
-        if let Some(subagent) = subagent_header_value(&self.state.session_source) {
-            if let Ok(val) = HeaderValue::from_str(&subagent) {
-                extra_headers.insert(X_OPENAI_SUBAGENT_HEADER, val);
-            }
+        if let Some(subagent) = subagent_header_value(&self.state.session_source)
+            && let Ok(val) = HeaderValue::from_str(&subagent)
+        {
+            extra_headers.insert(X_OPENAI_SUBAGENT_HEADER, val);
         }
-        if let Some(parent_thread_id) = parent_thread_id_header_value(&self.state.session_source) {
-            if let Ok(val) = HeaderValue::from_str(&parent_thread_id) {
-                extra_headers.insert(X_CODEX_PARENT_THREAD_ID_HEADER, val);
-            }
+        if let Some(parent_thread_id) = parent_thread_id_header_value(&self.state.session_source)
+            && let Ok(val) = HeaderValue::from_str(&parent_thread_id)
+        {
+            extra_headers.insert(X_CODEX_PARENT_THREAD_ID_HEADER, val);
         }
         extra_headers
     }
@@ -594,14 +596,17 @@ impl ModelClientSession {
                 );
             }
             let websocket_telemetry = Self::build_websocket_telemetry(otel_manager);
+            let websocket_client = ApiWebSocketResponsesClient::new(api_provider, api_auth);
+            let connect = websocket_client.connect(
+                headers,
+                default_headers(),
+                options.turn_state.clone(),
+                Some(websocket_telemetry),
+            );
             let new_conn: ApiWebSocketConnection =
-                ApiWebSocketResponsesClient::new(api_provider, api_auth)
-                    .connect(
-                        headers,
-                        options.turn_state.clone(),
-                        Some(websocket_telemetry),
-                    )
-                    .await?;
+                tokio::time::timeout(DEFAULT_WEBSOCKET_CONNECT_TIMEOUT, connect)
+                    .await
+                    .map_err(|_| ApiError::Transport(TransportError::Timeout))??;
             self.connection = Some(new_conn);
         }
 
