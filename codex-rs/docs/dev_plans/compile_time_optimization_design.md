@@ -114,7 +114,7 @@ The branch-specific `ContinueTask` must be migrated with the rest. Its existence
   - `[profile.release] lto = "fat"`
   - `[profile.release] strip = "symbols"`
   - `[profile.release] codegen-units = 1`
-- Root `Cargo.toml` does **not** have the latest upstream local-dev profile optimization:
+- Root `Cargo.toml` already has the local-dev profile optimization:
   - `[profile.dev] debug = 1`
   - `[profile.dev-small]` inheriting `dev` with `debug = 0` and `strip = true`
 - v0.98 has `core/build.rs`, which recursively emits `cargo:rerun-if-changed` for `core/src/skills/assets/samples`. Latest upstream no longer has `core/build.rs`; skills were moved into separate crates. This is lower priority than the async-trait hotspots but worth keeping in the follow-up queue.
@@ -150,7 +150,7 @@ Use multiple complementary views because each answers a different question:
 
 | Setting/tool | Compile-time effect | v0.98 recommendation |
 |---|---|---|
-| `[profile.dev] debug = 1` | Reduces debug-info generation versus full dev debug info while preserving useful line tables/backtraces. | Low-risk local-dev improvement; backport from latest upstream. |
+| `[profile.dev] debug = 1` | Reduces debug-info generation versus full dev debug info while preserving useful line tables/backtraces. | Already applied. |
 | `[profile.dev-small] debug = 0`, `strip = true` | Fast/small local debug artifacts for scenarios that do not need debugger-friendly output. | Optional convenience profile; do not make it the default. |
 | `codegen-units` | More units can reduce compile time by increasing backend parallelism, but can reduce runtime performance/size. | Leave release `codegen-units = 1` because v0.98 explicitly optimizes shipped binaries. Do not use release profile to evaluate edit-build speed. |
 | `lto = "fat"` | Improves release runtime/size at substantial link-time cost. | Keep for release artifacts, but add documentation that developer loops should use `cargo check`, default dev profile, or `dev-small`. |
