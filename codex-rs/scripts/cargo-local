@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+workspace_dir="$(cd -- "${script_dir}/.." && pwd -P)"
+
+cargo_bin="${CODEX_RS_CARGO_BIN:-cargo}"
+
+workspace_key() {
+    local digest
+    digest="$(printf '%s' "${workspace_dir}" | shasum -a 256 | awk '{print substr($1, 1, 16)}')"
+    printf '%s-%s\n' "$(basename "${workspace_dir}")" "${digest}"
+}
+
+first_marker_build_root() {
+    local marker
+
+    for marker in /Volumes/*/.codex-rs-build-root; do
+        [ -d "${marker}" ] || continue
+        [ -w "${marker}" ] || continue
+        printf '%s\n' "${marker}"
+        return 0
+    done
+
+    return 1
+}
+
+resolve_build_root() {
+    local root="${1}"
+
+    mkdir -p "${root}"
+    cd -- "${root}" && pwd -P
+}
+
+select_target_dir() {
+    local build_root=""
+
+    if [ -n "${CARGO_TARGET_DIR:-}" ]; then
+        printf '%s\n' "${CARGO_TARGET_DIR}"
+        return 0
+    fi
+
+    if [ -n "${CODEX_RS_BUILD_ROOT:-}" ]; then
+        build_root="$(resolve_build_root "${CODEX_RS_BUILD_ROOT}")"
+    elif build_root="$(first_marker_build_root)"; then
+        build_root="$(resolve_build_root "${build_root}")"
+    else
+        printf '%s\n' "${workspace_dir}/target"
+        return 0
+    fi
+
+    printf '%s/target/%s\n' "${build_root}" "$(workspace_key)"
+}
+
+target_dir="$(select_target_dir)"
+
+if [ "${1:-}" = "--print-target-dir" ]; then
+    printf '%s\n' "${target_dir}"
+    exit 0
+fi
+
+if [ -z "${CARGO_TARGET_DIR:-}" ] && [ "${target_dir}" != "${workspace_dir}/target" ]; then
+    mkdir -p "${target_dir}"
+    export CARGO_TARGET_DIR="${target_dir}"
+fi
+
+if [ "${CODEX_RS_CARGO_LOCAL_VERBOSE:-}" = "1" ]; then
+    printf 'cargo-local: CARGO_TARGET_DIR=%s\n' "${target_dir}" >&2
+fi
+
+exec "${cargo_bin}" "$@"
