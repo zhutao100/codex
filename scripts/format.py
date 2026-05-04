@@ -41,7 +41,8 @@ def just_formatter_group(*, check: bool) -> FormatterGroup:
 
 
 def rust_formatter_group(*, check: bool) -> FormatterGroup:
-    args = ["cargo", "fmt", "--", "--config", "imports_granularity=Item"]
+    cargo_bin = "cargo" if os.name == "nt" else "scripts/cargo-local"
+    args = [cargo_bin, "fmt", "--", "--config", "imports_granularity=Item"]
     if check:
         args.append("--check")
     command = Command(tuple(args), REPO_ROOT / "codex-rs")

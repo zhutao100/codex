@@ -1,24 +1,29 @@
 set working-directory := "codex-rs"
-set positional-arguments
+set positional-arguments := true
+
 export JUST_SHELL := justfile_directory() / "scripts/just-shell.py"
+
 set shell := ["python3", "-c", 'import os, runpy; runpy.run_path(os.environ["JUST_SHELL"], run_name="__main__")']
 set windows-shell := ["python", "-c", 'import os, runpy; runpy.run_path(os.environ["JUST_SHELL"], run_name="__main__")']
 
-rust_min_stack := "8388608" # 8 MiB
+rust_min_stack := "8388608"
 python := if os_family() == "windows" { "python" } else { "python3" }
+cargo_cmd := if os_family() == "windows" { "cargo" } else { "scripts/cargo-local" }
 
 # Display help
 help:
     just -l
 
 # `codex`
+
 alias c := codex
+
 codex *args:
-    cargo run --bin codex -- {args}
+    {{ cargo_cmd }} run --bin codex -- {args}
 
 # `codex exec`
 exec *args:
-    cargo run --bin codex -- exec {args}
+    {{ cargo_cmd }} run --bin codex -- exec {args}
 
 # Start `codex exec-server` and run codex-tui.
 [no-cd]
@@ -29,13 +34,19 @@ tui-with-exec-server *args:
 
 # Run the CLI version of the file-search crate.
 file-search *args:
-    cargo run --bin codex-file-search -- {args}
+    {{ cargo_cmd }} run --bin codex-file-search -- {args}
 
 # Run the standalone code-mode host from source.
 code-mode-host *args:
     cargo run --bin codex-code-mode-host -- {args}
 
 # Build the CLI and run the app-server test client
+[unix]
+app-server-test-client *args:
+    {{ cargo_cmd }} build -p codex-cli
+    {{ cargo_cmd }} run -p codex-app-server-test-client -- --codex-bin "$$({{ cargo_cmd }} --print-target-dir)/debug/codex" "$@"
+
+[windows]
 app-server-test-client *args:
     cargo build -p codex-cli
     cargo run -p codex-app-server-test-client -- --codex-bin ./target/debug/codex {args}
@@ -49,15 +60,15 @@ fmt-check:
     @{{ python }} ../scripts/format.py --check
 
 fix *args:
-    cargo clippy --fix --tests --allow-dirty {args}
+    {{ cargo_cmd }} clippy --fix --tests --allow-dirty {args}
 
 clippy *args:
-    cargo clippy --tests {args}
+    {{ cargo_cmd }} clippy --tests {args}
 
 [unix]
 install:
     rustup show active-toolchain
-    cargo fetch
+    {{ cargo_cmd }} fetch
 
 [windows]
 install:
@@ -76,16 +87,19 @@ install:
 #
 # Run `cargo install --locked cargo-nextest` if you don't have it installed.
 # Prefer this for routine local runs. Workspace crate features are banned, so
+
 # there should be no need to add `--all-features`.
 [unix]
 test *args:
-    RUST_MIN_STACK={{ rust_min_stack }} NEXTEST_PROFILE=local cargo nextest run --no-fail-fast "$@"
+    RUST_MIN_STACK={{ rust_min_stack }} NEXTEST_PROFILE=local {{ cargo_cmd }} nextest run --no-fail-fast "$@"
+    just bench-smoke
 
 [windows]
 test *args:
     $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo nextest run --no-fail-fast @($args | Select-Object -Skip 1)
 
 # Run from the repository root so scripts that resolve paths from `cwd` see
+
 # the same layout they use in GitHub Actions.
 [no-cd]
 test-github-scripts:
@@ -93,7 +107,7 @@ test-github-scripts:
 
 # Run explicit workspace benchmark targets.
 bench *args:
-    cargo bench --workspace --bench '*' {args}
+    {{ cargo_cmd }} bench --workspace --bench '*' {args}
 
 # Run benchmark targets once to ensure they start successfully.
 bench-smoke:
@@ -114,6 +128,7 @@ bench-e2e-smoke:
 
 # Build and run Codex from source using Bazel.
 # On Unix, use `[no-cd]` and `--run_under="cd $PWD &&"` to ensure Bazel runs
+
 # the command in the current working directory.
 [no-cd]
 [unix]
@@ -165,19 +180,19 @@ build-for-release:
 
 # Run the MCP server
 mcp-server-run *args:
-    cargo run -p codex-mcp-server -- {args}
+    {{ cargo_cmd }} run -p codex-mcp-server -- {args}
 
 # Regenerate the json schema for config.toml from the current config types.
 write-config-schema:
-    cargo run -p codex-core --bin codex-write-config-schema
+    {{ cargo_cmd }} run -p codex-core --bin codex-write-config-schema
 
 # Regenerate vendored app-server protocol schema artifacts.
 write-app-server-schema *args:
-    cargo run -p codex-app-server-protocol --bin write_schema_fixtures -- {args}
+    {{ cargo_cmd }} run -p codex-app-server-protocol --bin write_schema_fixtures -- {args}
 
 [no-cd]
 write-hooks-schema:
-    cargo run --manifest-path {{ justfile_directory() }}/codex-rs/Cargo.toml -p codex-hooks --bin write_hooks_schema_fixtures
+    {{ cargo_cmd }} run --manifest-path {{ justfile_directory() }}/codex-rs/Cargo.toml -p codex-hooks --bin write_hooks_schema_fixtures
 
 # Run the argument-comment Dylint checks across codex-rs.
 [no-cd]
@@ -196,7 +211,7 @@ argument-comment-lint-from-source *args:
 # Tail logs from the state SQLite database
 [unix]
 log *args:
-    if [ "${1:-}" = "--" ]; then shift; fi; cargo run -p codex-state --bin logs_client -- "$@"
+    if [ "${1:-}" = "--" ]; then shift; fi; {{ cargo_cmd }} run -p codex-state --bin logs_client -- "$@"
 
 [windows]
 log *args:
