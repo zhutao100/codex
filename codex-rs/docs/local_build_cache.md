@@ -10,6 +10,8 @@ CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-core --lib
 ```
 
 The repo `just` recipes and `scripts/debug-codex.sh` call this wrapper.
+The workspace VS Code rust-analyzer settings also call it for diagnostics,
+build-script/proc-macro loading, and runnables.
 
 Target-dir selection:
 
@@ -30,6 +32,11 @@ scripts/cargo-local --print-target-dir
 Keep `sccache` configuration outside this repo. The wrapper does not start
 long-lived cache processes on external disks, so a removable target volume can
 be ejected after Cargo commands finish.
+
+If rust-analyzer recreates `target/debug/`, check that VS Code opened the repo
+root that contains `.vscode/settings.json`. The project settings override
+rust-analyzer's Cargo commands with `./scripts/cargo-local`; if those settings
+are not loaded, rust-analyzer falls back to direct `cargo` commands.
 
 For cleanup, prefer `cargo-sweep` when installed because it can remove stale
 target artifacts without deleting every warm build product:
