@@ -1,0 +1,263 @@
+# Model-related config.toml defaults
+#
+# Default means the behavior when a key is absent from `config.toml`.
+# Assignment examples are commented because TOML has no `null` value and most
+# defaults are represented internally as "unset".
+
+# Top-level model selection.
+#
+# Config default: unset. Effective runtime default is selected from available
+# model metadata; the bundled default model is currently `gpt-5.4`.
+# model = "gpt-5.4"
+
+# Config default: unset. `/review` uses the current session model.
+# review_model = "gpt-5.4"
+
+# Config default: unset. `/review` uses the current session provider.
+# review_model_provider = "openai"
+
+# Config default: unset. Effective provider id defaults to `openai`.
+# model_provider = "openai"
+
+# Config default: unset. Uses model metadata, if present.
+# model_context_window = 163840
+
+# Config default: unset. Uses model metadata, or 90% of `context_window` when
+# metadata omits an explicit auto-compact limit.
+# model_auto_compact_token_limit = 147456
+
+# Config default: unset. Path is resolved as an absolute-path config value.
+# When present, the file replaces model instructions for the selected model.
+# model_instructions_file = "~/.codex/model-instructions.md"
+
+# Config default: unset. Uses the selected model's default reasoning effort.
+# Values: "none", "minimal", "low", "medium", "high", "xhigh".
+# model_reasoning_effort = "medium"
+
+# Config default: "auto".
+# Values: "auto", "concise", "detailed", "none".
+# model_reasoning_summary = "auto"
+
+# Config default: unset. Uses the selected model's default verbosity when the
+# model supports verbosity.
+# Values: "low", "medium", "high".
+# model_verbosity = "medium"
+
+# Config default: unset. Uses selected model metadata.
+# model_supports_reasoning_summaries = true
+
+# Config default: unset. If the personality feature is enabled and this remains
+# unset, the effective personality defaults to `pragmatic`.
+# Values: "none", "friendly", "pragmatic".
+# personality = "pragmatic"
+
+# Config default: unset. Local-provider helpers may use this to choose between
+# built-in OSS providers.
+# Values: "lmstudio", "ollama".
+# oss_provider = "ollama"
+
+
+# Profile-scoped model fields.
+#
+# All profile values default to unset and inherit the top-level/effective
+# behavior unless that profile is active.
+#
+# [profiles.example]
+# model = "gpt-5.4"
+# model_provider = "openai"
+# model_instructions_file = "~/.codex/profile-model-instructions.md"
+# model_reasoning_effort = "medium"
+# model_reasoning_summary = "auto"
+# model_verbosity = "medium"
+# personality = "pragmatic"
+# oss_provider = "ollama"
+#
+# [profiles.example.features]
+# remote_models = true
+
+
+# Feature flags with model-bearing names.
+#
+# [features]
+# Default: true. When enabled, Codex can refresh and use live `/models` data.
+# remote_models = true
+
+
+# Notice fields with model-bearing names.
+#
+# [notice]
+# Default: unset, treated as not hidden/not acknowledged.
+# hide_rate_limit_model_nudge = false
+#
+# Default: empty map of acknowledged old-model -> new-model migrations.
+# [notice.model_migrations]
+# "old-model" = "new-model"
+
+
+# Built-in provider map.
+#
+# The config default is no user-defined provider tables. At runtime, Codex adds
+# these built-in provider ids: `openai`, `ollama`, and `lmstudio`.
+#
+# User-defined provider tables extend the map for new ids. In this fork,
+# user-defined tables with built-in ids do not replace the built-ins.
+#
+# Built-in `openai` effective defaults:
+# [model_providers.openai]
+# name = "OpenAI"
+# base_url = "<OPENAI_BASE_URL if set, otherwise unset>"
+# env_key = "<unset>"
+# env_key_instructions = "<unset>"
+# experimental_bearer_token = "<unset>"
+# wire_api = "responses"
+# query_params = "<unset>"
+# http_headers = { version = "<current Codex version>" }
+# env_http_headers = { OpenAI-Organization = "OPENAI_ORGANIZATION", OpenAI-Project = "OPENAI_PROJECT" }
+# request_max_retries = "<unset, effective 4>"
+# stream_max_retries = "<unset, effective 5>"
+# stream_idle_timeout_ms = "<unset, effective 300000>"
+# requires_openai_auth = true
+# supports_websockets = true
+#
+# Built-in `ollama` effective defaults:
+# [model_providers.ollama]
+# name = "gpt-oss"
+# base_url = "<CODEX_OSS_BASE_URL, or http://localhost:${CODEX_OSS_PORT:-11434}/v1>"
+# wire_api = "responses"
+# requires_openai_auth = false
+# supports_websockets = false
+#
+# Built-in `lmstudio` effective defaults:
+# [model_providers.lmstudio]
+# name = "gpt-oss"
+# base_url = "<CODEX_OSS_BASE_URL, or http://localhost:${CODEX_OSS_PORT:-1234}/v1>"
+# wire_api = "responses"
+# requires_openai_auth = false
+# supports_websockets = false
+
+
+# User-defined provider shape.
+#
+# [model_providers.example]
+# Required for user-defined providers.
+# name = "Example Provider"
+#
+# Default: unset. If unset, request code falls back to the OpenAI API base URL
+# for API-key/no-auth requests or the ChatGPT Codex base URL for ChatGPT auth.
+# base_url = "https://provider.example.com/v1"
+#
+# Default: unset.
+# env_key = "EXAMPLE_API_KEY"
+# env_key_instructions = "Set EXAMPLE_API_KEY to your provider API key."
+# experimental_bearer_token = "token"
+#
+# Default: "responses". `responses` is the only supported value.
+# wire_api = "responses"
+#
+# Default: unset.
+# query_params = { api_version = "2025-01-01" }
+# http_headers = { "X-Provider" = "example" }
+# env_http_headers = { "X-Provider-Key" = "EXAMPLE_PROVIDER_KEY" }
+#
+# Defaults: unset in TOML, effective values shown.
+# request_max_retries = 4
+# stream_max_retries = 5
+# stream_idle_timeout_ms = 300000
+#
+# Serde defaults for user-defined providers.
+# requires_openai_auth = false
+# supports_websockets = false
+
+
+# Model overlay.
+#
+# Config default: unset. If absent, model metadata is not locally patched.
+#
+# [model_overlay]
+#
+# Final instruction replacement defaults.
+# final_instruction_override = "<unset>"
+# final_instruction_override_file = "<unset>"
+#
+# Patch fields default to unset, which preserves the selected model metadata.
+# For an unknown/custom slug, the fallback model metadata is shown in comments.
+# display_name = "<unset; custom fallback: slug>"
+# description = "<unset; custom fallback: unset>"
+# default_reasoning_level = "<unset; custom fallback: medium>"
+# supported_reasoning_levels = [
+#   { effort = "low", description = "Fast responses with lighter reasoning" },
+#   { effort = "medium", description = "Balances speed and reasoning depth for everyday tasks" },
+#   { effort = "high", description = "Greater reasoning depth for complex problems" },
+# ]
+# shell_type = "<unset; custom fallback: shell_command>"
+# visibility = "<unset; custom fallback: none>"
+# supported_in_api = true
+# priority = 99
+# upgrade = { model = "new-model", migration_markdown = "Migration notes" }
+# base_instructions = "<unset; custom fallback: bundled other-model instructions>"
+# base_instructions_file = "<unset>"
+#
+# Root-level instruction-template aliases. Do not combine these with the
+# equivalent `model_messages.instructions_template` fields.
+# instructions_template = "<unset>"
+# instructions_template_file = "<unset>"
+#
+# clear_model_messages default: false.
+# clear_model_messages = false
+#
+# supports_reasoning_summaries = true
+# support_verbosity = true
+# default_verbosity = "low"
+# apply_patch_tool_type = "freeform"
+# truncation_policy = { mode = "bytes", limit = 10000 }
+# supports_parallel_tool_calls = true
+# context_window = 163840
+# auto_compact_token_limit = 109226
+# effective_context_window_percent = 95
+# experimental_supported_tools = []
+# input_modalities = ["text", "image"]
+#
+# [model_overlay.model_messages]
+# instructions_template = "<unset>"
+# instructions_template_file = "<unset>"
+#
+# [model_overlay.model_messages.instructions_variables]
+# personality_default = "<unset>"
+# personality_default_file = "<unset>"
+# personality_friendly = "<unset>"
+# personality_friendly_file = "<unset>"
+# personality_pragmatic = "<unset>"
+# personality_pragmatic_file = "<unset>"
+
+
+# Per-model overlay entries.
+#
+# Default: no entries. Each entry requires `slug`; every patch field accepted
+# under `[model_overlay]` is also accepted under each `[[model_overlay.models]]`
+# entry, including `model_messages` and `final_instruction_override`.
+#
+# [[model_overlay.models]]
+# slug = "custom-model"
+# display_name = "Custom Model"
+# visibility = "list"
+# context_window = 163840
+# auto_compact_token_limit = 109226
+# final_instruction_override = "<unset>"
+# final_instruction_override_file = "<unset>"
+#
+# [model_overlay.models.model_messages]
+# instructions_template = "<unset>"
+#
+# [model_overlay.models.model_messages.instructions_variables]
+# personality_default = "<unset>"
+# personality_friendly = "<unset>"
+# personality_pragmatic = "<unset>"
+
+
+# Overlay enum value reference.
+#
+# shell_type: "default", "local", "unified_exec", "disabled", "shell_command"
+# visibility: "list", "hide", "none"
+# apply_patch_tool_type: "freeform", "function"
+# truncation_policy.mode: "bytes", "tokens"
+# input_modalities: "text", "image"
