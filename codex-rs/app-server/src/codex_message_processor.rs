@@ -4717,7 +4717,13 @@ impl CodexMessageProcessor {
         parent_thread_uuid: ThreadId,
         parent_thread_id: String,
     ) -> std::result::Result<(), JSONRPCErrorError> {
-        let turn_model = Some(parent_thread.config_snapshot().await.model);
+        let config_snapshot = parent_thread.config_snapshot().await;
+        let turn_model = Some(
+            self.config
+                .review_model
+                .clone()
+                .unwrap_or(config_snapshot.model),
+        );
         let turn_id = parent_thread.submit(Op::Review { review_request }).await;
 
         match turn_id {
@@ -4763,9 +4769,14 @@ impl CodexMessageProcessor {
                 })?;
 
         let mut config = self.config.as_ref().clone();
-        if let Some(review_model) = &config.review_model {
-            config.model = Some(review_model.clone());
-        }
+        config
+            .apply_review_model_overrides()
+            .map_err(|err| JSONRPCErrorError {
+                code: INTERNAL_ERROR_CODE,
+                message: format!("failed to apply review model settings: {err}"),
+                data: None,
+            })?;
+        let fallback_provider = config.model_provider_id.clone();
 
         let NewThread {
             thread_id,
@@ -4794,9 +4805,10 @@ impl CodexMessageProcessor {
             );
         }
 
-        let fallback_provider = self.config.model_provider_id.as_str();
         if let Some(rollout_path) = review_thread.rollout_path() {
-            match read_summary_from_rollout(rollout_path.as_path(), fallback_provider).await {
+            match read_summary_from_rollout(rollout_path.as_path(), fallback_provider.as_str())
+                .await
+            {
                 Ok(summary) => {
                     let mut thread = summary_to_thread(summary);
                     thread.model = Some(review_model.clone());

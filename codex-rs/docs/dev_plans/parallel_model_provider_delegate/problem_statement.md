@@ -5,6 +5,9 @@ one code-level update: request auth is now centralized in
 `core/src/api_bridge.rs::resolve_request_auth(...)`; the older
 `auth_provider_from_auth(...)` helper described in the initial assessment has
 been removed.
+Follow-up validation also found that TOML table scoping can silently place
+`review_model` keys under `[[model_overlay.models]]`; runtime validation now
+rejects that placement with a targeted error.
 
 ## Scenario
 

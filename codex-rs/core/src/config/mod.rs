@@ -32,6 +32,7 @@ use crate::config_loader::McpServerRequirement;
 use crate::config_loader::ResidencyRequirement;
 use crate::config_loader::Sourced;
 use crate::config_loader::load_config_layers_state;
+use crate::error::CodexErr;
 use crate::features::Feature;
 use crate::features::FeatureOverrides;
 use crate::features::Features;
@@ -513,6 +514,29 @@ impl ConfigBuilder {
 }
 
 impl Config {
+    pub fn apply_model_provider_id(&mut self, provider_id: &str) -> Result<(), CodexErr> {
+        let provider = self
+            .model_providers
+            .get(provider_id)
+            .cloned()
+            .ok_or_else(|| CodexErr::Fatal(format!("Model provider `{provider_id}` not found")))?;
+
+        self.model_provider_id = provider_id.to_string();
+        self.model_provider = provider;
+        Ok(())
+    }
+
+    pub fn apply_review_model_overrides(&mut self) -> Result<(), CodexErr> {
+        if let Some(review_model) = self.review_model.clone() {
+            self.model = Some(review_model);
+        }
+        if let Some(provider_id) = self.review_model_provider.clone() {
+            self.apply_model_provider_id(&provider_id)?;
+            self.features.disable(Feature::RemoteModels);
+        }
+        Ok(())
+    }
+
     /// This is the preferred way to create an instance of [Config].
     pub async fn load_with_cli_overrides(
         cli_overrides: Vec<(String, TomlValue)>,
@@ -4031,6 +4055,36 @@ wire_api = "responses"
             Some("external-review")
         );
         assert!(config.model_providers.contains_key("external-review"));
+        Ok(())
+    }
+
+    #[test]
+    fn review_model_keys_under_model_overlay_entry_are_rejected() -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+        let cfg: ConfigToml = toml::from_str(
+            r#"
+model = "gpt-5.5"
+
+[[model_overlay.models]]
+slug = "gpt-5.5"
+review_model = "external-reviewer"
+review_model_provider = "external-review"
+"#,
+        )
+        .expect("TOML deserialization should keep misplaced fields for validation");
+
+        let err = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )
+        .expect_err("misplaced review fields should be rejected");
+
+        let message = err.to_string();
+        assert!(message.contains("review_model"));
+        assert!(message.contains("review_model_provider"));
+        assert!(message.contains("top level"));
+        assert!(message.contains("model_overlay.models[slug=gpt-5.5]"));
         Ok(())
     }
 

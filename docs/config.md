@@ -68,6 +68,11 @@ supports_websockets = false
 
 Use `model_overlay` for metadata when `review_model` is not an OpenAI-listed model. The delegate request uses the provider's `env_key` bearer token and does not mutate the primary session auth.
 
+`review_model` and `review_model_provider` are top-level keys. In TOML, keys
+after `[model_overlay]`, `[[model_overlay.models]]`, or
+`[model_providers.<id>]` belong to that table until the next table header, so
+put review keys before table sections.
+
 ## Service Tier
 
 `service_tier` controls the OpenAI Responses service tier. Supported values are `"flex"` and `"fast"`. If omitted, Codex leaves the request unspecified so the API uses its default tier. Explicit `"fast"` is sent to OpenAI Responses as `"priority"`.

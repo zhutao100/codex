@@ -108,6 +108,7 @@ use crate::client::ModelClient;
 use crate::client::ModelClientSession;
 use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
+use crate::codex_delegate::apply_delegate_model_provider;
 use crate::codex_thread::ThreadConfigSnapshot;
 use crate::compact::collect_user_messages;
 use crate::config::Config;
@@ -3800,17 +3801,31 @@ async fn spawn_review_thread(
         .review_model
         .clone()
         .unwrap_or_else(|| parent_turn_context.model_info.slug.clone());
-    let review_model_info = sess
-        .services
-        .models_manager
-        .get_model_info(&model, &config)
-        .await;
     // For reviews, disable web_search and view_image regardless of global settings.
     let mut review_features = sess.features.clone();
     review_features
         .disable(crate::features::Feature::WebSearchRequest)
         .disable(crate::features::Feature::WebSearchCached);
     let review_web_search_mode = WebSearchMode::Disabled;
+
+    // Build per-turn config before resolving model metadata so the review
+    // context and detached review rollouts reflect task-local provider/model
+    // overrides, not only the inner one-shot delegate request.
+    let mut per_turn_config = (*config).clone();
+    per_turn_config.model = Some(model.clone());
+    if let Some(provider_id) = config.review_model_provider.as_deref()
+        && apply_delegate_model_provider(&mut per_turn_config, provider_id).is_ok()
+    {
+        review_features.disable(crate::features::Feature::RemoteModels);
+    }
+    per_turn_config.features = review_features.clone();
+    per_turn_config.web_search_mode = Some(review_web_search_mode);
+
+    let review_model_info = sess
+        .services
+        .models_manager
+        .get_model_info(&model, &per_turn_config)
+        .await;
     let tools_config = ToolsConfig::new(&ToolsConfigParams {
         model_info: &review_model_info,
         features: &review_features,
@@ -3818,15 +3833,9 @@ async fn spawn_review_thread(
     });
 
     let review_prompt = resolved.prompt.clone();
-    let provider = parent_turn_context.provider.clone();
+    let provider = per_turn_config.model_provider.clone();
     let auth_manager = parent_turn_context.auth_manager.clone();
     let model_info = review_model_info.clone();
-
-    // Build per‑turn client with the requested model/family.
-    let mut per_turn_config = (*config).clone();
-    per_turn_config.model = Some(model.clone());
-    per_turn_config.features = review_features.clone();
-    per_turn_config.web_search_mode = Some(review_web_search_mode);
 
     let otel_manager = parent_turn_context
         .otel_manager
@@ -3854,7 +3863,7 @@ async fn spawn_review_thread(
         service_tier,
         session_source,
         tools_config,
-        features: parent_turn_context.features.clone(),
+        features: review_features,
         ghost_snapshot: parent_turn_context.ghost_snapshot.clone(),
         developer_instructions: None,
         user_instructions: None,

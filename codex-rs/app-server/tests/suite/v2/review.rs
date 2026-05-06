@@ -18,6 +18,7 @@ use codex_app_server_protocol::ReviewTarget;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
+use codex_app_server_protocol::ThreadStartedNotification;
 use codex_app_server_protocol::TurnStatus;
 use serde_json::json;
 use tempfile::TempDir;
@@ -128,6 +129,39 @@ async fn review_start_runs_review_turn_and_emits_code_review_item() -> Result<()
     let review = review_body.expect("did not observe a code review item");
     assert!(review.contains("Prefer Stylize helpers"));
     assert!(review.contains("/tmp/file.rs:10-20"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn inline_review_start_reports_review_model_from_config() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+
+    let codex_home = TempDir::new()?;
+    create_config_toml_with_review_model_provider(codex_home.path(), &server.uri())?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let thread_id = start_default_thread(&mut mcp).await?;
+
+    let review_req = mcp
+        .send_review_start_request(ReviewStartParams {
+            thread_id,
+            delivery: Some(ReviewDelivery::Inline),
+            target: ReviewTarget::Custom {
+                instructions: "inline review".to_string(),
+            },
+        })
+        .await?;
+    let review_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(review_req)),
+    )
+    .await??;
+    let ReviewStartResponse { turn, .. } = to_response::<ReviewStartResponse>(review_resp)?;
+
+    assert_eq!(turn.model.as_deref(), Some("review-model"));
 
     Ok(())
 }
@@ -247,7 +281,7 @@ async fn review_start_with_detached_delivery_returns_new_thread_id() -> Result<(
     let server = create_mock_responses_server_repeating_assistant(&review_payload).await;
 
     let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
+    create_config_toml_with_review_model_provider(codex_home.path(), &server.uri())?;
 
     let mut mcp = McpProcess::new(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
@@ -274,10 +308,30 @@ async fn review_start_with_detached_delivery_returns_new_thread_id() -> Result<(
     } = to_response::<ReviewStartResponse>(review_resp)?;
 
     assert_eq!(turn.status, TurnStatus::InProgress);
+    assert_eq!(turn.model.as_deref(), Some("review-model"));
     assert_ne!(
         review_thread_id, thread_id,
         "detached review should run on a different thread"
     );
+
+    let mut started = None;
+    for _ in 0..5 {
+        let notif: JSONRPCNotification = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_notification_message("thread/started"),
+        )
+        .await??;
+        let candidate: ThreadStartedNotification =
+            serde_json::from_value(notif.params.expect("params must be present"))?;
+        if candidate.thread.id == review_thread_id {
+            started = Some(candidate);
+            break;
+        }
+    }
+    let started = started.expect("did not observe detached review thread/started notification");
+    assert_eq!(started.thread.id, review_thread_id);
+    assert_eq!(started.thread.model.as_deref(), Some("review-model"));
+    assert_eq!(started.thread.model_provider, "review_provider");
 
     Ok(())
 }
@@ -372,6 +426,41 @@ async fn start_default_thread(mcp: &mut McpProcess) -> Result<String> {
 
 fn create_config_toml(codex_home: &std::path::Path, server_uri: &str) -> std::io::Result<()> {
     create_config_toml_with_approval_policy(codex_home, server_uri, "never")
+}
+
+fn create_config_toml_with_review_model_provider(
+    codex_home: &std::path::Path,
+    server_uri: &str,
+) -> std::io::Result<()> {
+    let config_toml = codex_home.join("config.toml");
+    std::fs::write(
+        config_toml,
+        format!(
+            r#"
+model = "mock-model"
+review_model = "review-model"
+review_model_provider = "review_provider"
+approval_policy = "never"
+sandbox_mode = "read-only"
+
+model_provider = "mock_provider"
+
+[model_providers.mock_provider]
+name = "Mock provider"
+base_url = "{server_uri}/v1"
+wire_api = "responses"
+request_max_retries = 0
+stream_max_retries = 0
+
+[model_providers.review_provider]
+name = "Review provider"
+base_url = "{server_uri}/v1"
+wire_api = "responses"
+request_max_retries = 0
+stream_max_retries = 0
+"#
+        ),
+    )
 }
 
 fn create_config_toml_with_approval_policy(

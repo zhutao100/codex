@@ -290,10 +290,21 @@ pub struct ModelOverlayToml {
     pub final_instruction_override_file: Option<AbsolutePathBuf>,
     #[serde(default)]
     pub models: Vec<ModelOverlayEntryToml>,
+    #[serde(default, skip_serializing)]
+    #[schemars(skip)]
+    pub review_model: Option<toml::Value>,
+    #[serde(default, skip_serializing)]
+    #[schemars(skip)]
+    pub review_model_provider: Option<toml::Value>,
 }
 
 impl ModelOverlayToml {
     pub(crate) fn resolve(self) -> io::Result<ModelOverlay> {
+        reject_misplaced_review_fields(
+            "model_overlay",
+            self.review_model.as_ref(),
+            self.review_model_provider.as_ref(),
+        )?;
         let final_instruction_override = resolve_text_field(
             self.final_instruction_override,
             self.final_instruction_override_file,
@@ -322,6 +333,12 @@ pub struct ModelOverlayEntryToml {
     pub patch: ModelInfoPatchToml,
     pub final_instruction_override: Option<String>,
     pub final_instruction_override_file: Option<AbsolutePathBuf>,
+    #[serde(default, skip_serializing)]
+    #[schemars(skip)]
+    pub review_model: Option<toml::Value>,
+    #[serde(default, skip_serializing)]
+    #[schemars(skip)]
+    pub review_model_provider: Option<toml::Value>,
 }
 
 impl ModelOverlayEntryToml {
@@ -334,6 +351,11 @@ impl ModelOverlayEntryToml {
         }
 
         let context = format!("model_overlay.models[slug={}]", self.slug);
+        reject_misplaced_review_fields(
+            &context,
+            self.review_model.as_ref(),
+            self.review_model_provider.as_ref(),
+        )?;
         let final_instruction_override = resolve_text_field(
             self.final_instruction_override,
             self.final_instruction_override_file,
@@ -347,6 +369,31 @@ impl ModelOverlayEntryToml {
             final_instruction_override,
         })
     }
+}
+
+fn reject_misplaced_review_fields(
+    context: &str,
+    review_model: Option<&toml::Value>,
+    review_model_provider: Option<&toml::Value>,
+) -> io::Result<()> {
+    let mut fields = Vec::new();
+    if review_model.is_some() {
+        fields.push("review_model");
+    }
+    if review_model_provider.is_some() {
+        fields.push("review_model_provider");
+    }
+    if fields.is_empty() {
+        return Ok(());
+    }
+
+    let fields = fields.join("`, `");
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "`{fields}` must be set at the top level of config.toml, not under `{context}`. In TOML, keys after `[[model_overlay.models]]` belong to that model entry until the next table header."
+        ),
+    ))
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema)]

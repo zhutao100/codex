@@ -10,6 +10,12 @@ Implementation notes added during validation:
   `ModelsManager` live-model fetch path.
 - Unknown review provider ids are surfaced as review task error events instead
   of being swallowed by the previous `Option` return path.
+- App-server inline and detached review entry points apply the review model
+  metadata consistently; detached review threads also apply
+  `review_model_provider` before the thread is forked.
+- Runtime config validation rejects `review_model` and
+  `review_model_provider` when TOML scoping places them under
+  `model_overlay` entries instead of at the top level.
 
 ## Objective
 
