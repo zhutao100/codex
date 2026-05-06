@@ -130,6 +130,9 @@ pub struct Config {
     /// Model used specifically for review sessions.
     pub review_model: Option<String>,
 
+    /// Provider used specifically for review sessions.
+    pub review_model_provider: Option<String>,
+
     /// Size of the context window for the model, in tokens.
     pub model_context_window: Option<i64>,
 
@@ -842,6 +845,9 @@ pub struct ConfigToml {
     /// Review model override used by the `/review` feature.
     pub review_model: Option<String>,
 
+    /// Review model provider override used by the `/review` feature.
+    pub review_model_provider: Option<String>,
+
     /// Provider to use from the model_providers map.
     pub model_provider: Option<String>,
 
@@ -1270,6 +1276,7 @@ impl ConfigToml {
 pub struct ConfigOverrides {
     pub model: Option<String>,
     pub review_model: Option<String>,
+    pub review_model_provider: Option<String>,
     pub cwd: Option<PathBuf>,
     pub service_tier: Option<ServiceTier>,
     pub approval_policy: Option<AskForApproval>,
@@ -1378,6 +1385,7 @@ impl Config {
         let ConfigOverrides {
             model,
             review_model: override_review_model,
+            review_model_provider: override_review_model_provider,
             cwd,
             service_tier,
             approval_policy: approval_policy_override,
@@ -1622,6 +1630,7 @@ impl Config {
         let compact_prompt = compact_prompt.or(file_compact_prompt);
 
         let review_model = override_review_model.or(cfg.review_model);
+        let review_model_provider = override_review_model_provider.or(cfg.review_model_provider);
 
         let service_tier = service_tier
             .or(config_profile.service_tier)
@@ -1662,6 +1671,7 @@ impl Config {
         let config = Self {
             model,
             review_model,
+            review_model_provider,
             model_context_window: cfg.model_context_window,
             model_auto_compact_token_limit: cfg.model_auto_compact_token_limit,
             model_overlay,
@@ -3990,6 +4000,40 @@ service_tier = "flex"
         assert!(err.to_string().contains("unknown variant"));
     }
 
+    #[test]
+    fn review_model_provider_keeps_primary_provider_selection() -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+        let cfg: ConfigToml = toml::from_str(
+            r#"
+model_provider = "openai"
+review_model = "external-reviewer"
+review_model_provider = "external-review"
+
+[model_providers.external-review]
+name = "External Review"
+base_url = "https://review.example.com/v1"
+env_key = "EXTERNAL_REVIEW_API_KEY"
+wire_api = "responses"
+"#,
+        )
+        .expect("TOML deserialization should succeed");
+
+        let config = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )?;
+
+        assert_eq!(config.model_provider_id, "openai");
+        assert_eq!(config.review_model.as_deref(), Some("external-reviewer"));
+        assert_eq!(
+            config.review_model_provider.as_deref(),
+            Some("external-review")
+        );
+        assert!(config.model_providers.contains_key("external-review"));
+        Ok(())
+    }
+
     fn create_test_fixture() -> std::io::Result<PrecedenceTestFixture> {
         let toml = r#"
 model = "o3"
@@ -4118,6 +4162,7 @@ model_verbosity = "high"
             Config {
                 model: Some("o3".to_string()),
                 review_model: None,
+                review_model_provider: None,
                 model_context_window: None,
                 model_auto_compact_token_limit: None,
                 model_overlay: None,
@@ -4214,6 +4259,7 @@ model_verbosity = "high"
         let expected_gpt3_profile_config = Config {
             model: Some("gpt-3.5-turbo".to_string()),
             review_model: None,
+            review_model_provider: None,
             model_context_window: None,
             model_auto_compact_token_limit: None,
             model_overlay: None,
@@ -4325,6 +4371,7 @@ model_verbosity = "high"
         let expected_zdr_profile_config = Config {
             model: Some("o3".to_string()),
             review_model: None,
+            review_model_provider: None,
             model_context_window: None,
             model_auto_compact_token_limit: None,
             model_overlay: None,
@@ -4422,6 +4469,7 @@ model_verbosity = "high"
         let expected_gpt5_profile_config = Config {
             model: Some("gpt-5.1".to_string()),
             review_model: None,
+            review_model_provider: None,
             model_context_window: None,
             model_auto_compact_token_limit: None,
             model_overlay: None,

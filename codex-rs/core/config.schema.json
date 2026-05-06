@@ -2078,6 +2078,10 @@
       "description": "Review model override used by the `/review` feature.",
       "type": "string"
     },
+    "review_model_provider": {
+      "description": "Review model provider override used by the `/review` feature.",
+      "type": "string"
+    },
     "sandbox_mode": {
       "allOf": [
         {

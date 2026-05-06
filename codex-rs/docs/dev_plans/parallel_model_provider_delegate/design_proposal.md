@@ -1,5 +1,16 @@
 # Design Proposal
 
+Status: implemented for `/review`.
+
+Implementation notes added during validation:
+
+- `review_model_provider` is also exposed through the app-server v2 typed
+  `Config` payload and regenerated schema/TypeScript artifacts.
+- Request-auth centralization applies to `ModelClient` request paths and the
+  `ModelsManager` live-model fetch path.
+- Unknown review provider ids are surfaced as review task error events instead
+  of being swallowed by the previous `Option` return path.
+
 ## Objective
 
 Add a minimal first-class path for a delegate task to use a secondary model provider and provider-local API key while the primary session remains on default OpenAI + ChatGPT auth.
@@ -68,6 +79,7 @@ to:
 
 - `core/src/config/mod.rs::ConfigToml`;
 - `core/src/config/mod.rs::Config`;
+- `app-server-protocol/src/protocol/v2.rs::Config`;
 - schema generation / expected config-schema output;
 - any test fixture expected `Config` values.
 
@@ -146,7 +158,7 @@ run_codex_thread_one_shot(
 
 The existing `start_review_conversation(...) -> Option<Receiver<Event>>` currently swallows errors with `.ok()`. For a provider config error, prefer returning/logging a `CodexErr` and surfacing an error event rather than silently skipping the task.
 
-### 4. Keep `ModelsManager` unchanged in the first patch
+### 4. Keep `ModelsManager` cache architecture unchanged in the first patch
 
 The spawned delegate can use the parent `ModelsManager` because:
 
@@ -184,7 +196,7 @@ However, this is not a true session-level `AuthMode::ApiKey`. The delegate still
 
 Centralize request-auth resolution so provider-local credentials are classified as API-key request auth even when account auth is ChatGPT.
 
-Replace direct calls to `auth_provider_from_auth(...)` plus separate `auth.auth_mode()` checks with a helper shaped like:
+Replace direct bearer-token resolution plus separate `auth.auth_mode()` checks with a helper shaped like:
 
 ```rust
 pub(crate) struct ResolvedRequestAuth {
@@ -243,7 +255,7 @@ pub(crate) fn resolve_request_auth(
 }
 ```
 
-Use `ResolvedRequestAuth.auth_mode` for `ModelProviderInfo::to_api_provider(...)` so a provider-local `env_key` behaves as API-key auth for default URL selection and telemetry classification.
+Use `ResolvedRequestAuth.auth_mode` for `ModelProviderInfo::to_api_provider(...)` so a provider-local `env_key` behaves as API-key auth for default URL selection and request classification.
 
 Use `enable_unauthorized_recovery` to construct `UnauthorizedRecovery` only when the request is actually using OpenAI ChatGPT auth. This prevents a 401 from a secondary API-key provider from triggering ChatGPT token refresh and accidentally reporting `RefreshTokenFailed` instead of the provider's real 401.
 
@@ -322,7 +334,7 @@ Assert:
 1. Add `review_model_provider` or equivalent new-task-specific provider field.
 2. Add `apply_delegate_model_provider(...)` and use it in the delegate task before `run_codex_thread_one_shot(...)`.
 3. Disable `Feature::RemoteModels` in the delegate config when a task-specific secondary provider is selected.
-4. Add `resolve_request_auth(...)` and migrate `ModelClient` request paths from separate auth/provider resolution to the centralized helper.
+4. Add `resolve_request_auth(...)` and migrate `ModelClient` plus live-model fetch request paths from separate auth/provider resolution to the centralized helper.
 5. Add request-routing and 401-recovery tests.
 6. Add user-facing config docs only after the above behavior is covered by tests.
 

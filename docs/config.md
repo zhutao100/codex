@@ -48,6 +48,26 @@ final_instruction_override_file = "~/.codex/model-overlays/private.md"
 
 For personality-enabled models, `base_instructions` is not always the effective runtime instruction source because `model_messages.instructions_template` can take precedence. Use `final_instruction_override` or `final_instruction_override_file` when you need the final system instructions to be replaced regardless of personality.
 
+## Review Model Provider
+
+`/review` can use a task-local provider without changing the primary session provider:
+
+```toml
+model_provider = "openai"
+review_model = "external-reviewer"
+review_model_provider = "external-review"
+
+[model_providers.external-review]
+name = "External Review Provider"
+base_url = "https://review-provider.example.com/v1"
+env_key = "EXTERNAL_REVIEW_API_KEY"
+wire_api = "responses"
+requires_openai_auth = false
+supports_websockets = false
+```
+
+Use `model_overlay` for metadata when `review_model` is not an OpenAI-listed model. The delegate request uses the provider's `env_key` bearer token and does not mutate the primary session auth.
+
 ## Service Tier
 
 `service_tier` controls the OpenAI Responses service tier. Supported values are `"flex"` and `"fast"`. If omitted, Codex leaves the request unspecified so the API uses its default tier. Explicit `"fast"` is sent to OpenAI Responses as `"priority"`.

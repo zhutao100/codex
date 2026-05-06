@@ -8,6 +8,7 @@ use codex_api::rate_limits::parse_rate_limit;
 use http::HeaderMap;
 use serde::Deserialize;
 
+use crate::auth::AuthMode;
 use crate::auth::CodexAuth;
 use crate::error::CodexErr;
 use crate::error::ModelCapError;
@@ -124,9 +125,13 @@ const CF_RAY_HEADER: &str = "cf-ray";
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model_provider_info::WireApi;
     use codex_api::TransportError;
     use http::HeaderMap;
     use http::StatusCode;
+    use pretty_assertions::assert_eq;
+    use serial_test::serial;
+    use std::ffi::OsString;
 
     #[test]
     fn map_api_error_maps_model_cap_headers() {
@@ -152,6 +157,97 @@ mod tests {
         assert_eq!(model_cap.model, "boomslang");
         assert_eq!(model_cap.reset_after_seconds, Some(120));
     }
+
+    #[serial(env_vars)]
+    #[test]
+    fn resolve_request_auth_classifies_provider_env_key_as_api_key() {
+        let _guard = EnvGuard::set("CODEX_TEST_PROVIDER_API_KEY", "provider-key");
+        let provider = test_provider_with_env_key("CODEX_TEST_PROVIDER_API_KEY");
+
+        let resolved = resolve_request_auth(
+            Some(CodexAuth::create_dummy_chatgpt_auth_for_testing()),
+            &provider,
+        )
+        .expect("provider env key should resolve");
+
+        assert_eq!(resolved.provider.token.as_deref(), Some("provider-key"));
+        assert_eq!(resolved.provider.account_id.as_deref(), None);
+        assert_eq!(resolved.auth_mode, Some(AuthMode::ApiKey));
+        assert!(!resolved.enable_unauthorized_recovery);
+    }
+
+    #[test]
+    fn resolve_request_auth_enables_recovery_only_for_openai_chatgpt_auth() {
+        let provider = ModelProviderInfo {
+            requires_openai_auth: true,
+            ..test_provider()
+        };
+
+        let resolved = resolve_request_auth(
+            Some(CodexAuth::create_dummy_chatgpt_auth_for_testing()),
+            &provider,
+        )
+        .expect("chatgpt auth should resolve");
+
+        assert_eq!(resolved.provider.token.as_deref(), Some("Access Token"));
+        assert_eq!(resolved.provider.account_id.as_deref(), Some("account_id"));
+        assert_eq!(resolved.auth_mode, Some(AuthMode::Chatgpt));
+        assert!(resolved.enable_unauthorized_recovery);
+    }
+
+    fn test_provider_with_env_key(env_key: &str) -> ModelProviderInfo {
+        ModelProviderInfo {
+            env_key: Some(env_key.to_string()),
+            ..test_provider()
+        }
+    }
+
+    fn test_provider() -> ModelProviderInfo {
+        ModelProviderInfo {
+            name: "test".to_string(),
+            base_url: Some("http://example.com/v1".to_string()),
+            env_key: None,
+            env_key_instructions: None,
+            experimental_bearer_token: None,
+            wire_api: WireApi::Responses,
+            query_params: None,
+            http_headers: None,
+            env_http_headers: None,
+            request_max_retries: Some(0),
+            stream_max_retries: Some(0),
+            stream_idle_timeout_ms: Some(5_000),
+            requires_openai_auth: false,
+            supports_websockets: false,
+        }
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        original: Option<OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let original = std::env::var_os(key);
+            // SAFETY: this serial test owns the process environment mutation.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: the guard restores the original environment value before the serial test exits.
+            unsafe {
+                match &self.original {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
 }
 
 fn extract_request_tracking_id(headers: Option<&HeaderMap>) -> Option<String> {
@@ -171,34 +267,58 @@ fn extract_header(headers: Option<&HeaderMap>, name: &str) -> Option<String> {
     })
 }
 
-pub(crate) fn auth_provider_from_auth(
+pub(crate) struct ResolvedRequestAuth {
+    pub provider: CoreAuthProvider,
+    pub auth_mode: Option<AuthMode>,
+    pub enable_unauthorized_recovery: bool,
+}
+
+pub(crate) fn resolve_request_auth(
     auth: Option<CodexAuth>,
     provider: &ModelProviderInfo,
-) -> crate::error::Result<CoreAuthProvider> {
+) -> crate::error::Result<ResolvedRequestAuth> {
     if let Some(api_key) = provider.api_key()? {
-        return Ok(CoreAuthProvider {
-            token: Some(api_key),
-            account_id: None,
+        return Ok(ResolvedRequestAuth {
+            provider: CoreAuthProvider {
+                token: Some(api_key),
+                account_id: None,
+            },
+            auth_mode: Some(AuthMode::ApiKey),
+            enable_unauthorized_recovery: false,
         });
     }
 
     if let Some(token) = provider.experimental_bearer_token.clone() {
-        return Ok(CoreAuthProvider {
-            token: Some(token),
-            account_id: None,
+        return Ok(ResolvedRequestAuth {
+            provider: CoreAuthProvider {
+                token: Some(token),
+                account_id: None,
+            },
+            auth_mode: Some(AuthMode::ApiKey),
+            enable_unauthorized_recovery: false,
         });
     }
 
     if let Some(auth) = auth {
+        let auth_mode = auth.auth_mode();
         let token = auth.get_token()?;
-        Ok(CoreAuthProvider {
-            token: Some(token),
-            account_id: auth.get_account_id(),
+        Ok(ResolvedRequestAuth {
+            provider: CoreAuthProvider {
+                token: Some(token),
+                account_id: auth.get_account_id(),
+            },
+            auth_mode: Some(auth_mode),
+            enable_unauthorized_recovery: auth_mode == AuthMode::Chatgpt
+                && provider.requires_openai_auth,
         })
     } else {
-        Ok(CoreAuthProvider {
-            token: None,
-            account_id: None,
+        Ok(ResolvedRequestAuth {
+            provider: CoreAuthProvider {
+                token: None,
+                account_id: None,
+            },
+            auth_mode: None,
+            enable_unauthorized_recovery: false,
         })
     }
 }

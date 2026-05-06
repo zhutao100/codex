@@ -19,8 +19,9 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
 use crate::api_bridge::CoreAuthProvider;
-use crate::api_bridge::auth_provider_from_auth;
 use crate::api_bridge::map_api_error;
+use crate::api_bridge::resolve_request_auth;
+use crate::auth::AuthMode;
 use crate::auth::UnauthorizedRecovery;
 use codex_api::CompactClient as ApiCompactClient;
 use codex_api::CompactionInput as ApiCompactionInput;
@@ -73,7 +74,6 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::warn;
 
 use crate::AuthManager;
-use crate::auth::CodexAuth;
 use crate::auth::RefreshTokenError;
 use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
@@ -246,11 +246,12 @@ impl ModelClient {
             Some(manager) => manager.auth().await,
             None => None,
         };
+        let request_auth = resolve_request_auth(auth, &self.state.provider)?;
         let api_provider = self
             .state
             .provider
-            .to_api_provider(auth.as_ref().map(CodexAuth::auth_mode))?;
-        let api_auth = auth_provider_from_auth(auth.clone(), &self.state.provider)?;
+            .to_api_provider(request_auth.auth_mode)?;
+        let api_auth = request_auth.provider;
         let transport = ReqwestTransport::new(build_reqwest_client());
         let request_telemetry = Self::build_request_telemetry(otel_manager);
         let client = ApiCompactClient::new(transport, api_provider, api_auth)
@@ -295,11 +296,12 @@ impl ModelClient {
             Some(manager) => manager.auth().await,
             None => None,
         };
+        let request_auth = resolve_request_auth(auth, &self.state.provider)?;
         let api_provider = self
             .state
             .provider
-            .to_api_provider(auth.as_ref().map(CodexAuth::auth_mode))?;
-        let api_auth = auth_provider_from_auth(auth, &self.state.provider)?;
+            .to_api_provider(request_auth.auth_mode)?;
+        let api_auth = request_auth.provider;
         let transport = ReqwestTransport::new(build_reqwest_client());
         let request_telemetry = Self::build_request_telemetry(otel_manager);
         let client = ApiMemoriesClient::new(transport, api_provider, api_auth)
@@ -615,9 +617,9 @@ impl ModelClientSession {
         ))
     }
 
-    fn responses_request_compression(&self, auth: Option<&crate::auth::CodexAuth>) -> Compression {
+    fn responses_request_compression(&self, auth_mode: Option<AuthMode>) -> Compression {
         if self.client.state.enable_request_compression
-            && auth.is_some_and(CodexAuth::is_chatgpt_auth)
+            && auth_mode == Some(AuthMode::Chatgpt)
             && self.client.state.provider.is_openai()
         {
             Compression::Zstd
@@ -655,23 +657,27 @@ impl ModelClientSession {
         let auth_manager = self.client.state.auth_manager.clone();
         let api_prompt = Self::build_responses_request(prompt)?;
 
-        let mut auth_recovery = auth_manager
-            .as_ref()
-            .map(super::auth::AuthManager::unauthorized_recovery);
+        let mut auth_recovery = None;
         loop {
             let auth = match auth_manager.as_ref() {
                 Some(manager) => manager.auth().await,
                 None => None,
             };
+            let request_auth = resolve_request_auth(auth, &self.client.state.provider)?;
+            if request_auth.enable_unauthorized_recovery && auth_recovery.is_none() {
+                auth_recovery = auth_manager
+                    .as_ref()
+                    .map(super::auth::AuthManager::unauthorized_recovery);
+            }
             let api_provider = self
                 .client
                 .state
                 .provider
-                .to_api_provider(auth.as_ref().map(CodexAuth::auth_mode))?;
-            let api_auth = auth_provider_from_auth(auth.clone(), &self.client.state.provider)?;
+                .to_api_provider(request_auth.auth_mode)?;
+            let api_auth = request_auth.provider;
             let transport = ReqwestTransport::new(build_reqwest_client());
             let (request_telemetry, sse_telemetry) = Self::build_streaming_telemetry(otel_manager);
-            let compression = self.responses_request_compression(auth.as_ref());
+            let compression = self.responses_request_compression(request_auth.auth_mode);
 
             let client = ApiResponsesClient::new(transport, api_provider, api_auth)
                 .with_telemetry(Some(request_telemetry), Some(sse_telemetry));
@@ -722,21 +728,25 @@ impl ModelClientSession {
         let auth_manager = self.client.state.auth_manager.clone();
         let api_prompt = Self::build_responses_request(prompt)?;
 
-        let mut auth_recovery = auth_manager
-            .as_ref()
-            .map(super::auth::AuthManager::unauthorized_recovery);
+        let mut auth_recovery = None;
         loop {
             let auth = match auth_manager.as_ref() {
                 Some(manager) => manager.auth().await,
                 None => None,
             };
+            let request_auth = resolve_request_auth(auth, &self.client.state.provider)?;
+            if request_auth.enable_unauthorized_recovery && auth_recovery.is_none() {
+                auth_recovery = auth_manager
+                    .as_ref()
+                    .map(super::auth::AuthManager::unauthorized_recovery);
+            }
             let api_provider = self
                 .client
                 .state
                 .provider
-                .to_api_provider(auth.as_ref().map(CodexAuth::auth_mode))?;
-            let api_auth = auth_provider_from_auth(auth.clone(), &self.client.state.provider)?;
-            let compression = self.responses_request_compression(auth.as_ref());
+                .to_api_provider(request_auth.auth_mode)?;
+            let api_auth = request_auth.provider;
+            let compression = self.responses_request_compression(request_auth.auth_mode);
 
             let options = self.build_responses_options(
                 prompt,

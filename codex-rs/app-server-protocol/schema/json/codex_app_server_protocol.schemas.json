@@ -10785,6 +10785,12 @@
               "null"
             ]
           },
+          "review_model_provider": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "sandbox_mode": {
             "anyOf": [
               {

@@ -240,24 +240,17 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
     // Load configuration and determine approval policy
     let overrides = ConfigOverrides {
         model,
-        review_model: None,
         config_profile,
         // Default to never ask for approvals in headless mode. Feature flags can override.
         approval_policy: Some(AskForApproval::Never),
         sandbox_mode,
         cwd: resolved_cwd,
-        service_tier: None,
         model_provider: model_provider.clone(),
         codex_linux_sandbox_exe,
-        base_instructions: None,
-        developer_instructions: None,
-        personality: None,
-        compact_prompt: None,
-        include_apply_patch_tool: None,
         show_raw_agent_reasoning: oss.then_some(true),
-        tools_web_search_request: None,
         ephemeral: ephemeral.then_some(true),
         additional_writable_roots: add_dir,
+        ..Default::default()
     };
 
     let config = ConfigBuilder::default()

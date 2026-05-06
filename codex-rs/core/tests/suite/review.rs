@@ -1,7 +1,10 @@
+use codex_core::CodexAuth;
 use codex_core::CodexThread;
 use codex_core::ContentItem;
+use codex_core::ModelProviderInfo;
 use codex_core::REVIEW_PROMPT;
 use codex_core::ResponseItem;
+use codex_core::WireApi;
 use codex_core::config::Config;
 use codex_core::protocol::ENVIRONMENT_CONTEXT_OPEN_TAG;
 use codex_core::protocol::EventMsg;
@@ -24,12 +27,16 @@ use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
+use serial_test::serial;
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::io::AsyncWriteExt as _;
 use uuid::Uuid;
 use wiremock::MockServer;
+
+const REVIEW_PROVIDER_API_KEY_ENV: &str = "CODEX_REVIEW_TEST_PROVIDER_API_KEY";
 
 /// Verify that submitting `Op::Review` spawns a child task and emits
 /// EnteredReviewMode -> ExitedReviewMode(None) -> TurnComplete
@@ -430,6 +437,162 @@ async fn review_uses_custom_review_model_from_config() {
 
     let _codex_home_guard = codex_home;
     server.verify().await;
+}
+
+#[serial(env_vars)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_model_provider_routes_delegate_only_to_secondary_provider() {
+    let sse_raw = r#"[
+        {"type":"response.completed", "response": {"id": "__ID__"}}
+    ]"#;
+    let (primary_server, primary_log) = start_responses_server_with_sse(sse_raw, 1).await;
+    let (secondary_server, secondary_log) = start_responses_server_with_sse(sse_raw, 1).await;
+    let _env_guard = EnvGuard::set(REVIEW_PROVIDER_API_KEY_ENV, "secondary-key");
+    let secondary_base_url = format!("{}/v1", secondary_server.uri());
+
+    let codex_home = Arc::new(TempDir::new().unwrap());
+    let mut builder = test_codex()
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_home(codex_home.clone())
+        .with_config(move |cfg| {
+            cfg.model = Some("gpt-4.1".to_string());
+            cfg.review_model = Some("external-reviewer".to_string());
+            cfg.review_model_provider = Some("external-review".to_string());
+            cfg.model_providers.insert(
+                "external-review".to_string(),
+                ModelProviderInfo {
+                    name: "External Review".to_string(),
+                    base_url: Some(secondary_base_url),
+                    env_key: Some(REVIEW_PROVIDER_API_KEY_ENV.to_string()),
+                    env_key_instructions: None,
+                    experimental_bearer_token: None,
+                    wire_api: WireApi::Responses,
+                    query_params: None,
+                    http_headers: None,
+                    env_http_headers: None,
+                    request_max_retries: Some(0),
+                    stream_max_retries: Some(0),
+                    stream_idle_timeout_ms: Some(5_000),
+                    requires_openai_auth: false,
+                    supports_websockets: false,
+                },
+            );
+        });
+    let test = builder
+        .build(&primary_server)
+        .await
+        .expect("create conversation");
+    assert_eq!(test.config.model_provider_id, "openai");
+    assert_eq!(test.session_configured.model_provider_id, "openai");
+    let codex = test.codex;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "parent turn".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await
+        .unwrap();
+    let _parent_complete =
+        wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    codex
+        .submit(Op::Review {
+            review_request: ReviewRequest {
+                target: ReviewTarget::Custom {
+                    instructions: "provider-specific review".to_string(),
+                },
+                user_facing_hint: None,
+            },
+        })
+        .await
+        .unwrap();
+
+    let _entered = wait_for_event(&codex, |ev| matches!(ev, EventMsg::EnteredReviewMode(_))).await;
+    let _closed = wait_for_event(&codex, |ev| {
+        matches!(
+            ev,
+            EventMsg::ExitedReviewMode(ExitedReviewModeEvent {
+                review_output: None
+            })
+        )
+    })
+    .await;
+    let _review_complete =
+        wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let primary_request = primary_log.single_request();
+    assert_eq!(primary_request.path(), "/v1/responses");
+    assert_eq!(
+        primary_request.body_json()["model"].as_str(),
+        Some("gpt-4.1")
+    );
+
+    let secondary_request = secondary_log.single_request();
+    assert_eq!(secondary_request.path(), "/v1/responses");
+    assert_eq!(
+        secondary_request.body_json()["model"].as_str(),
+        Some("external-reviewer")
+    );
+    assert_eq!(
+        secondary_request.header("authorization").as_deref(),
+        Some("Bearer secondary-key")
+    );
+    assert_ne!(
+        secondary_request.header("authorization").as_deref(),
+        Some("Bearer Access Token")
+    );
+
+    let _codex_home_guard = codex_home;
+    primary_server.verify().await;
+    secondary_server.verify().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_review_model_provider_surfaces_error_event() {
+    let server = MockServer::start().await;
+    let codex_home = Arc::new(TempDir::new().unwrap());
+    let codex = new_conversation_for_server(&server, codex_home.clone(), |cfg| {
+        cfg.review_model = Some("external-reviewer".to_string());
+        cfg.review_model_provider = Some("missing-review-provider".to_string());
+    })
+    .await;
+
+    codex
+        .submit(Op::Review {
+            review_request: ReviewRequest {
+                target: ReviewTarget::Custom {
+                    instructions: "provider error".to_string(),
+                },
+                user_facing_hint: None,
+            },
+        })
+        .await
+        .unwrap();
+
+    let error = wait_for_event(&codex, |ev| {
+        matches!(
+            ev,
+            EventMsg::Error(err)
+                if err.message.contains("Model provider `missing-review-provider` not found")
+        )
+    })
+    .await;
+    assert!(matches!(error, EventMsg::Error(_)));
+    let _closed = wait_for_event(&codex, |ev| {
+        matches!(
+            ev,
+            EventMsg::ExitedReviewMode(ExitedReviewModeEvent {
+                review_output: None
+            })
+        )
+    })
+    .await;
+
+    let _codex_home_guard = codex_home;
 }
 
 /// Ensure that when `review_model` is not set in the config, the review request
@@ -927,4 +1090,32 @@ where
         .await
         .expect("resume conversation")
         .codex
+}
+
+struct EnvGuard {
+    key: &'static str,
+    original: Option<OsString>,
+}
+
+impl EnvGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        let original = std::env::var_os(key);
+        // SAFETY: tests that use this guard run under the shared `env_vars` serial group.
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        Self { key, original }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: the guard restores the original value before the serial test exits.
+        unsafe {
+            match &self.original {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
 }

@@ -1,6 +1,6 @@
 use super::cache::ModelsCacheManager;
-use crate::api_bridge::auth_provider_from_auth;
 use crate::api_bridge::map_api_error;
+use crate::api_bridge::resolve_request_auth;
 use crate::auth::AuthManager;
 use crate::auth::AuthMode;
 use crate::config::Config;
@@ -301,9 +301,9 @@ impl ModelsManager {
         let _timer =
             codex_otel::start_global_timer("codex.remote_models.fetch_update.duration_ms", &[]);
         let auth = self.auth_manager.auth().await;
-        let auth_mode = self.auth_manager.auth_mode();
-        let api_provider = self.provider.to_api_provider(auth_mode)?;
-        let api_auth = auth_provider_from_auth(auth.clone(), &self.provider)?;
+        let request_auth = resolve_request_auth(auth, &self.provider)?;
+        let api_provider = self.provider.to_api_provider(request_auth.auth_mode)?;
+        let api_auth = request_auth.provider;
         let transport = ReqwestTransport::new(build_reqwest_client());
         let client = ModelsClient::new(transport, api_provider, api_auth);
 

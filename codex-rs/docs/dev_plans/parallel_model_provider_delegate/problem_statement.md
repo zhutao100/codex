@@ -1,5 +1,11 @@
 # Problem Statement
 
+Status: implemented. The pre-change assessment below remains useful context, with
+one code-level update: request auth is now centralized in
+`core/src/api_bridge.rs::resolve_request_auth(...)`; the older
+`auth_provider_from_auth(...)` helper described in the initial assessment has
+been removed.
+
 ## Scenario
 
 The branch has a primary Codex session that should keep using the normal OpenAI provider path:
@@ -53,14 +59,19 @@ A `ModelProviderInfo` can carry provider-local credentials through:
 - `CodexAuth::Chatgpt(...)` and `CodexAuth::ChatgptAuthTokens(...)` report `AuthMode::Chatgpt` and use ChatGPT access tokens.
 - `AuthManager` is session-global. It caches one current auth value and performs ChatGPT token refresh / unauthorized recovery for ChatGPT auth.
 
-Request auth is slightly more flexible than account auth. `core/src/api_bridge.rs::auth_provider_from_auth(...)` resolves bearer auth in this order:
+Request auth is slightly more flexible than account auth.
+`core/src/api_bridge.rs::resolve_request_auth(...)` resolves bearer auth in this order:
 
 1. provider `env_key` API key;
 2. provider `experimental_bearer_token`;
 3. current `CodexAuth::get_token()` from the supplied `AuthManager`;
 4. no bearer token.
 
-Therefore, a custom provider with `env_key` can send provider-local API-key bearer credentials even when the primary session `AuthManager` is ChatGPT. However, the session's account auth mode remains `Chatgpt`; telemetry and unauthorized-recovery decisions are still driven by the shared `AuthManager` unless code changes are made.
+Therefore, a custom provider with `env_key` can send provider-local API-key bearer credentials even when the primary session `AuthManager` is ChatGPT. However, the session's account auth mode remains `Chatgpt`; session-level telemetry remains tied to the shared `AuthManager`.
+
+The implemented helper also classifies provider-local credentials as request
+`AuthMode::ApiKey` and disables ChatGPT unauthorized recovery for those
+requests, while leaving the parent session `AuthManager` unchanged.
 
 ### `/review` delegate workflow
 
@@ -87,8 +98,8 @@ The task changes only the model slug. It does not have a review-specific provide
 | Use a different model in `/review` | Supported | Existing `review_model` changes only the model slug. |
 | Use a different provider in `/review` or a sibling task | Not first-class | The task must mutate `sub_agent_config.model_provider_id` and `sub_agent_config.model_provider` itself; no config field exists. |
 | Use provider-local API-key bearer credentials while parent auth is ChatGPT | Partially supported | `env_key` wins over `AuthManager` token for the HTTP bearer token. This is wire-compatible API-key auth, but not an actual `AuthMode::ApiKey` session. |
-| Make the delegate report/behave as `AuthMode::ApiKey` | Not supported | `AuthManager` is shared and remains ChatGPT; telemetry and 401 recovery still see ChatGPT. |
-| Avoid OpenAI remote-model refresh for the secondary provider | Not first-class | `ModelsManager` is OpenAI-scoped in production. Disable `Feature::RemoteModels` for the delegate config and use `model_overlay` metadata. |
+| Make the delegate report/behave as `AuthMode::ApiKey` | Partially supported | Request auth is classified as `AuthMode::ApiKey` when provider-local credentials are used. The shared `AuthManager` remains ChatGPT. |
+| Avoid OpenAI remote-model refresh for the secondary provider | Supported for `/review` delegate spawn | `Feature::RemoteModels` is disabled on the cloned delegate config when `review_model_provider` is set; use `model_overlay` metadata for custom slugs. |
 | Maintain a provider-specific model cache for the secondary provider | Not supported | `MODEL_CACHE_FILE` is not provider-namespaced and `ModelsManager::new(...)` uses the OpenAI provider. This is unnecessary for the minimal delegate use case. |
 
 ## Conclusion

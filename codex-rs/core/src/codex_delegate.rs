@@ -32,6 +32,21 @@ use crate::error::CodexErr;
 use crate::models_manager::manager::ModelsManager;
 use codex_protocol::protocol::InitialHistory;
 
+pub(crate) fn apply_delegate_model_provider(
+    config: &mut Config,
+    provider_id: &str,
+) -> Result<(), CodexErr> {
+    let provider = config
+        .model_providers
+        .get(provider_id)
+        .cloned()
+        .ok_or_else(|| CodexErr::Fatal(format!("Model provider `{provider_id}` not found")))?;
+
+    config.model_provider_id = provider_id.to_string();
+    config.model_provider = provider;
+    Ok(())
+}
+
 /// Start an interactive sub-Codex thread and return IO channels.
 ///
 /// The returned `events_rx` yields non-approval events emitted by the sub-agent.

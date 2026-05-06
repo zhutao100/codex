@@ -10,6 +10,7 @@ use codex_core::Prompt;
 use codex_core::ResponseEvent;
 use codex_core::ResponseItem;
 use codex_core::WireApi;
+use codex_core::error::CodexErr;
 use codex_core::models_manager::manager::ModelsManager;
 use codex_otel::OtelManager;
 use codex_otel::TelemetryAuthMode;
@@ -23,6 +24,7 @@ use core_test_support::test_codex::test_codex;
 use futures::StreamExt;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
+use wiremock::ResponseTemplate;
 use wiremock::matchers::header;
 
 #[tokio::test]
@@ -367,6 +369,108 @@ async fn responses_respects_model_info_overrides_from_config() {
             .and_then(|value| value.get("summary"))
             .and_then(|value| value.as_str()),
         Some("detailed")
+    );
+}
+
+#[tokio::test]
+async fn provider_local_bearer_401_does_not_run_chatgpt_recovery() {
+    let server = responses::start_mock_server().await;
+    let request_recorder = responses::mount_response_once(
+        &server,
+        ResponseTemplate::new(401).set_body_string("provider unauthorized"),
+    )
+    .await;
+
+    let provider = ModelProviderInfo {
+        name: "mock".into(),
+        base_url: Some(format!("{}/v1", server.uri())),
+        env_key: None,
+        env_key_instructions: None,
+        experimental_bearer_token: Some("secondary-key".to_string()),
+        wire_api: WireApi::Responses,
+        query_params: None,
+        http_headers: None,
+        env_http_headers: None,
+        request_max_retries: Some(0),
+        stream_max_retries: Some(0),
+        stream_idle_timeout_ms: Some(5_000),
+        requires_openai_auth: false,
+        supports_websockets: false,
+    };
+
+    let codex_home = TempDir::new().expect("failed to create TempDir");
+    let mut config = load_default_config_for_test(&codex_home).await;
+    config.model_provider_id = provider.name.clone();
+    config.model_provider = provider.clone();
+    let effort = config.model_reasoning_effort;
+    let summary = config.model_reasoning_summary;
+    let model = ModelsManager::get_model_offline(config.model.as_deref());
+    config.model = Some(model.clone());
+    let config = Arc::new(config);
+
+    let conversation_id = ThreadId::new();
+    let session_source = SessionSource::SubAgent(SubAgentSource::Review);
+    let model_info = ModelsManager::construct_model_info_offline(model.as_str(), &config);
+    let otel_manager = OtelManager::new(
+        conversation_id,
+        model.as_str(),
+        model_info.slug.as_str(),
+        None,
+        Some("test@test.com".to_string()),
+        Some(TelemetryAuthMode::Chatgpt),
+        false,
+        "test".to_string(),
+        session_source.clone(),
+    );
+
+    let auth_manager =
+        AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+    let client = ModelClient::new(
+        Some(auth_manager),
+        conversation_id,
+        provider,
+        session_source,
+        config.model_verbosity,
+        false,
+        false,
+        false,
+        false,
+        None,
+    );
+    let mut client_session = client.new_session();
+
+    let mut prompt = Prompt::default();
+    prompt.input = vec![ResponseItem::Message {
+        id: None,
+        role: "user".into(),
+        content: vec![ContentItem::InputText {
+            text: "hello".into(),
+        }],
+        end_turn: None,
+        phase: None,
+    }];
+
+    let result = client_session
+        .stream(
+            &prompt,
+            &model_info,
+            &otel_manager,
+            effort,
+            summary,
+            None,
+            None,
+        )
+        .await;
+    let err = match result {
+        Ok(_) => panic!("provider 401 should surface directly"),
+        Err(err) => err,
+    };
+
+    assert!(matches!(err, CodexErr::UnexpectedStatus(status) if status.status.as_u16() == 401));
+    let request = request_recorder.single_request();
+    assert_eq!(
+        request.header("authorization").as_deref(),
+        Some("Bearer secondary-key")
     );
 }
 
