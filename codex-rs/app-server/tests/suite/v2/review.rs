@@ -15,7 +15,6 @@ use codex_app_server_protocol::ReviewDelivery;
 use codex_app_server_protocol::ReviewStartParams;
 use codex_app_server_protocol::ReviewStartResponse;
 use codex_app_server_protocol::ReviewTarget;
-use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
@@ -134,7 +133,7 @@ async fn review_start_runs_review_turn_and_emits_code_review_item() -> Result<()
 }
 
 #[tokio::test]
-async fn review_start_exec_approval_item_id_matches_command_execution_item() -> Result<()> {
+async fn review_start_reviewer_command_item_uses_tool_call_id() -> Result<()> {
     let responses = vec![
         create_shell_command_sse_response(
             vec![
@@ -176,17 +175,6 @@ async fn review_start_exec_approval_item_id_matches_command_execution_item() -> 
     let ReviewStartResponse { turn, .. } = to_response::<ReviewStartResponse>(review_resp)?;
     let turn_id = turn.id.clone();
 
-    let server_req = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_request_message(),
-    )
-    .await??;
-    let ServerRequest::CommandExecutionRequestApproval { request_id, params } = server_req else {
-        panic!("expected CommandExecutionRequestApproval request");
-    };
-    assert_eq!(params.item_id, "review-call-1");
-    assert_eq!(params.turn_id, turn_id);
-
     let mut command_item_id = None;
     for _ in 0..10 {
         let item_started: JSONRPCNotification = timeout(
@@ -197,18 +185,13 @@ async fn review_start_exec_approval_item_id_matches_command_execution_item() -> 
         let started: ItemStartedNotification =
             serde_json::from_value(item_started.params.expect("params must be present"))?;
         if let ThreadItem::CommandExecution { id, .. } = started.item {
+            assert_eq!(started.turn_id, turn_id);
             command_item_id = Some(id);
             break;
         }
     }
     let command_item_id = command_item_id.expect("did not observe command execution item");
-    assert_eq!(command_item_id, params.item_id);
-
-    mcp.send_response(
-        request_id,
-        serde_json::json!({ "decision": codex_core::protocol::ReviewDecision::Approved }),
-    )
-    .await?;
+    assert_eq!(command_item_id, "review-call-1");
     timeout(
         DEFAULT_READ_TIMEOUT,
         mcp.read_stream_until_notification_message("turn/completed"),

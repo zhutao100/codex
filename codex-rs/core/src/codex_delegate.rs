@@ -49,7 +49,7 @@ pub(crate) async fn run_codex_thread_interactive(
     let (tx_sub, rx_sub) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
     let (tx_ops, rx_ops) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
 
-    let CodexSpawnOk { codex, .. } = Codex::spawn(
+    let CodexSpawnOk { codex, .. } = Box::pin(Codex::spawn(
         config,
         auth_manager,
         models_manager,
@@ -59,8 +59,9 @@ pub(crate) async fn run_codex_thread_interactive(
         SessionSource::SubAgent(SubAgentSource::Review),
         parent_session.services.agent_control.clone(),
         Vec::new(),
-    )
-    .await?;
+    ))
+    .or_cancel(&cancel_token)
+    .await??;
     let codex = Arc::new(codex);
 
     // Use a child token so parent cancel cascades but we can scope it to this task
@@ -296,11 +297,11 @@ async fn forward_ops(
     cancel_token_ops: CancellationToken,
 ) {
     loop {
-        let op: Op = match rx_ops.recv().or_cancel(&cancel_token_ops).await {
-            Ok(Ok(Submission { id: _, op })) => op,
+        let submission = match rx_ops.recv().or_cancel(&cancel_token_ops).await {
+            Ok(Ok(submission)) => submission,
             Ok(Err(_)) | Err(_) => break,
         };
-        let _ = codex.submit(op).await;
+        let _ = codex.submit_with_id(submission).await;
     }
 }
 
@@ -454,6 +455,43 @@ mod tests {
     use codex_protocol::protocol::TurnAbortedEvent;
     use pretty_assertions::assert_eq;
     use tokio::sync::watch;
+
+    #[tokio::test]
+    async fn forward_ops_preserves_submission_id() {
+        let (tx_child, rx_child) = bounded(SUBMISSION_CHANNEL_CAPACITY);
+        let (tx_events, rx_events) = bounded(SUBMISSION_CHANNEL_CAPACITY);
+        let (_agent_status_tx, agent_status) = watch::channel(AgentStatus::PendingInit);
+        let (session, _ctx, _rx_evt) = crate::codex::make_session_and_context_with_rx().await;
+        let codex = Arc::new(Codex {
+            next_id: AtomicU64::new(0),
+            tx_sub: tx_child,
+            rx_event: rx_events,
+            agent_status,
+            session,
+        });
+        let (tx_ops, rx_ops) = bounded(SUBMISSION_CHANNEL_CAPACITY);
+        let cancel = CancellationToken::new();
+        let forward = tokio::spawn(forward_ops(codex, rx_ops, cancel));
+
+        tx_ops
+            .send(Submission {
+                id: "caller-submission".to_string(),
+                op: Op::Interrupt,
+            })
+            .await
+            .unwrap();
+        drop(tx_ops);
+        drop(tx_events);
+
+        timeout(std::time::Duration::from_millis(1000), forward)
+            .await
+            .expect("forward_ops hung")
+            .expect("forward_ops join error");
+
+        let forwarded = rx_child.recv().await.expect("forwarded submission");
+        assert_eq!("caller-submission", forwarded.id);
+        assert_eq!(Op::Interrupt, forwarded.op);
+    }
 
     #[tokio::test]
     async fn forward_events_cancelled_while_send_blocked_shuts_down_delegate() {

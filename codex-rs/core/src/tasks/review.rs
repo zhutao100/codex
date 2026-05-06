@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use codex_protocol::config_types::WebSearchMode;
@@ -6,6 +7,7 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AgentMessageContentDeltaEvent;
 use codex_protocol::protocol::AgentMessageDeltaEvent;
+use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExitedReviewModeEvent;
@@ -16,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 use crate::codex::Session;
 use crate::codex::TurnContext;
 use crate::codex_delegate::run_codex_thread_one_shot;
+use crate::features::Feature;
 use crate::review_format::format_review_findings_block;
 use crate::review_format::render_review_output_text;
 use crate::state::TaskKind;
@@ -83,11 +86,17 @@ async fn start_review_conversation(
     let config = ctx.config.clone();
     let mut sub_agent_config = config.as_ref().clone();
     // Carry over review-only feature restrictions so the delegate cannot
-    // re-enable blocked tools (web search, view image).
+    // re-enable blocked tools or spawn nested agents.
     sub_agent_config.web_search_mode = Some(WebSearchMode::Disabled);
+    sub_agent_config
+        .features
+        .disable(Feature::WebSearchRequest)
+        .disable(Feature::WebSearchCached)
+        .disable(Feature::Collab);
 
     // Set explicit review rubric for the sub-agent
     sub_agent_config.base_instructions = Some(crate::REVIEW_PROMPT.to_string());
+    sub_agent_config.approval_policy = crate::config::Constrained::allow_any(AskForApproval::Never);
 
     let model = config
         .review_model
@@ -200,12 +209,14 @@ pub(crate) async fn exit_review_mode(
             let block = format_review_findings_block(&out.findings, None);
             findings_str.push_str(&format!("\n{block}"));
         }
-        let rendered =
-            crate::client_common::REVIEW_EXIT_SUCCESS_TMPL.replace("{results}", &findings_str);
+        let rendered = render_review_exit_success(&findings_str);
         let assistant_message = render_review_output_text(&out);
         (rendered, assistant_message)
     } else {
-        let rendered = crate::client_common::REVIEW_EXIT_INTERRUPTED_TMPL.to_string();
+        let rendered = normalize_review_template_line_endings(
+            crate::client_common::REVIEW_EXIT_INTERRUPTED_TMPL,
+        )
+        .into_owned();
         let assistant_message =
             "Review was interrupted. Please re-run /review and wait for it to complete."
                 .to_string();
@@ -244,4 +255,53 @@ pub(crate) async fn exit_review_mode(
             },
         )
         .await;
+
+    // Review output is synthetic and can be the first user-visible turn data.
+    // Flush after client-facing events/items have been emitted so persistence is
+    // durable without delaying review-mode exit.
+    session.flush_rollout().await;
+}
+
+fn render_review_exit_success(results: &str) -> String {
+    const RESULTS_PLACEHOLDER: &str = "{{results}}";
+
+    let template =
+        normalize_review_template_line_endings(crate::client_common::REVIEW_EXIT_SUCCESS_TMPL);
+    let count = template.match_indices(RESULTS_PLACEHOLDER).count();
+    assert_eq!(
+        1, count,
+        "review exit success template must contain exactly one {RESULTS_PLACEHOLDER} placeholder"
+    );
+    template.replacen(RESULTS_PLACEHOLDER, results, 1)
+}
+
+fn normalize_review_template_line_endings(template: &str) -> Cow<'_, str> {
+    if template.contains('\r') {
+        Cow::Owned(template.replace("\r\n", "\n").replace('\r', "\n"))
+    } else {
+        Cow::Borrowed(template)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_review_template_line_endings;
+    use super::render_review_exit_success;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn render_review_exit_success_replaces_results_placeholder() {
+        assert_eq!(
+            render_review_exit_success("Finding A\nFinding B"),
+            "<user_action>\n  <context>User initiated a review task. Here's the full review output from reviewer model. User may select one or more comments to resolve.</context>\n  <action>review</action>\n  <results>\n  Finding A\nFinding B\n  </results>\n  </user_action>\n"
+        );
+    }
+
+    #[test]
+    fn normalize_review_template_line_endings_rewrites_crlf_and_cr() {
+        assert_eq!(
+            normalize_review_template_line_endings("<user_action>\r\n  <results>\r  None.\r\n"),
+            "<user_action>\n  <results>\n  None.\n"
+        );
+    }
 }
