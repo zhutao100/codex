@@ -1796,17 +1796,33 @@ impl Session {
         }
     }
 
-    pub(crate) async fn send_event_raw(&self, event: Event) {
-        // Record the last known agent status.
-        if let Some(status) = agent_status_from_event(&event.msg) {
-            self.agent_status.send_replace(status);
+    /// Send an event to clients without recording it in this session's rollout.
+    ///
+    /// Use this for events whose canonical persistence belongs to another
+    /// session, such as forwarded delegate events.
+    pub(crate) async fn send_event_transient(&self, turn_context: &TurnContext, msg: EventMsg) {
+        let legacy_source = msg.clone();
+        let event = Event {
+            id: turn_context.sub_id.clone(),
+            msg,
+        };
+        self.send_event_raw_transient(event).await;
+
+        let show_raw_agent_reasoning = self.show_raw_agent_reasoning();
+        for legacy in legacy_source.as_legacy_events(show_raw_agent_reasoning) {
+            let legacy_event = Event {
+                id: turn_context.sub_id.clone(),
+                msg: legacy,
+            };
+            self.send_event_raw_transient(legacy_event).await;
         }
+    }
+
+    pub(crate) async fn send_event_raw(&self, event: Event) {
         // Persist the event into rollout (recorder filters as needed)
         let rollout_items = vec![RolloutItem::EventMsg(event.msg.clone())];
         self.persist_rollout_items(&rollout_items).await;
-        if let Err(e) = self.tx_event.send(event).await {
-            debug!("dropping event because channel is closed: {e}");
-        }
+        self.dispatch_event_raw(event).await;
     }
 
     /// Persist the event to the rollout file, flush it, and only then deliver it to clients.
@@ -1815,13 +1831,21 @@ impl Session {
     /// clients (e.g. app-server thread/rollback) re-read the rollout file synchronously on
     /// receipt of the event and depend on the marker already being visible on disk.
     pub(crate) async fn send_event_raw_flushed(&self, event: Event) {
+        self.persist_rollout_items(&[RolloutItem::EventMsg(event.msg.clone())])
+            .await;
+        self.flush_rollout().await;
+        self.dispatch_event_raw(event).await;
+    }
+
+    async fn send_event_raw_transient(&self, event: Event) {
+        self.dispatch_event_raw(event).await;
+    }
+
+    async fn dispatch_event_raw(&self, event: Event) {
         // Record the last known agent status.
         if let Some(status) = agent_status_from_event(&event.msg) {
             self.agent_status.send_replace(status);
         }
-        self.persist_rollout_items(&[RolloutItem::EventMsg(event.msg.clone())])
-            .await;
-        self.flush_rollout().await;
         if let Err(e) = self.tx_event.send(event).await {
             debug!("dropping event because channel is closed: {e}");
         }
