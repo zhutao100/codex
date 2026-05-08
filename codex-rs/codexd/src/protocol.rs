@@ -10,9 +10,11 @@ pub struct HubNotification {
     pub params: Option<JsonValue>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ActiveTurnSnapshot {
+    #[serde(default)]
+    pub turn_key: Option<String>,
     pub thread_id: String,
     pub turn_id: String,
     #[serde(default)]
@@ -21,6 +23,36 @@ pub struct ActiveTurnSnapshot {
     pub started_at: Option<i64>,
     #[serde(default)]
     pub model: Option<String>,
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub task_kind: Option<String>,
+    #[serde(default)]
+    pub session_source: Option<String>,
+    #[serde(default)]
+    pub sub_agent_source: Option<String>,
+    #[serde(default)]
+    pub parent_thread_id: Option<String>,
+    #[serde(default)]
+    pub parent_turn_id: Option<String>,
+    #[serde(default)]
+    pub model_provider: Option<String>,
+    #[serde(default)]
+    pub thinking_level: Option<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub approval: Option<String>,
+    #[serde(default)]
+    pub sandbox: Option<String>,
+    #[serde(default)]
+    pub model_context_window: Option<i64>,
+    #[serde(default)]
+    pub context_remaining_percent: Option<i64>,
+    #[serde(default)]
+    pub token_usage: Option<JsonValue>,
+    #[serde(default)]
+    pub thread_name: Option<String>,
     #[serde(default)]
     pub latest_label: Option<String>,
 }

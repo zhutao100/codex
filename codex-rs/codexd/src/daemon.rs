@@ -79,11 +79,7 @@ impl RuntimeState {
     }
 
     fn as_snapshot(&self, runtime_id: String) -> RuntimeSnapshot {
-        let active_turns = self
-            .active_turns
-            .values()
-            .map(|turn| turn.clone())
-            .collect();
+        let active_turns = self.active_turns.values().cloned().collect();
 
         RuntimeSnapshot {
             runtime_id,
@@ -127,7 +123,11 @@ impl DaemonState {
     fn hello(&self) -> CodexdHelloResponse {
         CodexdHelloResponse {
             protocol_version: PROTOCOL_VERSION,
-            capabilities: vec!["eventReplay".to_string(), "runtimeState".to_string()],
+            capabilities: vec![
+                "eventReplay".to_string(),
+                "runtimeState".to_string(),
+                "activeTurnContext".to_string(),
+            ],
             seq: self.seq,
         }
     }
@@ -234,7 +234,13 @@ impl DaemonState {
             runtime.active_turns = params
                 .active_turns
                 .into_iter()
-                .map(|turn| (turn.turn_id.clone(), turn))
+                .map(|mut turn| {
+                    let turn_key = turn.turn_key.clone().unwrap_or_else(|| {
+                        turn_key(turn.thread_id.as_str(), turn.turn_id.as_str())
+                    });
+                    turn.turn_key = Some(turn_key.clone());
+                    (turn_key, turn)
+                })
                 .collect();
             runtime.as_snapshot(runtime_id)
         };
@@ -243,38 +249,31 @@ impl DaemonState {
     }
 
     fn apply_runtime_notification(&mut self, params: RuntimeEventParams) {
-        let runtime = self
-            .runtimes
-            .entry(params.runtime_id.clone())
-            .or_insert_with(|| RuntimeState {
-                pid: None,
-                session_source: None,
-                cwd: None,
-                display_name: None,
-                active_turns: BTreeMap::new(),
-            });
+        let runtime_id = params.runtime_id;
+        let notification = params.notification;
+        let updated_snapshot = {
+            let runtime = self
+                .runtimes
+                .entry(runtime_id.clone())
+                .or_insert_with(|| RuntimeState {
+                    pid: None,
+                    session_source: None,
+                    cwd: None,
+                    display_name: None,
+                    active_turns: BTreeMap::new(),
+                });
 
-        if let Some((thread_id, turn_id)) = parse_active_turn_started(&params.notification) {
-            runtime.active_turns.insert(
-                turn_id.clone(),
-                ActiveTurnSnapshot {
-                    thread_id,
-                    turn_id,
-                    status: Some("inProgress".to_string()),
-                    started_at: None,
-                    model: parse_turn_model(&params.notification),
-                    latest_label: None,
-                },
-            );
-        }
+            apply_notification_to_runtime(runtime, &notification)
+                .then(|| runtime.as_snapshot(runtime_id.clone()))
+        };
 
-        if let Some(turn_id) = parse_active_turn_completed(&params.notification) {
-            runtime.active_turns.remove(&turn_id);
+        if let Some(runtime) = updated_snapshot {
+            self.broadcast_event(CodexdEventPayload::RuntimeUpsert { runtime });
         }
 
         self.broadcast_event(CodexdEventPayload::RuntimeNotification {
-            runtime_id: params.runtime_id,
-            notification: params.notification,
+            runtime_id,
+            notification,
         });
     }
 
@@ -597,7 +596,65 @@ async fn handle_runtime_unregister_method(
     Ok(serde_json::json!({}))
 }
 
-fn parse_active_turn_started(notification: &HubNotification) -> Option<(String, String)> {
+fn apply_notification_to_runtime(
+    runtime: &mut RuntimeState,
+    notification: &HubNotification,
+) -> bool {
+    if let Some(snapshot) = parse_active_turn_started(notification) {
+        let turn_key = snapshot
+            .turn_key
+            .clone()
+            .unwrap_or_else(|| turn_key(snapshot.thread_id.as_str(), snapshot.turn_id.as_str()));
+        runtime.active_turns.insert(turn_key, snapshot);
+        return true;
+    }
+
+    if let Some(completion) = parse_active_turn_completed(notification) {
+        return remove_completed_turn(runtime, completion);
+    }
+
+    if let Some(update) = parse_turn_context_update(notification) {
+        return apply_turn_context_update(runtime, update);
+    }
+
+    if let Some(update) = parse_thread_token_usage_update(notification) {
+        return apply_turn_context_update(runtime, update);
+    }
+
+    false
+}
+
+struct TurnCompletion {
+    turn_key: Option<String>,
+    thread_id: Option<String>,
+    turn_id: String,
+}
+
+struct TurnContextUpdate {
+    turn_key: Option<String>,
+    thread_id: Option<String>,
+    turn_id: Option<String>,
+    status: Option<String>,
+    model: Option<String>,
+    latest_label: Option<String>,
+    scope: Option<String>,
+    task_kind: Option<String>,
+    session_source: Option<String>,
+    sub_agent_source: Option<String>,
+    parent_thread_id: Option<String>,
+    parent_turn_id: Option<String>,
+    model_provider: Option<String>,
+    thinking_level: Option<String>,
+    cwd: Option<String>,
+    approval: Option<String>,
+    sandbox: Option<String>,
+    model_context_window: Option<i64>,
+    context_remaining_percent: Option<i64>,
+    token_usage: Option<JsonValue>,
+    thread_name: Option<String>,
+}
+
+fn parse_active_turn_started(notification: &HubNotification) -> Option<ActiveTurnSnapshot> {
     if notification.method != "turn/started" {
         return None;
     }
@@ -606,26 +663,217 @@ fn parse_active_turn_started(notification: &HubNotification) -> Option<(String, 
     let thread_id = params.get("threadId")?.as_str()?.to_string();
     let turn = params.get("turn")?.as_object()?;
     let turn_id = turn.get("id")?.as_str()?.to_string();
+    let turn_key =
+        parse_string_field(turn, "key").unwrap_or_else(|| turn_key(&thread_id, &turn_id));
 
-    Some((thread_id, turn_id))
+    Some(ActiveTurnSnapshot {
+        turn_key: Some(turn_key),
+        thread_id,
+        turn_id,
+        status: parse_string_field(turn, "status").or_else(|| Some("inProgress".to_string())),
+        started_at: parse_i64_field(turn, "startedAt"),
+        model: parse_string_field(turn, "model"),
+        scope: parse_string_field(turn, "scope"),
+        task_kind: parse_string_field(turn, "taskKind"),
+        session_source: parse_string_field(turn, "sessionSource"),
+        sub_agent_source: parse_string_field(turn, "subAgentSource"),
+        parent_thread_id: parse_string_field(turn, "parentThreadId"),
+        parent_turn_id: parse_string_field(turn, "parentTurnId"),
+        model_provider: parse_string_field(turn, "modelProvider"),
+        thinking_level: parse_string_field(turn, "thinkingLevel"),
+        cwd: parse_string_field(turn, "cwd"),
+        approval: parse_string_field(turn, "approval"),
+        sandbox: parse_string_field(turn, "sandbox"),
+        model_context_window: parse_i64_field(turn, "modelContextWindow"),
+        context_remaining_percent: parse_i64_field(turn, "contextRemainingPercent"),
+        token_usage: turn.get("tokenUsage").cloned(),
+        thread_name: parse_string_field(turn, "threadName"),
+        latest_label: parse_string_field(turn, "latestLabel"),
+    })
 }
 
-fn parse_turn_model(notification: &HubNotification) -> Option<String> {
-    let params = notification.params.as_ref()?.as_object()?;
-    let turn = params.get("turn")?.as_object()?;
-    turn.get("model")?.as_str().map(ToString::to_string)
-}
-
-fn parse_active_turn_completed(notification: &HubNotification) -> Option<String> {
+fn parse_active_turn_completed(notification: &HubNotification) -> Option<TurnCompletion> {
     if notification.method != "turn/completed" {
         return None;
     }
 
     let params = notification.params.as_ref()?.as_object()?;
+    let thread_id = params
+        .get("threadId")
+        .and_then(JsonValue::as_str)
+        .map(ToString::to_string);
     let turn = params.get("turn")?.as_object()?;
     let turn_id = turn.get("id")?.as_str()?.to_string();
+    let turn_key = parse_string_field(turn, "key")
+        .or_else(|| params.get("turnKey")?.as_str().map(ToString::to_string));
 
-    Some(turn_id)
+    Some(TurnCompletion {
+        turn_key,
+        thread_id,
+        turn_id,
+    })
+}
+
+fn parse_turn_context_update(notification: &HubNotification) -> Option<TurnContextUpdate> {
+    if !matches!(
+        notification.method.as_str(),
+        "turn/contextUpdated" | "turn/stateUpdated"
+    ) {
+        return None;
+    }
+
+    let params = notification.params.as_ref()?.as_object()?;
+    Some(TurnContextUpdate {
+        turn_key: parse_string_field(params, "turnKey"),
+        thread_id: parse_string_field(params, "threadId"),
+        turn_id: parse_string_field(params, "turnId"),
+        status: parse_string_field(params, "status"),
+        model: parse_string_field(params, "model"),
+        latest_label: parse_string_field(params, "latestLabel"),
+        scope: parse_string_field(params, "scope"),
+        task_kind: parse_string_field(params, "taskKind"),
+        session_source: parse_string_field(params, "sessionSource"),
+        sub_agent_source: parse_string_field(params, "subAgentSource"),
+        parent_thread_id: parse_string_field(params, "parentThreadId"),
+        parent_turn_id: parse_string_field(params, "parentTurnId"),
+        model_provider: parse_string_field(params, "modelProvider"),
+        thinking_level: parse_string_field(params, "thinkingLevel"),
+        cwd: parse_string_field(params, "cwd"),
+        approval: parse_string_field(params, "approval"),
+        sandbox: parse_string_field(params, "sandbox"),
+        model_context_window: parse_i64_field(params, "modelContextWindow"),
+        context_remaining_percent: parse_i64_field(params, "contextRemainingPercent"),
+        token_usage: params.get("tokenUsage").cloned(),
+        thread_name: parse_string_field(params, "threadName"),
+    })
+}
+
+fn parse_thread_token_usage_update(notification: &HubNotification) -> Option<TurnContextUpdate> {
+    if notification.method != "thread/tokenUsage/updated" {
+        return None;
+    }
+
+    let params = notification.params.as_ref()?.as_object()?;
+    let token_usage = params.get("tokenUsage").cloned();
+    let model_context_window = token_usage
+        .as_ref()
+        .and_then(|usage| usage.as_object())
+        .and_then(|usage| parse_i64_field(usage, "modelContextWindow"));
+
+    Some(TurnContextUpdate {
+        turn_key: parse_string_field(params, "turnKey"),
+        thread_id: parse_string_field(params, "threadId"),
+        turn_id: parse_string_field(params, "turnId"),
+        status: None,
+        model: None,
+        latest_label: None,
+        scope: None,
+        task_kind: None,
+        session_source: None,
+        sub_agent_source: None,
+        parent_thread_id: None,
+        parent_turn_id: None,
+        model_provider: None,
+        thinking_level: None,
+        cwd: None,
+        approval: None,
+        sandbox: None,
+        model_context_window,
+        context_remaining_percent: parse_i64_field(params, "contextRemainingPercent"),
+        token_usage,
+        thread_name: None,
+    })
+}
+
+fn remove_completed_turn(runtime: &mut RuntimeState, completion: TurnCompletion) -> bool {
+    if let Some(turn_key) = completion.turn_key
+        && runtime.active_turns.remove(&turn_key).is_some()
+    {
+        return true;
+    }
+
+    if let Some(thread_id) = completion.thread_id.as_deref() {
+        let key = turn_key(thread_id, completion.turn_id.as_str());
+        if runtime.active_turns.remove(&key).is_some() {
+            return true;
+        }
+    }
+
+    let key = runtime
+        .active_turns
+        .iter()
+        .find_map(|(key, turn)| (turn.turn_id == completion.turn_id).then(|| key.clone()));
+
+    key.is_some_and(|key| runtime.active_turns.remove(&key).is_some())
+}
+
+fn apply_turn_context_update(runtime: &mut RuntimeState, update: TurnContextUpdate) -> bool {
+    let key = update
+        .turn_key
+        .clone()
+        .or_else(|| {
+            Some(turn_key(
+                update.thread_id.as_deref()?,
+                update.turn_id.as_deref()?,
+            ))
+        })
+        .or_else(|| {
+            let turn_id = update.turn_id.as_ref()?;
+            runtime
+                .active_turns
+                .iter()
+                .find_map(|(key, turn)| (turn.turn_id == *turn_id).then(|| key.clone()))
+        });
+    let Some(key) = key else {
+        return false;
+    };
+    let Some(turn) = runtime.active_turns.get_mut(&key) else {
+        return false;
+    };
+
+    merge_opt(&mut turn.status, update.status);
+    merge_opt(&mut turn.model, update.model);
+    merge_opt(&mut turn.latest_label, update.latest_label);
+    merge_opt(&mut turn.scope, update.scope);
+    merge_opt(&mut turn.task_kind, update.task_kind);
+    merge_opt(&mut turn.session_source, update.session_source);
+    merge_opt(&mut turn.sub_agent_source, update.sub_agent_source);
+    merge_opt(&mut turn.parent_thread_id, update.parent_thread_id);
+    merge_opt(&mut turn.parent_turn_id, update.parent_turn_id);
+    merge_opt(&mut turn.model_provider, update.model_provider);
+    merge_opt(&mut turn.thinking_level, update.thinking_level);
+    merge_opt(&mut turn.cwd, update.cwd);
+    merge_opt(&mut turn.approval, update.approval);
+    merge_opt(&mut turn.sandbox, update.sandbox);
+    merge_opt(&mut turn.model_context_window, update.model_context_window);
+    merge_opt(
+        &mut turn.context_remaining_percent,
+        update.context_remaining_percent,
+    );
+    merge_opt(&mut turn.token_usage, update.token_usage);
+    merge_opt(&mut turn.thread_name, update.thread_name);
+    true
+}
+
+fn merge_opt<T>(target: &mut Option<T>, update: Option<T>) {
+    if update.is_some() {
+        *target = update;
+    }
+}
+
+fn parse_string_field(object: &serde_json::Map<String, JsonValue>, field: &str) -> Option<String> {
+    object
+        .get(field)
+        .and_then(JsonValue::as_str)
+        .map(ToString::to_string)
+}
+
+fn parse_i64_field(object: &serde_json::Map<String, JsonValue>, field: &str) -> Option<i64> {
+    object.get(field).and_then(JsonValue::as_i64)
+}
+
+fn turn_key(thread_id: &str, turn_id: &str) -> String {
+    format!("{thread_id}:{turn_id}")
 }
 
 fn deserialize_params<T: DeserializeOwned>(params: Option<JsonValue>) -> Result<T, String> {
@@ -787,7 +1035,11 @@ mod tests {
             state.hello(),
             CodexdHelloResponse {
                 protocol_version: PROTOCOL_VERSION,
-                capabilities: vec!["eventReplay".to_string(), "runtimeState".to_string()],
+                capabilities: vec![
+                    "eventReplay".to_string(),
+                    "runtimeState".to_string(),
+                    "activeTurnContext".to_string(),
+                ],
                 seq: 1,
             }
         );
@@ -809,6 +1061,7 @@ mod tests {
                 started_at: Some(1_760_000_000),
                 model: Some("gpt-5-codex".to_string()),
                 latest_label: Some("Running tests".to_string()),
+                ..Default::default()
             }],
         });
 
@@ -825,6 +1078,7 @@ mod tests {
                 started_at: None,
                 model: None,
                 latest_label: Some("Reading files".to_string()),
+                ..Default::default()
             }],
         });
 
@@ -838,14 +1092,189 @@ mod tests {
                 cwd: Some("/tmp/work".to_string()),
                 display_name: Some("codex-tui".to_string()),
                 active_turns: vec![ActiveTurnSnapshot {
+                    turn_key: Some("thread-2:turn-2".to_string()),
                     thread_id: "thread-2".to_string(),
                     turn_id: "turn-2".to_string(),
                     status: Some("inProgress".to_string()),
                     started_at: None,
                     model: None,
                     latest_label: Some("Reading files".to_string()),
+                    ..Default::default()
                 }],
             }]
+        );
+    }
+
+    #[test]
+    fn runtime_notifications_key_active_turns_by_thread_and_turn() {
+        let mut state = DaemonState::default();
+
+        for thread_id in ["thread-a", "thread-b"] {
+            state.apply_runtime_notification(RuntimeEventParams {
+                runtime_id: "rt-1".to_string(),
+                notification: HubNotification {
+                    method: "turn/started".to_string(),
+                    params: Some(serde_json::json!({
+                        "threadId": thread_id,
+                        "turn": {
+                            "id": "turn-1",
+                            "status": "inProgress",
+                            "model": format!("model-{thread_id}"),
+                        },
+                    })),
+                },
+            });
+        }
+
+        let snapshot = state.snapshot();
+        assert_eq!(
+            snapshot.runtimes[0].active_turns,
+            vec![
+                ActiveTurnSnapshot {
+                    turn_key: Some("thread-a:turn-1".to_string()),
+                    thread_id: "thread-a".to_string(),
+                    turn_id: "turn-1".to_string(),
+                    status: Some("inProgress".to_string()),
+                    model: Some("model-thread-a".to_string()),
+                    ..Default::default()
+                },
+                ActiveTurnSnapshot {
+                    turn_key: Some("thread-b:turn-1".to_string()),
+                    thread_id: "thread-b".to_string(),
+                    turn_id: "turn-1".to_string(),
+                    status: Some("inProgress".to_string()),
+                    model: Some("model-thread-b".to_string()),
+                    ..Default::default()
+                },
+            ]
+        );
+
+        state.apply_runtime_notification(RuntimeEventParams {
+            runtime_id: "rt-1".to_string(),
+            notification: HubNotification {
+                method: "turn/completed".to_string(),
+                params: Some(serde_json::json!({
+                    "threadId": "thread-b",
+                    "turn": {
+                        "id": "turn-1",
+                        "status": "completed",
+                    },
+                })),
+            },
+        });
+
+        assert_eq!(
+            state.snapshot().runtimes[0].active_turns,
+            vec![ActiveTurnSnapshot {
+                turn_key: Some("thread-a:turn-1".to_string()),
+                thread_id: "thread-a".to_string(),
+                turn_id: "turn-1".to_string(),
+                status: Some("inProgress".to_string()),
+                model: Some("model-thread-a".to_string()),
+                ..Default::default()
+            }]
+        );
+    }
+
+    #[test]
+    fn runtime_context_updates_active_turn_and_broadcasts_snapshot() {
+        let mut state = DaemonState::default();
+        state.apply_runtime_notification(RuntimeEventParams {
+            runtime_id: "rt-1".to_string(),
+            notification: HubNotification {
+                method: "turn/started".to_string(),
+                params: Some(serde_json::json!({
+                    "threadId": "thread-1",
+                    "turn": {
+                        "id": "turn-1",
+                        "key": "thread-1:turn-1",
+                        "status": "inProgress",
+                        "scope": "delegate",
+                        "taskKind": "review",
+                        "sessionSource": "subagent_review",
+                        "subAgentSource": "review",
+                        "parentThreadId": "parent-thread",
+                        "parentTurnId": "parent-turn",
+                        "model": "delegate-model",
+                        "modelProvider": "delegate-provider",
+                        "thinkingLevel": "high",
+                        "cwd": "/tmp/delegate",
+                        "approval": "never",
+                        "sandbox": "read-only",
+                        "modelContextWindow": 100000,
+                    },
+                })),
+            },
+        });
+        let seq_before_update = state.seq;
+
+        state.apply_runtime_notification(RuntimeEventParams {
+            runtime_id: "rt-1".to_string(),
+            notification: HubNotification {
+                method: "thread/tokenUsage/updated".to_string(),
+                params: Some(serde_json::json!({
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "turnKey": "thread-1:turn-1",
+                    "contextRemainingPercent": 42,
+                    "tokenUsage": {
+                        "total": { "totalTokens": 90000 },
+                        "last": { "totalTokens": 12000 },
+                        "modelContextWindow": 100000,
+                    },
+                })),
+            },
+        });
+
+        assert_eq!(state.seq, seq_before_update + 2);
+        let snapshot = state.snapshot();
+        assert_eq!(
+            snapshot.runtimes[0].active_turns,
+            vec![ActiveTurnSnapshot {
+                turn_key: Some("thread-1:turn-1".to_string()),
+                thread_id: "thread-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                status: Some("inProgress".to_string()),
+                model: Some("delegate-model".to_string()),
+                scope: Some("delegate".to_string()),
+                task_kind: Some("review".to_string()),
+                session_source: Some("subagent_review".to_string()),
+                sub_agent_source: Some("review".to_string()),
+                parent_thread_id: Some("parent-thread".to_string()),
+                parent_turn_id: Some("parent-turn".to_string()),
+                model_provider: Some("delegate-provider".to_string()),
+                thinking_level: Some("high".to_string()),
+                cwd: Some("/tmp/delegate".to_string()),
+                approval: Some("never".to_string()),
+                sandbox: Some("read-only".to_string()),
+                model_context_window: Some(100000),
+                context_remaining_percent: Some(42),
+                token_usage: Some(serde_json::json!({
+                    "total": { "totalTokens": 90000 },
+                    "last": { "totalTokens": 12000 },
+                    "modelContextWindow": 100000,
+                })),
+                ..Default::default()
+            }]
+        );
+
+        let upsert_line = &state.recent_events[state.recent_events.len() - 2].1;
+        let upsert: JsonValue = serde_json::from_str(upsert_line).expect("upsert json");
+        assert_eq!(
+            upsert["params"]["event"]["type"],
+            JsonValue::String("runtimeUpsert".to_string())
+        );
+        assert_eq!(
+            upsert["params"]["event"]["runtime"]["activeTurns"][0]["contextRemainingPercent"],
+            JsonValue::from(42)
+        );
+
+        let notification_line = &state.recent_events[state.recent_events.len() - 1].1;
+        let notification: JsonValue =
+            serde_json::from_str(notification_line).expect("notification json");
+        assert_eq!(
+            notification["params"]["event"]["type"],
+            JsonValue::String("runtimeNotification".to_string())
         );
     }
 }

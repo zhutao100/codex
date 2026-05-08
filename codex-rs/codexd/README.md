@@ -76,7 +76,7 @@ Typical client flow:
 `codexd/hello` returns:
 
 - `protocolVersion`
-- `capabilities`
+- `capabilities` (`eventReplay`, `runtimeState`, `activeTurnContext`)
 - current `seq`
 
 The `codexd/event` stream is sequenced:
@@ -115,11 +115,23 @@ Event `type` values:
 - `cwd` (string | null)
 - `displayName` (string | null)
 - `activeTurns` (array)
+  - `turnKey` (stable composite key, normally `<threadId>:<turnId>`)
   - `threadId`
   - `turnId`
   - optional summary fields: `status`, `startedAt`, `model`, `latestLabel`
+  - optional active-context fields: `scope`, `taskKind`, `sessionSource`,
+    `subAgentSource`, `parentThreadId`, `parentTurnId`, `modelProvider`,
+    `thinkingLevel`, `cwd`, `approval`, `sandbox`, `modelContextWindow`,
+    `contextRemainingPercent`, `tokenUsage`, `threadName`
 
-The `notification` in `runtimeNotification` is a generic hub notification forwarded from runtimes. `codexd` only interprets `turn/started` and `turn/completed` to maintain `activeTurns` in snapshots; all other notifications are forwarded as-is.
+The `notification` in `runtimeNotification` is a generic hub notification forwarded from runtimes. `codexd` interprets `turn/started`, `turn/completed`, `turn/contextUpdated`, `turn/stateUpdated`, and `thread/tokenUsage/updated` to maintain `activeTurns` in snapshots; all notifications are still forwarded as-is.
+
+Active turns are keyed by `turnKey`. Producers should send `turn.key` or
+`turnKey`; otherwise `codexd` computes `<threadId>:<turnId>`. Legacy
+`turn/completed` notifications without a key fall back to this composite key
+when `threadId` is present, then to a bare `turnId` search for older producers.
+When a runtime notification changes the snapshot, `codexd` emits a
+`runtimeUpsert` before the corresponding `runtimeNotification`.
 
 ## Producer flow (runtime side)
 
