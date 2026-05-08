@@ -755,6 +755,11 @@ pub enum EventMsg {
     /// Optional means unknown — UIs should not display when `None`.
     TokenCount(TokenCountEvent),
 
+    /// Active runtime context changed without switching the primary session.
+    RuntimeContextActivated(RuntimeContextActivatedEvent),
+    RuntimeContextUpdated(RuntimeContextUpdatedEvent),
+    RuntimeContextDeactivated(RuntimeContextDeactivatedEvent),
+
     /// Agent text output message
     AgentMessage(AgentMessageEvent),
 
@@ -1295,6 +1300,74 @@ impl TokenUsageInfo {
 pub struct TokenCountEvent {
     pub info: Option<TokenUsageInfo>,
     pub rate_limits: Option<RateLimitSnapshot>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+pub enum RuntimeContextScope {
+    Primary,
+    Delegate,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub struct RuntimeContextSnapshot {
+    pub scope_id: String,
+    pub scope: RuntimeContextScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub task_kind: Option<String>,
+    pub session_source: SessionSource,
+    pub session_id: ThreadId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub parent_session_id: Option<ThreadId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub parent_turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub thread_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub rollout_path: Option<PathBuf>,
+    pub cwd: PathBuf,
+    pub model: String,
+    pub model_provider_id: String,
+    pub approval_policy: AskForApproval,
+    pub sandbox_policy: SandboxPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub reasoning_effort: Option<ReasoningEffortConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub service_tier: Option<ServiceTier>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub model_context_window: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub agents_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub token_info: Option<TokenUsageInfo>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
+pub struct RuntimeContextActivatedEvent {
+    pub snapshot: RuntimeContextSnapshot,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
+pub struct RuntimeContextUpdatedEvent {
+    pub snapshot: RuntimeContextSnapshot,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
+pub struct RuntimeContextDeactivatedEvent {
+    pub scope_id: String,
+    pub session_id: ThreadId,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema, TS)]

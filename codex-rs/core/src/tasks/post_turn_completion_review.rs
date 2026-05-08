@@ -20,6 +20,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::codex::Session;
 use crate::codex::TurnContext;
+use crate::codex_delegate::DelegateRuntimeContextParams;
 use crate::codex_delegate::run_codex_thread_one_shot;
 use crate::error::CodexErr;
 use crate::state::CompletedTurnForReview;
@@ -120,6 +121,7 @@ async fn start_post_turn_completion_review_conversation(
     completed_turn: &CompletedTurnForReview,
     cancellation_token: CancellationToken,
 ) -> Result<async_channel::Receiver<Event>, CodexErr> {
+    let instruction_profile = ReviewDelegateInstructionProfile::PostTurnCompletionReview;
     let sub_agent_config = configure_review_delegate_config(
         ctx.config.as_ref(),
         ctx.model_info.slug.as_str(),
@@ -127,9 +129,12 @@ async fn start_post_turn_completion_review_conversation(
             base_instructions: ctx.config.post_turn_completion_review_prompt(),
             sandbox_policy: SandboxPolicy::ReadOnly,
             disable_collab: true,
-            instruction_profile: ReviewDelegateInstructionProfile::PostTurnCompletionReview,
+            instruction_profile,
         },
     )?;
+    let agents_summary = instruction_profile
+        .host_instruction_filenames(ctx.config.as_ref())
+        .join(", ");
 
     let input = vec![UserInput::Text {
         text: render_completed_turn_context(completed_turn),
@@ -145,6 +150,11 @@ async fn start_post_turn_completion_review_conversation(
         ctx,
         cancellation_token,
         SubAgentSource::Review,
+        DelegateRuntimeContextParams {
+            task_kind: Some("post_turn_completion_review".to_string()),
+            parent_turn_id: Some(completed_turn.turn_id.clone()),
+            agents_summary: Some(agents_summary),
+        },
         Some(InitialHistory::New),
     )
     .await

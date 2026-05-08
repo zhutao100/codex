@@ -1213,6 +1213,71 @@
           "type": "object"
         },
         {
+          "description": "Active runtime context changed without switching the primary session.",
+          "properties": {
+            "snapshot": {
+              "$ref": "#/definitions/RuntimeContextSnapshot"
+            },
+            "type": {
+              "enum": [
+                "runtime_context_activated"
+              ],
+              "title": "RuntimeContextActivatedEventMsgType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "snapshot",
+            "type"
+          ],
+          "title": "RuntimeContextActivatedEventMsg",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "snapshot": {
+              "$ref": "#/definitions/RuntimeContextSnapshot"
+            },
+            "type": {
+              "enum": [
+                "runtime_context_updated"
+              ],
+              "title": "RuntimeContextUpdatedEventMsgType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "snapshot",
+            "type"
+          ],
+          "title": "RuntimeContextUpdatedEventMsg",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "scope_id": {
+              "type": "string"
+            },
+            "session_id": {
+              "$ref": "#/definitions/ThreadId"
+            },
+            "type": {
+              "enum": [
+                "runtime_context_deactivated"
+              ],
+              "title": "RuntimeContextDeactivatedEventMsgType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "scope_id",
+            "session_id",
+            "type"
+          ],
+          "title": "RuntimeContextDeactivatedEventMsg",
+          "type": "object"
+        },
+        {
           "description": "Agent text output message",
           "properties": {
             "message": {
@@ -5432,6 +5497,133 @@
         }
       ]
     },
+    "RuntimeContextScope": {
+      "enum": [
+        "primary",
+        "delegate"
+      ],
+      "type": "string"
+    },
+    "RuntimeContextSnapshot": {
+      "properties": {
+        "agents_summary": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "approval_policy": {
+          "$ref": "#/definitions/AskForApproval"
+        },
+        "cwd": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "model_context_window": {
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "model_provider_id": {
+          "type": "string"
+        },
+        "parent_session_id": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ThreadId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "parent_turn_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reasoning_effort": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ReasoningEffort"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "rollout_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sandbox_policy": {
+          "$ref": "#/definitions/SandboxPolicy"
+        },
+        "scope": {
+          "$ref": "#/definitions/RuntimeContextScope"
+        },
+        "scope_id": {
+          "type": "string"
+        },
+        "service_tier": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ServiceTier"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "session_id": {
+          "$ref": "#/definitions/ThreadId"
+        },
+        "session_source": {
+          "$ref": "#/definitions/SessionSource2"
+        },
+        "task_kind": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "thread_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "token_info": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TokenUsageInfo"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "approval_policy",
+        "cwd",
+        "model",
+        "model_provider_id",
+        "sandbox_policy",
+        "scope",
+        "scope_id",
+        "session_id",
+        "session_source"
+      ],
+      "type": "object"
+    },
     "SandboxPolicy": {
       "description": "Determines execution restrictions for model shell commands.",
       "oneOf": [
@@ -5617,6 +5809,33 @@
             "subAgent"
           ],
           "title": "SubAgentSessionSource",
+          "type": "object"
+        }
+      ]
+    },
+    "SessionSource2": {
+      "oneOf": [
+        {
+          "enum": [
+            "cli",
+            "vscode",
+            "exec",
+            "mcp",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "subagent": {
+              "$ref": "#/definitions/SubAgentSource"
+            }
+          },
+          "required": [
+            "subagent"
+          ],
+          "title": "SubagentSessionSource2",
           "type": "object"
         }
       ]

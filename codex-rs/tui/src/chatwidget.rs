@@ -4359,6 +4359,9 @@ impl ChatWidget {
         match msg {
             EventMsg::SessionConfigured(e) => self.on_session_configured(e),
             EventMsg::ThreadNameUpdated(e) => self.on_thread_name_updated(e),
+            EventMsg::RuntimeContextActivated(_)
+            | EventMsg::RuntimeContextUpdated(_)
+            | EventMsg::RuntimeContextDeactivated(_) => {}
             EventMsg::AgentMessage(AgentMessageEvent { message }) => {
                 self.on_agent_message(message, from_replay)
             }

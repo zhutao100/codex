@@ -19,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::codex::Session;
 use crate::codex::TurnContext;
+use crate::codex_delegate::DelegateRuntimeContextParams;
 use crate::codex_delegate::apply_delegate_model_provider;
 use crate::codex_delegate::run_codex_thread_one_shot;
 use crate::config::Config;
@@ -57,7 +58,7 @@ pub(crate) enum ReviewDelegateInstructionProfile {
 }
 
 impl ReviewDelegateInstructionProfile {
-    fn host_instruction_filenames(self, config: &Config) -> Vec<&str> {
+    pub(crate) fn host_instruction_filenames(self, config: &Config) -> Vec<&str> {
         match self {
             ReviewDelegateInstructionProfile::Review => {
                 vec![
@@ -170,6 +171,7 @@ async fn start_review_conversation(
     cancellation_token: CancellationToken,
 ) -> Result<async_channel::Receiver<Event>, CodexErr> {
     let config = ctx.config.clone();
+    let instruction_profile = ReviewDelegateInstructionProfile::Review;
     let sub_agent_config = configure_review_delegate_config(
         config.as_ref(),
         ctx.model_info.slug.as_str(),
@@ -177,9 +179,12 @@ async fn start_review_conversation(
             base_instructions: config.review_prompt(),
             sandbox_policy: ctx.sandbox_policy.clone(),
             disable_collab: true,
-            instruction_profile: ReviewDelegateInstructionProfile::Review,
+            instruction_profile,
         },
     )?;
+    let agents_summary = instruction_profile
+        .host_instruction_filenames(config.as_ref())
+        .join(", ");
 
     run_codex_thread_one_shot(
         sub_agent_config,
@@ -190,6 +195,11 @@ async fn start_review_conversation(
         ctx.clone(),
         cancellation_token,
         SubAgentSource::Review,
+        DelegateRuntimeContextParams {
+            task_kind: Some("review".to_string()),
+            parent_turn_id: None,
+            agents_summary: Some(agents_summary),
+        },
         None,
     )
     .await
