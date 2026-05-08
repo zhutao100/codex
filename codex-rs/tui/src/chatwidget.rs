@@ -3376,6 +3376,9 @@ impl ChatWidget {
             SlashCommand::Review => {
                 self.open_review_popup();
             }
+            SlashCommand::ReviewCompletedTurn => {
+                self.submit_op(Op::ReviewCompletedTurn);
+            }
             SlashCommand::Rename => {
                 self.open_rename_thread_view();
             }
@@ -4551,6 +4554,29 @@ impl ChatWidget {
                 }
             }
             // Final message is rendered as part of the AgentMessage.
+        }
+        if let Some(output) = review.post_turn_completion_review_output {
+            self.flush_answer_stream_with_separator();
+            self.flush_interrupt_queue();
+            self.flush_active_cell();
+
+            let mut rendered: Vec<ratatui::text::Line<'static>> = vec!["".into()];
+            append_markdown(output.evaluation.trim(), None, &mut rendered);
+            rendered.push("".into());
+            rendered.push(
+                format!(
+                    "Fix actions advised: {}",
+                    if output.fix_actions_advised {
+                        "yes"
+                    } else {
+                        "no"
+                    }
+                )
+                .into(),
+            );
+            let body_cell = AgentMessageCell::new(rendered, false);
+            self.app_event_tx
+                .send(AppEvent::InsertHistoryCell(Box::new(body_cell)));
         }
 
         self.is_review_mode = false;
@@ -8703,7 +8729,9 @@ impl ChatWidget {
     pub(crate) fn submit_op(&mut self, op: Op) {
         // Record outbound operation for session replay fidelity.
         crate::session_log::log_outbound_op(&op);
-        if matches!(&op, Op::Review { .. }) && !self.bottom_pane.is_task_running() {
+        if matches!(&op, Op::Review { .. } | Op::ReviewCompletedTurn)
+            && !self.bottom_pane.is_task_running()
+        {
             self.bottom_pane.set_task_running(true);
         }
         if let Err(e) = self.codex_op_tx.send(op) {

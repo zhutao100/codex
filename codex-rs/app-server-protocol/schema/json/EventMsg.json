@@ -2241,6 +2241,16 @@
         {
           "description": "Exited review mode with an optional final result to apply.",
           "properties": {
+            "post_turn_completion_review_output": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/PostTurnCompletionReviewOutputEvent"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "review_output": {
               "anyOf": [
                 {
@@ -3437,6 +3447,22 @@
         "unknown"
       ],
       "type": "string"
+    },
+    "PostTurnCompletionReviewOutputEvent": {
+      "description": "Structured review result produced by a post-turn completion reviewer.",
+      "properties": {
+        "evaluation": {
+          "type": "string"
+        },
+        "fix_actions_advised": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "evaluation",
+        "fix_actions_advised"
+      ],
+      "type": "object"
     },
     "ProgressTraceCategory": {
       "enum": [
@@ -4791,7 +4817,8 @@
     "TurnContinuationSource": {
       "enum": [
         "paused",
-        "interrupted"
+        "interrupted",
+        "post_turn_completion_review"
       ],
       "type": "string"
     },
@@ -6987,6 +7014,16 @@
     {
       "description": "Exited review mode with an optional final result to apply.",
       "properties": {
+        "post_turn_completion_review_output": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PostTurnCompletionReviewOutputEvent"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "review_output": {
           "anyOf": [
             {

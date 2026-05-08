@@ -36,7 +36,9 @@ impl Default for ActiveTurn {
 pub(crate) enum TaskKind {
     Regular,
     Review,
+    PostTurnCompletionReview,
     Compact,
+    UserShell,
 }
 
 pub(crate) struct RunningTask {
@@ -46,6 +48,7 @@ pub(crate) struct RunningTask {
     pub(crate) cancellation_token: CancellationToken,
     pub(crate) handle: Arc<AbortOnDropHandle<()>>,
     pub(crate) turn_context: Arc<TurnContext>,
+    pub(crate) completed_turn_user_messages: Vec<String>,
     // Timer recorded when the task drops to capture the full turn duration.
     pub(crate) _timer: Option<codex_otel::Timer>,
 }
@@ -56,9 +59,8 @@ impl ActiveTurn {
         self.tasks.insert(sub_id, task);
     }
 
-    pub(crate) fn remove_task(&mut self, sub_id: &str) -> bool {
-        self.tasks.swap_remove(sub_id);
-        self.tasks.is_empty()
+    pub(crate) fn remove_task(&mut self, sub_id: &str) -> Option<RunningTask> {
+        self.tasks.swap_remove(sub_id)
     }
 
     pub(crate) fn drain_tasks(&mut self) -> Vec<RunningTask> {

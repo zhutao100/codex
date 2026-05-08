@@ -48,6 +48,7 @@ use codex_core::protocol::McpStartupUpdateEvent;
 use codex_core::protocol::Op;
 use codex_core::protocol::PatchApplyBeginEvent;
 use codex_core::protocol::PatchApplyEndEvent;
+use codex_core::protocol::PostTurnCompletionReviewOutputEvent;
 use codex_core::protocol::RateLimitWindow;
 use codex_core::protocol::ReviewRequest;
 use codex_core::protocol::ReviewTarget;
@@ -570,6 +571,44 @@ async fn entered_review_mode_defaults_to_current_changes_banner() {
     assert!(chat.is_review_mode);
 }
 
+#[tokio::test]
+async fn review_completed_turn_command_sends_op_and_marks_task_running() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(None).await;
+
+    chat.dispatch_command(SlashCommand::ReviewCompletedTurn);
+
+    match op_rx.try_recv() {
+        Ok(Op::ReviewCompletedTurn) => {}
+        other => panic!("expected ReviewCompletedTurn op, got {other:?}"),
+    }
+    assert!(chat.bottom_pane.is_task_running());
+}
+
+#[tokio::test]
+async fn exited_review_mode_renders_post_turn_completion_output() {
+    let (mut chat, mut rx, _ops) = make_chatwidget_manual(None).await;
+
+    chat.handle_codex_event(Event {
+        id: "review-end".into(),
+        msg: EventMsg::ExitedReviewMode(ExitedReviewModeEvent {
+            review_output: None,
+            post_turn_completion_review_output: Some(PostTurnCompletionReviewOutputEvent {
+                evaluation: "Missed `core/src/lib.rs` update.".to_string(),
+                fix_actions_advised: true,
+            }),
+        }),
+    });
+
+    let cells = drain_insert_history(&mut rx);
+    let rendered = cells
+        .iter()
+        .map(|cell| lines_to_single_string(cell))
+        .collect::<String>();
+    assert!(rendered.contains("Missed core/src/lib.rs update."));
+    assert!(rendered.contains("Fix actions advised: yes"));
+    assert!(rendered.contains("<< Code review finished >>"));
+}
+
 /// Exiting review restores the pre-review context window indicator.
 #[tokio::test]
 async fn review_restores_context_window_indicator() {
@@ -611,6 +650,7 @@ async fn review_restores_context_window_indicator() {
         id: "review-end".into(),
         msg: EventMsg::ExitedReviewMode(ExitedReviewModeEvent {
             review_output: None,
+            post_turn_completion_review_output: None,
         }),
     });
     let _ = drain_insert_history(&mut rx);

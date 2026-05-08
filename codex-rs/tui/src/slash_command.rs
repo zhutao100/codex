@@ -20,6 +20,8 @@ pub enum SlashCommand {
     Experimental,
     Skills,
     Review,
+    #[strum(serialize = "review-completed-turn")]
+    ReviewCompletedTurn,
     Rename,
     Export,
     New,
@@ -70,6 +72,9 @@ impl SlashCommand {
             SlashCommand::Init => "create an AGENTS.md file with instructions for Codex",
             SlashCommand::Compact => "summarize conversation to prevent hitting the context limit",
             SlashCommand::Review => "review my current changes and find issues",
+            SlashCommand::ReviewCompletedTurn => {
+                "review the last completed turn for missed follow-ups"
+            }
             SlashCommand::Pause => "pause the current turn so it can be continued later",
             SlashCommand::Continue => "continue the paused or interrupted turn",
             SlashCommand::Rename => "rename the current thread",
@@ -149,6 +154,7 @@ impl SlashCommand {
             | SlashCommand::ElevateSandbox
             | SlashCommand::Experimental
             | SlashCommand::Review
+            | SlashCommand::ReviewCompletedTurn
             | SlashCommand::Plan
             | SlashCommand::Logout => false,
             SlashCommand::Diff
@@ -197,4 +203,23 @@ pub fn built_in_slash_commands() -> Vec<(&'static str, SlashCommand)> {
         .filter(|command| command.is_visible())
         .map(|c| (c.command(), c))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SlashCommand;
+
+    #[test]
+    fn review_completed_turn_command_shape() {
+        assert_eq!(
+            SlashCommand::ReviewCompletedTurn.command(),
+            "review-completed-turn"
+        );
+        assert_eq!(
+            SlashCommand::ReviewCompletedTurn.description(),
+            "review the last completed turn for missed follow-ups"
+        );
+        assert!(!SlashCommand::ReviewCompletedTurn.supports_inline_args());
+        assert!(!SlashCommand::ReviewCompletedTurn.available_during_task());
+    }
 }

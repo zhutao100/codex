@@ -80,6 +80,8 @@ pub enum Feature {
     // Experimental
     /// Automatically rename new threads based on the conversation content.
     AutoRenameThread,
+    /// Automatically review the completed turn for missed follow-ups.
+    AutoPostTurnCompletionReview,
     /// Use the single unified PTY-backed exec tool.
     UnifiedExec,
     /// Include the freeform apply_patch tool.
@@ -418,6 +420,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         id: Feature::AutoRenameThread,
         key: "auto_rename_thread",
         stage: Stage::Stable,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::AutoPostTurnCompletionReview,
+        key: "auto_post_turn_completion_review",
+        stage: Stage::UnderDevelopment,
         default_enabled: false,
     },
     FeatureSpec {

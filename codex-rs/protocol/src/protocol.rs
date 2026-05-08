@@ -101,6 +101,9 @@ pub enum Op {
     /// new user input message.
     Continue,
 
+    /// Review the most recent completed regular Codex turn.
+    ReviewCompletedTurn,
+
     /// Legacy user input.
     ///
     /// Prefer [`Op::UserTurn`] so the caller provides full turn context
@@ -1175,6 +1178,9 @@ impl HasLegacyEvent for EventMsg {
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
 pub struct ExitedReviewModeEvent {
     pub review_output: Option<ReviewOutputEvent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub post_turn_completion_review_output: Option<PostTurnCompletionReviewOutputEvent>,
 }
 
 // Individual event payload types matching each `EventMsg` variant.
@@ -1892,6 +1898,13 @@ pub struct ReviewOutputEvent {
     pub overall_confidence_score: f32,
 }
 
+/// Structured review result produced by a post-turn completion reviewer.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
+pub struct PostTurnCompletionReviewOutputEvent {
+    pub evaluation: String,
+    pub fix_actions_advised: bool,
+}
+
 impl Default for ReviewOutputEvent {
     fn default() -> Self {
         Self {
@@ -2483,6 +2496,7 @@ pub struct TurnContinuedEvent {
 pub enum TurnContinuationSource {
     Paused,
     Interrupted,
+    PostTurnCompletionReview,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]

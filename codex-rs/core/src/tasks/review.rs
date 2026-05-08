@@ -13,12 +13,15 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExitedReviewModeEvent;
 use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::ReviewOutputEvent;
+use codex_protocol::protocol::SandboxPolicy;
 use tokio_util::sync::CancellationToken;
 
 use crate::codex::Session;
 use crate::codex::TurnContext;
 use crate::codex_delegate::apply_delegate_model_provider;
 use crate::codex_delegate::run_codex_thread_one_shot;
+use crate::config::Config;
+use crate::config::Constrained;
 use crate::error::CodexErr;
 use crate::features::Feature;
 use crate::review_format::format_review_findings_block;
@@ -36,6 +39,45 @@ impl ReviewTask {
     pub(crate) fn new() -> Self {
         Self
     }
+}
+
+#[derive(Clone)]
+pub(crate) struct ReviewDelegateConfigParams<'a> {
+    pub(crate) base_instructions: &'a str,
+    pub(crate) sandbox_policy: SandboxPolicy,
+    pub(crate) disable_collab: bool,
+}
+
+pub(crate) fn configure_review_delegate_config(
+    parent_config: &Config,
+    parent_model_slug: &str,
+    params: ReviewDelegateConfigParams<'_>,
+) -> Result<Config, CodexErr> {
+    let mut sub_agent_config = parent_config.clone();
+    sub_agent_config.web_search_mode = Some(WebSearchMode::Disabled);
+    sub_agent_config
+        .features
+        .disable(Feature::WebSearchRequest)
+        .disable(Feature::WebSearchCached);
+    if params.disable_collab {
+        sub_agent_config.features.disable(Feature::Collab);
+    }
+
+    sub_agent_config.base_instructions = Some(params.base_instructions.to_string());
+    sub_agent_config.approval_policy = Constrained::allow_any(AskForApproval::Never);
+    sub_agent_config.sandbox_policy = Constrained::allow_any(params.sandbox_policy);
+
+    let model = parent_config
+        .review_model
+        .clone()
+        .unwrap_or_else(|| parent_model_slug.to_string());
+    sub_agent_config.model = Some(model);
+    if let Some(provider_id) = parent_config.review_model_provider.as_deref() {
+        apply_delegate_model_provider(&mut sub_agent_config, provider_id)?;
+        sub_agent_config.features.disable(Feature::RemoteModels);
+    }
+
+    Ok(sub_agent_config)
 }
 
 impl SessionTask for ReviewTask {
@@ -95,29 +137,15 @@ async fn start_review_conversation(
     cancellation_token: CancellationToken,
 ) -> Result<async_channel::Receiver<Event>, CodexErr> {
     let config = ctx.config.clone();
-    let mut sub_agent_config = config.as_ref().clone();
-    // Carry over review-only feature restrictions so the delegate cannot
-    // re-enable blocked tools or spawn nested agents.
-    sub_agent_config.web_search_mode = Some(WebSearchMode::Disabled);
-    sub_agent_config
-        .features
-        .disable(Feature::WebSearchRequest)
-        .disable(Feature::WebSearchCached)
-        .disable(Feature::Collab);
-
-    // Set explicit review rubric for the sub-agent
-    sub_agent_config.base_instructions = Some(crate::REVIEW_PROMPT.to_string());
-    sub_agent_config.approval_policy = crate::config::Constrained::allow_any(AskForApproval::Never);
-
-    let model = config
-        .review_model
-        .clone()
-        .unwrap_or_else(|| ctx.model_info.slug.clone());
-    sub_agent_config.model = Some(model);
-    if let Some(provider_id) = config.review_model_provider.as_deref() {
-        apply_delegate_model_provider(&mut sub_agent_config, provider_id)?;
-        sub_agent_config.features.disable(Feature::RemoteModels);
-    }
+    let sub_agent_config = configure_review_delegate_config(
+        config.as_ref(),
+        ctx.model_info.slug.as_str(),
+        ReviewDelegateConfigParams {
+            base_instructions: crate::REVIEW_PROMPT,
+            sandbox_policy: ctx.sandbox_policy.clone(),
+            disable_collab: true,
+        },
+    )?;
 
     run_codex_thread_one_shot(
         sub_agent_config,
@@ -260,7 +288,10 @@ pub(crate) async fn exit_review_mode(
     session
         .send_event(
             ctx.as_ref(),
-            EventMsg::ExitedReviewMode(ExitedReviewModeEvent { review_output }),
+            EventMsg::ExitedReviewMode(ExitedReviewModeEvent {
+                review_output,
+                post_turn_completion_review_output: None,
+            }),
         )
         .await;
     session
@@ -307,8 +338,15 @@ fn normalize_review_template_line_endings(template: &str) -> Cow<'_, str> {
 
 #[cfg(test)]
 mod tests {
+    use super::ReviewDelegateConfigParams;
+    use super::configure_review_delegate_config;
     use super::normalize_review_template_line_endings;
     use super::render_review_exit_success;
+    use crate::config::test_config;
+    use crate::features::Feature;
+    use crate::protocol::AskForApproval;
+    use crate::protocol::SandboxPolicy;
+    use codex_protocol::config_types::WebSearchMode;
     use pretty_assertions::assert_eq;
 
     #[test]
@@ -324,6 +362,38 @@ mod tests {
         assert_eq!(
             normalize_review_template_line_endings("<user_action>\r\n  <results>\r  None.\r\n"),
             "<user_action>\n  <results>\n  None.\n"
+        );
+    }
+
+    #[test]
+    fn configure_review_delegate_forces_review_restrictions() {
+        let mut config = test_config();
+        config.review_model = Some("review-model".to_string());
+        config.features.enable(Feature::WebSearchRequest);
+        config.features.enable(Feature::WebSearchCached);
+        config.features.enable(Feature::Collab);
+
+        let delegate = configure_review_delegate_config(
+            &config,
+            "parent-model",
+            ReviewDelegateConfigParams {
+                base_instructions: "review prompt",
+                sandbox_policy: SandboxPolicy::ReadOnly,
+                disable_collab: true,
+            },
+        )
+        .expect("delegate config");
+
+        assert_eq!(delegate.model.as_deref(), Some("review-model"));
+        assert_eq!(delegate.base_instructions.as_deref(), Some("review prompt"));
+        assert_eq!(delegate.web_search_mode, Some(WebSearchMode::Disabled));
+        assert!(!delegate.features.enabled(Feature::WebSearchRequest));
+        assert!(!delegate.features.enabled(Feature::WebSearchCached));
+        assert!(!delegate.features.enabled(Feature::Collab));
+        assert_eq!(*delegate.approval_policy.get(), AskForApproval::Never);
+        assert_eq!(
+            delegate.sandbox_policy.get().clone(),
+            SandboxPolicy::ReadOnly
         );
     }
 }

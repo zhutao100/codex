@@ -108,7 +108,6 @@ use crate::client::ModelClient;
 use crate::client::ModelClientSession;
 use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
-use crate::codex_delegate::apply_delegate_model_provider;
 use crate::codex_thread::ThreadConfigSnapshot;
 use crate::compact::collect_user_messages;
 use crate::config::Config;
@@ -197,14 +196,18 @@ use crate::skills::injection::app_id_from_path;
 use crate::skills::injection::tool_kind_for_path;
 use crate::skills::resolve_skill_dependencies_for_turn;
 use crate::state::ActiveTurn;
+use crate::state::CompletedTurnForReview;
 use crate::state::PendingContinuation;
 use crate::state::SessionServices;
 use crate::state::SessionState;
 use crate::state_db;
 use crate::tasks::GhostSnapshotTask;
+use crate::tasks::PostTurnCompletionReviewTask;
+use crate::tasks::ReviewDelegateConfigParams;
 use crate::tasks::ReviewTask;
 use crate::tasks::SessionTask;
 use crate::tasks::SessionTaskContext;
+use crate::tasks::configure_review_delegate_config;
 use crate::tools::ToolRouter;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::parallel::ToolCallExecutionMode;
@@ -401,6 +404,7 @@ impl Codex {
             auth_manager.clone(),
             models_manager.clone(),
             exec_policy,
+            tx_sub.clone(),
             tx_event.clone(),
             agent_status_tx.clone(),
             conversation_history,
@@ -495,6 +499,7 @@ impl Codex {
 /// A session has at most 1 running task at a time, and can be interrupted by user input.
 pub(crate) struct Session {
     pub(crate) conversation_id: ThreadId,
+    tx_sub: Sender<Submission>,
     tx_event: Sender<Event>,
     agent_status: watch::Sender<AgentStatus>,
     state: Mutex<SessionState>,
@@ -884,6 +889,7 @@ impl Session {
         auth_manager: Arc<AuthManager>,
         models_manager: Arc<ModelsManager>,
         exec_policy: ExecPolicyManager,
+        tx_sub: Sender<Submission>,
         tx_event: Sender<Event>,
         agent_status: watch::Sender<AgentStatus>,
         initial_history: InitialHistory,
@@ -1151,6 +1157,7 @@ impl Session {
 
         let sess = Arc::new(Session {
             conversation_id,
+            tx_sub,
             tx_event: tx_event.clone(),
             agent_status,
             state: Mutex::new(state),
@@ -1278,10 +1285,14 @@ impl Session {
     }
 
     fn next_internal_sub_id(&self) -> String {
+        self.next_internal_sub_id_with_prefix("auto-compact")
+    }
+
+    pub(crate) fn next_internal_sub_id_with_prefix(&self, prefix: &str) -> String {
         let id = self
             .next_internal_sub_id
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        format!("auto-compact-{id}")
+        format!("{prefix}-{id}")
     }
 
     async fn get_total_token_usage(&self) -> i64 {
@@ -2747,6 +2758,90 @@ impl Session {
         self.set_pending_continuation(None).await;
     }
 
+    pub(crate) async fn submit_internal_op(&self, id: String, op: Op) {
+        if self.tx_sub.send(Submission { id, op }).await.is_err() {
+            warn!("failed to submit internal session operation");
+        }
+    }
+
+    pub(crate) async fn set_pending_post_turn_completion_review_continuation(
+        &self,
+        pending_continuation: Option<PendingContinuation>,
+    ) {
+        let mut state = self.state.lock().await;
+        state.pending_post_turn_completion_review_continuation = pending_continuation;
+    }
+
+    pub(crate) async fn take_pending_post_turn_completion_review_continuation(
+        &self,
+    ) -> Option<PendingContinuation> {
+        let mut state = self.state.lock().await;
+        state
+            .pending_post_turn_completion_review_continuation
+            .take()
+    }
+
+    pub(crate) async fn last_completed_regular_turn_for_review(
+        &self,
+    ) -> Option<CompletedTurnForReview> {
+        let state = self.state.lock().await;
+        state.last_completed_regular_turn_for_review.clone()
+    }
+
+    pub(crate) async fn completed_turn_for_review(&self) -> Option<CompletedTurnForReview> {
+        let state = self.state.lock().await;
+        state
+            .last_completed_regular_turn_for_review
+            .clone()
+            .or_else(|| {
+                completed_turn_for_review_from_history(
+                    state.history.raw_items(),
+                    state.session_configuration.cwd.clone(),
+                )
+            })
+    }
+
+    pub(crate) async fn capture_completed_regular_turn_for_review(
+        &self,
+        turn_context: &TurnContext,
+        mut user_messages: Vec<String>,
+        final_agent_message: Option<&str>,
+    ) {
+        let Some(final_agent_message) = final_agent_message else {
+            return;
+        };
+        if final_agent_message.trim().is_empty() {
+            return;
+        }
+
+        if user_messages.is_empty()
+            && let Some(reconstructed) = self.reconstruct_completed_turn_for_review().await
+        {
+            user_messages = reconstructed.user_messages;
+        }
+
+        if user_messages.is_empty() {
+            return;
+        }
+
+        let completed_turn = CompletedTurnForReview {
+            turn_id: turn_context.sub_id.clone(),
+            cwd: turn_context.cwd.clone(),
+            user_messages,
+            final_agent_message: final_agent_message.to_string(),
+        };
+        let mut state = self.state.lock().await;
+        state.last_completed_regular_turn_for_review = Some(completed_turn);
+    }
+
+    async fn reconstruct_completed_turn_for_review(&self) -> Option<CompletedTurnForReview> {
+        let state = self.state.lock().await;
+        completed_turn_for_review_from_history(
+            state.history.raw_items(),
+            state.session_configuration.cwd.clone(),
+        )
+    }
+
     async fn prepare_history_for_continuation(&self, remove_interrupted_abort: bool) {
         let mut state = self.state.lock().await;
         let mut items = state.history.raw_items().to_vec();
@@ -3043,6 +3138,9 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
             Op::Review { review_request } => {
                 handlers::review(&sess, &config, sub.id.clone(), review_request).await;
             }
+            Op::ReviewCompletedTurn => {
+                handlers::review_completed_turn(&sess, sub.id.clone()).await;
+            }
             _ => {} // Ignore unknown ops; enum is non_exhaustive to allow extensions.
         }
     }
@@ -3055,6 +3153,7 @@ mod handlers {
     use crate::codex::SessionSettingsUpdate;
     use crate::codex::TurnContext;
 
+    use crate::codex::spawn_post_turn_completion_review;
     use crate::codex::spawn_review_thread;
     use crate::config::Config;
 
@@ -3811,6 +3910,50 @@ mod handlers {
             }
         }
     }
+
+    pub async fn review_completed_turn(sess: &Arc<Session>, sub_id: String) {
+        if sess.active_turn.lock().await.is_some() {
+            sess.send_event_raw(Event {
+                id: sub_id,
+                msg: EventMsg::Error(ErrorEvent {
+                    message: "Cannot review a completed turn while another task is running."
+                        .to_string(),
+                    codex_error_info: Some(CodexErrorInfo::BadRequest),
+                }),
+            })
+            .await;
+            return;
+        }
+
+        let Some(completed_turn) = sess.completed_turn_for_review().await else {
+            sess.send_event_raw(Event {
+                id: sub_id,
+                msg: EventMsg::Error(ErrorEvent {
+                    message: "No completed Codex turn is available to review yet. Run a normal prompt first, wait for Codex to finish, then use /review-completed-turn."
+                        .to_string(),
+                    codex_error_info: Some(CodexErrorInfo::BadRequest),
+                }),
+            })
+            .await;
+            return;
+        };
+
+        if completed_turn.final_agent_message.trim().is_empty() {
+            sess.send_event_raw(Event {
+                id: sub_id,
+                msg: EventMsg::Error(ErrorEvent {
+                    message: "The last completed turn has no final assistant message to review. Run another prompt or retry after a completed response."
+                        .to_string(),
+                    codex_error_info: Some(CodexErrorInfo::BadRequest),
+                }),
+            })
+            .await;
+            return;
+        }
+
+        let turn_context = sess.new_default_turn_with_sub_id(sub_id).await;
+        spawn_post_turn_completion_review(Arc::clone(sess), turn_context, completed_turn).await;
+    }
 }
 
 /// Spawn a review thread using the given prompt.
@@ -3821,29 +3964,35 @@ async fn spawn_review_thread(
     sub_id: String,
     resolved: crate::review_prompts::ResolvedReviewRequest,
 ) {
-    let model = config
-        .review_model
+    let per_turn_config = configure_review_delegate_config(
+        config.as_ref(),
+        parent_turn_context.model_info.slug.as_str(),
+        ReviewDelegateConfigParams {
+            base_instructions: crate::REVIEW_PROMPT,
+            sandbox_policy: parent_turn_context.sandbox_policy.clone(),
+            disable_collab: true,
+        },
+    )
+    .unwrap_or_else(|_| {
+        let mut fallback = config.as_ref().clone();
+        fallback.model = config
+            .review_model
+            .clone()
+            .or_else(|| Some(parent_turn_context.model_info.slug.clone()));
+        fallback.web_search_mode = Some(WebSearchMode::Disabled);
+        fallback
+            .features
+            .disable(Feature::WebSearchRequest)
+            .disable(Feature::WebSearchCached)
+            .disable(Feature::Collab);
+        fallback
+    });
+    let model = per_turn_config
+        .model
         .clone()
         .unwrap_or_else(|| parent_turn_context.model_info.slug.clone());
-    // For reviews, disable web_search and view_image regardless of global settings.
-    let mut review_features = sess.features.clone();
-    review_features
-        .disable(crate::features::Feature::WebSearchRequest)
-        .disable(crate::features::Feature::WebSearchCached);
+    let review_features = per_turn_config.features.clone();
     let review_web_search_mode = WebSearchMode::Disabled;
-
-    // Build per-turn config before resolving model metadata so the review
-    // context and detached review rollouts reflect task-local provider/model
-    // overrides, not only the inner one-shot delegate request.
-    let mut per_turn_config = (*config).clone();
-    per_turn_config.model = Some(model.clone());
-    if let Some(provider_id) = config.review_model_provider.as_deref()
-        && apply_delegate_model_provider(&mut per_turn_config, provider_id).is_ok()
-    {
-        review_features.disable(crate::features::Feature::RemoteModels);
-    }
-    per_turn_config.features = review_features.clone();
-    per_turn_config.web_search_mode = Some(review_web_search_mode);
 
     let review_model_info = sess
         .services
@@ -3877,7 +4026,7 @@ async fn spawn_review_thread(
 
     let review_turn_context = TurnContext {
         sub_id: sub_id.to_string(),
-        config: per_turn_config,
+        config: Arc::clone(&per_turn_config),
         auth_manager: auth_manager_for_context,
         model_info: model_info.clone(),
         otel_manager: otel_manager_for_context,
@@ -3895,8 +4044,8 @@ async fn spawn_review_thread(
         collaboration_mode: parent_turn_context.collaboration_mode.clone(),
         personality: parent_turn_context.personality,
         final_instruction_override: None,
-        approval_policy: parent_turn_context.approval_policy,
-        sandbox_policy: parent_turn_context.sandbox_policy.clone(),
+        approval_policy: *per_turn_config.approval_policy.get(),
+        sandbox_policy: per_turn_config.sandbox_policy.get().clone(),
         windows_sandbox_level: parent_turn_context.windows_sandbox_level,
         shell_environment_policy: parent_turn_context.shell_environment_policy.clone(),
         cwd: parent_turn_context.cwd.clone(),
@@ -3924,6 +4073,27 @@ async fn spawn_review_thread(
     };
     sess.send_event(&tc, EventMsg::EnteredReviewMode(review_request))
         .await;
+}
+
+pub(crate) async fn spawn_post_turn_completion_review(
+    sess: Arc<Session>,
+    turn_context: Arc<TurnContext>,
+    completed_turn: CompletedTurnForReview,
+) {
+    let review_request = ReviewRequest {
+        target: codex_protocol::protocol::ReviewTarget::Custom {
+            instructions: "Review the last completed Codex turn.".to_string(),
+        },
+        user_facing_hint: Some("completed turn".to_string()),
+    };
+    sess.send_event(&turn_context, EventMsg::EnteredReviewMode(review_request))
+        .await;
+    sess.spawn_task(
+        Arc::clone(&turn_context),
+        Vec::new(),
+        PostTurnCompletionReviewTask::new(completed_turn),
+    )
+    .await;
 }
 
 fn skills_to_info(
@@ -4524,6 +4694,102 @@ fn history_needs_continuation(history: &[ResponseItem]) -> bool {
         }),
         None => true,
     }
+}
+
+fn completed_turn_for_review_from_history(
+    items: &[ResponseItem],
+    cwd: PathBuf,
+) -> Option<CompletedTurnForReview> {
+    let mut search_end = items.len();
+    while let Some(assistant_index) = items[..search_end]
+        .iter()
+        .rposition(|item| assistant_message_text(item).is_some_and(|text| !text.trim().is_empty()))
+    {
+        let final_agent_message = assistant_message_text(&items[assistant_index])?
+            .trim()
+            .to_string();
+        let Some((user_index, user_messages)) = items[..assistant_index]
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, item)| {
+                user_message_texts_for_review(item).map(|texts| (index, texts))
+            })
+        else {
+            search_end = assistant_index;
+            continue;
+        };
+
+        let has_review_synthetic_between = items[user_index + 1..assistant_index]
+            .iter()
+            .any(is_review_rollout_user_message);
+        if has_review_synthetic_between {
+            search_end = assistant_index;
+            continue;
+        }
+
+        return Some(CompletedTurnForReview {
+            turn_id: format!("reconstructed-{user_index}-{assistant_index}"),
+            cwd,
+            user_messages,
+            final_agent_message,
+        });
+    }
+
+    None
+}
+
+fn assistant_message_text(item: &ResponseItem) -> Option<String> {
+    let ResponseItem::Message { role, content, .. } = item else {
+        return None;
+    };
+    if role != "assistant" {
+        return None;
+    }
+    let text = content
+        .iter()
+        .filter_map(|item| match item {
+            ContentItem::OutputText { text } | ContentItem::InputText { text } => {
+                Some(text.as_str())
+            }
+            ContentItem::InputImage { .. } => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!text.trim().is_empty()).then_some(text)
+}
+
+fn user_message_texts_for_review(item: &ResponseItem) -> Option<Vec<String>> {
+    if !is_user_turn_boundary_response_item(item) || is_review_rollout_user_message(item) {
+        return None;
+    }
+    let ResponseItem::Message { content, .. } = item else {
+        return None;
+    };
+    let texts = content
+        .iter()
+        .filter_map(|item| match item {
+            ContentItem::InputText { text } if !text.trim().is_empty() => Some(text.clone()),
+            ContentItem::OutputText { text } if !text.trim().is_empty() => Some(text.clone()),
+            ContentItem::InputText { .. }
+            | ContentItem::OutputText { .. }
+            | ContentItem::InputImage { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    (!texts.is_empty()).then_some(texts)
+}
+
+fn is_review_rollout_user_message(item: &ResponseItem) -> bool {
+    let ResponseItem::Message { role, content, .. } = item else {
+        return false;
+    };
+    role == "user"
+        && content.iter().any(|item| match item {
+            ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+                text.contains("User initiated a review task.")
+            }
+            ContentItem::InputImage { .. } => false,
+        })
 }
 
 fn is_user_turn_boundary_response_item(item: &ResponseItem) -> bool {
@@ -6713,6 +6979,7 @@ mod tests {
         let agent_control = AgentControl::default();
         let exec_policy = ExecPolicyManager::default();
         let (agent_status_tx, _agent_status_rx) = watch::channel(AgentStatus::PendingInit);
+        let (tx_sub, _rx_sub) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
         let model = ModelsManager::get_model_offline(config.model.as_deref());
         let model_info = models_manager
             .get_model_info(model.as_str(), config.as_ref())
@@ -6816,6 +7083,7 @@ mod tests {
 
         let session = Session {
             conversation_id,
+            tx_sub,
             tx_event,
             agent_status: agent_status_tx,
             state: Mutex::new(state),
@@ -6850,6 +7118,7 @@ mod tests {
         let agent_control = AgentControl::default();
         let exec_policy = ExecPolicyManager::default();
         let (agent_status_tx, _agent_status_rx) = watch::channel(AgentStatus::PendingInit);
+        let (tx_sub, _rx_sub) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
         let model = ModelsManager::get_model_offline(config.model.as_deref());
         let model_info = models_manager
             .get_model_info(model.as_str(), config.as_ref())
@@ -6953,6 +7222,7 @@ mod tests {
 
         let session = Arc::new(Session {
             conversation_id,
+            tx_sub,
             tx_event,
             agent_status: agent_status_tx,
             state: Mutex::new(state),
@@ -7176,6 +7446,106 @@ mod tests {
         assert!(
             history.raw_items().iter().any(|item| item == &expected),
             "expected pending input to be persisted into history on turn completion"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn regular_task_completion_stores_completed_turn_for_review() {
+        let (sess, tc, _rx) = make_session_and_context_with_rx().await;
+        let input = vec![
+            UserInput::Text {
+                text: "first user message".to_string(),
+                text_elements: Vec::new(),
+            },
+            UserInput::Image {
+                image_url: "data:image/png;base64,aaa".to_string(),
+            },
+            UserInput::Text {
+                text: "second user message".to_string(),
+                text_elements: Vec::new(),
+            },
+        ];
+        sess.spawn_task(
+            Arc::clone(&tc),
+            input,
+            NeverEndingTask {
+                kind: TaskKind::Regular,
+                listen_to_cancellation_token: false,
+            },
+        )
+        .await;
+
+        sess.on_task_finished(
+            Arc::clone(&tc),
+            Some("final assistant message".to_string()),
+            TaskKind::Regular,
+        )
+        .await;
+
+        assert_eq!(
+            sess.last_completed_regular_turn_for_review().await,
+            Some(CompletedTurnForReview {
+                turn_id: tc.sub_id.clone(),
+                cwd: tc.cwd.clone(),
+                user_messages: vec![
+                    "first user message".to_string(),
+                    "second user message".to_string()
+                ],
+                final_agent_message: "final assistant message".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn completed_turn_reconstruction_uses_user_and_final_assistant_text() {
+        let cwd = PathBuf::from("/tmp/project");
+        let history = vec![
+            DeveloperInstructions::new("developer note").into(),
+            user_message("implement the feature"),
+            ResponseItem::FunctionCall {
+                id: None,
+                name: "shell".to_string(),
+                arguments: "{}".to_string(),
+                call_id: "call-1".to_string(),
+            },
+            ResponseItem::FunctionCallOutput {
+                call_id: "call-1".to_string(),
+                output: FunctionCallOutputPayload::from_text("tool output".to_string()),
+            },
+            assistant_message("done"),
+        ];
+
+        assert_eq!(
+            completed_turn_for_review_from_history(&history, cwd.clone()),
+            Some(CompletedTurnForReview {
+                turn_id: "reconstructed-1-4".to_string(),
+                cwd,
+                user_messages: vec!["implement the feature".to_string()],
+                final_agent_message: "done".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn completed_turn_reconstruction_skips_review_synthetic_turn() {
+        let cwd = PathBuf::from("/tmp/project");
+        let history = vec![
+            user_message("real request"),
+            assistant_message("real response"),
+            user_message(
+                "<user_action>\n  <context>User initiated a review task.</context>\n</user_action>",
+            ),
+            assistant_message("review output"),
+        ];
+
+        assert_eq!(
+            completed_turn_for_review_from_history(&history, cwd.clone()),
+            Some(CompletedTurnForReview {
+                turn_id: "reconstructed-0-1".to_string(),
+                cwd,
+                user_messages: vec!["real request".to_string()],
+                final_agent_message: "real response".to_string(),
+            })
         );
     }
 

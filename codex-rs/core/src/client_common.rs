@@ -17,6 +17,10 @@ use tokio::sync::mpsc;
 /// Review thread system prompt. Edit `core/src/review_prompt.md` to customize.
 pub const REVIEW_PROMPT: &str = include_str!("../review_prompt.md");
 
+/// Post-turn completion review system prompt.
+pub const POST_TURN_COMPLETION_REVIEW_PROMPT: &str =
+    include_str!("../post_turn_completion_review_prompt.md");
+
 // Centralized templates for review-related user messages
 pub const REVIEW_EXIT_SUCCESS_TMPL: &str = include_str!("../templates/review/exit_success.xml");
 pub const REVIEW_EXIT_INTERRUPTED_TMPL: &str =

@@ -131,6 +131,7 @@ export type { PlanDeltaEvent } from "./PlanDeltaEvent";
 export type { PlanItem } from "./PlanItem";
 export type { PlanItemArg } from "./PlanItemArg";
 export type { PlanType } from "./PlanType";
+export type { PostTurnCompletionReviewOutputEvent } from "./PostTurnCompletionReviewOutputEvent";
 export type { Profile } from "./Profile";
 export type { ProgressTraceCategory } from "./ProgressTraceCategory";
 export type { ProgressTraceEvent } from "./ProgressTraceEvent";

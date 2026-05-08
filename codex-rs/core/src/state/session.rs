@@ -3,6 +3,7 @@
 use codex_protocol::models::ResponseItem;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::path::PathBuf;
 
 use crate::codex::SessionConfiguration;
 use crate::context_manager::ContextManager;
@@ -16,6 +17,14 @@ use crate::truncate::TruncationPolicy;
 pub(crate) struct PendingContinuation {
     pub(crate) source: TurnContinuationSource,
     pub(crate) continued_from_turn_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CompletedTurnForReview {
+    pub(crate) turn_id: String,
+    pub(crate) cwd: PathBuf,
+    pub(crate) user_messages: Vec<String>,
+    pub(crate) final_agent_message: String,
 }
 
 /// Persistent, session-scoped state previously stored directly on `Session`.
@@ -35,6 +44,10 @@ pub(crate) struct SessionState {
     pub(crate) pending_resume_previous_model: Option<String>,
     /// Most recent paused/interrupted turn that can be continued without a new user input.
     pub(crate) pending_continuation: Option<PendingContinuation>,
+    /// Most recent completed regular turn that can be reviewed independently.
+    pub(crate) last_completed_regular_turn_for_review: Option<CompletedTurnForReview>,
+    /// Continuation requested by a post-turn completion review that advised fixes.
+    pub(crate) pending_post_turn_completion_review_continuation: Option<PendingContinuation>,
     /// Tracks whether automatic thread naming has already been attempted.
     pub(crate) auto_rename_attempted: bool,
     /// Tracks whether this session originated from a fork.
@@ -55,6 +68,8 @@ impl SessionState {
             initial_context_seeded: false,
             pending_resume_previous_model: None,
             pending_continuation: None,
+            last_completed_regular_turn_for_review: None,
+            pending_post_turn_completion_review_continuation: None,
             auto_rename_attempted: false,
             is_forked_session: false,
         }

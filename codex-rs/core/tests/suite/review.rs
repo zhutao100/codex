@@ -18,6 +18,7 @@ use codex_core::protocol::ReviewRequest;
 use codex_core::protocol::ReviewTarget;
 use codex_core::protocol::RolloutItem;
 use codex_core::protocol::RolloutLine;
+use codex_core::protocol::TurnContinuationSource;
 use codex_core::review_format::render_review_output_text;
 use codex_protocol::user_input::UserInput;
 use core_test_support::load_sse_fixture_with_id_from_str;
@@ -234,6 +235,128 @@ async fn review_op_with_plain_text_emits_review_fallback() {
     };
     assert_eq!(expected, review);
     let _complete = wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let _codex_home_guard = codex_home;
+    server.verify().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_completed_turn_positive_output_records_developer_advisory_and_continues() {
+    skip_if_no_network!();
+
+    let review_json = serde_json::json!({
+        "evaluation": "A concrete follow-up is needed.",
+        "fix_actions_advised": true
+    })
+    .to_string();
+    let review_json_escaped = serde_json::to_string(&review_json).unwrap();
+    let sse_parent = r#"[
+        {"type":"response.output_item.done", "item":{
+            "type":"message", "role":"assistant",
+            "content":[{"type":"output_text","text":"initial done"}]
+        }},
+        {"type":"response.completed", "response": {"id": "__ID__"}}
+    ]"#;
+    let sse_review = format!(
+        r#"[
+            {{"type":"response.output_item.done", "item":{{
+                "type":"message", "role":"assistant",
+                "content":[{{"type":"output_text","text":{review_json_escaped}}}]
+            }}}},
+            {{"type":"response.completed", "response": {{"id": "__ID__"}}}}
+        ]"#
+    );
+    let sse_continue = r#"[
+        {"type":"response.output_item.done", "item":{
+            "type":"message", "role":"assistant",
+            "content":[{"type":"output_text","text":"follow-up done"}]
+        }},
+        {"type":"response.completed", "response": {"id": "__ID__"}}
+    ]"#;
+    let server = MockServer::start().await;
+    let request_log = mount_sse_sequence(
+        &server,
+        vec![
+            load_sse_fixture_with_id_from_str(sse_parent, &Uuid::new_v4().to_string()),
+            load_sse_fixture_with_id_from_str(&sse_review, &Uuid::new_v4().to_string()),
+            load_sse_fixture_with_id_from_str(sse_continue, &Uuid::new_v4().to_string()),
+        ],
+    )
+    .await;
+    let codex_home = Arc::new(TempDir::new().unwrap());
+    let codex = new_conversation_for_server(&server, codex_home.clone(), |_| {}).await;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "finish the change".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await
+        .unwrap();
+    let _parent_complete =
+        wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    codex.submit(Op::ReviewCompletedTurn).await.unwrap();
+
+    let entered = wait_for_event(&codex, |ev| matches!(ev, EventMsg::EnteredReviewMode(_))).await;
+    match entered {
+        EventMsg::EnteredReviewMode(request) => {
+            assert_eq!(request.user_facing_hint.as_deref(), Some("completed turn"));
+        }
+        other => panic!("expected EnteredReviewMode, got {other:?}"),
+    }
+    let exited = wait_for_event(&codex, |ev| matches!(ev, EventMsg::ExitedReviewMode(_))).await;
+    match exited {
+        EventMsg::ExitedReviewMode(event) => {
+            let output = event
+                .post_turn_completion_review_output
+                .expect("post-turn review output");
+            assert_eq!(output.evaluation, "A concrete follow-up is needed.");
+            assert!(output.fix_actions_advised);
+        }
+        other => panic!("expected ExitedReviewMode, got {other:?}"),
+    }
+    let _review_complete =
+        wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    let continued = wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnContinued(_))).await;
+    match continued {
+        EventMsg::TurnContinued(event) => {
+            assert_eq!(
+                event.source,
+                TurnContinuationSource::PostTurnCompletionReview
+            );
+        }
+        other => panic!("expected TurnContinued, got {other:?}"),
+    }
+    let _continuation_complete =
+        wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let requests = request_log.requests();
+    assert_eq!(requests.len(), 3);
+    let delegate_input = serde_json::to_string(&requests[1].input()).expect("serialize input");
+    assert!(
+        delegate_input.contains("<completed_turn_review_context>"),
+        "delegate input should contain completed-turn context: {delegate_input}"
+    );
+    assert!(delegate_input.contains("finish the change"));
+    assert!(delegate_input.contains("initial done"));
+
+    let continuation_body = requests[2].body_json();
+    let continuation_input = continuation_body["input"].as_array().expect("input array");
+    let saw_advisory = continuation_input.iter().any(|item| {
+        item["role"].as_str() == Some("developer")
+            && item["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("<post_turn_completion_review>")
+    });
+    assert!(
+        saw_advisory,
+        "developer advisory missing from continuation request"
+    );
 
     let _codex_home_guard = codex_home;
     server.verify().await;
@@ -512,7 +635,8 @@ async fn review_uses_custom_review_model_from_config() {
         matches!(
             ev,
             EventMsg::ExitedReviewMode(ExitedReviewModeEvent {
-                review_output: None
+                review_output: None,
+                ..
             })
         )
     })
@@ -606,7 +730,8 @@ async fn review_model_provider_routes_delegate_only_to_secondary_provider() {
         matches!(
             ev,
             EventMsg::ExitedReviewMode(ExitedReviewModeEvent {
-                review_output: None
+                review_output: None,
+                ..
             })
         )
     })
@@ -676,7 +801,8 @@ async fn unknown_review_model_provider_surfaces_error_event() {
         matches!(
             ev,
             EventMsg::ExitedReviewMode(ExitedReviewModeEvent {
-                review_output: None
+                review_output: None,
+                ..
             })
         )
     })
@@ -720,7 +846,8 @@ async fn review_uses_session_model_when_review_model_unset() {
         matches!(
             ev,
             EventMsg::ExitedReviewMode(ExitedReviewModeEvent {
-                review_output: None
+                review_output: None,
+                ..
             })
         )
     })
@@ -838,7 +965,8 @@ async fn review_input_isolated_from_parent_history() {
         matches!(
             ev,
             EventMsg::ExitedReviewMode(ExitedReviewModeEvent {
-                review_output: None
+                review_output: None,
+                ..
             })
         )
     })
@@ -949,7 +1077,8 @@ async fn review_history_surfaces_in_parent_session() {
         matches!(
             ev,
             EventMsg::ExitedReviewMode(ExitedReviewModeEvent {
-                review_output: Some(_)
+                review_output: Some(_),
+                ..
             })
         )
     })

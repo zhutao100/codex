@@ -1,6 +1,7 @@
 mod compact;
 mod continue_task;
 mod ghost_snapshot;
+mod post_turn_completion_review;
 mod regular;
 mod review;
 mod undo;
@@ -51,8 +52,11 @@ use codex_protocol::user_input::UserInput;
 pub(crate) use compact::CompactTask;
 pub(crate) use continue_task::ContinueTask;
 pub(crate) use ghost_snapshot::GhostSnapshotTask;
+pub(crate) use post_turn_completion_review::PostTurnCompletionReviewTask;
 pub(crate) use regular::RegularTask;
+pub(crate) use review::ReviewDelegateConfigParams;
 pub(crate) use review::ReviewTask;
+pub(crate) use review::configure_review_delegate_config;
 pub(crate) use undo::UndoTask;
 pub(crate) use user_shell::UserShellCommandMode;
 pub(crate) use user_shell::UserShellCommandTask;
@@ -60,6 +64,21 @@ pub(crate) use user_shell::execute_user_shell_command;
 
 const GRACEFULL_INTERRUPTION_TIMEOUT_MS: u64 = 100;
 const TURN_ABORTED_INTERRUPTED_GUIDANCE: &str = "The user interrupted the previous turn on purpose. If any tools/commands were aborted, they may have partially executed; verify current state before retrying.";
+
+fn user_text_messages_for_completed_turn_review(input: &[UserInput]) -> Vec<String> {
+    input
+        .iter()
+        .filter_map(|item| match item {
+            UserInput::Text { text, .. } if !text.trim().is_empty() => Some(text.clone()),
+            UserInput::Text { .. }
+            | UserInput::Image { .. }
+            | UserInput::LocalImage { .. }
+            | UserInput::Skill { .. }
+            | UserInput::Mention { .. } => None,
+            _ => None,
+        })
+        .collect()
+}
 
 #[derive(Clone, Debug)]
 enum TaskStopReason {
@@ -200,6 +219,11 @@ impl Session {
 
         let task: Arc<dyn AnySessionTask> = Arc::new(task);
         let task_kind = task.kind();
+        let completed_turn_user_messages = if task_kind == TaskKind::Regular {
+            user_text_messages_for_completed_turn_review(&input)
+        } else {
+            Vec::new()
+        };
 
         let cancellation_token = CancellationToken::new();
         let done = Arc::new(Notify::new());
@@ -247,6 +271,7 @@ impl Session {
             task,
             cancellation_token,
             turn_context: Arc::clone(&turn_context),
+            completed_turn_user_messages,
             _timer: timer,
         };
         self.register_new_active_task(running_task).await;
@@ -276,12 +301,16 @@ impl Session {
         let mut active = self.active_turn.lock().await;
         let mut pending_input = Vec::<ResponseInputItem>::new();
         let mut should_close_processes = false;
+        let mut completed_turn_user_messages = Vec::new();
         if let Some(at) = active.as_mut()
-            && at.remove_task(&turn_context.sub_id)
+            && let Some(task) = at.remove_task(&turn_context.sub_id)
         {
-            let mut ts = at.turn_state.lock().await;
-            pending_input = ts.take_pending_input();
-            should_close_processes = true;
+            completed_turn_user_messages = task.completed_turn_user_messages;
+            if at.tasks.is_empty() {
+                let mut ts = at.turn_state.lock().await;
+                pending_input = ts.take_pending_input();
+                should_close_processes = true;
+            }
         }
         if should_close_processes {
             *active = None;
@@ -299,11 +328,30 @@ impl Session {
             self.close_unified_exec_processes().await;
         }
         self.clear_pending_continuation().await;
+        if task_kind == TaskKind::Regular {
+            self.capture_completed_regular_turn_for_review(
+                turn_context.as_ref(),
+                completed_turn_user_messages,
+                last_agent_message.as_deref(),
+            )
+            .await;
+        }
         let event = EventMsg::TurnComplete(TurnCompleteEvent {
             last_agent_message: last_agent_message.clone(),
         });
         self.send_event(turn_context.as_ref(), event).await;
-        self.maybe_auto_rename_thread(turn_context, last_agent_message, task_kind)
+        if task_kind == TaskKind::PostTurnCompletionReview {
+            self.continue_after_post_turn_completion_review(turn_context)
+                .await;
+            return;
+        }
+        self.maybe_auto_rename_thread(
+            Arc::clone(&turn_context),
+            last_agent_message.clone(),
+            task_kind,
+        )
+        .await;
+        self.maybe_auto_post_turn_completion_review(turn_context, last_agent_message, task_kind)
             .await;
     }
 
@@ -399,6 +447,62 @@ impl Session {
                 )
                 .await;
         });
+    }
+
+    async fn maybe_auto_post_turn_completion_review(
+        self: &Arc<Self>,
+        turn_context: Arc<TurnContext>,
+        last_agent_message: Option<String>,
+        task_kind: TaskKind,
+    ) {
+        if task_kind != TaskKind::Regular
+            || !turn_context
+                .features
+                .enabled(Feature::AutoPostTurnCompletionReview)
+            || matches!(turn_context.session_source, SessionSource::SubAgent(_))
+        {
+            return;
+        }
+
+        let Some(message) = last_agent_message.as_ref() else {
+            return;
+        };
+        if message.trim().is_empty() || self.active_turn.lock().await.is_some() {
+            return;
+        }
+
+        if self
+            .last_completed_regular_turn_for_review()
+            .await
+            .is_none()
+        {
+            return;
+        }
+
+        self.submit_internal_op(
+            self.next_internal_sub_id_with_prefix("post-turn-review"),
+            crate::protocol::Op::ReviewCompletedTurn,
+        )
+        .await;
+    }
+
+    async fn continue_after_post_turn_completion_review(
+        self: &Arc<Self>,
+        _completed_review_context: Arc<TurnContext>,
+    ) {
+        let Some(checkpoint) = self
+            .take_pending_post_turn_completion_review_continuation()
+            .await
+        else {
+            return;
+        };
+
+        self.set_pending_continuation(Some(checkpoint)).await;
+        self.submit_internal_op(
+            self.next_internal_sub_id_with_prefix("post-turn-review-continuation"),
+            crate::protocol::Op::Continue,
+        )
+        .await;
     }
 
     async fn register_new_active_task(&self, task: RunningTask) {
