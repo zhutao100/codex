@@ -13,6 +13,7 @@ use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::PostTurnCompletionReviewOutputEvent;
 use codex_protocol::protocol::SandboxPolicy;
+use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::TurnContinuationSource;
 use codex_protocol::user_input::UserInput;
 use tokio_util::sync::CancellationToken;
@@ -143,6 +144,7 @@ async fn start_post_turn_completion_review_conversation(
         session.clone_session(),
         ctx,
         cancellation_token,
+        SubAgentSource::Review,
         Some(InitialHistory::New),
     )
     .await
