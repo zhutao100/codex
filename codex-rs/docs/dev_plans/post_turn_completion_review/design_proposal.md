@@ -1,12 +1,18 @@
 # Design Proposal
 
+## Implementation Status
+
+The initial workflow is present in this project: `Op::ReviewCompletedTurn`, `PostTurnCompletionReviewTask`, `core/post_turn_completion_review_prompt.md`, read-only review delegate configuration, post-turn output parsing, and continuation handoff are wired. Test runs revealed a follow-up design issue: the delegate can still follow the same keyword-search and range-read strategy as the main session, especially when inherited host-level `AGENTS.md` instructions encourage efficient main-session inspection. The rest of this document treats the existing implementation as the baseline and adds hardening requirements for the prompts, review-specific host instruction loading, and runtime configuration.
+
 ## Target Base
 
-This proposal targets this project's current customized branch shape with the custom `model_overlay` feature and the custom `review_model_provider` delegate override already present.
+This proposal targets this project's current customized code shape with the custom `model_overlay` feature and the custom `review_model_provider` delegate override already present.
 
 ## Design Summary
 
 Add a sibling workflow named `post_turn_completion_review` that can be invoked manually through `/review-completed-turn` or automatically after a regular `TurnComplete` when `[features].auto_post_turn_completion_review = true` is enabled. The workflow spawns a read-only review delegate using the existing review model/provider selection, evaluates the last completed turn using only the user messages and final agent message, and, when it advises fixes, injects an advisory developer message into the main session and continues without a new user turn.
+
+The hardening layer also updates generic `/review` and post-turn review delegate setup so each review task can use review-scoped host `AGENTS.*.md` instructions and optional prompt files from `~/.codex/config.toml`, while retaining the built-in prompts and project-level `AGENTS.md` docs as fallbacks.
 
 The design intentionally keeps the delegate independent from the main agent's hidden reasoning and tool transcript. This makes the review useful for the specific blind points of context-efficient coding turns: missed files, partial reads, duplicated logic, and final deliverable overclaims.
 
@@ -60,6 +66,49 @@ auto_post_turn_completion_review = true
 ```
 
 The automatic mode should trigger only after a successful regular main-session `TurnComplete` with a non-empty final assistant message. It should not trigger for review tasks, compact tasks, user-shell tasks, sub-agent sessions, auto-rename tasks, or the post-turn review delegate itself.
+
+## Review Configuration Keys
+
+Add top-level `~/.codex/config.toml` keys for review host-instruction filenames and prompt-file overrides:
+
+```toml
+# Host-level AGENTS filename candidates, resolved under CODEX_HOME.
+host_agents_filename = "AGENTS.md"
+review_agents_filename = "AGENTS.review.md"
+post_turn_completion_review_agents_filename = "AGENTS.post-turn-review.md"
+
+# Optional on-disk prompt overrides. Unset means use the built-in prompt files.
+review_prompt_file = "~/.codex/prompts/review.md"
+post_turn_completion_review_prompt_file = "~/.codex/prompts/post-turn-review.md"
+```
+
+Host filename keys are filenames, not paths. Resolve them under `Config::codex_home`, reject absolute paths or path separators, and fall back to each default filename when the configured value is unset or empty after trimming. Missing candidate files are not errors; they fall through to the next candidate in the hierarchy. Unreadable non-missing files should produce a clear config or task error.
+
+Prompt-file keys are on-disk paths. Read the configured file at runtime, trim surrounding whitespace, reject empty prompt files, and use the contents as the delegate `base_instructions`. If unset, generic `/review` falls back to `core/review_prompt.md` through `REVIEW_PROMPT`, and post-turn completion review falls back to `core/post_turn_completion_review_prompt.md` through `POST_TURN_COMPLETION_REVIEW_PROMPT`.
+
+The first implementation uses the host filename keys only while constructing review delegate configs. It does not change normal main-session host instruction loading.
+
+Implementation shape:
+
+```rust
+pub struct ConfigToml {
+    pub host_agents_filename: Option<String>,
+    pub review_agents_filename: Option<String>,
+    pub post_turn_completion_review_agents_filename: Option<String>,
+    pub review_prompt_file: Option<AbsolutePathBuf>,
+    pub post_turn_completion_review_prompt_file: Option<AbsolutePathBuf>,
+}
+
+pub struct Config {
+    pub host_agents_filename: String,
+    pub review_agents_filename: String,
+    pub post_turn_completion_review_agents_filename: String,
+    pub review_prompt: Option<String>,
+    pub post_turn_completion_review_prompt: Option<String>,
+}
+```
+
+Keep these keys top-level for the first implementation. If profile-scoped prompt or host filename overrides are needed later, add them by mirroring the existing profile merge rules for other config fields rather than special-casing review tasks.
 
 ## Protocol Additions
 
@@ -179,17 +228,24 @@ If resume support for manual `/review-completed-turn` is required, add a fallbac
 
 ## Delegate Prompt And Input
 
-Add a dedicated prompt file:
+Keep the dedicated built-in prompt file:
 
 ```text
 core/post_turn_completion_review_prompt.md
 ```
 
-Add a corresponding include in `core/src/client_common.rs`:
+Keep the corresponding include in `core/src/client_common.rs` as the fallback prompt:
 
 ```rust
 pub const POST_TURN_COMPLETION_REVIEW_PROMPT: &str = include_str!("../post_turn_completion_review_prompt.md");
 ```
+
+At task setup, resolve the effective prompt from config before calling `configure_review_delegate_config(...)`:
+
+1. If `Config::post_turn_completion_review_prompt` was loaded from `post_turn_completion_review_prompt_file`, use that string.
+2. Otherwise use `POST_TURN_COMPLETION_REVIEW_PROMPT`.
+
+Apply the same pattern to generic `/review` with `review_prompt_file` and `REVIEW_PROMPT` from `core/review_prompt.md`.
 
 The prompt should instruct the delegate to:
 
@@ -214,15 +270,37 @@ Pass the completed-turn context as the delegate's only user input:
 
 Do not pass the normal session history as `InitialHistory`; use `InitialHistory::New`. The delegate can inspect the repository read-only through tools, but the only conversation context it receives should be the user message(s) and final agent message from the completed turn.
 
+
+## Review Effectiveness Hardening
+
+The post-turn reviewer must be optimized for complementarity, not for repeating the main session. The base prompt should explicitly state that the main session may already have used context-efficient keyword search and narrow range reads, and that the review delegate should use a different coverage-driven inspection strategy.
+
+Minimum prompt requirements:
+
+1. Treat the completed turn as an end-state artifact to verify, not as a request to perform a generic review.
+2. Start by deriving a coverage checklist from the user request, the final assistant message, changed or untracked files when available, repository manifests, neighboring modules, tests, schemas, protocol definitions, generated bindings, and registration points.
+3. Prefer whole-file reads for small and medium changed files. For large files, inspect the whole relevant symbol or module context plus imports, exports, registration tables, nearby tests, and paired helper functions. Do not rely only on `rg` hits followed by narrow `sed` ranges.
+4. Use multiple orthogonal searches for duplicate or related logic: new symbol names, semantic concepts, config keys, protocol variants, UI labels, test names, file families, and neighboring directory structure.
+5. For each suspected issue, cite concrete repository evidence in the `evaluation` text: file path, missing paired surface, conflicting existing helper, unsupported final-answer claim, or test gap.
+6. Set `fix_actions_advised = true` only for concrete actionable follow-up. Use `false` for speculative concerns, stylistic preferences, missing evidence, or findings that do not require the main session to continue.
+
+A useful `evaluation` format is Markdown inside the JSON string with short sections such as `Inspection coverage`, `Findings`, and `Fix actions advised`. The schema should stay unchanged so existing clients only need the `evaluation` text and the boolean signal.
+
 ## Delegate Configuration
 
 Extract the shared `/review` delegate setup into a helper so both workflows stay aligned:
 
 ```rust
+pub(crate) enum ReviewDelegateInstructionProfile {
+    Review,
+    PostTurnCompletionReview,
+}
+
 pub(crate) struct ReviewDelegateConfigParams<'a> {
     pub(crate) base_instructions: &'a str,
     pub(crate) sandbox_policy: SandboxPolicy,
     pub(crate) disable_collab: bool,
+    pub(crate) instruction_profile: ReviewDelegateInstructionProfile,
 }
 
 pub(crate) fn configure_review_delegate_config(
@@ -238,28 +316,71 @@ The helper should apply the common policy:
 - set `web_search_mode = Some(WebSearchMode::Disabled)`;
 - disable `Feature::WebSearchRequest` and `Feature::WebSearchCached`;
 - disable `Feature::Collab` unless a caller explicitly permits it;
-- set `base_instructions` to the caller's prompt;
+- set `base_instructions` to the caller's resolved prompt;
 - set `approval_policy = Constrained::allow_any(AskForApproval::Never)`;
 - select `review_model` when set, otherwise `parent_model_slug`;
 - apply `review_model_provider` through `apply_delegate_model_provider(...)`;
 - disable `Feature::RemoteModels` when `review_model_provider` is set;
-- set the caller-specified sandbox policy.
+- set the caller-specified sandbox policy;
+- apply the caller-specified instruction profile so review delegates can avoid host main-session-only guidance while keeping project docs.
 
-For `/review`, call the helper with the existing prompt and the parent sandbox policy to preserve behavior. For `post_turn_completion_review`, call it with `POST_TURN_COMPLETION_REVIEW_PROMPT` and `SandboxPolicy::ReadOnly`:
+For `/review`, call the helper with the resolved `/review` prompt, the parent sandbox policy, and `ReviewDelegateInstructionProfile::Review`. For `post_turn_completion_review`, call it with the resolved post-turn prompt, `SandboxPolicy::ReadOnly`, and `ReviewDelegateInstructionProfile::PostTurnCompletionReview`:
 
 ```rust
+let prompt = ctx
+    .config
+    .post_turn_completion_review_prompt
+    .as_deref()
+    .unwrap_or(crate::POST_TURN_COMPLETION_REVIEW_PROMPT);
+
 let sub_agent_config = configure_review_delegate_config(
     ctx.config.as_ref(),
     ctx.model_info.slug.as_str(),
     ReviewDelegateConfigParams {
-        base_instructions: crate::POST_TURN_COMPLETION_REVIEW_PROMPT,
+        base_instructions: prompt,
         sandbox_policy: SandboxPolicy::ReadOnly,
         disable_collab: true,
+        instruction_profile: ReviewDelegateInstructionProfile::PostTurnCompletionReview,
     },
 )?;
 ```
 
 Use `run_codex_thread_one_shot(...)` from `core/src/codex_delegate.rs` exactly as `/review` does. Keep `InitialHistory::New`.
+
+
+## Review-Scoped Host Instructions
+
+`configure_review_delegate_config(...)` currently clones the parent `Config`, so the delegate inherits the parent `Config::user_instructions` that was loaded for the main session. `Codex::spawn(...)` then calls `project_doc::get_user_instructions(...)`, which combines host-level instructions from `Config::user_instructions`, project-level docs discovered by `core/src/project_doc.rs`, skills, and the hierarchical `AGENTS.md` note. Project-level instructions should remain available to review delegates, but host-level main-session tool-use and editing guidance should not control review methodology.
+
+Add a source-separated host instruction loader that can be used after cloning the parent config:
+
+```rust
+pub(crate) enum ReviewDelegateInstructionProfile {
+    Review,
+    PostTurnCompletionReview,
+}
+
+pub(crate) fn load_review_host_instructions(
+    config: &Config,
+    profile: ReviewDelegateInstructionProfile,
+) -> std::io::Result<Option<String>>;
+```
+
+The helper resolves candidates under `config.codex_home`:
+
+|Profile|Candidate order|
+|---|---|
+|`Review`|`review_agents_filename`, then `host_agents_filename`|
+|`PostTurnCompletionReview`|`post_turn_completion_review_agents_filename`, then `review_agents_filename`, then `host_agents_filename`|
+
+With default filenames, the effective hierarchy is:
+
+1. Generic `/review`: prefer `~/.codex/AGENTS.review.md` if it exists and is non-empty; otherwise fall back to `~/.codex/AGENTS.md`.
+2. Post-turn completion review: prefer `~/.codex/AGENTS.post-turn-review.md` if it exists and is non-empty; then `~/.codex/AGENTS.review.md`; otherwise fall back to `~/.codex/AGENTS.md`.
+
+When configuring a delegate, replace `sub_agent_config.user_instructions` with the helper result for the selected profile before calling `run_codex_thread_one_shot(...)`. This intentionally avoids carrying main-session host instructions into review delegates. Do not mutate project doc discovery: `project_doc::get_user_instructions(...)` should still append repository `AGENTS.md` docs, skills, and the hierarchical agents note after the review-specific host instructions.
+
+Do not add host section-marker parsing in the first implementation. Separate `AGENTS.*.md` files plus filename override keys are enough for the desired hierarchy and avoid parsing already-concatenated instruction text. If a future project-level audience feature is needed, add it separately from host instruction selection.
 
 ## Core Workflow
 
@@ -279,11 +400,12 @@ High-level flow:
 4. If no valid context exists, emit a friendly `ErrorEvent` and return.
 5. Build a `TurnContext` using `new_default_turn_with_sub_id(...)`, then override the review delegate config inside the task as described above.
 6. Emit `EnteredReviewMode(ReviewRequest { target: ReviewTarget::Custom { ... }, user_facing_hint: Some("completed turn") })`.
-7. Run the read-only delegate with `POST_TURN_COMPLETION_REVIEW_PROMPT` and the structured completed-turn context.
-8. Parse the final delegate `last_agent_message` as `PostTurnCompletionReviewOutputEvent`, with a fallback that stores unparsable text as `evaluation` and sets `fix_actions_advised = false`.
-9. Emit `ExitedReviewMode(ExitedReviewModeEvent { review_output: None, post_turn_completion_review_output: Some(output.clone()) })`.
-10. If `fix_actions_advised` is false, finish normally and emit `TurnComplete` for the review task.
-11. If `fix_actions_advised` is true, inject an advisory developer message into the main session, then continue the main session without a new user message.
+7. Run the read-only delegate with the resolved post-turn prompt, the structured completed-turn context, and the post-turn review instruction profile.
+8. The delegate follows the coverage-driven review protocol from the prompt rather than replaying the main session search strategy.
+9. Parse the final delegate `last_agent_message` as `PostTurnCompletionReviewOutputEvent`, with a fallback that stores unparsable text as `evaluation` and sets `fix_actions_advised = false`.
+10. Emit `ExitedReviewMode(ExitedReviewModeEvent { review_output: None, post_turn_completion_review_output: Some(output.clone()) })`.
+11. If `fix_actions_advised` is false, finish normally and emit `TurnComplete` for the review task.
+12. If `fix_actions_advised` is true, inject an advisory developer message into the main session, then continue the main session without a new user message.
 
 ## Automatic Trigger
 
@@ -389,7 +511,7 @@ Keep the existing `>> Code review started: ... <<` and `<< Code review finished 
 
 ## Prompt File Draft
 
-A suitable first version of `core/post_turn_completion_review_prompt.md`:
+A suitable first version of `core/post_turn_completion_review_prompt.md` as the built-in fallback prompt. If `post_turn_completion_review_prompt_file` is configured, the configured file replaces this prompt at runtime:
 
 ```markdown
 # Post-turn completion review guidelines
@@ -398,9 +520,15 @@ You are an independent reviewer for a completed Codex coding turn. Review the re
 
 Your purpose is to catch issues that a context-efficient coding agent may miss: relevant files not found by keyword search, partial file reads that missed nearby contracts, duplicated existing functionality, incomplete paired updates, missing registration/schema/test changes, and final-answer claims that do not match repository state.
 
-You may inspect files and run read-only commands. Do not modify files. Do not request write approval. Do not use web search.
+Do not merely repeat the main session strategy of keyword search followed by narrow range reads. The main session may already have used that path. Build an independent coverage checklist from the user request, final assistant message, changed or untracked files when available, repository manifests, neighboring modules, tests, schemas, protocol definitions, generated bindings, and registration points.
+
+Prefer whole-file inspection for small and medium relevant files. For large files, inspect the whole relevant symbol or module context plus imports, exports, registration tables, nearby tests, and paired helper functions. Use multiple orthogonal searches for duplicate or related logic: new symbol names, semantic concepts, config keys, protocol variants, UI labels, test names, file families, and neighboring directory structure.
+
+You may inspect files and run read-only commands. Do not modify files. Do not request write approval. Do not use web search. If inherited instructions conflict with this review methodology, this prompt wins for the post-turn review task.
 
 Only use the completed-turn context supplied by the user message: the user messages and the final assistant message. Do not assume access to hidden reasoning, tool calls, or intermediate transcript events.
+
+In the `evaluation` string, include concrete evidence for any finding: file path, missing paired surface, conflicting existing helper, unsupported final-answer claim, or test gap. A compact structure such as `Inspection coverage`, `Findings`, and `Fix actions advised` is preferred.
 
 Return `fix_actions_advised = true` only when the main session should continue and consider concrete follow-up actions. Use `false` for clean reviews, speculative concerns, low-confidence style nits, or issues that are not actionable from the current repository state.
 
@@ -439,15 +567,17 @@ Do not set `fix_actions_advised = true` from an unparsable response. False negat
 
 1. Add protocol types: `Op::ReviewCompletedTurn`, `PostTurnCompletionReviewOutputEvent`, optional field on `ExitedReviewModeEvent`, and `TurnContinuationSource::PostTurnCompletionReview`.
 2. Add `Feature::AutoPostTurnCompletionReview` and its `FeatureSpec` with key `auto_post_turn_completion_review`, `Stage::UnderDevelopment`, and `default_enabled = false`.
-3. Add `core/post_turn_completion_review_prompt.md` and `POST_TURN_COMPLETION_REVIEW_PROMPT` include.
+3. Keep `core/review_prompt.md` and `core/post_turn_completion_review_prompt.md` as built-in fallbacks and add config-backed prompt-file loading for `review_prompt_file` and `post_turn_completion_review_prompt_file`.
 4. Add `CompletedTurnForReview` session state and capture it for completed regular turns.
-5. Extract shared review delegate config setup from `core/src/tasks/review.rs` into a helper and update `/review` to use it without behavior changes.
-6. Add `core/src/tasks/post_turn_completion_review.rs` and wire it into `core/src/tasks/mod.rs`.
-7. Add `handlers::review_completed_turn(...)` in `core/src/codex.rs` and route `Op::ReviewCompletedTurn` to it.
-8. Add automatic trigger after regular `TurnComplete` when the feature is enabled.
-9. Add developer-message injection and post-completion continuation helper.
-10. Add TUI slash command, dispatch, task-running handling, and post-turn review rendering.
-11. Add tests.
+5. Extract shared review delegate config setup from `core/src/tasks/review.rs` into a helper and update `/review` to use the `Review` instruction profile.
+6. Add review host filename config keys and the delegate host-instruction loader with the `/review` and post-turn `AGENTS.*.md` hierarchies.
+7. Add `core/src/tasks/post_turn_completion_review.rs` and wire it into `core/src/tasks/mod.rs`.
+8. Add `handlers::review_completed_turn(...)` in `core/src/codex.rs` and route `Op::ReviewCompletedTurn` to it.
+9. Add automatic trigger after regular `TurnComplete` when the feature is enabled.
+10. Add developer-message injection and post-completion continuation helper.
+11. Add TUI slash command, dispatch, task-running handling, and post-turn review rendering.
+12. Run `just write-config-schema` after adding `ConfigToml` keys.
+13. Add tests.
 
 ## Test Plan
 
@@ -459,6 +589,12 @@ Do not set `fix_actions_advised = true` from an unparsable response. False negat
 - Manual `ReviewCompletedTurn` uses `review_model` when set.
 - Manual `ReviewCompletedTurn` applies `review_model_provider` and disables `Feature::RemoteModels` in the delegate config.
 - The delegate config always has `WebSearchMode::Disabled`, disabled web-search features, `AskForApproval::Never`, and `SandboxPolicy::ReadOnly`.
+- The post-turn review prompt contains explicit coverage-driven review guidance and says not to replay the main session keyword/range-read strategy.
+- `review_prompt_file` overrides `REVIEW_PROMPT`; `post_turn_completion_review_prompt_file` overrides `POST_TURN_COMPLETION_REVIEW_PROMPT`; both reject empty files and report unreadable files clearly.
+- Generic `/review` loads `~/.codex/AGENTS.review.md` when present and non-empty, otherwise `~/.codex/AGENTS.md`.
+- Post-turn review loads `~/.codex/AGENTS.post-turn-review.md`, then `~/.codex/AGENTS.review.md`, then `~/.codex/AGENTS.md`.
+- `host_agents_filename`, `review_agents_filename`, and `post_turn_completion_review_agents_filename` override the corresponding hierarchy slots and reject path-like values.
+- The post-turn review instruction profile keeps project-level `AGENTS.md` instructions available while excluding host main-session-only guidance when review-scoped host instructions are configured.
 - `fix_actions_advised = false` emits review output but does not record a developer message and does not continue the main session.
 - `fix_actions_advised = true` records exactly one developer message and starts a continuation with `TurnContinuationSource::PostTurnCompletionReview`.
 - An unparsable delegate response is rendered as evaluation with `fix_actions_advised = false`.
@@ -485,7 +621,10 @@ Do not set `fix_actions_advised = true` from an unparsable response. False negat
 
 - `protocol/src/protocol.rs`: operation enum, review-mode payloads, continuation source, TypeScript bindings.
 - `core/src/features.rs`: feature enum and `FEATURES` registry ordering.
-- `core/src/tasks/review.rs`: shared delegate config extraction must preserve existing `/review` behavior.
+- `core/src/config/mod.rs` and `core/config.schema.json`: new host filename and prompt-file config keys.
+- `core/src/client_common.rs`: built-in review prompt constants remain fallbacks while task setup resolves configured prompt-file contents.
+- `core/src/tasks/review.rs`: shared delegate config extraction must preserve `/review` model, sandbox, output, and provider behavior while adding the `Review` instruction profile.
+- `core/src/project_doc.rs` and `core/src/instructions/user_instructions.rs`: review-scoped host instruction loading and source separation from project docs.
 - `core/src/codex_delegate.rs`: should remain the delegate runner; avoid embedding post-turn-specific behavior here.
 - `core/src/codex.rs`: operation routing, completed-turn capture, automatic trigger, and continuation handoff.
 - `core/src/tasks/mod.rs`: `TaskKind` additions and task lifecycle interactions.
@@ -494,4 +633,4 @@ Do not set `fix_actions_advised = true` from an unparsable response. False negat
 
 ## Bottom Line
 
-Implement `post_turn_completion_review` as a narrow sibling to `/review`: use the same review model/provider and `codex_delegate` machinery, force read-only and web-disabled execution, feed the delegate only the completed turn's user/final messages, and use a boolean advisory output to decide whether to continue the main session through a developer message instead of creating a new user turn.
+Keep `post_turn_completion_review` as a narrow sibling to `/review`: use the same review model/provider and `codex_delegate` machinery, force read-only and web-disabled execution, feed the delegate only the completed turn's user/final messages, and use a boolean advisory output to decide whether to continue the main session through a developer message instead of creating a new user turn. The follow-up hardening is to make review genuinely complementary by strengthening the post-turn prompt, allowing both review prompts to be overridden from configured files, and separating review-safe host instructions through the `AGENTS.review.md` / `AGENTS.post-turn-review.md` hierarchy while preserving project-level `AGENTS.md` context.

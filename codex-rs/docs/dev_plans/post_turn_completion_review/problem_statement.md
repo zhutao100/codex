@@ -2,13 +2,23 @@
 
 ## Status
 
-Proposed.
+Initial workflow implemented in this project; follow-up review-effectiveness hardening proposed.
 
 ## Scenario
 
 A normal Codex coding turn is intentionally optimized for context-window efficiency: the agent infers the task, uses keyword search to find likely relevant files, reads targeted ranges, and applies small diff-style edits. This usually produces fast and useful changes, but it can miss project-level context that was not reachable from the initial keywords or the ranges that were read.
 
 The proposed workflow adds an independent read-only review after a turn has completed. It reviews the completed turn's end-state and final deliverables, not the in-flight reasoning or tool transcript, and it can feed actionable concerns back into the same main session without requiring a new user message.
+
+## Test-Run Findings
+
+Test runs showed that post-turn review delegates often inspected the repository the same way as the main coding session: infer intent, run keyword searches, read narrow ranges, and judge from those slices. This weakens the workflow because the reviewer can repeat the same discovery path and miss the same adjacent files, paired updates, existing helpers, and repository-level consistency checks.
+
+Two likely causes are now in scope:
+
+- `core/post_turn_completion_review_prompt.md` states the high-level review purpose but does not require a different inspection methodology.
+- Review delegates inherit the same host-level and project-level `AGENTS.md` instruction stream through the normal instruction-loading path. Project-level instructions are still valuable, but host-level instructions can contain main-session editing and efficient-search guidance that is counterproductive for an independent review.
+- The review prompts are currently built in through `include_str!`, so changing `core/review_prompt.md` or `core/post_turn_completion_review_prompt.md` requires a rebuild rather than a host-level config change.
 
 ## Risks To Address
 
@@ -19,6 +29,9 @@ The proposed workflow adds an independent read-only review after a turn has comp
 |Reinvented duplicate logic|The main agent did not search broadly enough for existing helpers or patterns before adding new code.|Identify duplicate or conflicting logic and advise reusing the existing project component when the evidence is strong.|
 |Final answer overclaims|The final agent message may claim tests, guarantees, or implementation scope that the repository state does not support.|Compare the final user-facing deliverable against repository state and report mismatches.|
 |Unsafe follow-up assumptions|A successful-looking turn may leave a subtle required follow-up that the main session did not know to perform.|Produce an advisory result with an explicit binary `fix_actions_advised` signal so the main session can decide whether to continue.|
+|Reviewer repeats the main search path|The review prompt and inherited host instructions encourage context-efficient keyword/range inspection, which is the same strategy that caused the missed context.|Require the reviewer to build an independent coverage plan, inspect changed files and paired surfaces broadly, and search for duplicate or related implementations using multiple orthogonal signals.|
+|Main-session host instructions leak into review|Host-level `AGENTS.md` may mix machine resource notes with editing and efficiency instructions intended for normal work sessions.|Introduce review-scoped host instruction loading so `/review` prefers `AGENTS.review.md` and post-turn review prefers `AGENTS.post-turn-review.md`, with explicit fallback to shared host instructions.|
+|Review prompt changes require rebuilds|The built-in review prompts are compiled into the binary.|Add `review_prompt_file` and `post_turn_completion_review_prompt_file` config keys so users can supply prompt files from disk at runtime.|
 
 ## Existing Mechanics In This Project
 
@@ -31,7 +44,7 @@ The existing `/review` flow already has most of the process isolation and UI lif
 - `core/src/review_prompts.rs` resolves `ReviewTarget` into a concrete review prompt and user-facing hint.
 - `core/src/codex.rs::handlers::review(...)` builds a default `TurnContext`, resolves the request, and calls `spawn_review_thread(...)`.
 - `core/src/codex.rs::spawn_review_thread(...)` selects `review_model`, applies `review_model_provider` when configured, disables web search features, sets `WebSearchMode::Disabled`, builds review-local tools config, and starts `ReviewTask`.
-- `core/src/tasks/review.rs` clones the parent config, sets `base_instructions = REVIEW_PROMPT`, disables web search and collab, sets `approval_policy = Never`, applies `review_model` / `review_model_provider`, and uses `core/src/codex_delegate.rs::run_codex_thread_one_shot(...)`.
+- `core/src/tasks/review.rs` clones the parent config, sets `base_instructions = REVIEW_PROMPT`, inherits the parent `Config::user_instructions`, disables web search and collab, sets `approval_policy = Never`, applies `review_model` / `review_model_provider`, and uses `core/src/codex_delegate.rs::run_codex_thread_one_shot(...)`.
 - `core/src/codex_delegate.rs` is already a reusable delegate harness: it spawns a sub-Codex session, forwards non-approval events, routes approvals through the parent session, and shuts the delegate down after `TurnComplete`, `TurnAborted`, or `TurnPaused`.
 - `tui/src/chatwidget.rs::on_entered_review_mode(...)` and `tui/src/chatwidget.rs::on_exited_review_mode(...)` already provide the visible review-mode lifecycle banners and review output rendering.
 
@@ -60,6 +73,12 @@ The existing `ContinueTask` path is designed for paused or interrupted turns. It
 |Feed fix advice back as a developer message|When `fix_actions_advised` is true, wrap the evaluation in a developer message that labels it as independent advisory input and instructs the main model to verify before acting.|
 |Continue the main session instead of starting a new user turn|Reuse the no-new-user-input continuation machinery where possible, but add a post-completion continuation source to avoid pretending this was an interrupt or pause.|
 |Sanity-check misuse|Fresh sessions, active turns, sessions with no completed regular turn, or completed turns without a final assistant message should emit user-friendly errors and not spawn a delegate.|
+|Harden review methodology|The prompt should explicitly forbid merely replaying the main session search style and should require coverage-driven inspection of changed files, adjacent implementations, paired registrations, tests, schemas, and duplicate logic.|
+|Scope host instructions for review|Keep project-level `AGENTS.md` available, but reload host-level instructions for review delegates using the review-specific `AGENTS.*.md` hierarchy.|
+|Generic `/review` host hierarchy|For `core/src/tasks/review.rs`, prefer `~/.codex/AGENTS.review.md` when present and non-empty; otherwise fall back to `~/.codex/AGENTS.md`.|
+|Post-turn host hierarchy|For post-turn completion review, prefer `~/.codex/AGENTS.post-turn-review.md`, then `~/.codex/AGENTS.review.md`, then `~/.codex/AGENTS.md`.|
+|Configurable host filenames|Add `host_agents_filename`, `review_agents_filename`, and `post_turn_completion_review_agents_filename` keys in `~/.codex/config.toml` to override the hierarchy filenames while keeping them resolved under `codex_home`.|
+|Configurable review prompts|Add `review_prompt_file` and `post_turn_completion_review_prompt_file` keys in `~/.codex/config.toml` to override `core/review_prompt.md` and `core/post_turn_completion_review_prompt.md` from on-disk files at runtime.|
 
 ## Non-goals
 
@@ -72,4 +91,4 @@ The existing `ContinueTask` path is designed for paused or interrupted turns. It
 
 ## Conclusion
 
-The implementation should be a small sibling workflow beside `/review`: reuse the review model/provider override, `codex_delegate`, review-mode UI lifecycle, and `ReviewRequest`/`ReviewTarget::Custom` where practical, but introduce a dedicated prompt, completed-turn context capture, read-only sandbox override, loose post-turn output type, and post-completion continuation handoff.
+The implementation should remain a small sibling workflow beside `/review`: reuse the review model/provider override, `codex_delegate`, review-mode UI lifecycle, and `ReviewRequest`/`ReviewTarget::Custom` where practical, but keep hardening the prompt and instruction-loading path so reviewers perform independent, coverage-driven review rather than replaying the main session strategy. The host-level split should be explicit: generic `/review` uses review-scoped host instructions when available, post-turn review can specialize further, and both prompts can be overridden from configured files without rebuilding.
