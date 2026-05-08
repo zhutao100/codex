@@ -52,8 +52,13 @@ use codex_core::protocol::PostTurnCompletionReviewOutputEvent;
 use codex_core::protocol::RateLimitWindow;
 use codex_core::protocol::ReviewRequest;
 use codex_core::protocol::ReviewTarget;
+use codex_core::protocol::RuntimeContextActivatedEvent;
+use codex_core::protocol::RuntimeContextDeactivatedEvent;
+use codex_core::protocol::RuntimeContextScope;
+use codex_core::protocol::RuntimeContextSnapshot;
 use codex_core::protocol::SessionSource;
 use codex_core::protocol::StreamErrorEvent;
+use codex_core::protocol::SubAgentSource;
 use codex_core::protocol::TerminalInteractionEvent;
 use codex_core::protocol::ThreadRolledBackEvent;
 use codex_core::protocol::TokenCountEvent;
@@ -861,6 +866,7 @@ async fn make_chatwidget_manual(
         full_reasoning_buffer: String::new(),
         current_status_header: String::from("Working"),
         retry_status_header: None,
+        active_runtime_context: None,
         running_turn_model: None,
         running_turn_reasoning_effort: None,
         thread_id: None,
@@ -991,6 +997,33 @@ fn make_token_info(total_tokens: i64, context_window: i64) -> TokenUsageInfo {
         total_token_usage: usage(total_tokens),
         last_token_usage: usage(total_tokens),
         model_context_window: Some(context_window),
+    }
+}
+
+fn make_delegate_runtime_context(
+    scope_id: &str,
+    token_info: Option<TokenUsageInfo>,
+) -> RuntimeContextSnapshot {
+    RuntimeContextSnapshot {
+        scope_id: scope_id.to_string(),
+        scope: RuntimeContextScope::Delegate,
+        task_kind: Some("review".to_string()),
+        session_source: SessionSource::SubAgent(SubAgentSource::Review),
+        session_id: ThreadId::new(),
+        parent_session_id: Some(ThreadId::new()),
+        parent_turn_id: Some("parent-turn".to_string()),
+        thread_name: Some("Delegate review".to_string()),
+        rollout_path: None,
+        cwd: PathBuf::from("/tmp/delegate-project"),
+        model: "delegate-model".to_string(),
+        model_provider_id: "delegate-provider".to_string(),
+        approval_policy: AskForApproval::Never,
+        sandbox_policy: SandboxPolicy::ReadOnly,
+        reasoning_effort: Some(ReasoningEffortConfig::High),
+        service_tier: None,
+        model_context_window: Some(100_000),
+        agents_summary: Some("delegate AGENTS.md".to_string()),
+        token_info,
     }
 }
 
@@ -5555,6 +5588,155 @@ async fn status_line_model_tracks_selected_model_during_running_turn() {
     assert_eq!(
         chat.status_line_value_for_item(&crate::bottom_pane::StatusLineItem::ModelWithReasoning),
         Some("selected-model low".to_string())
+    );
+}
+
+#[tokio::test]
+async fn runtime_context_status_output_uses_delegate_until_deactivated() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("parent-model")).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.thread_name = Some("Parent thread".to_string());
+    chat.config.model_context_window = Some(200_000);
+    chat.set_token_info(Some(make_token_info(50_000, 200_000)));
+
+    let snapshot =
+        make_delegate_runtime_context("delegate-status", Some(make_token_info(90_000, 100_000)));
+    let delegate_session_id = snapshot.session_id;
+    chat.handle_codex_event(Event {
+        id: "runtime-active".into(),
+        msg: EventMsg::RuntimeContextActivated(RuntimeContextActivatedEvent { snapshot }),
+    });
+
+    chat.add_status_output();
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(cells.len(), 1, "expected delegate status output");
+    let rendered = lines_to_single_string(&cells[0]);
+    assert!(rendered.contains("delegate-model"), "{rendered}");
+    assert!(rendered.contains("delegate-provider"), "{rendered}");
+    assert!(rendered.contains("Status scope"), "{rendered}");
+    assert!(rendered.contains("delegate"), "{rendered}");
+    assert!(rendered.contains("Task"), "{rendered}");
+    assert!(rendered.contains("review"), "{rendered}");
+    assert!(rendered.contains("Parent session"), "{rendered}");
+    assert!(rendered.contains("Parent turn"), "{rendered}");
+
+    chat.handle_codex_event(Event {
+        id: "runtime-done".into(),
+        msg: EventMsg::RuntimeContextDeactivated(RuntimeContextDeactivatedEvent {
+            scope_id: "delegate-status".to_string(),
+            session_id: delegate_session_id,
+        }),
+    });
+
+    chat.add_status_output();
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(cells.len(), 1, "expected parent status output");
+    let rendered = lines_to_single_string(&cells[0]);
+    assert!(rendered.contains("parent-model"), "{rendered}");
+    assert!(!rendered.contains("delegate-model"), "{rendered}");
+    assert!(!rendered.contains("Status scope"), "{rendered}");
+}
+
+#[tokio::test]
+async fn runtime_context_status_line_uses_delegate_tokens_until_deactivated() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("parent-model")).await;
+    chat.config.model_context_window = Some(200_000);
+    let parent_token_info = make_token_info(50_000, 200_000);
+    let parent_remaining = parent_token_info
+        .last_token_usage
+        .percent_of_context_window_remaining(200_000);
+    chat.set_token_info(Some(parent_token_info));
+    assert_eq!(chat.status_line_context_window_size(), Some(200_000));
+    assert_eq!(
+        chat.status_line_context_remaining_percent(),
+        Some(parent_remaining)
+    );
+    assert_eq!(
+        chat.bottom_pane.context_window_percent(),
+        Some(parent_remaining)
+    );
+
+    let delegate_token_info = make_token_info(90_000, 100_000);
+    let delegate_remaining = delegate_token_info
+        .last_token_usage
+        .percent_of_context_window_remaining(100_000);
+    let snapshot = make_delegate_runtime_context("delegate-tokens", Some(delegate_token_info));
+    let delegate_session_id = snapshot.session_id;
+    chat.handle_codex_event(Event {
+        id: "runtime-active".into(),
+        msg: EventMsg::RuntimeContextActivated(RuntimeContextActivatedEvent { snapshot }),
+    });
+
+    assert_eq!(chat.status_line_context_window_size(), Some(100_000));
+    assert_eq!(
+        chat.status_line_context_remaining_percent(),
+        Some(delegate_remaining)
+    );
+    assert_eq!(chat.status_line_total_usage().total_tokens, 90_000);
+    assert_eq!(
+        chat.bottom_pane.context_window_percent(),
+        Some(delegate_remaining)
+    );
+
+    chat.handle_codex_event(Event {
+        id: "runtime-done".into(),
+        msg: EventMsg::RuntimeContextDeactivated(RuntimeContextDeactivatedEvent {
+            scope_id: "delegate-tokens".to_string(),
+            session_id: delegate_session_id,
+        }),
+    });
+
+    assert_eq!(chat.status_line_context_window_size(), Some(200_000));
+    assert_eq!(
+        chat.status_line_context_remaining_percent(),
+        Some(parent_remaining)
+    );
+    assert_eq!(chat.status_line_total_usage().total_tokens, 50_000);
+    assert_eq!(
+        chat.bottom_pane.context_window_percent(),
+        Some(parent_remaining)
+    );
+}
+
+#[tokio::test]
+async fn runtime_context_updates_running_status_model_subject() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("parent-model")).await;
+    chat.agent_turn_running = true;
+    chat.running_turn_model = Some("parent-model".to_string());
+    chat.running_turn_reasoning_effort = Some(ReasoningEffortConfig::Low);
+    chat.update_task_running_state();
+    let status = chat.bottom_pane.status_widget().expect("status widget");
+    assert_eq!(status.active_model(), Some("parent-model"));
+    assert_eq!(
+        status.active_reasoning_effort(),
+        Some(ReasoningEffortConfig::Low)
+    );
+
+    let snapshot = make_delegate_runtime_context("delegate-model", None);
+    let delegate_session_id = snapshot.session_id;
+    chat.handle_codex_event(Event {
+        id: "runtime-active".into(),
+        msg: EventMsg::RuntimeContextActivated(RuntimeContextActivatedEvent { snapshot }),
+    });
+    let status = chat.bottom_pane.status_widget().expect("status widget");
+    assert_eq!(status.active_model(), Some("delegate-model"));
+    assert_eq!(
+        status.active_reasoning_effort(),
+        Some(ReasoningEffortConfig::High)
+    );
+
+    chat.handle_codex_event(Event {
+        id: "runtime-done".into(),
+        msg: EventMsg::RuntimeContextDeactivated(RuntimeContextDeactivatedEvent {
+            scope_id: "delegate-model".to_string(),
+            session_id: delegate_session_id,
+        }),
+    });
+    let status = chat.bottom_pane.status_widget().expect("status widget");
+    assert_eq!(status.active_model(), Some("parent-model"));
+    assert_eq!(
+        status.active_reasoning_effort(),
+        Some(ReasoningEffortConfig::Low)
     );
 }
 

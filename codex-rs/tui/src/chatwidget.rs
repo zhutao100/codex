@@ -89,6 +89,8 @@ use codex_core::protocol::ProgressTraceEvent;
 use codex_core::protocol::RateLimitSnapshot;
 use codex_core::protocol::ReviewRequest;
 use codex_core::protocol::ReviewTarget;
+use codex_core::protocol::RuntimeContextDeactivatedEvent;
+use codex_core::protocol::RuntimeContextSnapshot;
 use codex_core::protocol::SkillMetadata as ProtocolSkillMetadata;
 use codex_core::protocol::StreamErrorEvent;
 use codex_core::protocol::TerminalInteractionEvent;
@@ -566,6 +568,8 @@ pub(crate) struct ChatWidget {
     current_status_header: String,
     // Previous status header to restore after a transient stream retry.
     retry_status_header: Option<String>,
+    // Runtime context currently surfaced as the active status subject.
+    active_runtime_context: Option<RuntimeContextSnapshot>,
     // Model used by the currently running turn.
     running_turn_model: Option<String>,
     // Reasoning effort used by the currently running turn.
@@ -781,10 +785,21 @@ impl ChatWidget {
         self.bottom_pane
             .set_task_running(self.agent_turn_running || self.mcp_startup_status.is_some());
         if self.agent_turn_running {
+            let active_model = self
+                .active_runtime_context
+                .as_ref()
+                .and_then(|snapshot| {
+                    (!snapshot.model.trim().is_empty()).then(|| snapshot.model.clone())
+                })
+                .or_else(|| self.running_turn_model.clone());
+            let active_reasoning_effort = self
+                .active_runtime_context
+                .as_ref()
+                .map(|snapshot| snapshot.reasoning_effort)
+                .unwrap_or(self.running_turn_reasoning_effort);
+            self.bottom_pane.set_active_model(active_model);
             self.bottom_pane
-                .set_active_model(self.running_turn_model.clone());
-            self.bottom_pane
-                .set_active_reasoning_effort(self.running_turn_reasoning_effort);
+                .set_active_reasoning_effort(active_reasoning_effort);
         } else {
             self.bottom_pane.set_active_model(None);
             self.bottom_pane.set_active_reasoning_effort(None);
@@ -971,6 +986,7 @@ impl ChatWidget {
         self.current_rollout_path = event.rollout_path.clone();
         self.current_cwd = Some(event.cwd.clone());
         self.copyable_messages.clear();
+        self.active_runtime_context = None;
         self.running_turn_model = None;
         self.running_turn_reasoning_effort = None;
         let initial_messages = event.initial_messages.clone();
@@ -1073,6 +1089,34 @@ impl ChatWidget {
             self.add_info_message(message, None);
             self.request_redraw();
         }
+    }
+
+    fn on_runtime_context_activated(&mut self, snapshot: RuntimeContextSnapshot) {
+        self.active_runtime_context = Some(snapshot);
+        self.refresh_status_subject();
+    }
+
+    fn on_runtime_context_updated(&mut self, snapshot: RuntimeContextSnapshot) {
+        self.active_runtime_context = Some(snapshot);
+        self.refresh_status_subject();
+    }
+
+    fn on_runtime_context_deactivated(&mut self, event: RuntimeContextDeactivatedEvent) {
+        if self
+            .active_runtime_context
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.scope_id == event.scope_id)
+        {
+            self.active_runtime_context = None;
+            self.refresh_status_subject();
+        }
+    }
+
+    fn refresh_status_subject(&mut self) {
+        self.sync_context_window_indicator();
+        self.refresh_status_line();
+        self.update_task_running_state();
+        self.request_redraw();
     }
 
     fn set_skills(&mut self, skills: Option<Vec<SkillMetadata>>) {
@@ -1254,8 +1298,17 @@ impl ChatWidget {
 
     fn on_task_started(&mut self) {
         if self.running_turn_model.is_none() {
-            self.running_turn_model = Some(self.current_model().to_string());
-            self.running_turn_reasoning_effort = self.effective_reasoning_effort();
+            if let Some(snapshot) = self
+                .active_runtime_context
+                .as_ref()
+                .filter(|snapshot| !snapshot.model.trim().is_empty())
+            {
+                self.running_turn_model = Some(snapshot.model.clone());
+                self.running_turn_reasoning_effort = snapshot.reasoning_effort;
+            } else {
+                self.running_turn_model = Some(self.current_model().to_string());
+                self.running_turn_reasoning_effort = self.effective_reasoning_effort();
+            }
         }
         self.agent_turn_running = true;
         self.saw_plan_update_this_turn = false;
@@ -1431,20 +1484,8 @@ impl ChatWidget {
     }
 
     pub(crate) fn set_token_info(&mut self, info: Option<TokenUsageInfo>) {
-        match info {
-            Some(info) => self.apply_token_info(info),
-            None => {
-                self.bottom_pane.set_context_window(None, None);
-                self.token_info = None;
-            }
-        }
-    }
-
-    fn apply_token_info(&mut self, info: TokenUsageInfo) {
-        let percent = self.context_remaining_percent(&info);
-        let used_tokens = self.context_used_tokens(&info, percent.is_some());
-        self.bottom_pane.set_context_window(percent, used_tokens);
-        self.token_info = Some(info);
+        self.token_info = info;
+        self.sync_context_window_indicator();
     }
 
     fn context_remaining_percent(&self, info: &TokenUsageInfo) -> Option<i64> {
@@ -1462,15 +1503,20 @@ impl ChatWidget {
         Some(info.total_token_usage.tokens_in_context_window())
     }
 
+    fn sync_context_window_indicator(&mut self) {
+        let Some(info) = self.status_subject_token_info() else {
+            self.bottom_pane.set_context_window(None, None);
+            return;
+        };
+        let percent = self.context_remaining_percent(info);
+        let used_tokens = self.context_used_tokens(info, percent.is_some());
+        self.bottom_pane.set_context_window(percent, used_tokens);
+    }
+
     fn restore_pre_review_token_info(&mut self) {
         if let Some(saved) = self.pre_review_token_info.take() {
-            match saved {
-                Some(info) => self.apply_token_info(info),
-                None => {
-                    self.bottom_pane.set_context_window(None, None);
-                    self.token_info = None;
-                }
-            }
+            self.token_info = saved;
+            self.sync_context_window_indicator();
         }
     }
 
@@ -2567,6 +2613,7 @@ impl ChatWidget {
             full_reasoning_buffer: String::new(),
             current_status_header: String::from("Working"),
             retry_status_header: None,
+            active_runtime_context: None,
             running_turn_model: None,
             running_turn_reasoning_effort: None,
             thread_id: None,
@@ -2758,6 +2805,7 @@ impl ChatWidget {
             full_reasoning_buffer: String::new(),
             current_status_header: String::from("Working"),
             retry_status_header: None,
+            active_runtime_context: None,
             running_turn_model: None,
             running_turn_reasoning_effort: None,
             thread_id: None,
@@ -2937,6 +2985,7 @@ impl ChatWidget {
             full_reasoning_buffer: String::new(),
             current_status_header: String::from("Working"),
             retry_status_header: None,
+            active_runtime_context: None,
             running_turn_model: None,
             running_turn_reasoning_effort: None,
             thread_id: None,
@@ -4359,9 +4408,15 @@ impl ChatWidget {
         match msg {
             EventMsg::SessionConfigured(e) => self.on_session_configured(e),
             EventMsg::ThreadNameUpdated(e) => self.on_thread_name_updated(e),
-            EventMsg::RuntimeContextActivated(_)
-            | EventMsg::RuntimeContextUpdated(_)
-            | EventMsg::RuntimeContextDeactivated(_) => {}
+            EventMsg::RuntimeContextActivated(event) => {
+                self.on_runtime_context_activated(event.snapshot)
+            }
+            EventMsg::RuntimeContextUpdated(event) => {
+                self.on_runtime_context_updated(event.snapshot)
+            }
+            EventMsg::RuntimeContextDeactivated(event) => {
+                self.on_runtime_context_deactivated(event)
+            }
             EventMsg::AgentMessage(AgentMessageEvent { message }) => {
                 self.on_agent_message(message, from_replay)
             }
@@ -6121,6 +6176,19 @@ impl ChatWidget {
     }
 
     pub(crate) fn add_status_output(&mut self) {
+        if let Some(runtime_context) = self.active_runtime_context.as_ref() {
+            let snapshot =
+                crate::status::StatusOutputSnapshot::from_runtime_context(runtime_context);
+            self.add_to_history(crate::status::new_status_output_from_snapshot(
+                snapshot,
+                self.auth_manager.as_ref(),
+                self.rate_limit_snapshot.as_ref(),
+                self.plan_type,
+                Local::now(),
+            ));
+            return;
+        }
+
         let default_usage = TokenUsage::default();
         let token_info = self.token_info.as_ref();
         let total_usage = token_info
@@ -6267,6 +6335,9 @@ impl ChatWidget {
     }
 
     fn status_line_cwd(&self) -> &Path {
+        if let Some(snapshot) = self.active_runtime_context.as_ref() {
+            return &snapshot.cwd;
+        }
         self.current_cwd.as_ref().unwrap_or(&self.config.cwd)
     }
 
@@ -6331,10 +6402,18 @@ impl ChatWidget {
     }
 
     fn status_line_model_display_name(&self) -> &str {
+        if let Some(snapshot) = self.active_runtime_context.as_ref()
+            && !snapshot.model.trim().is_empty()
+        {
+            return snapshot.model.as_str();
+        }
         self.model_display_name()
     }
 
     fn status_line_reasoning_effort(&self) -> Option<ReasoningEffortConfig> {
+        if let Some(snapshot) = self.active_runtime_context.as_ref() {
+            return snapshot.reasoning_effort;
+        }
         self.effective_reasoning_effort()
     }
 
@@ -6405,15 +6484,16 @@ impl ChatWidget {
                 "{} out",
                 format_tokens_compact(self.status_line_total_usage().output_tokens)
             )),
-            StatusLineItem::SessionId => self.thread_id.map(|id| id.to_string()),
+            StatusLineItem::SessionId => self
+                .active_runtime_context
+                .as_ref()
+                .map(|snapshot| snapshot.session_id.to_string())
+                .or_else(|| self.thread_id.map(|id| id.to_string())),
         }
     }
 
     fn status_line_context_window_size(&self) -> Option<i64> {
-        self.token_info
-            .as_ref()
-            .and_then(|info| info.model_context_window)
-            .or(self.config.model_context_window)
+        self.status_subject_context_window_size()
     }
 
     fn status_line_context_remaining_percent(&self) -> Option<i64> {
@@ -6422,8 +6502,7 @@ impl ChatWidget {
         };
         let default_usage = TokenUsage::default();
         let usage = self
-            .token_info
-            .as_ref()
+            .status_subject_token_info()
             .map(|info| &info.last_token_usage)
             .unwrap_or(&default_usage);
         Some(
@@ -6439,10 +6518,31 @@ impl ChatWidget {
     }
 
     fn status_line_total_usage(&self) -> TokenUsage {
-        self.token_info
-            .as_ref()
+        self.status_subject_token_info()
             .map(|info| info.total_token_usage.clone())
             .unwrap_or_default()
+    }
+
+    fn status_subject_token_info(&self) -> Option<&TokenUsageInfo> {
+        if let Some(snapshot) = self.active_runtime_context.as_ref() {
+            return snapshot.token_info.as_ref();
+        }
+
+        self.token_info.as_ref()
+    }
+
+    fn status_subject_model_context_window(&self) -> Option<i64> {
+        if let Some(snapshot) = self.active_runtime_context.as_ref() {
+            return snapshot.model_context_window;
+        }
+
+        self.config.model_context_window
+    }
+
+    fn status_subject_context_window_size(&self) -> Option<i64> {
+        self.status_subject_token_info()
+            .and_then(|info| info.model_context_window)
+            .or_else(|| self.status_subject_model_context_window())
     }
 
     fn status_line_limit_display(

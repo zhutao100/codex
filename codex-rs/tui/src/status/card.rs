@@ -5,10 +5,10 @@ use crate::history_cell::with_border_with_inner_width;
 use crate::version::CODEX_CLI_VERSION;
 use chrono::DateTime;
 use chrono::Local;
-use codex_common::summarize_sandbox_policy;
 use codex_core::WireApi;
 use codex_core::config::Config;
 use codex_core::protocol::NetworkAccess;
+use codex_core::protocol::RuntimeContextSnapshot;
 use codex_core::protocol::SandboxPolicy;
 use codex_core::protocol::TokenUsage;
 use codex_core::protocol::TokenUsageInfo;
@@ -68,11 +68,38 @@ struct StatusHistoryCell {
     collaboration_mode: Option<String>,
     model_provider: Option<String>,
     account: Option<StatusAccountDisplay>,
+    status_scope: Option<String>,
+    task_kind: Option<String>,
     thread_name: Option<String>,
     session_id: Option<String>,
     forked_from: Option<String>,
+    parent_session_id: Option<String>,
+    parent_turn_id: Option<String>,
     token_usage: StatusTokenUsageData,
     rate_limits: StatusRateLimitData,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct StatusOutputSnapshot {
+    model_name: String,
+    directory: PathBuf,
+    approval: String,
+    sandbox: String,
+    agents_summary: String,
+    collaboration_mode: Option<String>,
+    model_provider: Option<String>,
+    status_scope: Option<String>,
+    task_kind: Option<String>,
+    thread_name: Option<String>,
+    session_id: Option<String>,
+    forked_from: Option<String>,
+    parent_session_id: Option<String>,
+    parent_turn_id: Option<String>,
+    token_info: Option<TokenUsageInfo>,
+    total_usage: TokenUsage,
+    context_window: Option<i64>,
+    reasoning_effort: Option<ReasoningEffort>,
+    reasoning_summaries: Option<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -91,91 +118,141 @@ pub(crate) fn new_status_output(
     collaboration_mode: Option<&str>,
     reasoning_effort_override: Option<Option<ReasoningEffort>>,
 ) -> CompositeHistoryCell {
-    let command = PlainHistoryCell::new(vec!["/status".magenta().into()]);
-    let card = StatusHistoryCell::new(
+    let snapshot = StatusOutputSnapshot::from_config(
         config,
-        auth_manager,
         token_info,
         total_usage,
         session_id,
         thread_name,
         forked_from,
-        rate_limits,
-        plan_type,
-        now,
         model_name,
         collaboration_mode,
         reasoning_effort_override,
     );
+    new_status_output_from_snapshot(snapshot, auth_manager, rate_limits, plan_type, now)
+}
+
+pub(crate) fn new_status_output_from_snapshot(
+    snapshot: StatusOutputSnapshot,
+    auth_manager: &AuthManager,
+    rate_limits: Option<&RateLimitSnapshotDisplay>,
+    plan_type: Option<PlanType>,
+    now: DateTime<Local>,
+) -> CompositeHistoryCell {
+    let command = PlainHistoryCell::new(vec!["/status".magenta().into()]);
+    let card = StatusHistoryCell::new(snapshot, auth_manager, rate_limits, plan_type, now);
 
     CompositeHistoryCell::new(vec![Box::new(command), Box::new(card)])
 }
 
-impl StatusHistoryCell {
+impl StatusOutputSnapshot {
     #[allow(clippy::too_many_arguments)]
-    fn new(
+    pub(crate) fn from_config(
         config: &Config,
-        auth_manager: &AuthManager,
         token_info: Option<&TokenUsageInfo>,
         total_usage: &TokenUsage,
         session_id: &Option<ThreadId>,
         thread_name: Option<String>,
         forked_from: Option<ThreadId>,
-        rate_limits: Option<&RateLimitSnapshotDisplay>,
-        plan_type: Option<PlanType>,
-        now: DateTime<Local>,
         model_name: &str,
         collaboration_mode: Option<&str>,
         reasoning_effort_override: Option<Option<ReasoningEffort>>,
     ) -> Self {
-        let mut config_entries = vec![
-            ("workdir", config.cwd.display().to_string()),
-            ("model", model_name.to_string()),
-            ("provider", config.model_provider_id.clone()),
-            ("approval", config.approval_policy.value().to_string()),
-            (
-                "sandbox",
-                summarize_sandbox_policy(config.sandbox_policy.get()),
-            ),
-        ];
-        if config.model_provider.wire_api == WireApi::Responses {
-            let effort_value = reasoning_effort_override
+        let reasoning_effort = (config.model_provider.wire_api == WireApi::Responses).then(|| {
+            reasoning_effort_override
                 .unwrap_or(None)
-                .map(|effort| effort.to_string())
-                .unwrap_or_else(|| "none".to_string());
-            config_entries.push(("reasoning effort", effort_value));
-            config_entries.push((
-                "reasoning summaries",
-                config.model_reasoning_summary.to_string(),
-            ));
+                .or(config.model_reasoning_effort)
+                .unwrap_or(ReasoningEffort::None)
+        });
+        let reasoning_summaries = (config.model_provider.wire_api == WireApi::Responses)
+            .then(|| config.model_reasoning_summary.to_string());
+
+        Self {
+            model_name: model_name.to_string(),
+            directory: config.cwd.clone(),
+            approval: config.approval_policy.value().to_string(),
+            sandbox: sandbox_status_label(config.sandbox_policy.get()),
+            agents_summary: compose_agents_summary(config),
+            collaboration_mode: collaboration_mode.map(ToString::to_string),
+            model_provider: format_model_provider(config),
+            status_scope: None,
+            task_kind: None,
+            thread_name,
+            session_id: session_id.as_ref().map(ToString::to_string),
+            forked_from: forked_from.map(|id| id.to_string()),
+            parent_session_id: None,
+            parent_turn_id: None,
+            token_info: token_info.cloned(),
+            total_usage: total_usage.clone(),
+            context_window: config.model_context_window,
+            reasoning_effort,
+            reasoning_summaries,
         }
-        let (model_name, model_details) = compose_model_display(model_name, &config_entries);
-        let approval = config_entries
-            .iter()
-            .find(|(k, _)| *k == "approval")
-            .map(|(_, v)| v.clone())
-            .unwrap_or_else(|| "<unknown>".to_string());
-        let sandbox = match config.sandbox_policy.get() {
-            SandboxPolicy::DangerFullAccess => "danger-full-access".to_string(),
-            SandboxPolicy::ReadOnly => "read-only".to_string(),
-            SandboxPolicy::WorkspaceWrite { .. } => "workspace-write".to_string(),
-            SandboxPolicy::ExternalSandbox { network_access } => {
-                if matches!(network_access, NetworkAccess::Enabled) {
-                    "external-sandbox (network access enabled)".to_string()
-                } else {
-                    "external-sandbox".to_string()
-                }
-            }
-        };
-        let agents_summary = compose_agents_summary(config);
-        let model_provider = format_model_provider(config);
+    }
+
+    pub(crate) fn from_runtime_context(snapshot: &RuntimeContextSnapshot) -> Self {
+        let token_info = snapshot.token_info.clone();
+        let total_usage = token_info
+            .as_ref()
+            .map(|info| info.total_token_usage.clone())
+            .unwrap_or_default();
+        let context_window = token_info
+            .as_ref()
+            .and_then(|info| info.model_context_window)
+            .or(snapshot.model_context_window);
+
+        Self {
+            model_name: snapshot.model.clone(),
+            directory: snapshot.cwd.clone(),
+            approval: snapshot.approval_policy.to_string(),
+            sandbox: sandbox_status_label(&snapshot.sandbox_policy),
+            agents_summary: snapshot
+                .agents_summary
+                .clone()
+                .unwrap_or_else(|| "<none>".to_string()),
+            collaboration_mode: None,
+            model_provider: Some(snapshot.model_provider_id.clone()),
+            status_scope: Some(match snapshot.scope {
+                codex_core::protocol::RuntimeContextScope::Primary => "primary".to_string(),
+                codex_core::protocol::RuntimeContextScope::Delegate => "delegate".to_string(),
+            }),
+            task_kind: snapshot.task_kind.clone(),
+            thread_name: snapshot.thread_name.clone(),
+            session_id: Some(snapshot.session_id.to_string()),
+            forked_from: None,
+            parent_session_id: snapshot.parent_session_id.map(|id| id.to_string()),
+            parent_turn_id: snapshot.parent_turn_id.clone(),
+            token_info,
+            total_usage,
+            context_window,
+            reasoning_effort: snapshot.reasoning_effort,
+            reasoning_summaries: None,
+        }
+    }
+}
+
+impl StatusHistoryCell {
+    fn new(
+        snapshot: StatusOutputSnapshot,
+        auth_manager: &AuthManager,
+        rate_limits: Option<&RateLimitSnapshotDisplay>,
+        plan_type: Option<PlanType>,
+        now: DateTime<Local>,
+    ) -> Self {
+        let mut model_entries = Vec::new();
+        if let Some(reasoning_effort) = snapshot.reasoning_effort {
+            model_entries.push(("reasoning effort", reasoning_effort.to_string()));
+        }
+        if let Some(reasoning_summaries) = snapshot.reasoning_summaries.as_ref() {
+            model_entries.push(("reasoning summaries", reasoning_summaries.clone()));
+        }
+        let (model_name, model_details) =
+            compose_model_display(snapshot.model_name.as_str(), &model_entries);
         let account = compose_account_display(auth_manager, plan_type);
-        let session_id = session_id.as_ref().map(std::string::ToString::to_string);
-        let forked_from = forked_from.map(|id| id.to_string());
         let default_usage = TokenUsage::default();
-        let (context_usage, context_window) = match token_info {
+        let (context_usage, context_window) = match snapshot.token_info.as_ref() {
             Some(info) => (&info.last_token_usage, info.model_context_window),
-            None => (&default_usage, config.model_context_window),
+            None => (&default_usage, snapshot.context_window),
         };
         let context_window = context_window.map(|window| StatusContextWindowData {
             percent_remaining: context_usage.percent_of_context_window_remaining(window),
@@ -184,9 +261,9 @@ impl StatusHistoryCell {
         });
 
         let token_usage = StatusTokenUsageData {
-            total: total_usage.blended_total(),
-            input: total_usage.non_cached_input(),
-            output: total_usage.output_tokens,
+            total: snapshot.total_usage.blended_total(),
+            input: snapshot.total_usage.non_cached_input(),
+            output: snapshot.total_usage.output_tokens,
             context_window,
         };
         let rate_limits = compose_rate_limit_data(rate_limits, now);
@@ -194,16 +271,20 @@ impl StatusHistoryCell {
         Self {
             model_name,
             model_details,
-            directory: config.cwd.clone(),
-            approval,
-            sandbox,
-            agents_summary,
-            collaboration_mode: collaboration_mode.map(ToString::to_string),
-            model_provider,
+            directory: snapshot.directory,
+            approval: snapshot.approval,
+            sandbox: snapshot.sandbox,
+            agents_summary: snapshot.agents_summary,
+            collaboration_mode: snapshot.collaboration_mode,
+            model_provider: snapshot.model_provider,
             account,
-            thread_name,
-            session_id,
-            forked_from,
+            status_scope: snapshot.status_scope,
+            task_kind: snapshot.task_kind,
+            thread_name: snapshot.thread_name,
+            session_id: snapshot.session_id,
+            forked_from: snapshot.forked_from,
+            parent_session_id: snapshot.parent_session_id,
+            parent_turn_id: snapshot.parent_turn_id,
             token_usage,
             rate_limits,
         }
@@ -394,12 +475,24 @@ impl HistoryCell for StatusHistoryCell {
         if account_value.is_some() {
             push_label(&mut labels, &mut seen, "Account");
         }
+        if self.status_scope.is_some() {
+            push_label(&mut labels, &mut seen, "Status scope");
+        }
+        if self.task_kind.is_some() {
+            push_label(&mut labels, &mut seen, "Task");
+        }
         push_label(&mut labels, &mut seen, "Thread name");
         if self.session_id.is_some() {
             push_label(&mut labels, &mut seen, "Session");
         }
         if self.session_id.is_some() && self.forked_from.is_some() {
             push_label(&mut labels, &mut seen, "Forked from");
+        }
+        if self.parent_session_id.is_some() {
+            push_label(&mut labels, &mut seen, "Parent session");
+        }
+        if self.parent_turn_id.is_some() {
+            push_label(&mut labels, &mut seen, "Parent turn");
         }
         if self.collaboration_mode.is_some() {
             push_label(&mut labels, &mut seen, "Collaboration mode");
@@ -453,6 +546,12 @@ impl HistoryCell for StatusHistoryCell {
             lines.push(formatter.line("Account", vec![Span::from(account_value)]));
         }
 
+        if let Some(scope) = self.status_scope.as_ref() {
+            lines.push(formatter.line("Status scope", vec![Span::from(scope.clone())]));
+        }
+        if let Some(task_kind) = self.task_kind.as_ref() {
+            lines.push(formatter.line("Task", vec![Span::from(task_kind.clone())]));
+        }
         lines.push(formatter.line("Thread name", vec![Span::from(thread_name.to_string())]));
         if let Some(collab_mode) = self.collaboration_mode.as_ref() {
             lines.push(formatter.line("Collaboration mode", vec![Span::from(collab_mode.clone())]));
@@ -464,6 +563,15 @@ impl HistoryCell for StatusHistoryCell {
             && let Some(forked_from) = self.forked_from.as_ref()
         {
             lines.push(formatter.line("Forked from", vec![Span::from(forked_from.clone())]));
+        }
+        if let Some(parent_session_id) = self.parent_session_id.as_ref() {
+            lines.push(formatter.line(
+                "Parent session",
+                vec![Span::from(parent_session_id.clone())],
+            ));
+        }
+        if let Some(parent_turn_id) = self.parent_turn_id.as_ref() {
+            lines.push(formatter.line("Parent turn", vec![Span::from(parent_turn_id.clone())]));
         }
 
         lines.push(Line::from(Vec::<Span<'static>>::new()));
@@ -486,6 +594,21 @@ impl HistoryCell for StatusHistoryCell {
             .collect();
 
         with_border_with_inner_width(truncated_lines, inner_width)
+    }
+}
+
+fn sandbox_status_label(policy: &SandboxPolicy) -> String {
+    match policy {
+        SandboxPolicy::DangerFullAccess => "danger-full-access".to_string(),
+        SandboxPolicy::ReadOnly => "read-only".to_string(),
+        SandboxPolicy::WorkspaceWrite { .. } => "workspace-write".to_string(),
+        SandboxPolicy::ExternalSandbox { network_access } => {
+            if matches!(network_access, NetworkAccess::Enabled) {
+                "external-sandbox (network access enabled)".to_string()
+            } else {
+                "external-sandbox".to_string()
+            }
+        }
     }
 }
 

@@ -128,6 +128,16 @@ impl StatusIndicatorWidget {
         self.details.as_deref()
     }
 
+    #[cfg(test)]
+    pub(crate) fn active_model(&self) -> Option<&str> {
+        self.active_model.as_deref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_reasoning_effort(&self) -> Option<ReasoningEffort> {
+        self.active_reasoning_effort
+    }
+
     pub(crate) fn set_interrupt_hint_visible(&mut self, visible: bool) {
         self.show_interrupt_hint = visible;
     }

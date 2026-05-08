@@ -12,7 +12,9 @@ mod format;
 mod helpers;
 mod rate_limits;
 
+pub(crate) use card::StatusOutputSnapshot;
 pub(crate) use card::new_status_output;
+pub(crate) use card::new_status_output_from_snapshot;
 pub(crate) use helpers::format_directory_display;
 pub(crate) use helpers::format_tokens_compact;
 pub(crate) use rate_limits::RateLimitSnapshotDisplay;
