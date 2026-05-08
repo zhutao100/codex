@@ -36,6 +36,20 @@ The bridge also has a bare-turn-id uniqueness guard: if a turn id is already ass
 
 The daemon has the same keying problem because `RuntimeState.active_turns` is keyed by bare `turnId`.
 
+## Upstream app-server alignment
+
+The upstream project has no `codexd/` module, but app-server v2 provides the closest public protocol vocabulary. `codexd` should follow those shapes for overlapping concepts so downstream applications can bridge both APIs with minimal translation:
+
+| Concept | Upstream app-server v2 shape | `codexd` recommendation |
+| --- | --- | --- |
+| Thread/session lifecycle | `thread/started`, `thread/status/changed`, `thread/name/updated` | Use the same names when emitting thread-level lifecycle from `codexd`, or expose a direct mapping in `codexd/README.md`. |
+| Turn lifecycle | `turn/started`, `turn/completed`, each scoped by `thread_id` | Preserve these names and require `threadId` in producer events whenever available. |
+| Token/context-window usage | `thread/tokenUsage/updated` with `total`, `last`, `modelContextWindow` | Prefer this event for token usage and context window changes. Do not bury token usage only in a generic context update. |
+| Source classification | `SessionSource::SubAgent(CoreSubAgentSource)` | Add optional `sessionSource` and `subAgentSource` fields rather than only `taskKind`. |
+| External identity | `thread_id` plus `turn_id` | Use `turnKey = "${threadId}:${turnId}"` as the daemon key and keep bare `turnId` only as a legacy display field. |
+
+A `turn/contextUpdated` or `runtime/contextUpdated` notification is still useful for this project's additional runtime fields: model display name, provider id, approval policy, sandbox policy, instruction summary, parent thread id, parent turn id, and task kind. It should complement, not replace, app-server-compatible token and lifecycle events.
+
 ## Protocol extension
 
 Keep the generic notification stream, but define a richer active-turn contract for `turn/started` and optional update notifications.
@@ -95,7 +109,7 @@ There are two possible producer sources:
 1. TUI bridge source: the bridge consumes parent-visible events and publishes `codexd` notifications. This is the current shape and is sufficient if delegate runtime context events are forwarded to the TUI before delegate content events.
 2. Core/app-server source: every `Codex` session publishes lifecycle and context directly to `codexd`. This is more authoritative and helps non-TUI app-server sessions, but it is a larger architectural shift.
 
-Recommended first step: keep the TUI bridge producer, but feed it explicit active runtime context events. Then consider moving the same context event generation lower into core/app-server so all frontends share one producer path.
+Recommended first step: keep the TUI bridge producer, but feed it explicit active runtime context events and emit app-server-compatible names for overlapping lifecycle/token events. Then consider moving the same context event generation lower into core/app-server so all frontends share one producer path.
 
 ## Compatibility
 

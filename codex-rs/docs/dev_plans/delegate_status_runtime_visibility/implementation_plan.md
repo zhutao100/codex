@@ -4,6 +4,16 @@
 
 Proposed.
 
+## Upstream reuse decisions
+
+Before implementing the new runtime context layer, fold in the useful upstream project changes:
+
+- Change `core/src/codex_delegate.rs::run_codex_thread_interactive(...)` and `run_codex_thread_one_shot(...)` to accept a `SubAgentSource`, matching the upstream helper shape, instead of hardcoding `SubAgentSource::Review`.
+- Capture delegate runtime metadata close to the upstream `thread_config_snapshot()` call site, but emit it as a parent-visible runtime context event rather than only as analytics.
+- Use upstream app-server v2 names and field shapes where they overlap with `codexd`: `turn/started`, `turn/completed`, `thread/tokenUsage/updated`, `thread/name/updated`, and `ThreadTokenUsage { total, last, modelContextWindow }`.
+- Keep `post_turn_completion_review` as a task kind layered over `SubAgentSource::Review`; do not replace the low-level session source with the task label.
+- Treat upstream detached review as an optional downstream-client workflow. It is not an acceptance criterion for inline TUI status correctness.
+
 ## Phase 1: Add runtime context data structures
 
 Add protocol-safe data structures for active runtime status. Suggested names:
@@ -18,7 +28,7 @@ The first implementation can specialize names to `DelegateSessionStarted`, `Dele
 Implementation surfaces:
 
 - `protocol/src/protocol.rs`: event variants and serializable snapshot structs.
-- `core/src/codex_delegate.rs`: construct and forward delegate runtime context lifecycle events.
+- `core/src/codex_delegate.rs`: construct and forward delegate runtime context lifecycle events; adopt the upstream `SubAgentSource` parameterized helper shape.
 - `core/src/tasks/review.rs`: expose enough of the configured delegate profile to label task kind and instruction profile.
 - `core/src/tasks/post_turn_completion_review.rs`: pass `post_turn_completion_review` task kind and parent reviewed turn id when available.
 
@@ -46,7 +56,7 @@ Do not forward raw delegate `SessionConfigured` into the parent UI path. Instead
 
 - Convert delegate `SessionConfigured` into `RuntimeContextActivated`.
 - Convert delegate `ThreadNameUpdated` into `RuntimeContextUpdated`.
-- Convert delegate `TokenCount` into `RuntimeContextUpdated { token_info }`.
+- Convert delegate `TokenCount` into `RuntimeContextUpdated { token_info }` and, for `codexd`/app-server-compatible consumers, `thread/tokenUsage/updated`-shaped data.
 - Preserve approval routing to the parent session.
 - Preserve current content/progress event forwarding.
 - Emit `RuntimeContextDeactivated` when the delegate turn ends or is shut down.
@@ -102,8 +112,8 @@ TUI tests:
 `codexd` tests:
 
 - `turn/started` with `threadId = parent`, `turn.id = 0` and `threadId = delegate`, `turn.id = 0` creates two active turns.
-- Delegate active turn snapshot includes `scope = delegate`, `taskKind = post_turn_completion_review`, model, provider, sandbox, and parent linkage when supplied.
-- `turn/stateUpdated` or token-usage update changes the active delegate turn context without requiring a new `turn/started`.
+- Delegate active turn snapshot includes `scope = delegate`, `sessionSource = subAgent`, `subAgentSource = review`, `taskKind = post_turn_completion_review`, model, provider, sandbox, and parent linkage when supplied.
+- `turn/stateUpdated`, `runtime/contextUpdated`, or `thread/tokenUsage/updated` changes the active delegate turn context without requiring a new `turn/started`.
 - Legacy clients that read only `threadId`, `turnId`, `status`, `model`, and `latestLabel` still receive valid values.
 
 Manual acceptance scenario:

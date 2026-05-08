@@ -88,6 +88,18 @@ The current design therefore has two separate paths:
 
 The fix should connect the second path without regressing the first.
 
+## Upstream status
+
+The upstream project was inspected after this proposal was drafted. It does not remove the root cause for inline delegate visibility:
+
+- `core/src/codex_delegate.rs::forward_events(...)` still drops delegate `SessionConfigured` and `TokenCount` events. This branch also drops delegate `ThreadNameUpdated`; upstream no longer has that core event shape, but its app-server thread-name notification is still not a delegate runtime-context path.
+- `tui/src/chatwidget.rs::add_status_output(...)` and `tui/src/status/card.rs` still render `/status` from the parent `ChatWidget` state and parent `Config`.
+- `tui/src/chatwidget.rs::on_task_started()` still has no delegate runtime payload from which to display the active model/provider.
+- `status_line_context_window_size()` still derives its context window from parent token/config state.
+- The upstream project has no `codexd/` module, so `codexd`-specific visibility remains this project's responsibility.
+
+The upstream project does provide useful components to reuse: app-server v2 thread/turn lifecycle notifications, `thread/tokenUsage/updated`, `thread/name/updated`, `SessionSource::SubAgent(...)`, richer `SubAgentSource` values, and detached review delivery for app-server clients. These are compatibility and naming inputs, not a replacement for an explicit active runtime context.
+
 ## Design requirements
 
 - Preserve the parent session as the primary conversation; do not treat a delegate `SessionConfigured` as a top-level session switch.

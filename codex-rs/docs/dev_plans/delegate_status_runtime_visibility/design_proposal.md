@@ -10,6 +10,17 @@ Add an explicit active runtime context layer between delegate sessions and statu
 
 The recommended design is to add delegate-scoped protocol events or an equivalent internal event envelope that carries a compact `RuntimeContextSnapshot`. This snapshot should be independent from `Config` and safe to render in status surfaces.
 
+## Upstream-informed constraints
+
+The upstream project still has the same inline delegate status gap, but its newer app-server and delegate APIs provide alignment points:
+
+- Use `SessionSource::SubAgent(...)` and `SubAgentSource` values as the low-level session classification. Represent `post_turn_completion_review` as a higher-level task kind layered on top of `SubAgentSource::Review`.
+- Prefer upstream app-server v2 notification names and payload concepts when extending `codexd`: `thread/started`, `turn/started`, `turn/completed`, `thread/tokenUsage/updated`, and `thread/name/updated`.
+- Preserve thread-scoped token usage shape: `total`, `last`, and `modelContextWindow` should map cleanly to upstream `ThreadTokenUsage`.
+- Keep composite turn identity (`threadId` plus `turnId`) as the canonical external key. This matches upstream app-server v2's thread-scoped notifications and fixes this project's current bare-`turnId` ambiguity.
+- Do not treat upstream detached review delivery as the inline-status fix. Detached review can be a separate app-server-client strategy, but the TUI and post-turn review workflow still need a temporary active delegate runtime subject.
+- This project's delegate helper should adopt the upstream API shape where `run_codex_thread_interactive(...)` and `run_codex_thread_one_shot(...)` accept `SubAgentSource` instead of hardcoding `SubAgentSource::Review`.
+
 ## Non-goals
 
 - Do not forward raw delegate `SessionConfigured` into the parent TUI as a normal session configuration event.
@@ -131,6 +142,12 @@ All new fields can be optional for compatibility. The daemon should key active t
 |Enrich `TurnStartedEvent` only|Add model/provider/context fields to `TurnStartedEvent` and use them in TUI/codexd|Can fix bottom model display quickly|Does not solve `/status` sandbox, agents, session, parent linkage, token updates, or nested lifecycle|Useful as a short hotfix only|
 |Active runtime context snapshots|Add explicit delegate-scoped status context lifecycle|Preserves parent session, fixes `/status`, bottom line, status line, and `codexd` consistently|Requires protocol/UI/codexd changes|Recommended|
 |Register each delegate as a separate `codexd` runtime|Give each delegate its own runtime id|Clear separation for downstream apps|Still leaves TUI status unsolved; can overstate process/runtime boundaries; harder to correlate parent and delegate|Consider later if multiple concurrent delegates become common|
+
+### Detached review delivery from upstream app-server
+
+The upstream app-server can run review with detached delivery and emit a separate `thread/started` notification for the review thread. That is useful for external clients that naturally display review as its own thread.
+
+It is not sufficient for this proposal because `/review-completed-turn` is intentionally rendered inline against the parent conversation, the TUI review path still uses inline delivery, and the nested delegate status events are still filtered before they can update active status surfaces. Treat detached review as an optional product-mode alternative, not as the core runtime-visibility implementation.
 
 ## Migration and compatibility
 
