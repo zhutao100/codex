@@ -46,6 +46,33 @@ pub(crate) struct ReviewDelegateConfigParams<'a> {
     pub(crate) base_instructions: &'a str,
     pub(crate) sandbox_policy: SandboxPolicy,
     pub(crate) disable_collab: bool,
+    pub(crate) instruction_profile: ReviewDelegateInstructionProfile,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReviewDelegateInstructionProfile {
+    Review,
+    PostTurnCompletionReview,
+}
+
+impl ReviewDelegateInstructionProfile {
+    fn host_instruction_filenames(self, config: &Config) -> Vec<&str> {
+        match self {
+            ReviewDelegateInstructionProfile::Review => {
+                vec![
+                    config.review_agents_filename.as_str(),
+                    config.host_agents_filename.as_str(),
+                ]
+            }
+            ReviewDelegateInstructionProfile::PostTurnCompletionReview => {
+                vec![
+                    config.post_turn_completion_review_agents_filename.as_str(),
+                    config.review_agents_filename.as_str(),
+                    config.host_agents_filename.as_str(),
+                ]
+            }
+        }
+    }
 }
 
 pub(crate) fn configure_review_delegate_config(
@@ -64,6 +91,11 @@ pub(crate) fn configure_review_delegate_config(
     }
 
     sub_agent_config.base_instructions = Some(params.base_instructions.to_string());
+    let host_instruction_filenames = params
+        .instruction_profile
+        .host_instruction_filenames(parent_config);
+    sub_agent_config.user_instructions =
+        parent_config.load_host_instructions_from_filenames(&host_instruction_filenames)?;
     sub_agent_config.approval_policy = Constrained::allow_any(AskForApproval::Never);
     sub_agent_config.sandbox_policy = Constrained::allow_any(params.sandbox_policy);
 
@@ -141,9 +173,10 @@ async fn start_review_conversation(
         config.as_ref(),
         ctx.model_info.slug.as_str(),
         ReviewDelegateConfigParams {
-            base_instructions: crate::REVIEW_PROMPT,
+            base_instructions: config.review_prompt(),
             sandbox_policy: ctx.sandbox_policy.clone(),
             disable_collab: true,
+            instruction_profile: ReviewDelegateInstructionProfile::Review,
         },
     )?;
 
@@ -339,6 +372,7 @@ fn normalize_review_template_line_endings(template: &str) -> Cow<'_, str> {
 #[cfg(test)]
 mod tests {
     use super::ReviewDelegateConfigParams;
+    use super::ReviewDelegateInstructionProfile;
     use super::configure_review_delegate_config;
     use super::normalize_review_template_line_endings;
     use super::render_review_exit_success;
@@ -348,6 +382,7 @@ mod tests {
     use crate::protocol::SandboxPolicy;
     use codex_protocol::config_types::WebSearchMode;
     use pretty_assertions::assert_eq;
+    use tempfile::TempDir;
 
     #[test]
     fn render_review_exit_success_replaces_results_placeholder() {
@@ -380,6 +415,7 @@ mod tests {
                 base_instructions: "review prompt",
                 sandbox_policy: SandboxPolicy::ReadOnly,
                 disable_collab: true,
+                instruction_profile: ReviewDelegateInstructionProfile::Review,
             },
         )
         .expect("delegate config");
@@ -394,6 +430,168 @@ mod tests {
         assert_eq!(
             delegate.sandbox_policy.get().clone(),
             SandboxPolicy::ReadOnly
+        );
+    }
+
+    #[test]
+    fn review_delegate_loads_review_host_instructions() {
+        let codex_home = TempDir::new().expect("codex home");
+        std::fs::write(codex_home.path().join("AGENTS.md"), "main host")
+            .expect("write host agents");
+        std::fs::write(codex_home.path().join("AGENTS.review.md"), "review host")
+            .expect("write review agents");
+        let mut config = test_config();
+        config.codex_home = codex_home.path().to_path_buf();
+        config.user_instructions = Some("stale parent host".to_string());
+
+        let delegate = configure_review_delegate_config(
+            &config,
+            "parent-model",
+            ReviewDelegateConfigParams {
+                base_instructions: "review prompt",
+                sandbox_policy: SandboxPolicy::ReadOnly,
+                disable_collab: true,
+                instruction_profile: ReviewDelegateInstructionProfile::Review,
+            },
+        )
+        .expect("delegate config");
+
+        assert_eq!(delegate.user_instructions.as_deref(), Some("review host"));
+    }
+
+    #[test]
+    fn review_delegate_falls_back_to_shared_host_instructions() {
+        let codex_home = TempDir::new().expect("codex home");
+        std::fs::write(codex_home.path().join("AGENTS.md"), "main host")
+            .expect("write host agents");
+        let mut config = test_config();
+        config.codex_home = codex_home.path().to_path_buf();
+        config.user_instructions = Some("stale parent host".to_string());
+
+        let delegate = configure_review_delegate_config(
+            &config,
+            "parent-model",
+            ReviewDelegateConfigParams {
+                base_instructions: "review prompt",
+                sandbox_policy: SandboxPolicy::ReadOnly,
+                disable_collab: true,
+                instruction_profile: ReviewDelegateInstructionProfile::Review,
+            },
+        )
+        .expect("delegate config");
+
+        assert_eq!(delegate.user_instructions.as_deref(), Some("main host"));
+    }
+
+    #[test]
+    fn post_turn_review_delegate_uses_post_then_review_then_host_instructions() {
+        let codex_home = TempDir::new().expect("codex home");
+        std::fs::write(codex_home.path().join("AGENTS.md"), "main host")
+            .expect("write host agents");
+        std::fs::write(codex_home.path().join("AGENTS.review.md"), "review host")
+            .expect("write review agents");
+        std::fs::write(
+            codex_home.path().join("AGENTS.post-turn-review.md"),
+            "post host",
+        )
+        .expect("write post-turn review agents");
+        let mut config = test_config();
+        config.codex_home = codex_home.path().to_path_buf();
+
+        let delegate = configure_review_delegate_config(
+            &config,
+            "parent-model",
+            ReviewDelegateConfigParams {
+                base_instructions: "review prompt",
+                sandbox_policy: SandboxPolicy::ReadOnly,
+                disable_collab: true,
+                instruction_profile: ReviewDelegateInstructionProfile::PostTurnCompletionReview,
+            },
+        )
+        .expect("delegate config");
+
+        assert_eq!(delegate.user_instructions.as_deref(), Some("post host"));
+
+        std::fs::write(codex_home.path().join("AGENTS.post-turn-review.md"), " \n")
+            .expect("empty post-turn review agents");
+        let delegate = configure_review_delegate_config(
+            &config,
+            "parent-model",
+            ReviewDelegateConfigParams {
+                base_instructions: "review prompt",
+                sandbox_policy: SandboxPolicy::ReadOnly,
+                disable_collab: true,
+                instruction_profile: ReviewDelegateInstructionProfile::PostTurnCompletionReview,
+            },
+        )
+        .expect("delegate config");
+
+        assert_eq!(delegate.user_instructions.as_deref(), Some("review host"));
+
+        std::fs::write(codex_home.path().join("AGENTS.review.md"), " \n")
+            .expect("empty review agents");
+        let delegate = configure_review_delegate_config(
+            &config,
+            "parent-model",
+            ReviewDelegateConfigParams {
+                base_instructions: "review prompt",
+                sandbox_policy: SandboxPolicy::ReadOnly,
+                disable_collab: true,
+                instruction_profile: ReviewDelegateInstructionProfile::PostTurnCompletionReview,
+            },
+        )
+        .expect("delegate config");
+
+        assert_eq!(delegate.user_instructions.as_deref(), Some("main host"));
+    }
+
+    #[test]
+    fn review_delegate_uses_configured_host_instruction_filenames() {
+        let codex_home = TempDir::new().expect("codex home");
+        std::fs::write(codex_home.path().join("HOST.md"), "custom host")
+            .expect("write custom host agents");
+        std::fs::write(codex_home.path().join("REVIEW.md"), "custom review")
+            .expect("write custom review agents");
+        std::fs::write(codex_home.path().join("POST.md"), "custom post")
+            .expect("write custom post-turn review agents");
+        std::fs::write(codex_home.path().join("AGENTS.review.md"), "default review")
+            .expect("write default review agents");
+        let mut config = test_config();
+        config.codex_home = codex_home.path().to_path_buf();
+        config.host_agents_filename = "HOST.md".to_string();
+        config.review_agents_filename = "REVIEW.md".to_string();
+        config.post_turn_completion_review_agents_filename = "POST.md".to_string();
+
+        let review_delegate = configure_review_delegate_config(
+            &config,
+            "parent-model",
+            ReviewDelegateConfigParams {
+                base_instructions: "review prompt",
+                sandbox_policy: SandboxPolicy::ReadOnly,
+                disable_collab: true,
+                instruction_profile: ReviewDelegateInstructionProfile::Review,
+            },
+        )
+        .expect("review delegate config");
+        let post_delegate = configure_review_delegate_config(
+            &config,
+            "parent-model",
+            ReviewDelegateConfigParams {
+                base_instructions: "review prompt",
+                sandbox_policy: SandboxPolicy::ReadOnly,
+                disable_collab: true,
+                instruction_profile: ReviewDelegateInstructionProfile::PostTurnCompletionReview,
+            },
+        )
+        .expect("post-turn delegate config");
+
+        assert_eq!(
+            review_delegate.user_instructions.as_deref(),
+            Some("custom review")
+        );
+        assert_eq!(
+            post_delegate.user_instructions.as_deref(),
+            Some("custom post")
         );
     }
 }

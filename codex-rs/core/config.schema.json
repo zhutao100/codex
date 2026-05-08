@@ -1902,6 +1902,10 @@
       "default": null,
       "description": "Settings that govern if and what will be written to `~/.codex/history.jsonl`."
     },
+    "host_agents_filename": {
+      "description": "Shared host-level AGENTS filename under the Codex home directory for review delegate fallbacks.",
+      "type": "string"
+    },
     "instructions": {
       "description": "System instructions.",
       "type": "string"
@@ -2041,6 +2045,18 @@
       ],
       "description": "Optionally specify a personality for the model"
     },
+    "post_turn_completion_review_agents_filename": {
+      "description": "Post-turn-review-specific host-level AGENTS filename under the Codex home directory.",
+      "type": "string"
+    },
+    "post_turn_completion_review_prompt_file": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/AbsolutePathBuf"
+        }
+      ],
+      "description": "Optional file containing the post-turn completion review base prompt."
+    },
     "profile": {
       "description": "Profile to use from the `profiles` map.",
       "type": "string"
@@ -2080,6 +2096,10 @@
       },
       "type": "object"
     },
+    "review_agents_filename": {
+      "description": "Generic-review host-level AGENTS filename under the Codex home directory.",
+      "type": "string"
+    },
     "review_model": {
       "description": "Review model override used by the `/review` feature.",
       "type": "string"
@@ -2087,6 +2107,14 @@
     "review_model_provider": {
       "description": "Review model provider override used by the `/review` feature.",
       "type": "string"
+    },
+    "review_prompt_file": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/AbsolutePathBuf"
+        }
+      ],
+      "description": "Optional file containing the `/review` base prompt."
     },
     "sandbox_mode": {
       "allOf": [

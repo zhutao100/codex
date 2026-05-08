@@ -75,6 +75,7 @@ use similar::DiffableStr;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::io::ErrorKind;
+use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
 #[cfg(test)]
@@ -106,6 +107,10 @@ pub(crate) const PROJECT_DOC_MAX_BYTES: usize = 32 * 1024; // 32 KiB
 pub(crate) const DEFAULT_AGENT_MAX_THREADS: Option<usize> = Some(6);
 
 pub const CONFIG_TOML_FILE: &str = "config.toml";
+pub(crate) const DEFAULT_HOST_AGENTS_FILENAME: &str = DEFAULT_PROJECT_DOC_FILENAME;
+pub(crate) const DEFAULT_REVIEW_AGENTS_FILENAME: &str = "AGENTS.review.md";
+pub(crate) const DEFAULT_POST_TURN_COMPLETION_REVIEW_AGENTS_FILENAME: &str =
+    "AGENTS.post-turn-review.md";
 
 #[cfg(test)]
 pub(crate) fn test_config() -> Config {
@@ -187,8 +192,25 @@ pub struct Config {
     /// User-provided instructions from AGENTS.md.
     pub user_instructions: Option<String>,
 
+    /// Shared host-level AGENTS filename under `codex_home` for review delegate
+    /// fallbacks.
+    pub host_agents_filename: String,
+
+    /// Generic-review host-level AGENTS filename under `codex_home`.
+    pub review_agents_filename: String,
+
+    /// Post-turn-review-specific host-level AGENTS filename under `codex_home`.
+    pub post_turn_completion_review_agents_filename: String,
+
     /// Base instructions override.
     pub base_instructions: Option<String>,
+
+    /// Optional `/review` prompt loaded from `review_prompt_file`.
+    pub review_prompt: Option<String>,
+
+    /// Optional post-turn completion review prompt loaded from
+    /// `post_turn_completion_review_prompt_file`.
+    pub post_turn_completion_review_prompt: Option<String>,
 
     /// Developer instructions override injected as a separate message.
     pub developer_instructions: Option<String>,
@@ -871,6 +893,22 @@ pub struct ConfigToml {
 
     /// Review model provider override used by the `/review` feature.
     pub review_model_provider: Option<String>,
+
+    /// Shared host-level AGENTS filename under the Codex home directory for
+    /// review delegate fallbacks.
+    pub host_agents_filename: Option<String>,
+
+    /// Generic-review host-level AGENTS filename under the Codex home directory.
+    pub review_agents_filename: Option<String>,
+
+    /// Post-turn-review-specific host-level AGENTS filename under the Codex home directory.
+    pub post_turn_completion_review_agents_filename: Option<String>,
+
+    /// Optional file containing the `/review` base prompt.
+    pub review_prompt_file: Option<AbsolutePathBuf>,
+
+    /// Optional file containing the post-turn completion review base prompt.
+    pub post_turn_completion_review_prompt_file: Option<AbsolutePathBuf>,
 
     /// Provider to use from the model_providers map.
     pub model_provider: Option<String>,
@@ -1655,6 +1693,27 @@ impl Config {
 
         let review_model = override_review_model.or(cfg.review_model);
         let review_model_provider = override_review_model_provider.or(cfg.review_model_provider);
+        let host_agents_filename = Self::resolve_host_agents_filename(
+            cfg.host_agents_filename,
+            DEFAULT_HOST_AGENTS_FILENAME,
+            "host_agents_filename",
+        )?;
+        let review_agents_filename = Self::resolve_host_agents_filename(
+            cfg.review_agents_filename,
+            DEFAULT_REVIEW_AGENTS_FILENAME,
+            "review_agents_filename",
+        )?;
+        let post_turn_completion_review_agents_filename = Self::resolve_host_agents_filename(
+            cfg.post_turn_completion_review_agents_filename,
+            DEFAULT_POST_TURN_COMPLETION_REVIEW_AGENTS_FILENAME,
+            "post_turn_completion_review_agents_filename",
+        )?;
+        let review_prompt =
+            Self::try_read_non_empty_file(cfg.review_prompt_file.as_ref(), "review prompt file")?;
+        let post_turn_completion_review_prompt = Self::try_read_non_empty_file(
+            cfg.post_turn_completion_review_prompt_file.as_ref(),
+            "post-turn completion review prompt file",
+        )?;
 
         let service_tier = service_tier
             .or(config_profile.service_tier)
@@ -1711,7 +1770,12 @@ impl Config {
             shell_environment_policy,
             notify: cfg.notify,
             user_instructions,
+            host_agents_filename,
+            review_agents_filename,
+            post_turn_completion_review_agents_filename,
             base_instructions,
+            review_prompt,
+            post_turn_completion_review_prompt,
             personality,
             developer_instructions,
             compact_prompt,
@@ -1874,6 +1938,82 @@ impl Config {
             }
         }
         None
+    }
+
+    fn resolve_host_agents_filename(
+        value: Option<String>,
+        default: &str,
+        key: &str,
+    ) -> std::io::Result<String> {
+        let Some(value) = value else {
+            return Ok(default.to_string());
+        };
+
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return Ok(default.to_string());
+        }
+
+        let path = Path::new(trimmed);
+        let mut components = path.components();
+        let is_single_normal_component =
+            matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none();
+        if path.is_absolute()
+            || trimmed.contains('/')
+            || trimmed.contains('\\')
+            || !is_single_normal_component
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{key} must be a filename under codex_home, got `{trimmed}`"),
+            ));
+        }
+
+        Ok(trimmed.to_string())
+    }
+
+    pub(crate) fn review_prompt(&self) -> &str {
+        self.review_prompt
+            .as_deref()
+            .unwrap_or(crate::REVIEW_PROMPT)
+    }
+
+    pub(crate) fn post_turn_completion_review_prompt(&self) -> &str {
+        self.post_turn_completion_review_prompt
+            .as_deref()
+            .unwrap_or(crate::POST_TURN_COMPLETION_REVIEW_PROMPT)
+    }
+
+    pub(crate) fn load_host_instructions_from_filenames(
+        &self,
+        filenames: &[&str],
+    ) -> std::io::Result<Option<String>> {
+        let mut seen = Vec::with_capacity(filenames.len());
+        for filename in filenames {
+            if seen.contains(filename) {
+                continue;
+            }
+            seen.push(*filename);
+
+            let path = self.codex_home.join(filename);
+            let contents = match std::fs::read_to_string(&path) {
+                Ok(contents) => contents,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => {
+                    return Err(std::io::Error::new(
+                        err.kind(),
+                        format!("failed to read host instructions {}: {err}", path.display()),
+                    ));
+                }
+            };
+
+            let trimmed = contents.trim();
+            if !trimmed.is_empty() {
+                return Ok(Some(trimmed.to_string()));
+            }
+        }
+
+        Ok(None)
     }
 
     /// If `path` is `Some`, attempts to read the file at the given path and
@@ -4059,6 +4199,157 @@ wire_api = "responses"
     }
 
     #[test]
+    fn review_prompt_files_are_loaded_and_trimmed() -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+        let review_prompt_path = codex_home.path().join("review-prompt.md");
+        let post_turn_prompt_path = codex_home.path().join("post-turn-prompt.md");
+        std::fs::write(&review_prompt_path, "\ncustom review prompt\n")?;
+        std::fs::write(&post_turn_prompt_path, "\ncustom post-turn prompt\n")?;
+
+        let cfg = ConfigToml {
+            review_prompt_file: Some(AbsolutePathBuf::from_absolute_path(&review_prompt_path)?),
+            post_turn_completion_review_prompt_file: Some(AbsolutePathBuf::from_absolute_path(
+                &post_turn_prompt_path,
+            )?),
+            ..Default::default()
+        };
+
+        let config = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )?;
+
+        assert_eq!(
+            config.review_prompt.as_deref(),
+            Some("custom review prompt")
+        );
+        assert_eq!(config.review_prompt(), "custom review prompt");
+        assert_eq!(
+            config.post_turn_completion_review_prompt.as_deref(),
+            Some("custom post-turn prompt")
+        );
+        assert_eq!(
+            config.post_turn_completion_review_prompt(),
+            "custom post-turn prompt"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn review_prompt_files_reject_empty_files() -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+        let review_prompt_path = codex_home.path().join("review-prompt.md");
+        std::fs::write(&review_prompt_path, " \n")?;
+        let cfg = ConfigToml {
+            review_prompt_file: Some(AbsolutePathBuf::from_absolute_path(&review_prompt_path)?),
+            ..Default::default()
+        };
+
+        let err = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )
+        .expect_err("empty review prompt should be rejected");
+
+        assert!(err.to_string().contains("review prompt file is empty"));
+        Ok(())
+    }
+
+    #[test]
+    fn review_prompt_files_report_unreadable_files() -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+        let missing_prompt_path = codex_home.path().join("missing-post-turn-prompt.md");
+        let cfg = ConfigToml {
+            post_turn_completion_review_prompt_file: Some(AbsolutePathBuf::from_absolute_path(
+                &missing_prompt_path,
+            )?),
+            ..Default::default()
+        };
+
+        let err = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )
+        .expect_err("missing post-turn prompt should be rejected");
+
+        assert!(
+            err.to_string()
+                .contains("failed to read post-turn completion review prompt file")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn review_host_agent_filenames_are_validated() -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+        let cfg = ConfigToml {
+            host_agents_filename: Some(" HOST.md ".to_string()),
+            review_agents_filename: Some(" ".to_string()),
+            post_turn_completion_review_agents_filename: Some("POST.md".to_string()),
+            ..Default::default()
+        };
+
+        let config = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )?;
+
+        assert_eq!(config.host_agents_filename, "HOST.md");
+        assert_eq!(
+            config.review_agents_filename,
+            DEFAULT_REVIEW_AGENTS_FILENAME
+        );
+        assert_eq!(
+            config.post_turn_completion_review_agents_filename,
+            "POST.md"
+        );
+
+        for (key, cfg) in [
+            (
+                "host_agents_filename",
+                ConfigToml {
+                    host_agents_filename: Some("dir/AGENTS.md".to_string()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "review_agents_filename",
+                ConfigToml {
+                    review_agents_filename: Some("dir\\AGENTS.md".to_string()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "post_turn_completion_review_agents_filename",
+                ConfigToml {
+                    post_turn_completion_review_agents_filename: Some("..".to_string()),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let err = Config::load_from_base_config_with_overrides(
+                cfg,
+                ConfigOverrides::default(),
+                codex_home.path().to_path_buf(),
+            )
+            .expect_err("path-like host agents filename should be rejected");
+
+            let message = err.to_string();
+            assert!(message.contains(key), "error should name {key}: {message}");
+            assert!(
+                message.contains("must be a filename under codex_home"),
+                "error should explain filename constraint: {message}"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
     fn review_model_keys_under_model_overlay_entry_are_rejected() -> std::io::Result<()> {
         let codex_home = TempDir::new()?;
         let cfg: ConfigToml = toml::from_str(
@@ -4230,6 +4521,10 @@ model_verbosity = "high"
                 forced_auto_mode_downgraded_on_windows: false,
                 shell_environment_policy: ShellEnvironmentPolicy::default(),
                 user_instructions: None,
+                host_agents_filename: DEFAULT_HOST_AGENTS_FILENAME.to_string(),
+                review_agents_filename: DEFAULT_REVIEW_AGENTS_FILENAME.to_string(),
+                post_turn_completion_review_agents_filename:
+                    DEFAULT_POST_TURN_COMPLETION_REVIEW_AGENTS_FILENAME.to_string(),
                 notify: None,
                 cwd: fixture.cwd(),
                 cli_auth_credentials_store_mode: Default::default(),
@@ -4257,6 +4552,8 @@ model_verbosity = "high"
                 personality: Some(Personality::Pragmatic),
                 chatgpt_base_url: "https://chatgpt.com/backend-api/".to_string(),
                 base_instructions: None,
+                review_prompt: None,
+                post_turn_completion_review_prompt: None,
                 developer_instructions: None,
                 compact_prompt: None,
                 forced_chatgpt_workspace_id: None,
@@ -4327,6 +4624,10 @@ model_verbosity = "high"
             forced_auto_mode_downgraded_on_windows: false,
             shell_environment_policy: ShellEnvironmentPolicy::default(),
             user_instructions: None,
+            host_agents_filename: DEFAULT_HOST_AGENTS_FILENAME.to_string(),
+            review_agents_filename: DEFAULT_REVIEW_AGENTS_FILENAME.to_string(),
+            post_turn_completion_review_agents_filename:
+                DEFAULT_POST_TURN_COMPLETION_REVIEW_AGENTS_FILENAME.to_string(),
             notify: None,
             cwd: fixture.cwd(),
             cli_auth_credentials_store_mode: Default::default(),
@@ -4354,6 +4655,8 @@ model_verbosity = "high"
             personality: Some(Personality::Pragmatic),
             chatgpt_base_url: "https://chatgpt.com/backend-api/".to_string(),
             base_instructions: None,
+            review_prompt: None,
+            post_turn_completion_review_prompt: None,
             developer_instructions: None,
             compact_prompt: None,
             forced_chatgpt_workspace_id: None,
@@ -4439,6 +4742,10 @@ model_verbosity = "high"
             forced_auto_mode_downgraded_on_windows: false,
             shell_environment_policy: ShellEnvironmentPolicy::default(),
             user_instructions: None,
+            host_agents_filename: DEFAULT_HOST_AGENTS_FILENAME.to_string(),
+            review_agents_filename: DEFAULT_REVIEW_AGENTS_FILENAME.to_string(),
+            post_turn_completion_review_agents_filename:
+                DEFAULT_POST_TURN_COMPLETION_REVIEW_AGENTS_FILENAME.to_string(),
             notify: None,
             cwd: fixture.cwd(),
             cli_auth_credentials_store_mode: Default::default(),
@@ -4466,6 +4773,8 @@ model_verbosity = "high"
             personality: Some(Personality::Pragmatic),
             chatgpt_base_url: "https://chatgpt.com/backend-api/".to_string(),
             base_instructions: None,
+            review_prompt: None,
+            post_turn_completion_review_prompt: None,
             developer_instructions: None,
             compact_prompt: None,
             forced_chatgpt_workspace_id: None,
@@ -4537,6 +4846,10 @@ model_verbosity = "high"
             forced_auto_mode_downgraded_on_windows: false,
             shell_environment_policy: ShellEnvironmentPolicy::default(),
             user_instructions: None,
+            host_agents_filename: DEFAULT_HOST_AGENTS_FILENAME.to_string(),
+            review_agents_filename: DEFAULT_REVIEW_AGENTS_FILENAME.to_string(),
+            post_turn_completion_review_agents_filename:
+                DEFAULT_POST_TURN_COMPLETION_REVIEW_AGENTS_FILENAME.to_string(),
             notify: None,
             cwd: fixture.cwd(),
             cli_auth_credentials_store_mode: Default::default(),
@@ -4564,6 +4877,8 @@ model_verbosity = "high"
             personality: Some(Personality::Pragmatic),
             chatgpt_base_url: "https://chatgpt.com/backend-api/".to_string(),
             base_instructions: None,
+            review_prompt: None,
+            post_turn_completion_review_prompt: None,
             developer_instructions: None,
             compact_prompt: None,
             forced_chatgpt_workspace_id: None,

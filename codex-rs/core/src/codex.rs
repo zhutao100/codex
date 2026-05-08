@@ -204,6 +204,7 @@ use crate::state_db;
 use crate::tasks::GhostSnapshotTask;
 use crate::tasks::PostTurnCompletionReviewTask;
 use crate::tasks::ReviewDelegateConfigParams;
+use crate::tasks::ReviewDelegateInstructionProfile;
 use crate::tasks::ReviewTask;
 use crate::tasks::SessionTask;
 use crate::tasks::SessionTaskContext;
@@ -3968,9 +3969,10 @@ async fn spawn_review_thread(
         config.as_ref(),
         parent_turn_context.model_info.slug.as_str(),
         ReviewDelegateConfigParams {
-            base_instructions: crate::REVIEW_PROMPT,
+            base_instructions: config.review_prompt(),
             sandbox_policy: parent_turn_context.sandbox_policy.clone(),
             disable_collab: true,
+            instruction_profile: ReviewDelegateInstructionProfile::Review,
         },
     )
     .unwrap_or_else(|_| {

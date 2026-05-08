@@ -55,6 +55,7 @@ pub(crate) use ghost_snapshot::GhostSnapshotTask;
 pub(crate) use post_turn_completion_review::PostTurnCompletionReviewTask;
 pub(crate) use regular::RegularTask;
 pub(crate) use review::ReviewDelegateConfigParams;
+pub(crate) use review::ReviewDelegateInstructionProfile;
 pub(crate) use review::ReviewTask;
 pub(crate) use review::configure_review_delegate_config;
 pub(crate) use undo::UndoTask;

@@ -16,6 +16,28 @@
 # Config default: unset. `/review` uses the current session provider.
 # review_model_provider = "openai"
 
+# Config default: "AGENTS.md". Shared host-level instructions filename under
+# CODEX_HOME. Review delegates use this as their final host fallback.
+# host_agents_filename = "AGENTS.md"
+
+# Config default: "AGENTS.review.md". Generic `/review` first looks for this
+# host-level instructions filename under CODEX_HOME, then falls back to
+# `host_agents_filename`.
+# review_agents_filename = "AGENTS.review.md"
+
+# Config default: "AGENTS.post-turn-review.md". Post-turn completion review
+# first looks for this host-level instructions filename under CODEX_HOME, then
+# `review_agents_filename`, then `host_agents_filename`.
+# post_turn_completion_review_agents_filename = "AGENTS.post-turn-review.md"
+
+# Config default: unset. When present, the file replaces the built-in `/review`
+# base prompt at runtime.
+# review_prompt_file = "~/.codex/prompts/review.md"
+
+# Config default: unset. When present, the file replaces the built-in
+# post-turn completion review base prompt at runtime.
+# post_turn_completion_review_prompt_file = "~/.codex/prompts/post-turn-review.md"
+
 # Config default: unset. Effective provider id defaults to `openai`.
 # model_provider = "openai"
 

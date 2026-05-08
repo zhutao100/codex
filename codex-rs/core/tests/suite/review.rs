@@ -362,6 +362,185 @@ async fn review_completed_turn_positive_output_records_developer_advisory_and_co
     server.verify().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_completed_turn_false_output_does_not_continue() {
+    skip_if_no_network!();
+
+    let review_json = serde_json::json!({
+        "evaluation": "Inspection coverage: checked changed files and tests.\n\nFindings:\n- None.\n\nFix actions advised: no",
+        "fix_actions_advised": false
+    })
+    .to_string();
+    let review_json_escaped = serde_json::to_string(&review_json).unwrap();
+    let sse_parent = r#"[
+        {"type":"response.output_item.done", "item":{
+            "type":"message", "role":"assistant",
+            "content":[{"type":"output_text","text":"initial done"}]
+        }},
+        {"type":"response.completed", "response": {"id": "__ID__"}}
+    ]"#;
+    let sse_review = format!(
+        r#"[
+            {{"type":"response.output_item.done", "item":{{
+                "type":"message", "role":"assistant",
+                "content":[{{"type":"output_text","text":{review_json_escaped}}}]
+            }}}},
+            {{"type":"response.completed", "response": {{"id": "__ID__"}}}}
+        ]"#
+    );
+    let server = MockServer::start().await;
+    let request_log = mount_sse_sequence(
+        &server,
+        vec![
+            load_sse_fixture_with_id_from_str(sse_parent, &Uuid::new_v4().to_string()),
+            load_sse_fixture_with_id_from_str(&sse_review, &Uuid::new_v4().to_string()),
+        ],
+    )
+    .await;
+    let codex_home = Arc::new(TempDir::new().unwrap());
+    let codex = new_conversation_for_server(&server, codex_home.clone(), |_| {}).await;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "finish the change".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await
+        .unwrap();
+    let _parent_complete =
+        wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    codex.submit(Op::ReviewCompletedTurn).await.unwrap();
+    let _entered = wait_for_event(&codex, |ev| matches!(ev, EventMsg::EnteredReviewMode(_))).await;
+    let exited = wait_for_event(&codex, |ev| matches!(ev, EventMsg::ExitedReviewMode(_))).await;
+    match exited {
+        EventMsg::ExitedReviewMode(event) => {
+            let output = event
+                .post_turn_completion_review_output
+                .expect("post-turn review output");
+            assert!(output.evaluation.starts_with("Inspection coverage:"));
+            assert!(!output.fix_actions_advised);
+        }
+        other => panic!("expected ExitedReviewMode, got {other:?}"),
+    }
+    let _review_complete =
+        wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        request_log.requests().len(),
+        2,
+        "false fix_actions_advised should not trigger a continuation request"
+    );
+
+    let _codex_home_guard = codex_home;
+    server.verify().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn post_turn_review_delegate_keeps_project_docs_and_uses_review_host_instructions() {
+    skip_if_no_network!();
+
+    let review_json = serde_json::json!({
+        "evaluation": "Inspection coverage: checked project docs.\n\nFindings:\n- None.\n\nFix actions advised: no",
+        "fix_actions_advised": false
+    })
+    .to_string();
+    let review_json_escaped = serde_json::to_string(&review_json).unwrap();
+    let sse_parent = r#"[
+        {"type":"response.output_item.done", "item":{
+            "type":"message", "role":"assistant",
+            "content":[{"type":"output_text","text":"initial done"}]
+        }},
+        {"type":"response.completed", "response": {"id": "__ID__"}}
+    ]"#;
+    let sse_review = format!(
+        r#"[
+            {{"type":"response.output_item.done", "item":{{
+                "type":"message", "role":"assistant",
+                "content":[{{"type":"output_text","text":{review_json_escaped}}}]
+            }}}},
+            {{"type":"response.completed", "response": {{"id": "__ID__"}}}}
+        ]"#
+    );
+    let server = MockServer::start().await;
+    let request_log = mount_sse_sequence(
+        &server,
+        vec![
+            load_sse_fixture_with_id_from_str(sse_parent, &Uuid::new_v4().to_string()),
+            load_sse_fixture_with_id_from_str(&sse_review, &Uuid::new_v4().to_string()),
+        ],
+    )
+    .await;
+    let codex_home = Arc::new(TempDir::new().unwrap());
+    std::fs::write(
+        codex_home.path().join("AGENTS.md"),
+        "main-session-only editing workflow",
+    )
+    .unwrap();
+    std::fs::write(
+        codex_home.path().join("AGENTS.post-turn-review.md"),
+        "review-safe machine resource notes",
+    )
+    .unwrap();
+    let codex = new_conversation_for_server(&server, codex_home.clone(), |config| {
+        std::fs::write(
+            config.cwd.join("AGENTS.md"),
+            "project build and test guidance",
+        )
+        .unwrap();
+    })
+    .await;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "finish the change".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await
+        .unwrap();
+    let _parent_complete =
+        wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    codex.submit(Op::ReviewCompletedTurn).await.unwrap();
+    let _entered = wait_for_event(&codex, |ev| matches!(ev, EventMsg::EnteredReviewMode(_))).await;
+    let _exited = wait_for_event(&codex, |ev| matches!(ev, EventMsg::ExitedReviewMode(_))).await;
+    let _review_complete =
+        wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let requests = request_log.requests();
+    assert_eq!(requests.len(), 2);
+    let delegate_body = requests[1].body_json();
+    let delegate_input = delegate_body["input"].as_array().expect("input array");
+    let delegate_text = delegate_input
+        .iter()
+        .filter_map(|item| item["content"][0]["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        delegate_text.contains("review-safe machine resource notes"),
+        "post-turn delegate should use review host instructions: {delegate_text}"
+    );
+    assert!(
+        delegate_text.contains("project build and test guidance"),
+        "post-turn delegate should keep project AGENTS.md docs: {delegate_text}"
+    );
+    assert!(
+        !delegate_text.contains("main-session-only editing workflow"),
+        "post-turn delegate should not inherit main-session host instructions: {delegate_text}"
+    );
+
+    let _codex_home_guard = codex_home;
+    server.verify().await;
+}
+
 /// Ensure review flow suppresses assistant-specific streaming/completion events:
 /// - AgentMessageContentDelta
 /// - AgentMessageDelta (legacy)

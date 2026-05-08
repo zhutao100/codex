@@ -2,7 +2,7 @@
 
 ## Status
 
-Follow-up proposal after test-run findings. The baseline post-turn completion review workflow exists in this project; this document focuses on making the reviewer less likely to repeat the main session's failure modes.
+Implemented. The baseline post-turn completion review workflow exists in this project; this document records the hardening layer that makes the reviewer less likely to repeat the main session's failure modes.
 
 ## Problem
 

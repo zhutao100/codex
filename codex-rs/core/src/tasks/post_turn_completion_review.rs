@@ -26,6 +26,7 @@ use crate::state::PendingContinuation;
 use crate::state::TaskKind;
 
 use super::ReviewDelegateConfigParams;
+use super::ReviewDelegateInstructionProfile;
 use super::SessionTask;
 use super::SessionTaskContext;
 use super::configure_review_delegate_config;
@@ -122,9 +123,10 @@ async fn start_post_turn_completion_review_conversation(
         ctx.config.as_ref(),
         ctx.model_info.slug.as_str(),
         ReviewDelegateConfigParams {
-            base_instructions: crate::POST_TURN_COMPLETION_REVIEW_PROMPT,
+            base_instructions: ctx.config.post_turn_completion_review_prompt(),
             sandbox_policy: SandboxPolicy::ReadOnly,
             disable_collab: true,
+            instruction_profile: ReviewDelegateInstructionProfile::PostTurnCompletionReview,
         },
     )?;
 
@@ -331,5 +333,15 @@ mod tests {
 
         assert_eq!(output.evaluation, "not json");
         assert!(!output.fix_actions_advised);
+    }
+
+    #[test]
+    fn prompt_requires_coverage_driven_inspection() {
+        let prompt = crate::POST_TURN_COMPLETION_REVIEW_PROMPT;
+
+        assert!(prompt.contains("Do not perform a generic code review"));
+        assert!(prompt.contains("keyword-search plus narrow range reads"));
+        assert!(prompt.contains("coverage-driven"));
+        assert!(prompt.contains("Inspection coverage:"));
     }
 }
