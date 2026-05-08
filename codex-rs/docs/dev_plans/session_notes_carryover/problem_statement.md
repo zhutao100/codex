@@ -1,10 +1,14 @@
 # Task
 
+## Status
+
+Implemented with two rollout findings: pre-turn auto-compaction must also capture notes, and pending input must be deferred until after compaction so notes capture is not short-circuited.
+
 Prepare a drop-in design for carrying forward structured session work notes before auto-compaction.
 
 ## Target Base
 
-This plan is written against branch base `fe8b474acd43cb8894d661944c6b5c8db0ef0ad1`.
+This plan is written against code shape `fe8b474acd43cb8894d661944c6b5c8db0ef0ad1`.
 
 The relevant surfaces on this base are:
 
@@ -117,10 +121,3 @@ The design is successful if it does all of the following:
 - preserves the original context and loss-avoidance goals.
 - reads as a standalone plan for the `fe8b474...` code shape.
 - remains useful as a future rebase reference by documenting the base-specific drift points and invariants, not just the idealized end state.
-
-## Post-rollout findings
-
-After the first implementation shipped, session logs highlighted two operational requirements that are easy to miss in a design-only pass:
-
-- **Pre-turn auto-compaction must also capture notes** (when a turn begins over the token limit), otherwise preserved notes can become stale across repeated compactions.
-- **Notes capture should not be short-circuited by pending input**; deferring pending input until after compaction preserves ordering and allows fresh notes to be captured reliably.

@@ -2,7 +2,7 @@
 
 ## Target Base
 
-This proposal targets this project's current v0.98-shaped codebase with the custom `model_overlay` feature and the custom `review_model_provider` delegate override already present.
+This proposal targets this project's current customized branch shape with the custom `model_overlay` feature and the custom `review_model_provider` delegate override already present.
 
 ## Design Summary
 
@@ -425,15 +425,15 @@ Do not set `fix_actions_advised = true` from an unparsable response. False negat
 
 ## Failure Handling
 
-| Failure | Behavior |
-| --- | --- |
-| Fresh session or no completed regular turn | Emit `ErrorEvent` with the friendly guidance above; do not enter review mode. |
-| Active task is running | Emit `Cannot review a completed turn while another task is running.` |
-| Last completed regular turn has no final assistant message | Emit `The last completed turn has no final assistant message to review.` |
-| Delegate spawn fails | Emit `ErrorEvent` with prefix `Post-turn completion review failed`. |
-| Delegate interrupted | Emit `ExitedReviewMode` with no post-turn output and a short interrupted message; do not inject a developer message. |
-| Delegate output unparsable | Render the raw text as evaluation, set `fix_actions_advised = false`, and do not continue automatically. |
-| Developer-message continuation spawn fails | Emit an error and leave the advisory review visible in the transcript; do not retry automatically. |
+|Failure|Behavior|
+|---|---|
+|Fresh session or no completed regular turn|Emit `ErrorEvent` with the friendly guidance above; do not enter review mode.|
+|Active task is running|Emit `Cannot review a completed turn while another task is running.`|
+|Last completed regular turn has no final assistant message|Emit `The last completed turn has no final assistant message to review.`|
+|Delegate spawn fails|Emit `ErrorEvent` with prefix `Post-turn completion review failed`.|
+|Delegate interrupted|Emit `ExitedReviewMode` with no post-turn output and a short interrupted message; do not inject a developer message.|
+|Delegate output unparsable|Render the raw text as evaluation, set `fix_actions_advised = false`, and do not continue automatically.|
+|Developer-message continuation spawn fails|Emit an error and leave the advisory review visible in the transcript; do not retry automatically.|
 
 ## Implementation Sequence
 

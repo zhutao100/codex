@@ -1,6 +1,8 @@
 # Problem Statement
 
-Status: proposed.
+## Status
+
+Proposed.
 
 ## Scenario
 
@@ -10,13 +12,13 @@ The proposed workflow adds an independent read-only review after a turn has comp
 
 ## Risks To Address
 
-| Risk | Typical cause | Desired review behavior |
-| --- | --- | --- |
-| Missed relevant files | The main agent used keyword search and did not discover adjacent implementations, registration sites, tests, generated schemas, or platform-specific variants. | Search and inspect the current repository state read-only, then call out missed updates when they are concrete and actionable. |
-| Partial context from range reads | The main agent read only selected line ranges and missed invariants, nearby helpers, module-level contracts, or paired methods. | Re-read whole relevant files or broader symbol/module context when needed, then assess whether the final change is internally consistent. |
-| Reinvented duplicate logic | The main agent did not search broadly enough for existing helpers or patterns before adding new code. | Identify duplicate or conflicting logic and advise reusing the existing project component when the evidence is strong. |
-| Final answer overclaims | The final agent message may claim tests, guarantees, or implementation scope that the repository state does not support. | Compare the final user-facing deliverable against repository state and report mismatches. |
-| Unsafe follow-up assumptions | A successful-looking turn may leave a subtle required follow-up that the main session did not know to perform. | Produce an advisory result with an explicit binary `fix_actions_advised` signal so the main session can decide whether to continue. |
+|Risk|Typical cause|Desired review behavior|
+|---|---|---|
+|Missed relevant files|The main agent used keyword search and did not discover adjacent implementations, registration sites, tests, generated schemas, or platform-specific variants.|Search and inspect the current repository state read-only, then call out missed updates when they are concrete and actionable.|
+|Partial context from range reads|The main agent read only selected line ranges and missed invariants, nearby helpers, module-level contracts, or paired methods.|Re-read whole relevant files or broader symbol/module context when needed, then assess whether the final change is internally consistent.|
+|Reinvented duplicate logic|The main agent did not search broadly enough for existing helpers or patterns before adding new code.|Identify duplicate or conflicting logic and advise reusing the existing project component when the evidence is strong.|
+|Final answer overclaims|The final agent message may claim tests, guarantees, or implementation scope that the repository state does not support.|Compare the final user-facing deliverable against repository state and report mismatches.|
+|Unsafe follow-up assumptions|A successful-looking turn may leave a subtle required follow-up that the main session did not know to perform.|Produce an advisory result with an explicit binary `fix_actions_advised` signal so the main session can decide whether to continue.|
 
 ## Existing Mechanics In This Project
 
@@ -45,19 +47,19 @@ The existing `ContinueTask` path is designed for paused or interrupted turns. It
 
 ## Requirements
 
-| Requirement | Assessment |
-| --- | --- |
-| Manual invocation through `/review-completed-turn` | Add a TUI slash command and a core operation, rather than overloading `/review`, because this workflow validates completed-turn state and has different safety semantics. |
-| Automatic invocation through `auto_post_turn_completion_review` | Add `Feature::AutoPostTurnCompletionReview` with key `auto_post_turn_completion_review`, `Stage::UnderDevelopment`, and `default_enabled = false`. |
-| Respect `review_model` and `review_model_provider` | Reuse the same selection and provider override path as `/review`; if a provider override is configured, disable `Feature::RemoteModels` for the delegate. |
-| Always disable web search | Force `WebSearchMode::Disabled` and disable `Feature::WebSearchRequest` / `Feature::WebSearchCached` in the delegate config. |
-| Always run read-only | Force the delegate `sandbox_policy` to `SandboxPolicy::ReadOnly` regardless of the main session policy, and keep approval policy at `AskForApproval::Never` to prevent escalation into writes. |
-| Use a dedicated prompt file | Add a prompt file separate from `core/review_prompt.md`, for example `core/post_turn_completion_review_prompt.md`. |
-| Pass only user messages and final agent messages as context | Capture or reconstruct a compact completed-turn context and pass no reasoning, tool calls, tool outputs, approval events, or intermediate assistant messages. |
-| Produce a loose evaluation plus a binary fix signal | Add a small output type such as `PostTurnCompletionReviewOutputEvent { evaluation: String, fix_actions_advised: bool }`. |
-| Feed fix advice back as a developer message | When `fix_actions_advised` is true, wrap the evaluation in a developer message that labels it as independent advisory input and instructs the main model to verify before acting. |
-| Continue the main session instead of starting a new user turn | Reuse the no-new-user-input continuation machinery where possible, but add a post-completion continuation source to avoid pretending this was an interrupt or pause. |
-| Sanity-check misuse | Fresh sessions, active turns, sessions with no completed regular turn, or completed turns without a final assistant message should emit user-friendly errors and not spawn a delegate. |
+|Requirement|Assessment|
+|---|---|
+|Manual invocation through `/review-completed-turn`|Add a TUI slash command and a core operation, rather than overloading `/review`, because this workflow validates completed-turn state and has different safety semantics.|
+|Automatic invocation through `auto_post_turn_completion_review`|Add `Feature::AutoPostTurnCompletionReview` with key `auto_post_turn_completion_review`, `Stage::UnderDevelopment`, and `default_enabled = false`.|
+|Respect `review_model` and `review_model_provider`|Reuse the same selection and provider override path as `/review`; if a provider override is configured, disable `Feature::RemoteModels` for the delegate.|
+|Always disable web search|Force `WebSearchMode::Disabled` and disable `Feature::WebSearchRequest` / `Feature::WebSearchCached` in the delegate config.|
+|Always run read-only|Force the delegate `sandbox_policy` to `SandboxPolicy::ReadOnly` regardless of the main session policy, and keep approval policy at `AskForApproval::Never` to prevent escalation into writes.|
+|Use a dedicated prompt file|Add a prompt file separate from `core/review_prompt.md`, for example `core/post_turn_completion_review_prompt.md`.|
+|Pass only user messages and final agent messages as context|Capture or reconstruct a compact completed-turn context and pass no reasoning, tool calls, tool outputs, approval events, or intermediate assistant messages.|
+|Produce a loose evaluation plus a binary fix signal|Add a small output type such as `PostTurnCompletionReviewOutputEvent { evaluation: String, fix_actions_advised: bool }`.|
+|Feed fix advice back as a developer message|When `fix_actions_advised` is true, wrap the evaluation in a developer message that labels it as independent advisory input and instructs the main model to verify before acting.|
+|Continue the main session instead of starting a new user turn|Reuse the no-new-user-input continuation machinery where possible, but add a post-completion continuation source to avoid pretending this was an interrupt or pause.|
+|Sanity-check misuse|Fresh sessions, active turns, sessions with no completed regular turn, or completed turns without a final assistant message should emit user-friendly errors and not spawn a delegate.|
 
 ## Non-goals
 

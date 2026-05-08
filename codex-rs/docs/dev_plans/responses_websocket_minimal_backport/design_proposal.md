@@ -2,16 +2,16 @@
 
 ## Design Principle
 
-Patch the old branch in place.
+Patch this branch in place.
 
-Keep these old-branch shapes:
+Keep these current-branch shapes:
 
 - `codex-api/src/endpoint/responses_websocket.rs` owns WebSocket connect and stream parsing.
 - `codex-api/src/sse/responses.rs` owns shared Responses stream event parsing.
 - `core/src/client.rs` owns transport selection, retries, WebSocket request construction, and fallback.
 - `core/src/codex.rs` owns turn sampling and `/pause` / `/continue` semantics.
 
-Do not port the latest `core/src/session/*` refactor. Use latest as a behavioral reference.
+Do not port the upstream branch's `core/src/session/*` refactor. Use the upstream branch as a behavioral reference.
 
 ## Proposed Patch Sequence
 
@@ -21,7 +21,7 @@ Cross-validation against the alternative draft changes the order of the first pa
 - Treat WebSocket connect `426 Upgrade Required` as immediate HTTP fallback instead of spending stream retry budget.
 - Add body-level `client_metadata` with the first protocol patch because handshake headers are not resent per `response.create`.
 - After adding `generate` and `client_metadata`, exclude both WebSocket-only fields from incremental eligibility comparisons unless a larger canonical request refactor is being ported.
-- Treat connect timeout, custom CA, and `permessage-deflate` as transport hardening. `permessage-deflate` is low risk only if the pinned tungstenite API exposes the same extension config; custom CA should be skipped unless the old branch has or receives a small standalone helper.
+- Treat connect timeout, custom CA, and `permessage-deflate` as transport hardening. `permessage-deflate` is low risk only if the pinned tungstenite API exposes the same extension config; custom CA should be skipped unless this branch has or receives a small standalone helper.
 - Do not blindly cache cross-turn WebSocket state. Store/reuse only completed response chains, and reset on pause, interruption, fallback, compaction, rollback, or any stream error.
 
 ### Patch 0 - Fixture and fallback guardrails
@@ -43,7 +43,7 @@ fn responses_websocket_enabled(&self) -> bool {
 }
 ```
 
-2. Add a small local outcome enum instead of porting the latest session result model:
+2. Add a small local outcome enum instead of porting the upstream branch session result model:
 
 ```rust
 enum WebsocketStreamOutcome {
@@ -52,8 +52,7 @@ enum WebsocketStreamOutcome {
 }
 ```
 
-3. Map WebSocket connect `426 Upgrade Required` to `FallbackToHttp`, then call
-   `try_switch_fallback_transport(...)` and stream the same request over HTTP.
+3. Map WebSocket connect `426 Upgrade Required` to `FallbackToHttp`, then call `try_switch_fallback_transport(...)` and stream the same request over HTTP.
 
 Tests to add:
 
@@ -120,7 +119,7 @@ if let Err(err) = result {
 }
 ```
 
-5. Ensure a terminal error clears `websocket_last_request` and `websocket_last_response_rx` before the next request can compute an incremental delta. In the current old branch this can be done either:
+5. Ensure a terminal error clears `websocket_last_request` and `websocket_last_response_rx` before the next request can compute an incremental delta. In the current this branch this can be done either:
 
 - by clearing in `ModelClientSession::try_switch_fallback_transport(...)`; and
 - by clearing when `websocket_connection(...)` sees the stored connection is closed;
@@ -145,7 +144,7 @@ Tests to add:
 
 Notes:
 
-- The old branch already maps `ApiError::Retryable` to retryable `CodexErr::Stream`; use that instead of inventing new retry plumbing.
+- This branch already maps `ApiError::Retryable` to retryable `CodexErr::Stream`; use that instead of inventing new retry plumbing.
 - Do not make `previous_response_not_found` retryable. It means the connection-local state is unavailable. The safe fallback is a full `response.create` without `previous_response_id`.
 
 ### Patch 2 - Shared Responses stream parser parity
@@ -196,11 +195,11 @@ if let Some(false) = end_turn {
 }
 ```
 
-6. Optionally add explicit `ApiError::ServerOverloaded` and `ApiError::CyberPolicy { message }`. This is parser parity but not required for WebSocket correctness if the branch does not have the latest user-facing cyber/trusted-access UX.
+6. Optionally add explicit `ApiError::ServerOverloaded` and `ApiError::CyberPolicy { message }`. This is parser parity but not required for WebSocket correctness if this branch does not have the upstream branch’s user-facing cyber/trusted-access UX.
 
 Required mechanical updates:
 
-- Update all old-branch tests and constructors that match or build `ResponseEvent::Completed`.
+- Update all current-branch tests and constructors that match or build `ResponseEvent::Completed`.
 - Update `codex-api/src/endpoint/aggregate.rs` and any fixture helpers to pass `end_turn: None`.
 
 Tests to add:
@@ -232,7 +231,7 @@ pub generate: Option<bool>,
 pub client_metadata: Option<HashMap<String, String>>,
 ```
 
-If the branch already has `instructions`, only add the skip attribute; do not duplicate the field.
+If this branch already has `instructions`, only add the skip attribute; do not duplicate the field.
 
 2. Populate `client_metadata` on every `response.create` payload before changing incremental behavior:
 
@@ -339,18 +338,18 @@ fn merge_request_headers(
 
 2. Change `ResponsesWebsocketClient::connect(...)` to accept `default_headers: HeaderMap` and use the helper.
 
-3. If the old branch has a default-header builder equivalent to latest's `codex_login::default_client::default_headers()`, pass it. If not, add only the minimal defaults the HTTP path already uses, especially user-agent/originator if present.
+3. If this branch has a default-header builder equivalent to upstream branch's `codex_login::default_client::default_headers()`, pass it. If not, add only the minimal defaults the HTTP path already uses, especially user-agent/originator if present.
 
-4. Add `client_metadata` support to `ResponseCreateWsRequest` and populate fields available in the old branch:
+4. Add `client_metadata` support to `ResponseCreateWsRequest` and populate fields available in this branch:
 
-| Metadata key | Old-branch source | Required? |
+|Metadata key|Current-branch source|Required?|
 |---|---|---|
-| `x-codex-turn-metadata` | `turn_metadata_header` argument | Yes |
-| `x-openai-subagent` | existing `build_subagent_headers()` / `SessionSource::SubAgent` | Yes for subagents |
-| `x-codex-parent-thread-id` | `SessionSource::SubAgent(ThreadSpawn { parent_thread_id, .. })` | Yes if available |
-| `x-codex-installation-id` | only if old config/state has it | Optional |
-| `x-codex-window-id` | only if cross-turn cache/window generation is added | Optional until Patch 8 |
-| `traceparent`, `tracestate` | only if old telemetry exposes W3C trace context | Optional |
+|`x-codex-turn-metadata`|`turn_metadata_header` argument|Yes|
+|`x-openai-subagent`|existing `build_subagent_headers()` / `SessionSource::SubAgent`|Yes for subagents|
+|`x-codex-parent-thread-id`|`SessionSource::SubAgent(ThreadSpawn { parent_thread_id, .. })`|Yes if available|
+|`x-codex-installation-id`|only if old config/state has it|Optional|
+|`x-codex-window-id`|only if cross-turn cache/window generation is added|Optional until Patch 8|
+|`traceparent`, `tracestate`|only if old telemetry exposes W3C trace context|Optional|
 
 5. Keep headers for sticky routing and transport-level controls. Do not move `x-codex-turn-state` into `client_metadata`; it remains a header contract.
 
@@ -383,10 +382,10 @@ Changes:
 
 4. Deduplicate server-model events per stream.
 
-5. Minimal surfaced behavior for old branch:
+5. Minimal surfaced behavior for this branch:
 
 - log a warning when server model differs from `turn_context.model_info.slug`; or
-- add a small `EventMsg::ModelReroute` equivalent if the branch needs latest's user-visible cyber reroute warning.
+- add a small `EventMsg::ModelReroute` equivalent if this branch needs upstream branch's user-visible cyber reroute warning.
 
 6. Optional model verification support:
 
@@ -467,8 +466,8 @@ fn websocket_config() -> WebSocketConfig {
 
 6. Custom CA prerequisite:
 
-- If the old branch already has `maybe_build_rustls_client_config_with_custom_ca()` and the rustls provider helper, call them here.
-- If not, do not import the whole latest auth/provider stack. Either defer custom CA support or port only the helper plus its smallest dependency set.
+- If this branch already has `maybe_build_rustls_client_config_with_custom_ca()` and the rustls provider helper, call them here.
+- If not, do not import the whole upstream branch auth/provider stack. Either defer custom CA support or port only the helper plus its smallest dependency set.
 
 Tests to add:
 
@@ -517,7 +516,7 @@ pub async fn prewarm_websocket(
 
 3. Call `prewarm_websocket(...)` best-effort immediately before the first generated sampling request in `core/src/codex.rs`, after prompt construction is stable and before the request that should benefit from warmup.
 
-4. Do not add latest's startup prewarm scheduler in the first patch. A just-in-time prewarm inside the turn has fewer lifetime interactions with `/pause` and rollout resume.
+4. Do not add upstream branch's startup prewarm scheduler in the first patch. A just-in-time prewarm inside the turn has fewer lifetime interactions with `/pause` and rollout resume.
 
 5. If prewarm sees `426 Upgrade Required`, switch to HTTP fallback without surfacing a warning as a turn error.
 
@@ -596,7 +595,7 @@ Tests to add:
 
 Design caution:
 
-- The old branch's comments correctly state that `x-codex-turn-state` is turn scoped. Do not reuse a stale `turn_state` header across new WebSocket handshakes. An already-open socket can be reused, but any reconnect for a new turn must use that turn's fresh `OnceLock`.
+- This branch's comments correctly state that `x-codex-turn-state` is turn scoped. Do not reuse a stale `turn_state` header across new WebSocket handshakes. An already-open socket can be reused, but any reconnect for a new turn must use that turn's fresh `OnceLock`.
 
 ### Patch 9 - Optional custom-tool input delta UI
 
@@ -619,28 +618,28 @@ ToolCallInputDelta {
 }
 ```
 
-2. Parse only `response.custom_tool_call_input.delta`. Latest does not emit an event for `response.function_call_arguments.delta` in this path.
+2. Parse only `response.custom_tool_call_input.delta`. Upstream branch does not emit an event for `response.function_call_arguments.delta` in this path.
 
-3. Wire into the old branch only if it already has a tool-argument-diff consumer. Otherwise, parse and ignore is not worth a surfaced protocol change.
+3. Wire into this branch only if it already has a tool-argument-diff consumer. Otherwise, parse and ignore is not worth a surfaced protocol change.
 
 ## Minimal Dependency Matrix
 
-| Desired change | Minimal prerequisite | Avoid porting |
+|Desired change|Minimal prerequisite|Avoid porting|
 |---|---|---|
-| Wrapped error mapping | `serde::Deserialize`, existing `ApiError` and `TransportError` | latest session refactor |
-| Connection-limit retry | Wrapped error mapping | new retry subsystem |
-| Drop-on-error | None | close-handshake orchestration |
-| `response.incomplete` | Shared parser edit | latest full error taxonomy |
-| `end_turn` | `ResponseEvent::Completed` signature update | latest turn module split |
-| v2 create-only | Existing `previous_response_id` v2 fields | latest `ResponsesApiRequest` if too invasive |
-| `generate: false` prewarm | `generate` field, v2 create-only | startup prewarm scheduler |
-| `client_metadata` | `HashMap<String, String>` field on `ResponseCreateWsRequest` | latest W3C trace plumbing if absent |
-| Header merge defaults | local helper + existing default-header function | latest auth/provider stack |
-| Pump/ping-pong | local wrapper in endpoint module | core session refactor |
-| `permessage-deflate` | tungstenite extension config enabled in Cargo features | custom CA if helper unavailable |
-| Custom CA | port only the rustls helper and provider init | latest login/provider rewrite |
-| Cross-turn cache | small `WebsocketSession` and explicit invalidators | latest full window/session machinery |
-| Model verification UX | tiny protocol enum/event | full cyber/trusted-access UX if undesired |
+|Wrapped error mapping|`serde::Deserialize`, existing `ApiError` and `TransportError`|upstream branch session refactor|
+|Connection-limit retry|Wrapped error mapping|new retry subsystem|
+|Drop-on-error|None|close-handshake orchestration|
+|`response.incomplete`|Shared parser edit|upstream branch full error taxonomy|
+|`end_turn`|`ResponseEvent::Completed` signature update|upstream branch turn module split|
+|v2 create-only|Existing `previous_response_id` v2 fields|upstream branch's `ResponsesApiRequest` if too invasive|
+|`generate: false` prewarm|`generate` field, v2 create-only|startup prewarm scheduler|
+|`client_metadata`|`HashMap<String, String>` field on `ResponseCreateWsRequest`|upstream branch W3C trace plumbing if absent|
+|Header merge defaults|local helper + existing default-header function|upstream branch auth/provider stack|
+|Pump/ping-pong|local wrapper in endpoint module|core session refactor|
+|`permessage-deflate`|tungstenite extension config enabled in Cargo features|custom CA if helper unavailable|
+|Custom CA|port only the rustls helper and provider init|upstream branch login/provider rewrite|
+|Cross-turn cache|small `WebsocketSession` and explicit invalidators|upstream branch full window/session machinery|
+|Model verification UX|tiny protocol enum/event|full cyber/trusted-access UX if undesired|
 
 ## Test Plan
 
@@ -671,7 +670,7 @@ Extend `core/tests/suite/client_websockets.rs`:
 
 ### Pause/continue regression tests
 
-Add at least these old-branch-specific tests:
+Add at least these branch-specific tests:
 
 - pause during an active WebSocket stream clears incremental state;
 - `/continue` after a paused WebSocket stream sends full durable history, not a `previous_response_id` from a partial stream;
@@ -694,7 +693,7 @@ Run a short conversation over a fake WebSocket server:
 1. Land P0 correctness first with no feature-flag surface change.
 2. Land v2 create-only and metadata behind the existing WebSocket feature gate.
 3. Land transport parity (`permessage-deflate`, pump, optional custom CA).
-4. Land prewarm behind a new internal feature flag if the branch needs staged rollout.
+4. Land prewarm behind a new internal feature flag if this branch needs staged rollout.
 5. Land cross-turn cache only after pause/continue and compaction invalidation tests are passing.
 6. Land optional model-verification/model-reroute UI separately.
 

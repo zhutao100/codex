@@ -1,21 +1,8 @@
 # Design Proposal
 
-Status: implemented for `/review`.
+## Status
 
-Implementation notes added during validation:
-
-- `review_model_provider` is also exposed through the app-server v2 typed
-  `Config` payload and regenerated schema/TypeScript artifacts.
-- Request-auth centralization applies to `ModelClient` request paths and the
-  `ModelsManager` live-model fetch path.
-- Unknown review provider ids are surfaced as review task error events instead
-  of being swallowed by the previous `Option` return path.
-- App-server inline and detached review entry points apply the review model
-  metadata consistently; detached review threads also apply
-  `review_model_provider` before the thread is forked.
-- Runtime config validation rejects `review_model` and
-  `review_model_provider` when TOML scoping places them under
-  `model_overlay` entries instead of at the top level.
+Implemented for `/review`. Validation added app-server v2 typed config/schema exposure, request-auth centralization, clearer unknown-provider errors, consistent inline/detached review provider application, and targeted validation for misplaced `review_model` keys.
 
 ## Objective
 

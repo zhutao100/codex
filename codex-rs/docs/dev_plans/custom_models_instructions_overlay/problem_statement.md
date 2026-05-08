@@ -15,7 +15,7 @@ Primary surfaces inspected:
 
 ### Model metadata sources
 
-The branch currently has three relevant model metadata sources:
+This branch currently has three relevant model metadata sources:
 
 1. **Bundled metadata** in `core/models.json`.
    - `ModelsManager::new(...)` initializes `remote_models` from this file via `load_remote_models_from_file()`.
@@ -33,14 +33,14 @@ The branch currently has three relevant model metadata sources:
 
 The inspected `core/models.json` contains six `ModelInfo` entries:
 
-| Slug | Picker visibility | Context window | `base_instructions` | `instructions_template` |
-| --- | --- | ---: | ---: | ---: |
-| `gpt-5.4` | `list` | `272000` | present | present |
-| `gpt-5.4-mini` | `list` | `272000` | present | present |
-| `gpt-5.3-codex` | `list` | `272000` | present | present |
-| `gpt-5.3-codex-spark` | `list` | `128000` | present | present |
-| `gpt-5.2` | `list` | `272000` | present | absent |
-| `codex-auto-review` | `hide` | `272000` | present | present |
+|Slug|Picker visibility|Context window|`base_instructions`|`instructions_template`|
+|---|---|---:|---:|---:|
+|`gpt-5.4`|`list`|`272000`|present|present|
+|`gpt-5.4-mini`|`list`|`272000`|present|present|
+|`gpt-5.3-codex`|`list`|`272000`|present|present|
+|`gpt-5.3-codex-spark`|`list`|`128000`|present|present|
+|`gpt-5.2`|`list`|`272000`|present|absent|
+|`codex-auto-review`|`hide`|`272000`|present|present|
 
 Important details:
 
@@ -111,7 +111,7 @@ This means an overlay that only changes `base_instructions` is a true metadata f
 
 The bundled instruction fields are large Markdown-like strings. Maintaining corrected versions inline in `config.toml` would be brittle and noisy.
 
-The branch already has `model_instructions_file` for one global base-instruction override. The custom model overlay needs the same file-backed pattern for model-scoped and personality-scoped instruction fields.
+This branch already has `model_instructions_file` for one global base-instruction override. The custom model overlay needs the same file-backed pattern for model-scoped and personality-scoped instruction fields.
 
 ### 5. Cache mutation is the wrong extension point
 

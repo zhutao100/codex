@@ -1,5 +1,9 @@
 # Design Proposal
 
+## Status
+
+Implemented with rollout learnings incorporated into the design: pre-turn auto-compaction must also capture notes, and pending input must be deferred until after compaction so notes capture is not short-circuited.
+
 ## Target Base
 
 This proposal targets the `fe8b474acd43cb8894d661944c6b5c8db0ef0ad1` code shape.
@@ -320,13 +324,6 @@ The feature should degrade safely:
 - If the model tries to call tools during the note round, runtime rejection should prevent side effects and the turn should still compact afterward.
 - If the model returns empty notes or a non-notes message (missing `<AUTO_COMPACT_WORK_NOTES>`), retry capture a small number of times and then compact without notes.
 - If real user input arrives during the note round, defer draining/replaying it until after compaction.
-
-## Rollout learnings (post-implementation)
-
-Real session logs showed two important pitfalls that are easy to miss in a design-only pass:
-
-1. **Pre-turn auto-compaction must also capture notes.** If a turn begins over the limit and compacts without capturing notes, the preserved notes in `replacement_history` can remain stuck on the previous compaction's notes, and the UI may not render a fresh `<AUTO_COMPACT_WORK_NOTES>` section.
-2. **Do not short-circuit notes capture due to pending input.** Compacting without notes when interrupted (instead of deferring pending input) can produce the same stale-notes outcome and hides the notes section at the exact moment it is most valuable.
 
 ## Why This Stays Rebase-Friendly
 

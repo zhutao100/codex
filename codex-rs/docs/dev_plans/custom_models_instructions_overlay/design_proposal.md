@@ -1,17 +1,12 @@
 # Design Proposal
 
+## Status
+
+Implemented for the global `model_overlay` path. Profile-scoped overlays, generalized null/clear markers, and broader clear semantics remain deferred; `clear_model_messages = true` is the only first-class clear operation.
+
 ## Target Base
 
-This proposal was originally written against the `f0d4740cf3b1f6a864fd1536b6615bb2e9badd12` v0.98 branch shape and was validated for implementation on the `custom-0.98.0` branch at `ec279a530fbeebe7359669363349a27d36ab255c`.
-
-The design is intentionally scoped to local client behavior. It does not require server changes, wire API changes, or manual edits to `core/models.json` / `models_cache.json`.
-
-Validation outcome for the first implementation:
-
-- global `model_overlay` is supported;
-- profile-scoped `model_overlay` is intentionally not supported yet and remains rejected by the existing profile schema;
-- optional `ModelInfo` fields can be set by overlay fields, but generalized null/clear markers are still deferred;
-- `clear_model_messages = true` is the only first-class clear operation.
+This proposal targets this project's customized branch shape.
 
 ## Design Summary
 
@@ -20,7 +15,7 @@ Add a new optional `model_overlay` section to `config.toml` and resolve it into 
 Then apply the overlay in two places:
 
 1. **Model metadata resolution**
-   - Start from the same bundled/live candidate models the branch uses today.
+   - Start from the same bundled/live candidate models this branch uses today.
    - For custom slugs absent from candidates, start from `model_info_from_slug(slug)`.
    - Apply cross-model metadata overrides.
    - Apply per-model metadata overrides.
@@ -260,15 +255,15 @@ The config-facing TOML structs can live in `core/src/config/mod.rs` or a small `
 
 Support file variants for long instruction strings:
 
-| Inline field | File field |
-| --- | --- |
-| `base_instructions` | `base_instructions_file` |
-| `instructions_template` | `instructions_template_file` |
-| `model_messages.instructions_template` | `model_messages.instructions_template_file` |
-| `model_messages.instructions_variables.personality_default` | `...personality_default_file` |
-| `model_messages.instructions_variables.personality_friendly` | `...personality_friendly_file` |
-| `model_messages.instructions_variables.personality_pragmatic` | `...personality_pragmatic_file` |
-| `final_instruction_override` | `final_instruction_override_file` |
+|Inline field|File field|
+|---|---|
+|`base_instructions`|`base_instructions_file`|
+|`instructions_template`|`instructions_template_file`|
+|`model_messages.instructions_template`|`model_messages.instructions_template_file`|
+|`model_messages.instructions_variables.personality_default`|`...personality_default_file`|
+|`model_messages.instructions_variables.personality_friendly`|`...personality_friendly_file`|
+|`model_messages.instructions_variables.personality_pragmatic`|`...personality_pragmatic_file`|
+|`final_instruction_override`|`final_instruction_override_file`|
 
 Validation rules:
 
@@ -312,12 +307,12 @@ bundled core/models.json
 
 Precedence for metadata fields:
 
-| Priority | Layer | Notes |
-| ---: | --- | --- |
-| 1 | Built-in fallback / bundled / live fetched metadata | Existing source of truth. |
-| 2 | `model_overlay` top-level cross-model patch | Applies to every resolved model candidate. |
-| 3 | `model_overlay.models[]` entry matching `slug` | Per-model exact field override. |
-| 4 | Existing `Config` overrides | Preserve current behavior; config-level `model_context_window`, `model_auto_compact_token_limit`, `base_instructions`, and tool-output truncation remain strongest metadata overrides. |
+|Priority|Layer|Notes|
+|---:|---|---|
+|1|Built-in fallback / bundled / live fetched metadata|Existing source of truth.|
+|2|`model_overlay` top-level cross-model patch|Applies to every resolved model candidate.|
+|3|`model_overlay.models[]` entry matching `slug`|Per-model exact field override.|
+|4|Existing `Config` overrides|Preserve current behavior; config-level `model_context_window`, `model_auto_compact_token_limit`, `base_instructions`, and tool-output truncation remain strongest metadata overrides.|
 
 Custom model behavior:
 
@@ -351,13 +346,13 @@ Do not add `final_instruction_override` to `protocol/src/openai_models.rs`; that
 
 Resolve `SessionConfiguration.base_instructions` using:
 
-| Priority | Source | Rationale |
-| ---: | --- | --- |
-| 1 | Existing `config.base_instructions` | Preserve current explicit `instructions` / `model_instructions_file` semantics. |
-| 2 | Per-model `final_instruction_override` | Strong local correction for the selected model. |
-| 3 | Top-level `model_overlay.final_instruction_override` | Strong local correction across models. |
-| 4 | Resumed conversation `session_meta.base_instructions` | Preserve old session behavior when no explicit current override exists. |
-| 5 | `model_info.get_model_instructions(config.personality)` | Existing model-derived behavior. |
+|Priority|Source|Rationale|
+|---:|---|---|
+|1|Existing `config.base_instructions`|Preserve current explicit `instructions` / `model_instructions_file` semantics.|
+|2|Per-model `final_instruction_override`|Strong local correction for the selected model.|
+|3|Top-level `model_overlay.final_instruction_override`|Strong local correction across models.|
+|4|Resumed conversation `session_meta.base_instructions`|Preserve old session behavior when no explicit current override exists.|
+|5|`model_info.get_model_instructions(config.personality)`|Existing model-derived behavior.|
 
 This differs slightly from the current code only when an overlay final override is configured. It makes the final override truly effective for both new sessions and resumed sessions unless the user also sets the pre-existing explicit `instructions` / `model_instructions_file` override.
 
@@ -404,7 +399,7 @@ fn effective_model_instructions(
 
 Then ensure `TurnContext` either carries the resolved final instruction override or carries enough model identity/config to recompute it consistently.
 
-Minimal first implementation may avoid model-switch final override support only if model switching cannot change the system instructions in the target branch. On this base, there is explicit model-switch update code, so the resolver should be shared.
+Minimal first implementation may avoid model-switch final override support only if model switching cannot change the system instructions in this branch. On this base, there is explicit model-switch update code, so the resolver should be shared.
 
 ## ModelsManager Integration
 

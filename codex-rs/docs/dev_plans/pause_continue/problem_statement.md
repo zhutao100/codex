@@ -4,7 +4,7 @@ Prepare a drop-in design for recoverable mid-turn pause and continuation in the 
 
 ## Target Base
 
-This plan is written against branch base `15a9f932c49d78c8b5db4625bd542165b30e3c9b`.
+This plan is written against code shape `15a9f932c49d78c8b5db4625bd542165b30e3c9b`.
 
 The relevant surfaces on this base are:
 
