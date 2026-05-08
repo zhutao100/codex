@@ -2,7 +2,7 @@
 
 ## Status
 
-Inspected against the upstream project.
+Inspected against upstream and incorporated into the implementation.
 
 ## Summary
 
@@ -16,7 +16,7 @@ The upstream project does include reusable components that this project should a
 - detached review delivery for app-server clients.
 - analytics-side `ThreadConfigSnapshot` capture for sub-agent session start.
 
-The conclusion is therefore mixed: the upstream project does not remove the need for this proposal, but it provides protocol shapes and naming conventions that should be reused where possible.
+The conclusion is therefore mixed: the upstream project did not remove the need for this implementation, but it provided protocol shapes and naming conventions that were reused where possible.
 
 ## Upstream evidence
 
@@ -74,4 +74,4 @@ This project's `run_codex_thread_interactive(...)` currently hardcodes `SessionS
 
 ## Upstream status conclusion
 
-The upstream project still has the inline delegate status/runtime visibility gap. The useful upstream work is not a direct fix, but a set of protocol and API conventions to align with. The proposal remains necessary; the implementation should reuse upstream app-server v2 lifecycle/token naming, `SessionSource::SubAgent(...)` classification, and composite thread/turn identity semantics.
+The upstream project still has the inline delegate status/runtime visibility gap. The useful upstream work was not a direct fix, but it provided protocol and API conventions to align with. The implementation reused upstream app-server v2 lifecycle/token naming, `SessionSource::SubAgent(...)` classification, and composite thread/turn identity semantics.

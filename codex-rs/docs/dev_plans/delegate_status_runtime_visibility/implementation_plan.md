@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed.
+Implemented.
 
 ## Upstream reuse decisions
 
@@ -13,6 +13,13 @@ Before implementing the new runtime context layer, fold in the useful upstream p
 - Use upstream app-server v2 names and field shapes where they overlap with `codexd`: `turn/started`, `turn/completed`, `thread/tokenUsage/updated`, `thread/name/updated`, and `ThreadTokenUsage { total, last, modelContextWindow }`.
 - Keep `post_turn_completion_review` as a task kind layered over `SubAgentSource::Review`; do not replace the low-level session source with the task label.
 - Treat upstream detached review as an optional downstream-client workflow. It is not an acceptance criterion for inline TUI status correctness.
+
+## Implementation result
+
+- Delegate helpers now accept explicit `SubAgentSource` values and emit `RuntimeContextActivated`, `RuntimeContextUpdated`, and `RuntimeContextDeactivated` events instead of forwarding raw delegate `SessionConfigured` into parent state.
+- The TUI stores the active runtime context as the current status subject for `/status`, the bottom running model label, status-line model/session items, and context-window indicators.
+- `codexd` active turns use composite `turnKey` identity, expose the `activeTurnContext` capability, fold context/token updates into snapshots, and keep forwarding the raw runtime notifications.
+- The TUI menubar bridge publishes composite-key turns and enriches delegate turn notifications from `RuntimeContextSnapshot`.
 
 ## Phase 1: Add runtime context data structures
 

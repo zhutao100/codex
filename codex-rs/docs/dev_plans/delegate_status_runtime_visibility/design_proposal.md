@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed.
+Implemented.
 
 ## Summary
 
@@ -147,7 +147,7 @@ All new fields can be optional for compatibility. The daemon should key active t
 
 The upstream app-server can run review with detached delivery and emit a separate `thread/started` notification for the review thread. That is useful for external clients that naturally display review as its own thread.
 
-It is not sufficient for this proposal because `/review-completed-turn` is intentionally rendered inline against the parent conversation, the TUI review path still uses inline delivery, and the nested delegate status events are still filtered before they can update active status surfaces. Treat detached review as an optional product-mode alternative, not as the core runtime-visibility implementation.
+It was not sufficient for this proposal because `/review-completed-turn` is intentionally rendered inline against the parent conversation, the TUI review path still uses inline delivery, and the parent TUI needed an explicit runtime-context subject rather than raw delegate session events. Treat detached review as an optional product-mode alternative, not as the core runtime-visibility implementation.
 
 ## Migration and compatibility
 

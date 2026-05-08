@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed.
+Resolved by the active runtime context implementation.
 
 ## Target Base
 

@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed; upstream audit incorporated.
+Implemented.
 
 ## Target Base
 
@@ -14,8 +14,8 @@ The post-turn completion review delegate can run with an effective model, provid
 
 ## Documents
 
-- `problem_statement.md`: inspected behavior, code-path evidence, and root causes.
-- `design_proposal.md`: recommended active runtime context design, alternatives, and non-goals.
-- `codexd_protocol_notes.md`: focused protocol and state-machine changes for `codexd` and the TUI producer bridge.
-- `implementation_plan.md`: phased implementation surfaces, tests, and acceptance criteria.
+- `problem_statement.md`: inspected behavior, code-path evidence, root causes, and implemented resolution.
+- `design_proposal.md`: implemented active runtime context design, alternatives, and non-goals.
+- `codexd_protocol_notes.md`: implemented protocol and state-machine changes for `codexd` and the TUI producer bridge.
+- `implementation_plan.md`: completed implementation surfaces, tests, and acceptance criteria.
 - `upstream_audit.md`: upstream project comparison, remaining gaps, and reusable protocol/API components.

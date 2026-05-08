@@ -2,17 +2,17 @@
 
 ## Status
 
-Proposed.
+Implemented.
 
 ## Target Base
 
 This proposal targets this project's customized `v0.98` branch shape.
 
-## Current shape
+## Previous shape
 
-`codexd` currently treats each producer process as one runtime. The TUI producer registers a runtime id like `pid:<pid>` with session source `cli`, cwd, and display name. The daemon stores active turns inside that runtime.
+`codexd` previously treated each producer process as one runtime. The TUI producer registered a runtime id like `pid:<pid>` with session source `cli`, cwd, and display name. The daemon stored active turns inside that runtime.
 
-The current active turn snapshot contains only:
+The previous active turn snapshot contained only:
 
 - `threadId`.
 - `turnId`.
@@ -28,7 +28,7 @@ The daemon updates active turns only from forwarded generic notifications:
 
 All other notifications are forwarded to subscribers but are not folded into the daemon's snapshot state.
 
-## Current failure mode for delegates
+## Previous failure mode for delegates
 
 The TUI `MenuBarBridge` infers `turn/started` notifications from the TUI event stream. Its `current_model` and `current_model_provider` are updated only from visible `SessionConfigured` events. Because delegate `SessionConfigured` is filtered by `codex_delegate.rs`, delegate turns inherit stale parent model/provider metadata.
 
