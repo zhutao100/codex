@@ -25,6 +25,20 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 
+const SANDBOX_PERMISSIONS_DESCRIPTION: &str = "Sandbox permissions for the command. Set to \"require_escalated\" to request running without sandbox restrictions; defaults to \"use_default\".";
+const JUSTIFICATION_DESCRIPTION: &str = concat!(
+    "Only set if sandbox_permissions is \"require_escalated\". ",
+    "Request approval from the user to run this command outside the sandbox. ",
+    "Phrased as a simple question that summarizes the purpose of the ",
+    "command as it relates to the task at hand - e.g. 'Do you want to ",
+    "fetch and pull the latest version of this git branch?'",
+);
+const PREFIX_RULE_DESCRIPTION: &str = concat!(
+    "Only specify when sandbox_permissions is `require_escalated`. ",
+    "Suggest a prefix command pattern that will allow you to fulfill similar requests from the user in the future. ",
+    "Should be a short but reasonable prefix, e.g. [\"git\", \"pull\"] or [\"uv\", \"run\"] or [\"pytest\"].",
+);
+
 #[derive(Debug, Clone)]
 pub(crate) struct ToolsConfig {
     pub shell_type: ConfigShellToolType,
@@ -158,23 +172,13 @@ fn create_approval_parameters(include_prefix_rule: bool) -> BTreeMap<String, Jso
         (
             "sandbox_permissions".to_string(),
             JsonSchema::String {
-                description: Some(
-                    "Sandbox permissions for the command. Set to \"require_escalated\" to request running without sandbox restrictions; defaults to \"use_default\"."
-                        .to_string(),
-                ),
+                description: Some(SANDBOX_PERMISSIONS_DESCRIPTION.to_string()),
             },
         ),
         (
             "justification".to_string(),
             JsonSchema::String {
-                description: Some(
-                    r#"Only set if sandbox_permissions is \"require_escalated\". 
-                    Request approval from the user to run this command outside the sandbox. 
-                    Phrased as a simple question that summarizes the purpose of the 
-                    command as it relates to the task at hand - e.g. 'Do you want to 
-                    fetch and pull the latest version of this git branch?'"#
-                    .to_string(),
-                ),
+                description: Some(JUSTIFICATION_DESCRIPTION.to_string()),
             },
         ),
     ]);
@@ -184,12 +188,9 @@ fn create_approval_parameters(include_prefix_rule: bool) -> BTreeMap<String, Jso
             "prefix_rule".to_string(),
             JsonSchema::Array {
                 items: Box::new(JsonSchema::String { description: None }),
-                description: Some(
-                    r#"Only specify when sandbox_permissions is `require_escalated`. 
-                    Suggest a prefix command pattern that will allow you to fulfill similar requests from the user in the future.
-                    Should be a short but reasonable prefix, e.g. [\"git\", \"pull\"] or [\"uv\", \"run\"] or [\"pytest\"]."#.to_string(),
-                ),
-            });
+                description: Some(PREFIX_RULE_DESCRIPTION.to_string()),
+            },
+        );
     }
 
     properties
@@ -1488,6 +1489,33 @@ mod tests {
             icons: None,
             meta: None,
         }
+    }
+
+    #[test]
+    fn approval_parameter_descriptions_serialize_cleanly() {
+        let parameters =
+            serde_json::to_value(create_approval_parameters(true)).expect("serialize schema");
+
+        assert_eq!(
+            parameters,
+            serde_json::json!({
+                "justification": {
+                    "description": "Only set if sandbox_permissions is \"require_escalated\". Request approval from the user to run this command outside the sandbox. Phrased as a simple question that summarizes the purpose of the command as it relates to the task at hand - e.g. 'Do you want to fetch and pull the latest version of this git branch?'",
+                    "type": "string",
+                },
+                "prefix_rule": {
+                    "description": "Only specify when sandbox_permissions is `require_escalated`. Suggest a prefix command pattern that will allow you to fulfill similar requests from the user in the future. Should be a short but reasonable prefix, e.g. [\"git\", \"pull\"] or [\"uv\", \"run\"] or [\"pytest\"].",
+                    "items": {
+                        "type": "string",
+                    },
+                    "type": "array",
+                },
+                "sandbox_permissions": {
+                    "description": "Sandbox permissions for the command. Set to \"require_escalated\" to request running without sandbox restrictions; defaults to \"use_default\".",
+                    "type": "string",
+                },
+            })
+        );
     }
 
     #[test]
