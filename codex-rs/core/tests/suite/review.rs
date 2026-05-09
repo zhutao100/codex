@@ -21,7 +21,12 @@ use codex_protocol::user_input::UserInput;
 use core_test_support::PathBufExt;
 use core_test_support::responses;
 use core_test_support::responses::ResponseMock;
+use core_test_support::responses::ev_assistant_message;
+use core_test_support::responses::ev_completed;
+use core_test_support::responses::ev_reasoning_item;
+use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_sequence;
+use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::local_selections;
@@ -542,6 +547,74 @@ async fn review_does_not_emit_agent_message_on_structured_output() {
     .await;
     assert_eq!(1, agent_messages, "expected exactly one AgentMessage event");
     assert!(saw_entered && saw_exited, "missing review lifecycle events");
+
+    let _codex_home_guard = codex_home;
+    server.verify().await;
+}
+
+/// Review delegates emit both structured items and legacy compatibility events.
+/// The parent should not persist duplicate legacy records when it forwards the
+/// delegate stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_rollout_does_not_duplicate_forwarded_delegate_legacy_events() {
+    let review_text = "review assistant output";
+    let server = MockServer::start().await;
+    mount_sse_sequence(
+        &server,
+        vec![sse(vec![
+            ev_response_created("resp-1"),
+            ev_reasoning_item("reason-1", &["delegate reasoning"], &[]),
+            ev_assistant_message("msg-1", review_text),
+            ev_completed("resp-1"),
+        ])],
+    )
+    .await;
+    let codex_home = Arc::new(TempDir::new().unwrap());
+    let codex = new_conversation_for_server(&server, codex_home.clone(), |_| {}).await;
+
+    codex
+        .submit(Op::Review {
+            review_request: ReviewRequest {
+                target: ReviewTarget::Custom {
+                    instructions: "check rollout duplicates".to_string(),
+                },
+                user_facing_hint: None,
+            },
+        })
+        .await
+        .unwrap();
+
+    let _complete = wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let path = codex.rollout_path().expect("rollout path");
+    let lines = read_rollout_lines(&path);
+    let user_message_count = lines
+        .iter()
+        .filter(|line| matches!(line.item, RolloutItem::EventMsg(EventMsg::UserMessage(_))))
+        .count();
+    let agent_reasoning_count = lines
+        .iter()
+        .filter(|line| {
+            matches!(
+                line.item,
+                RolloutItem::EventMsg(EventMsg::AgentReasoning(_))
+            )
+        })
+        .count();
+
+    assert_eq!(
+        1, user_message_count,
+        "delegate user message should be persisted once"
+    );
+    assert_eq!(
+        1, agent_reasoning_count,
+        "delegate reasoning should be persisted once"
+    );
+    assert_eq!(
+        0,
+        adjacent_duplicate_rollout_items(&lines),
+        "rollout should not contain adjacent duplicate records"
+    );
 
     let _codex_home_guard = codex_home;
     server.verify().await;
@@ -1098,4 +1171,26 @@ where
         .await
         .expect("resume conversation")
         .codex
+}
+
+#[expect(clippy::expect_used)]
+fn read_rollout_lines(path: &std::path::Path) -> Vec<RolloutLine> {
+    std::fs::read_to_string(path)
+        .expect("read rollout file")
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("rollout line"))
+        .collect()
+}
+
+#[expect(clippy::expect_used)]
+fn adjacent_duplicate_rollout_items(lines: &[RolloutLine]) -> usize {
+    lines
+        .windows(2)
+        .filter(|pair| {
+            let previous = serde_json::to_value(&pair[0].item).expect("serialize rollout item");
+            let current = serde_json::to_value(&pair[1].item).expect("serialize rollout item");
+            previous == current
+        })
+        .count()
 }

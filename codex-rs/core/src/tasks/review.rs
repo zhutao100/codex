@@ -164,6 +164,13 @@ async fn process_review_events(
                 ..
             })
             | EventMsg::AgentMessageContentDelta(AgentMessageContentDeltaEvent { .. }) => {}
+            EventMsg::UserMessage(_)
+            | EventMsg::AgentReasoning(_)
+            | EventMsg::AgentReasoningRawContent(_) => {
+                // The delegate emits these legacy events immediately after the
+                // structured ItemCompleted events. Forwarding both would make
+                // the parent regenerate and persist duplicate legacy records.
+            }
             EventMsg::TurnComplete(task_complete) => {
                 // Parse review output from the last agent message (if present).
                 let out = task_complete
