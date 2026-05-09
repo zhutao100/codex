@@ -18,6 +18,7 @@ use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ApplyPatchToolType;
 use codex_protocol::openai_models::ConfigShellToolType;
+use codex_protocol::openai_models::InputModality;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelVisibility;
 use codex_protocol::openai_models::ModelsResponse;
@@ -447,10 +448,16 @@ async fn remote_model_override_uses_catalog_model_for_strict_auto_review() -> Re
     let server = MockServer::start().await;
     let model = "remote-auto-review-parent";
     let review_model = "remote-auto-review-reviewer";
+    let mut review_model_info = remote_model_with_auto_review_override(review_model, review_model);
+    review_model_info.auto_review_model_override = None;
+    review_model_info.input_modalities = vec![InputModality::Text];
     Mock::given(method("GET"))
         .and(path("/v1/models"))
         .respond_with(ResponseTemplate::new(200).set_body_json(ModelsResponse {
-            models: vec![remote_model_with_auto_review_override(model, review_model)],
+            models: vec![
+                remote_model_with_auto_review_override(model, review_model),
+                review_model_info,
+            ],
         }))
         .expect(1..)
         .mount(&server)
@@ -620,9 +627,16 @@ async fn remote_model_override_uses_catalog_model_for_strict_auto_review() -> Re
                 && request.body_json()["client_metadata"]["x-openai-subagent"] == "guardian"
         })
         .expect("expected Guardian request for apply_patch");
+    let guardian_request_body = guardian_request.body_json();
+    assert_eq!(guardian_request_body["model"].as_str(), Some(review_model));
     assert_eq!(
-        guardian_request.body_json()["model"].as_str(),
-        Some(review_model)
+        guardian_request_body["tools"]
+            .as_array()
+            .expect("Guardian request tools")
+            .iter()
+            .map(|tool| tool["name"].as_str().expect("Guardian request tool name"))
+            .collect::<Vec<_>>(),
+        vec!["exec_command", "write_stdin"]
     );
     assert_eq!(guardian_request.path(), "/v1/responses");
 

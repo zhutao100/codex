@@ -1440,7 +1440,7 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, registry: &mut Tool
 
     if features.enabled(Feature::ViewImage) {
         let include_environment_id = matches!(environment_mode, ToolEnvironmentMode::Multiple);
-        registry.add(ViewImageHandler::new(ViewImageToolOptions {
+        let handler = ViewImageHandler::new(ViewImageToolOptions {
             can_request_original_image_detail: can_request_original_image_detail(
                 context.model_info,
             ),
@@ -1449,7 +1449,16 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, registry: &mut Tool
                 context.model_info,
             ),
             include_environment_id,
-        }));
+        });
+        if context
+            .model_info
+            .input_modalities
+            .contains(&InputModality::Image)
+        {
+            registry.add(handler);
+        } else {
+            registry.add_with_exposure(handler, ToolExposure::Hidden);
+        }
     }
 }
 

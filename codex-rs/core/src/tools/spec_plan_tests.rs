@@ -1150,6 +1150,50 @@ async fn environment_tools_follow_the_step_context() {
 }
 
 #[tokio::test]
+async fn view_image_tool_requires_image_input_modality() {
+    let plan = probe(|turn| {
+        set_feature(turn, Feature::ViewImage, /*enabled*/ true);
+        update_turn_settings_for_test(turn, |settings| {
+            Arc::make_mut(&mut settings.model_info).input_modalities = vec![InputModality::Text];
+        });
+    })
+    .await;
+
+    plan.assert_visible_lacks(&["view_image"]);
+    plan.assert_registered_contains(&["view_image"]);
+}
+
+#[tokio::test]
+async fn reviewer_view_image_tool_requires_image_input_modality() {
+    let (mut session, mut turn) = make_session_and_context().await;
+    session.tool_policy = Arc::new(codex_guardian_reviewer::reviewer_tool_policy());
+    set_feature(&mut turn, Feature::ViewImage, /*enabled*/ true);
+    update_turn_settings_for_test(&mut turn, |settings| {
+        Arc::make_mut(&mut settings.model_info).input_modalities = vec![InputModality::Text];
+    });
+    let turn = Arc::new(turn);
+    let step_context = StepContext::for_test(Arc::clone(&turn));
+    let plan = ToolPlanProbe::from_router(
+        super::build_tool_router(
+            &session,
+            step_context.turn.as_ref(),
+            &step_context.settings.model_info,
+            &step_context.environments,
+            &step_context.mcp,
+            /*apps_enabled*/ false,
+            &turn.extension_data,
+            /*tool_suggest_candidates*/ None,
+            session.dynamic_tools().await.as_ref(),
+        )
+        .expect("build internal Guardian tool router"),
+    );
+
+    assert_eq!(plan.visible_names, vec!["exec_command", "write_stdin"]);
+    plan.assert_registered_contains(&["view_image"]);
+    assert_eq!(plan.exposure("view_image"), ToolExposure::Hidden);
+}
+
+#[tokio::test]
 async fn sleep_tool_follows_current_time_config() {
     let disabled = probe(|turn| {
         set_feature(turn, Feature::CurrentTimeReminder, /*enabled*/ true);
