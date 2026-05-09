@@ -2847,6 +2847,28 @@ impl Session {
         }
     }
 
+    /// Send an event to clients without recording it in this session's rollout.
+    ///
+    /// Use this for events whose canonical persistence belongs to another
+    /// session, such as forwarded delegate events.
+    pub(crate) async fn send_event_transient(&self, turn_context: &TurnContext, msg: EventMsg) {
+        let legacy_source = msg.clone();
+        let event = Event {
+            id: turn_context.sub_id.clone(),
+            msg,
+        };
+        self.deliver_event_raw(event).await;
+
+        let show_raw_agent_reasoning = self.show_raw_agent_reasoning();
+        for legacy in legacy_source.as_legacy_events(show_raw_agent_reasoning) {
+            let legacy_event = Event {
+                id: turn_context.sub_id.clone(),
+                msg: legacy,
+            };
+            self.deliver_event_raw(legacy_event).await;
+        }
+    }
+
     /// Classifies terminal results for native parent delivery and opted-in hosts.
     async fn maybe_publish_terminal_agent_result(
         &self,
