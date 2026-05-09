@@ -16,6 +16,7 @@ use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::models::VIEW_IMAGE_TOOL_NAME;
 use codex_protocol::openai_models::ApplyPatchToolType;
 use codex_protocol::openai_models::ConfigShellToolType;
+use codex_protocol::openai_models::InputModality;
 use codex_protocol::openai_models::ModelInfo;
 use serde::Deserialize;
 use serde::Serialize;
@@ -33,6 +34,7 @@ pub(crate) struct ToolsConfig {
     pub collaboration_modes_tools: bool,
     pub memory_tools: bool,
     pub request_rule_enabled: bool,
+    pub view_image_tool: bool,
     pub experimental_supported_tools: Vec<String>,
 }
 
@@ -54,6 +56,7 @@ impl ToolsConfig {
         let include_collaboration_modes_tools = features.enabled(Feature::CollaborationModes);
         let include_memory_tools = features.enabled(Feature::MemoryTool);
         let request_rule_enabled = features.enabled(Feature::RequestRule);
+        let include_view_image_tool = model_info.input_modalities.contains(&InputModality::Image);
 
         let shell_type = if !features.enabled(Feature::ShellTool) {
             ConfigShellToolType::Disabled
@@ -88,6 +91,7 @@ impl ToolsConfig {
             collaboration_modes_tools: include_collaboration_modes_tools,
             memory_tools: include_memory_tools,
             request_rule_enabled,
+            view_image_tool: include_view_image_tool,
             experimental_supported_tools: model_info.experimental_supported_tools.clone(),
         }
     }
@@ -1405,7 +1409,9 @@ pub(crate) fn build_specs(
         Some(WebSearchMode::Disabled) | None => {}
     }
 
-    builder.push_spec_with_parallel_support(create_view_image_tool(), true);
+    if config.view_image_tool {
+        builder.push_spec_with_parallel_support(create_view_image_tool(), true);
+    }
     builder.register_handler("view_image", view_image_handler);
 
     if config.collab_tools {
@@ -1727,6 +1733,26 @@ mod tests {
         assert_contains_tool_names(&tools, &["get_memory"]);
     }
 
+    #[test]
+    fn view_image_requires_image_input_modality() {
+        let config = test_config();
+        let mut model_info = ModelsManager::construct_model_info_offline("gpt-5-codex", &config);
+        model_info.input_modalities = vec![InputModality::Text];
+        let mut features = Features::with_defaults();
+        features.enable(Feature::CollaborationModes);
+        let tools_config = ToolsConfig::new(&ToolsConfigParams {
+            model_info: &model_info,
+            features: &features,
+            web_search_mode: Some(WebSearchMode::Cached),
+        });
+        let (tools, _) = build_specs(&tools_config, None, &[]).build();
+
+        assert!(
+            !tools.iter().any(|tool| tool.spec.name() == "view_image"),
+            "view_image should be disabled when the model does not support image inputs"
+        );
+    }
+
     fn assert_model_tools(
         model_slug: &str,
         features: &Features,
@@ -1904,7 +1930,6 @@ mod tests {
                 "request_user_input",
                 "apply_patch",
                 "web_search",
-                "view_image",
             ],
         );
     }
