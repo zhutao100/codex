@@ -553,16 +553,18 @@ async fn review_does_not_emit_agent_message_on_structured_output() {
 }
 
 /// Review delegates emit both structured items and legacy compatibility events.
-/// The parent should not persist duplicate legacy records when it forwards the
-/// delegate stream.
+/// The delegate rollout is the canonical transcript, so the parent should not
+/// copy forwarded delegate events into its own rollout.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn review_rollout_does_not_duplicate_forwarded_delegate_legacy_events() {
-    let review_text = "review assistant output";
+async fn review_rollout_omits_forwarded_delegate_transcript() {
+    let intermediate_text = "intermediate delegate note";
+    let review_text = "final review assistant output";
     let server = MockServer::start().await;
     mount_sse_sequence(
         &server,
         vec![sse(vec![
             ev_response_created("resp-1"),
+            ev_assistant_message("msg-0", intermediate_text),
             ev_reasoning_item("reason-1", &["delegate reasoning"], &[]),
             ev_assistant_message("msg-1", review_text),
             ev_completed("resp-1"),
@@ -588,32 +590,47 @@ async fn review_rollout_does_not_duplicate_forwarded_delegate_legacy_events() {
 
     let path = codex.rollout_path().expect("rollout path");
     let lines = read_rollout_lines(&path);
-    let user_message_count = lines
-        .iter()
-        .filter(|line| matches!(line.item, RolloutItem::EventMsg(EventMsg::UserMessage(_))))
-        .count();
-    let agent_reasoning_count = lines
-        .iter()
-        .filter(|line| {
-            matches!(
-                line.item,
-                RolloutItem::EventMsg(EventMsg::AgentReasoning(_))
-            )
-        })
-        .count();
+    let user_message_count =
+        rollout_event_count(&lines, |event| matches!(event, EventMsg::UserMessage(_)));
+    let agent_reasoning_count =
+        rollout_event_count(&lines, |event| matches!(event, EventMsg::AgentReasoning(_)));
 
     assert_eq!(
-        1, user_message_count,
-        "delegate user message should be persisted once"
+        0, user_message_count,
+        "delegate user message should not be persisted in parent rollout"
     );
     assert_eq!(
-        1, agent_reasoning_count,
-        "delegate reasoning should be persisted once"
+        0, agent_reasoning_count,
+        "delegate reasoning should not be persisted in parent rollout"
+    );
+    assert!(
+        !rollout_has_agent_message(&lines, intermediate_text),
+        "delegate agent message should not be persisted in parent rollout"
     );
     assert_eq!(
         0,
         adjacent_duplicate_rollout_items(&lines),
         "rollout should not contain adjacent duplicate records"
+    );
+
+    let delegate_lines = read_single_delegate_rollout(codex_home.path(), &path);
+    assert_eq!(
+        1,
+        rollout_event_count(&delegate_lines, |event| {
+            matches!(event, EventMsg::UserMessage(_))
+        }),
+        "delegate rollout should keep its user message"
+    );
+    assert_eq!(
+        1,
+        rollout_event_count(&delegate_lines, |event| {
+            matches!(event, EventMsg::AgentReasoning(_))
+        }),
+        "delegate rollout should keep its reasoning"
+    );
+    assert!(
+        rollout_has_agent_message(&delegate_lines, intermediate_text),
+        "delegate rollout should keep its assistant transcript"
     );
 
     let _codex_home_guard = codex_home;
@@ -1181,6 +1198,60 @@ fn read_rollout_lines(path: &std::path::Path) -> Vec<RolloutLine> {
         .filter(|line| !line.trim().is_empty())
         .map(|line| serde_json::from_str(line).expect("rollout line"))
         .collect()
+}
+
+#[expect(clippy::expect_used)]
+fn read_single_delegate_rollout(
+    codex_home: &std::path::Path,
+    parent_path: &std::path::Path,
+) -> Vec<RolloutLine> {
+    let mut paths = Vec::new();
+    collect_rollout_paths(&codex_home.join("sessions"), &mut paths);
+    paths.retain(|path| path != parent_path);
+    assert_eq!(1, paths.len(), "expected one delegate rollout");
+    read_rollout_lines(paths.first().expect("delegate rollout path"))
+}
+
+#[expect(clippy::expect_used)]
+fn collect_rollout_paths(dir: &std::path::Path, paths: &mut Vec<PathBuf>) {
+    if !dir.exists() {
+        return;
+    }
+    for entry in std::fs::read_dir(dir).expect("read rollout directory") {
+        let entry = entry.expect("rollout directory entry");
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rollout_paths(&path, paths);
+        } else if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"))
+        {
+            paths.push(path);
+        }
+    }
+}
+
+fn rollout_event_count(lines: &[RolloutLine], predicate: impl Fn(&EventMsg) -> bool) -> usize {
+    lines
+        .iter()
+        .filter(|line| match &line.item {
+            RolloutItem::EventMsg(event) => predicate(event),
+            RolloutItem::SessionMeta(_)
+            | RolloutItem::ResponseItem(_)
+            | RolloutItem::Compacted(_)
+            | RolloutItem::TurnContext(_) => false,
+        })
+        .count()
+}
+
+fn rollout_has_agent_message(lines: &[RolloutLine], text: &str) -> bool {
+    lines.iter().any(|line| {
+        matches!(
+            &line.item,
+            RolloutItem::EventMsg(EventMsg::AgentMessage(event)) if event.message == text
+        )
+    })
 }
 
 #[expect(clippy::expect_used)]
