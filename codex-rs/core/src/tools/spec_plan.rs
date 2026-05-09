@@ -775,12 +775,21 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
 
     if environment_mode.has_environment() {
         let include_environment_id = matches!(environment_mode, ToolEnvironmentMode::Multiple);
-        planned_tools.add(ViewImageHandler::new(ViewImageToolOptions {
+        let handler = ViewImageHandler::new(ViewImageToolOptions {
             can_request_original_image_detail: can_request_original_image_detail(
                 &turn_context.model_info,
             ),
             include_environment_id,
-        }));
+        });
+        if turn_context
+            .model_info
+            .input_modalities
+            .contains(&InputModality::Image)
+        {
+            planned_tools.add(handler);
+        } else {
+            planned_tools.add_dispatch_only(handler);
+        }
     }
 }
 

@@ -690,6 +690,17 @@ async fn environment_tools_follow_the_step_context() {
 }
 
 #[tokio::test]
+async fn view_image_tool_requires_image_input_modality() {
+    let plan = probe(|turn| {
+        turn.model_info.input_modalities = vec![InputModality::Text];
+    })
+    .await;
+
+    plan.assert_visible_lacks(&["view_image"]);
+    plan.assert_registered_contains(&["view_image"]);
+}
+
+#[tokio::test]
 async fn host_context_gates_agent_job_tools() {
     let normal_agent_job = probe(|turn| {
         set_feature(turn, Feature::SpawnCsv, /*enabled*/ true);

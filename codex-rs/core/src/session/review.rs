@@ -18,7 +18,8 @@ pub(super) async fn spawn_review_thread(
         .models_manager
         .get_model_info(&model, &config.to_models_manager_config())
         .await;
-    // For reviews, disable web_search and view_image regardless of global settings.
+    // For reviews, disable web_search regardless of global settings. Other tools
+    // remain gated by the review model metadata.
     let mut review_features = sess.features.clone();
     let _ = review_features.disable(Feature::WebSearchRequest);
     let _ = review_features.disable(Feature::WebSearchCached);
