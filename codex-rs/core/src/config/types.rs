@@ -687,6 +687,15 @@ pub struct SandboxWorkspaceWrite {
     pub exclude_slash_tmp: bool,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct SandboxReadOnlyConfig {
+    #[serde(default)]
+    pub writeable_slash_tmp_subdir: bool,
+    #[serde(default)]
+    pub writeable_tmpdir_env_var_subdir: bool,
+}
+
 impl From<SandboxWorkspaceWrite> for codex_app_server_protocol::SandboxSettings {
     fn from(sandbox_workspace_write: SandboxWorkspaceWrite) -> Self {
         Self {

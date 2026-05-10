@@ -395,10 +395,10 @@ allowed_sandbox_modes = ["read-only"]
         state.requirements().approval_policy.value(),
         AskForApproval::Never
     );
-    assert_eq!(
-        *state.requirements().sandbox_policy.get(),
-        SandboxPolicy::ReadOnly
-    );
+    assert!(matches!(
+        state.requirements().sandbox_policy.get(),
+        SandboxPolicy::ReadOnly { .. }
+    ));
     assert!(
         state
             .requirements()

@@ -123,9 +123,12 @@ async fn web_search_mode_defaults_to_cached_when_unset() {
         .await
         .expect("create test Codex conversation");
 
-    test.submit_turn_with_policy("hello default cached web search", SandboxPolicy::ReadOnly)
-        .await
-        .expect("submit turn");
+    test.submit_turn_with_policy(
+        "hello default cached web search",
+        SandboxPolicy::new_read_only_policy(),
+    )
+    .await
+    .expect("submit turn");
 
     let body = resp_mock.single_request().body_json();
     let tool = find_web_search_tool(&body);
@@ -168,7 +171,7 @@ async fn web_search_mode_updates_between_turns_with_sandbox_policy() {
         .await
         .expect("create test Codex conversation");
 
-    test.submit_turn_with_policy("hello cached", SandboxPolicy::ReadOnly)
+    test.submit_turn_with_policy("hello cached", SandboxPolicy::new_read_only_policy())
         .await
         .expect("submit first turn");
     test.submit_turn_with_policy("hello live", SandboxPolicy::DangerFullAccess)

@@ -89,7 +89,7 @@ impl Default for ConfigRequirements {
                 None,
             ),
             sandbox_policy: ConstrainedWithSource::new(
-                Constrained::allow_any(SandboxPolicy::ReadOnly),
+                Constrained::allow_any(SandboxPolicy::new_read_only_policy()),
                 None,
             ),
             mcp_servers: None,
@@ -300,7 +300,7 @@ impl TryFrom<ConfigRequirementsWithSources> for ConfigRequirements {
         // the other variants (WorkspaceWrite, ExternalSandbox) require
         // additional parameters. Ultimately, we should expand the config
         // format to allow specifying those parameters.
-        let default_sandbox_policy = SandboxPolicy::ReadOnly;
+        let default_sandbox_policy = SandboxPolicy::new_read_only_policy();
         let sandbox_policy = match allowed_sandbox_modes {
             Some(Sourced {
                 value: modes,
@@ -318,7 +318,7 @@ impl TryFrom<ConfigRequirementsWithSources> for ConfigRequirements {
                 let requirement_source_for_error = requirement_source.clone();
                 let constrained = Constrained::new(default_sandbox_policy, move |candidate| {
                     let mode = match candidate {
-                        SandboxPolicy::ReadOnly => SandboxModeRequirement::ReadOnly,
+                        SandboxPolicy::ReadOnly { .. } => SandboxModeRequirement::ReadOnly,
                         SandboxPolicy::WorkspaceWrite { .. } => {
                             SandboxModeRequirement::WorkspaceWrite
                         }
@@ -685,7 +685,7 @@ mod tests {
         assert!(
             requirements
                 .sandbox_policy
-                .can_set(&SandboxPolicy::ReadOnly)
+                .can_set(&SandboxPolicy::new_read_only_policy())
                 .is_ok()
         );
 
@@ -704,7 +704,7 @@ mod tests {
         assert!(
             requirements
                 .sandbox_policy
-                .can_set(&SandboxPolicy::ReadOnly)
+                .can_set(&SandboxPolicy::new_read_only_policy())
                 .is_ok()
         );
         assert!(

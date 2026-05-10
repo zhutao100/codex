@@ -108,13 +108,17 @@ fn is_write_patch_constrained_to_writable_paths(
 ) -> bool {
     // Early‑exit if there are no declared writable roots.
     let writable_roots = match sandbox_policy {
-        SandboxPolicy::ReadOnly => {
+        SandboxPolicy::ReadOnly {
+            temp_writable_roots,
+        } if temp_writable_roots.is_empty() => {
             return false;
         }
         SandboxPolicy::DangerFullAccess | SandboxPolicy::ExternalSandbox { .. } => {
             return true;
         }
-        SandboxPolicy::WorkspaceWrite { .. } => sandbox_policy.get_writable_roots_with_cwd(cwd),
+        SandboxPolicy::ReadOnly { .. } | SandboxPolicy::WorkspaceWrite { .. } => {
+            sandbox_policy.get_writable_roots_with_cwd(cwd)
+        }
     };
 
     // Normalize a path by removing `.` and resolving `..` without touching the

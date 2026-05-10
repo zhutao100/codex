@@ -880,7 +880,8 @@ mod tests {
                         model: "deepseek-v4-pro".to_string(),
                         model_provider_id: "deepseek".to_string(),
                         approval_policy: codex_protocol::protocol::AskForApproval::Never,
-                        sandbox_policy: codex_protocol::protocol::SandboxPolicy::ReadOnly,
+                        sandbox_policy:
+                            codex_protocol::protocol::SandboxPolicy::new_read_only_policy(),
                         cwd: std::path::PathBuf::from("/tmp/delegate"),
                         reasoning_effort: None,
                         service_tier: None,
@@ -970,7 +971,7 @@ mod tests {
                 model: "delegate-model".to_string(),
                 model_provider_id: "delegate-provider".to_string(),
                 approval_policy: codex_protocol::protocol::AskForApproval::Never,
-                sandbox_policy: codex_protocol::protocol::SandboxPolicy::ReadOnly,
+                sandbox_policy: codex_protocol::protocol::SandboxPolicy::new_read_only_policy(),
                 cwd: std::path::PathBuf::from("/tmp/delegate"),
                 reasoning_effort: None,
                 service_tier: None,

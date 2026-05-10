@@ -302,7 +302,16 @@ impl DeveloperInstructions {
 
         let (sandbox_mode, writable_roots) = match sandbox_policy {
             SandboxPolicy::DangerFullAccess => (SandboxMode::DangerFullAccess, None),
-            SandboxPolicy::ReadOnly => (SandboxMode::ReadOnly, None),
+            SandboxPolicy::ReadOnly {
+                temp_writable_roots,
+            } => {
+                let writable_roots = if temp_writable_roots.is_empty() {
+                    None
+                } else {
+                    Some(sandbox_policy.get_writable_roots_with_cwd(cwd))
+                };
+                (SandboxMode::ReadOnly, writable_roots)
+            }
             SandboxPolicy::ExternalSandbox { .. } => (SandboxMode::DangerFullAccess, None),
             SandboxPolicy::WorkspaceWrite { .. } => {
                 let roots = sandbox_policy.get_writable_roots_with_cwd(cwd);
@@ -354,11 +363,17 @@ impl DeveloperInstructions {
                 exec_policy,
                 request_rule_enabled,
             ))
-            .concat(DeveloperInstructions::from_writable_roots(writable_roots))
+            .concat(DeveloperInstructions::from_writable_roots(
+                sandbox_mode,
+                writable_roots,
+            ))
             .concat(end_tag)
     }
 
-    fn from_writable_roots(writable_roots: Option<Vec<WritableRoot>>) -> Self {
+    fn from_writable_roots(
+        sandbox_mode: SandboxMode,
+        writable_roots: Option<Vec<WritableRoot>>,
+    ) -> Self {
         let Some(roots) = writable_roots else {
             return DeveloperInstructions::new("");
         };
@@ -371,6 +386,16 @@ impl DeveloperInstructions {
             .iter()
             .map(|r| format!("`{}`", r.root.to_string_lossy()))
             .collect();
+        if matches!(sandbox_mode, SandboxMode::ReadOnly) {
+            let roots_text = roots_list
+                .iter()
+                .map(|root| format!("\n- {root}"))
+                .collect::<String>();
+            return DeveloperInstructions::new(format!(
+                " Filesystem access is read-only except for these dedicated session temp directories:{roots_text}\nYou may write inside those exact directories. Do not write to other paths under /tmp or $TMPDIR."
+            ));
+        }
+
         let text = if roots_list.len() == 1 {
             format!(" The writable root is {}.", roots_list[0])
         } else {
@@ -1065,6 +1090,7 @@ mod tests {
     use crate::protocol::AskForApproval;
     use anyhow::Result;
     use codex_execpolicy::Policy;
+    use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
     use std::path::PathBuf;
     use tempfile::tempdir;
@@ -1228,6 +1254,33 @@ mod tests {
         let text = instructions.into_text();
         assert!(text.contains("Network access is enabled."));
         assert!(text.contains("`approval_policy` is `unless-trusted`"));
+    }
+
+    #[test]
+    fn builds_permissions_from_read_only_policy_with_temp_roots() -> Result<()> {
+        let root = AbsolutePathBuf::from_absolute_path("/private/tmp/codex-readonly-test")?;
+        let policy = SandboxPolicy::read_only_with_temp_writable_roots(vec![root.clone()]);
+
+        let instructions = DeveloperInstructions::from_policy(
+            &policy,
+            AskForApproval::Never,
+            &Policy::empty(),
+            false,
+            &PathBuf::from("/tmp"),
+        );
+
+        let text = instructions.into_text();
+        assert!(
+            text.contains("dedicated session temp directories"),
+            "expected read-only temp directory guidance"
+        );
+        assert!(
+            text.contains(root.to_string_lossy().as_ref()),
+            "expected exact root path"
+        );
+        assert!(text.contains("Do not write to other paths under /tmp or $TMPDIR."));
+        assert!(!text.contains("The writable root is"));
+        Ok(())
     }
 
     #[test]

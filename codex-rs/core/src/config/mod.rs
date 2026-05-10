@@ -17,6 +17,7 @@ use crate::config::types::OtelConfigToml;
 use crate::config::types::OtelExporterKind;
 use crate::config::types::ProgressLegendMode;
 use crate::config::types::ProgressTraceStyleConfig;
+use crate::config::types::SandboxReadOnlyConfig;
 use crate::config::types::SandboxWorkspaceWrite;
 use crate::config::types::ShellEnvironmentPolicy;
 use crate::config::types::ShellEnvironmentPolicyToml;
@@ -164,6 +165,8 @@ pub struct Config {
     pub approval_policy: Constrained<AskForApproval>,
 
     pub sandbox_policy: Constrained<SandboxPolicy>,
+
+    pub sandbox_read_only: SandboxReadOnlyConfig,
 
     /// enforce_residency means web traffic cannot be routed outside of a
     /// particular geography. HTTP clients should direct their requests
@@ -937,6 +940,10 @@ pub struct ConfigToml {
 
     /// Sandbox configuration to apply if `sandbox` is `WorkspaceWrite`.
     pub sandbox_workspace_write: Option<SandboxWorkspaceWrite>,
+
+    /// ReadOnly sandbox configuration for dedicated temporary writable subdirectories.
+    #[serde(default)]
+    pub sandbox_read_only: SandboxReadOnlyConfig,
 
     /// Optional external command to spawn for end-user notifications.
     #[serde(default)]
@@ -1766,6 +1773,7 @@ impl Config {
             cwd: resolved_cwd,
             approval_policy: constrained_approval_policy.value,
             sandbox_policy: constrained_sandbox_policy.value,
+            sandbox_read_only: cfg.sandbox_read_only,
             enforce_residency: enforce_residency.value,
             did_user_set_custom_approval_policy_or_sandbox_mode,
             forced_auto_mode_downgraded_on_windows,
@@ -2388,7 +2396,39 @@ network_access = true  # This should be ignored.
         assert_eq!(
             resolution,
             SandboxPolicyResolution {
-                policy: SandboxPolicy::ReadOnly,
+                policy: SandboxPolicy::new_read_only_policy(),
+                forced_auto_mode_downgraded_on_windows: false,
+            }
+        );
+
+        let sandbox_read_only_with_temp_config = r#"
+sandbox_mode = "read-only"
+
+[sandbox_read_only]
+writeable_slash_tmp_subdir = true
+writeable_tmpdir_env_var_subdir = true
+"#;
+        let sandbox_read_only_with_temp_config =
+            toml::from_str::<ConfigToml>(sandbox_read_only_with_temp_config)
+                .expect("TOML deserialization should succeed");
+        assert_eq!(
+            sandbox_read_only_with_temp_config.sandbox_read_only,
+            SandboxReadOnlyConfig {
+                writeable_slash_tmp_subdir: true,
+                writeable_tmpdir_env_var_subdir: true,
+            }
+        );
+        let resolution = sandbox_read_only_with_temp_config.derive_sandbox_policy(
+            None,
+            None,
+            WindowsSandboxLevel::Disabled,
+            &PathBuf::from("/tmp/test"),
+            None,
+        );
+        assert_eq!(
+            resolution,
+            SandboxPolicyResolution {
+                policy: SandboxPolicy::new_read_only_policy(),
                 forced_auto_mode_downgraded_on_windows: false,
             }
         );
@@ -2422,7 +2462,7 @@ exclude_slash_tmp = true
             assert_eq!(
                 resolution,
                 SandboxPolicyResolution {
-                    policy: SandboxPolicy::ReadOnly,
+                    policy: SandboxPolicy::new_read_only_policy(),
                     forced_auto_mode_downgraded_on_windows: true,
                 }
             );
@@ -2472,7 +2512,7 @@ trust_level = "trusted"
             assert_eq!(
                 resolution,
                 SandboxPolicyResolution {
-                    policy: SandboxPolicy::ReadOnly,
+                    policy: SandboxPolicy::new_read_only_policy(),
                     forced_auto_mode_downgraded_on_windows: true,
                 }
             );
@@ -2654,7 +2694,7 @@ trust_level = "trusted"
                 "expected workspace-write request to be downgraded on Windows"
             );
             match config.sandbox_policy.get() {
-                &SandboxPolicy::ReadOnly => {}
+                &SandboxPolicy::ReadOnly { .. } => {}
                 other => panic!("expected read-only policy on Windows, got {other:?}"),
             }
         } else {
@@ -2799,7 +2839,8 @@ trust_level = "trusted"
 
     #[test]
     fn web_search_mode_for_turn_defaults_to_cached_when_unset() {
-        let mode = resolve_web_search_mode_for_turn(None, false, &SandboxPolicy::ReadOnly);
+        let mode =
+            resolve_web_search_mode_for_turn(None, false, &SandboxPolicy::new_read_only_policy());
 
         assert_eq!(mode, WebSearchMode::Cached);
     }
@@ -2967,7 +3008,7 @@ profile = "project"
         if cfg!(target_os = "windows") {
             assert!(matches!(
                 config.sandbox_policy.get(),
-                SandboxPolicy::ReadOnly
+                SandboxPolicy::ReadOnly { .. }
             ));
             assert!(config.forced_auto_mode_downgraded_on_windows);
         } else {
@@ -4540,6 +4581,7 @@ model_verbosity = "high"
                 model_provider: fixture.openai_provider.clone(),
                 approval_policy: Constrained::allow_any(AskForApproval::Never),
                 sandbox_policy: Constrained::allow_any(SandboxPolicy::new_read_only_policy()),
+                sandbox_read_only: SandboxReadOnlyConfig::default(),
                 enforce_residency: Constrained::allow_any(None),
                 did_user_set_custom_approval_policy_or_sandbox_mode: true,
                 forced_auto_mode_downgraded_on_windows: false,
@@ -4643,6 +4685,7 @@ model_verbosity = "high"
             model_provider: fixture.openai_custom_provider.clone(),
             approval_policy: Constrained::allow_any(AskForApproval::UnlessTrusted),
             sandbox_policy: Constrained::allow_any(SandboxPolicy::new_read_only_policy()),
+            sandbox_read_only: SandboxReadOnlyConfig::default(),
             enforce_residency: Constrained::allow_any(None),
             did_user_set_custom_approval_policy_or_sandbox_mode: true,
             forced_auto_mode_downgraded_on_windows: false,
@@ -4761,6 +4804,7 @@ model_verbosity = "high"
             model_provider: fixture.openai_provider.clone(),
             approval_policy: Constrained::allow_any(AskForApproval::OnFailure),
             sandbox_policy: Constrained::allow_any(SandboxPolicy::new_read_only_policy()),
+            sandbox_read_only: SandboxReadOnlyConfig::default(),
             enforce_residency: Constrained::allow_any(None),
             did_user_set_custom_approval_policy_or_sandbox_mode: true,
             forced_auto_mode_downgraded_on_windows: false,
@@ -4865,6 +4909,7 @@ model_verbosity = "high"
             model_provider: fixture.openai_provider.clone(),
             approval_policy: Constrained::allow_any(AskForApproval::OnFailure),
             sandbox_policy: Constrained::allow_any(SandboxPolicy::new_read_only_policy()),
+            sandbox_read_only: SandboxReadOnlyConfig::default(),
             enforce_residency: Constrained::allow_any(None),
             did_user_set_custom_approval_policy_or_sandbox_mode: true,
             forced_auto_mode_downgraded_on_windows: false,
@@ -5157,7 +5202,7 @@ trust_level = "untrusted"
         // Verify that untrusted projects get WorkspaceWrite (or ReadOnly on Windows due to downgrade)
         if cfg!(target_os = "windows") {
             assert!(
-                matches!(resolution.policy, SandboxPolicy::ReadOnly),
+                matches!(resolution.policy, SandboxPolicy::ReadOnly { .. }),
                 "Expected ReadOnly on Windows, got {:?}",
                 resolution.policy
             );
@@ -5253,7 +5298,7 @@ trust_level = "untrusted"
             assert_eq!(
                 resolution,
                 SandboxPolicyResolution {
-                    policy: SandboxPolicy::ReadOnly,
+                    policy: SandboxPolicy::new_read_only_policy(),
                     forced_auto_mode_downgraded_on_windows: true,
                 }
             );
@@ -5409,7 +5454,7 @@ mcp_oauth_callback_port = 5678
         // Verify that untrusted projects still get WorkspaceWrite sandbox (or ReadOnly on Windows)
         if cfg!(target_os = "windows") {
             assert!(
-                matches!(config.sandbox_policy.get(), SandboxPolicy::ReadOnly),
+                matches!(config.sandbox_policy.get(), SandboxPolicy::ReadOnly { .. }),
                 "Expected ReadOnly on Windows"
             );
         } else {
@@ -5443,7 +5488,10 @@ mcp_oauth_callback_port = 5678
             .build()
             .await?;
 
-        assert_eq!(*config.sandbox_policy.get(), SandboxPolicy::ReadOnly);
+        assert!(matches!(
+            config.sandbox_policy.get(),
+            SandboxPolicy::ReadOnly { .. }
+        ));
         Ok(())
     }
 

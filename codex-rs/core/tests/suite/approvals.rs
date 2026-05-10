@@ -842,7 +842,7 @@ fn scenarios() -> Vec<ScenarioSpec> {
         ScenarioSpec {
             name: "read_only_on_request_requires_approval",
             approval_policy: OnRequest,
-            sandbox_policy: SandboxPolicy::ReadOnly,
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
             action: ActionKind::WriteFile {
                 target: TargetPath::Workspace("ro_on_request.txt"),
                 content: "read-only-approval",
@@ -862,7 +862,7 @@ fn scenarios() -> Vec<ScenarioSpec> {
         ScenarioSpec {
             name: "read_only_on_request_requires_approval_gpt_5_1_no_exit",
             approval_policy: OnRequest,
-            sandbox_policy: SandboxPolicy::ReadOnly,
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
             action: ActionKind::WriteFile {
                 target: TargetPath::Workspace("ro_on_request_5_1.txt"),
                 content: "read-only-approval",
@@ -882,7 +882,7 @@ fn scenarios() -> Vec<ScenarioSpec> {
         ScenarioSpec {
             name: "trusted_command_on_request_read_only_runs_without_prompt",
             approval_policy: OnRequest,
-            sandbox_policy: SandboxPolicy::ReadOnly,
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
             action: ActionKind::RunCommand {
                 command: "echo trusted-read-only",
             },
@@ -897,7 +897,7 @@ fn scenarios() -> Vec<ScenarioSpec> {
         ScenarioSpec {
             name: "trusted_command_on_request_read_only_runs_without_prompt_gpt_5_1_no_exit",
             approval_policy: OnRequest,
-            sandbox_policy: SandboxPolicy::ReadOnly,
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
             action: ActionKind::RunCommand {
                 command: "echo trusted-read-only",
             },
@@ -912,7 +912,7 @@ fn scenarios() -> Vec<ScenarioSpec> {
         ScenarioSpec {
             name: "read_only_on_request_blocks_network",
             approval_policy: OnRequest,
-            sandbox_policy: SandboxPolicy::ReadOnly,
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
             action: ActionKind::FetchUrl {
                 endpoint: "/ro/network-blocked",
                 response_body: "should-not-see",
@@ -926,7 +926,7 @@ fn scenarios() -> Vec<ScenarioSpec> {
         ScenarioSpec {
             name: "read_only_on_request_denied_blocks_execution",
             approval_policy: OnRequest,
-            sandbox_policy: SandboxPolicy::ReadOnly,
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
             action: ActionKind::WriteFile {
                 target: TargetPath::Workspace("ro_on_request_denied.txt"),
                 content: "should-not-write",
@@ -947,7 +947,7 @@ fn scenarios() -> Vec<ScenarioSpec> {
         ScenarioSpec {
             name: "read_only_on_failure_escalates_after_sandbox_error",
             approval_policy: OnFailure,
-            sandbox_policy: SandboxPolicy::ReadOnly,
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
             action: ActionKind::WriteFile {
                 target: TargetPath::Workspace("ro_on_failure.txt"),
                 content: "read-only-on-failure",
@@ -968,7 +968,7 @@ fn scenarios() -> Vec<ScenarioSpec> {
         ScenarioSpec {
             name: "read_only_on_failure_escalates_after_sandbox_error_gpt_5_1_no_exit",
             approval_policy: OnFailure,
-            sandbox_policy: SandboxPolicy::ReadOnly,
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
             action: ActionKind::WriteFile {
                 target: TargetPath::Workspace("ro_on_failure_5_1.txt"),
                 content: "read-only-on-failure",
@@ -988,7 +988,7 @@ fn scenarios() -> Vec<ScenarioSpec> {
         ScenarioSpec {
             name: "read_only_on_request_network_escalates_when_approved",
             approval_policy: OnRequest,
-            sandbox_policy: SandboxPolicy::ReadOnly,
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
             action: ActionKind::FetchUrl {
                 endpoint: "/ro/network-approved",
                 response_body: "read-only-network-ok",
@@ -1007,7 +1007,7 @@ fn scenarios() -> Vec<ScenarioSpec> {
         ScenarioSpec {
             name: "read_only_on_request_network_escalates_when_approved_gpt_5_1_no_exit",
             approval_policy: OnRequest,
-            sandbox_policy: SandboxPolicy::ReadOnly,
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
             action: ActionKind::FetchUrl {
                 endpoint: "/ro/network-approved",
                 response_body: "read-only-network-ok",
@@ -1179,7 +1179,7 @@ fn scenarios() -> Vec<ScenarioSpec> {
         ScenarioSpec {
             name: "read_only_unless_trusted_requires_approval",
             approval_policy: UnlessTrusted,
-            sandbox_policy: SandboxPolicy::ReadOnly,
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
             action: ActionKind::WriteFile {
                 target: TargetPath::Workspace("ro_unless_trusted.txt"),
                 content: "read-only-unless-trusted",
@@ -1199,7 +1199,7 @@ fn scenarios() -> Vec<ScenarioSpec> {
         ScenarioSpec {
             name: "read_only_unless_trusted_requires_approval_gpt_5_1_no_exit",
             approval_policy: UnlessTrusted,
-            sandbox_policy: SandboxPolicy::ReadOnly,
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
             action: ActionKind::WriteFile {
                 target: TargetPath::Workspace("ro_unless_trusted_5_1.txt"),
                 content: "read-only-unless-trusted",
@@ -1219,7 +1219,7 @@ fn scenarios() -> Vec<ScenarioSpec> {
         ScenarioSpec {
             name: "read_only_never_reports_sandbox_failure",
             approval_policy: Never,
-            sandbox_policy: SandboxPolicy::ReadOnly,
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
             action: ActionKind::WriteFile {
                 target: TargetPath::Workspace("ro_never.txt"),
                 content: "read-only-never",
@@ -1243,7 +1243,7 @@ fn scenarios() -> Vec<ScenarioSpec> {
         ScenarioSpec {
             name: "trusted_command_never_runs_without_prompt",
             approval_policy: Never,
-            sandbox_policy: SandboxPolicy::ReadOnly,
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
             action: ActionKind::RunCommand {
                 command: "echo trusted-never",
             },
@@ -1408,7 +1408,7 @@ fn scenarios() -> Vec<ScenarioSpec> {
         ScenarioSpec {
             name: "unified exec on request escalated requires approval",
             approval_policy: OnRequest,
-            sandbox_policy: SandboxPolicy::ReadOnly,
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
             action: ActionKind::RunUnifiedExecCommand {
                 command: "python3 -c 'print('\"'\"'escalated unified exec'\"'\"')'",
                 justification: Some(DEFAULT_UNIFIED_EXEC_JUSTIFICATION),
@@ -1687,7 +1687,7 @@ async fn approving_apply_patch_for_session_skips_future_prompts_for_same_file() 
 async fn approving_execpolicy_amendment_persists_policy_and_skips_future_prompts() -> Result<()> {
     let server = start_mock_server().await;
     let approval_policy = AskForApproval::UnlessTrusted;
-    let sandbox_policy = SandboxPolicy::ReadOnly;
+    let sandbox_policy = SandboxPolicy::new_read_only_policy();
     let sandbox_policy_for_config = sandbox_policy.clone();
     let mut builder = test_codex().with_config(move |config| {
         config.approval_policy = Constrained::allow_any(approval_policy);

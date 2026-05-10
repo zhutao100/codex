@@ -129,7 +129,9 @@ pub fn main() -> Result<()> {
     let base = unsafe { get_current_token_for_restriction()? };
     let token_res: Result<HANDLE> = unsafe {
         match &policy {
-            SandboxPolicy::ReadOnly => create_readonly_token_with_caps_from(base, &cap_psids),
+            SandboxPolicy::ReadOnly { .. } => {
+                create_readonly_token_with_caps_from(base, &cap_psids)
+            }
             SandboxPolicy::WorkspaceWrite { .. } => {
                 create_workspace_write_token_with_caps_from(base, &cap_psids)
             }

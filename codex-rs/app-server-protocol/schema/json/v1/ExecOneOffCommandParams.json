@@ -34,8 +34,15 @@
           "type": "object"
         },
         {
-          "description": "Read-only access to the entire file-system.",
+          "description": "Read-only access to the entire file-system, with optional per-session temporary writable roots.",
           "properties": {
+            "temp_writable_roots": {
+              "description": "Dedicated temporary directories that remain writable in an otherwise read-only sandbox. Parent temporary directories are not writable.",
+              "items": {
+                "$ref": "#/definitions/AbsolutePathBuf"
+              },
+              "type": "array"
+            },
             "type": {
               "enum": [
                 "read-only"

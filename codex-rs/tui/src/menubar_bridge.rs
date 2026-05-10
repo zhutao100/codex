@@ -599,7 +599,7 @@ mod imp {
     fn sandbox_status_label(policy: &SandboxPolicy) -> String {
         match policy {
             SandboxPolicy::DangerFullAccess => "danger-full-access".to_string(),
-            SandboxPolicy::ReadOnly => "read-only".to_string(),
+            SandboxPolicy::ReadOnly { .. } => "read-only".to_string(),
             SandboxPolicy::WorkspaceWrite { .. } => "workspace-write".to_string(),
             SandboxPolicy::ExternalSandbox { network_access } => {
                 if matches!(network_access, NetworkAccess::Enabled) {
@@ -672,7 +672,7 @@ mod imp {
                 model: "delegate-model".to_string(),
                 model_provider_id: "delegate-provider".to_string(),
                 approval_policy: codex_core::protocol::AskForApproval::Never,
-                sandbox_policy: SandboxPolicy::ReadOnly,
+                sandbox_policy: SandboxPolicy::new_read_only_policy(),
                 reasoning_effort: Some(codex_protocol::openai_models::ReasoningEffort::High),
                 service_tier: None,
                 model_context_window: Some(100_000),

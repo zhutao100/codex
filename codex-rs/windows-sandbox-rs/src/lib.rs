@@ -261,7 +261,7 @@ mod windows_impl {
         let caps = load_or_create_cap_sids(codex_home)?;
         let (h_token, psid_generic, psid_workspace): (HANDLE, *mut c_void, Option<*mut c_void>) = unsafe {
             match &policy {
-                SandboxPolicy::ReadOnly => {
+                SandboxPolicy::ReadOnly { .. } => {
                     let psid = convert_string_sid_to_sid(&caps.readonly).unwrap();
                     let (h, _) = super::token::create_readonly_token_with_cap(psid)?;
                     (h, psid, None)
@@ -528,7 +528,9 @@ mod windows_impl {
 
         #[test]
         fn applies_network_block_for_read_only() {
-            assert!(should_apply_network_block(&SandboxPolicy::ReadOnly));
+            assert!(should_apply_network_block(
+                &SandboxPolicy::new_read_only_policy()
+            ));
         }
     }
 }

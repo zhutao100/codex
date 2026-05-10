@@ -183,6 +183,11 @@ impl Session {
                 RolloutRecorderParams::resume(resumed_history.rollout_path.clone()),
             ),
         };
+        let read_only_temp_warnings =
+            super::read_only_temp::materialize_read_only_temp_writable_roots(
+                &mut session_configuration.sandbox_policy,
+                &config.sandbox_read_only,
+            );
         let state_builder = match &initial_history {
             InitialHistory::Resumed(resumed) => metadata::builder_from_items(
                 resumed.history.as_slice(),
@@ -242,6 +247,12 @@ impl Session {
             .map(|rec| rec.rollout_path.clone());
 
         let mut post_session_configured_events = Vec::<Event>::new();
+        for message in read_only_temp_warnings {
+            post_session_configured_events.push(Event {
+                id: INITIAL_SUBMIT_ID.to_owned(),
+                msg: EventMsg::Warning(WarningEvent { message }),
+            });
+        }
 
         for usage in config.features.legacy_feature_usages() {
             post_session_configured_events.push(Event {
@@ -301,7 +312,7 @@ impl Session {
             config.model_context_window,
             config.model_auto_compact_token_limit,
             config.approval_policy.value(),
-            config.sandbox_policy.get().clone(),
+            session_configuration.sandbox_policy.get().clone(),
             mcp_servers.keys().map(String::as_str).collect(),
             config.active_profile.clone(),
         );

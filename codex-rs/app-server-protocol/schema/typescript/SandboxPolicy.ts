@@ -7,7 +7,12 @@ import type { NetworkAccess } from "./NetworkAccess";
 /**
  * Determines execution restrictions for model shell commands.
  */
-export type SandboxPolicy = { "type": "danger-full-access" } | { "type": "read-only" } | { "type": "external-sandbox", 
+export type SandboxPolicy = { "type": "danger-full-access" } | { "type": "read-only", 
+/**
+ * Dedicated temporary directories that remain writable in an otherwise
+ * read-only sandbox. Parent temporary directories are not writable.
+ */
+temp_writable_roots?: Array<AbsolutePathBuf>, } | { "type": "external-sandbox", 
 /**
  * Whether the external sandbox permits outbound network traffic.
  */

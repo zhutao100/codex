@@ -425,7 +425,7 @@ mod tests {
             "parent-model",
             ReviewDelegateConfigParams {
                 base_instructions: "review prompt",
-                sandbox_policy: SandboxPolicy::ReadOnly,
+                sandbox_policy: SandboxPolicy::new_read_only_policy(),
                 disable_collab: true,
                 instruction_profile: ReviewDelegateInstructionProfile::Review,
             },
@@ -439,10 +439,10 @@ mod tests {
         assert!(!delegate.features.enabled(Feature::WebSearchCached));
         assert!(!delegate.features.enabled(Feature::Collab));
         assert_eq!(*delegate.approval_policy.get(), AskForApproval::Never);
-        assert_eq!(
-            delegate.sandbox_policy.get().clone(),
-            SandboxPolicy::ReadOnly
-        );
+        assert!(matches!(
+            delegate.sandbox_policy.get(),
+            SandboxPolicy::ReadOnly { .. }
+        ));
     }
 
     #[test]
@@ -461,7 +461,7 @@ mod tests {
             "parent-model",
             ReviewDelegateConfigParams {
                 base_instructions: "review prompt",
-                sandbox_policy: SandboxPolicy::ReadOnly,
+                sandbox_policy: SandboxPolicy::new_read_only_policy(),
                 disable_collab: true,
                 instruction_profile: ReviewDelegateInstructionProfile::Review,
             },
@@ -485,7 +485,7 @@ mod tests {
             "parent-model",
             ReviewDelegateConfigParams {
                 base_instructions: "review prompt",
-                sandbox_policy: SandboxPolicy::ReadOnly,
+                sandbox_policy: SandboxPolicy::new_read_only_policy(),
                 disable_collab: true,
                 instruction_profile: ReviewDelegateInstructionProfile::Review,
             },
@@ -515,7 +515,7 @@ mod tests {
             "parent-model",
             ReviewDelegateConfigParams {
                 base_instructions: "review prompt",
-                sandbox_policy: SandboxPolicy::ReadOnly,
+                sandbox_policy: SandboxPolicy::new_read_only_policy(),
                 disable_collab: true,
                 instruction_profile: ReviewDelegateInstructionProfile::PostTurnCompletionReview,
             },
@@ -531,7 +531,7 @@ mod tests {
             "parent-model",
             ReviewDelegateConfigParams {
                 base_instructions: "review prompt",
-                sandbox_policy: SandboxPolicy::ReadOnly,
+                sandbox_policy: SandboxPolicy::new_read_only_policy(),
                 disable_collab: true,
                 instruction_profile: ReviewDelegateInstructionProfile::PostTurnCompletionReview,
             },
@@ -547,7 +547,7 @@ mod tests {
             "parent-model",
             ReviewDelegateConfigParams {
                 base_instructions: "review prompt",
-                sandbox_policy: SandboxPolicy::ReadOnly,
+                sandbox_policy: SandboxPolicy::new_read_only_policy(),
                 disable_collab: true,
                 instruction_profile: ReviewDelegateInstructionProfile::PostTurnCompletionReview,
             },
@@ -579,7 +579,7 @@ mod tests {
             "parent-model",
             ReviewDelegateConfigParams {
                 base_instructions: "review prompt",
-                sandbox_policy: SandboxPolicy::ReadOnly,
+                sandbox_policy: SandboxPolicy::new_read_only_policy(),
                 disable_collab: true,
                 instruction_profile: ReviewDelegateInstructionProfile::Review,
             },
@@ -590,7 +590,7 @@ mod tests {
             "parent-model",
             ReviewDelegateConfigParams {
                 base_instructions: "review prompt",
-                sandbox_policy: SandboxPolicy::ReadOnly,
+                sandbox_policy: SandboxPolicy::new_read_only_policy(),
                 disable_collab: true,
                 instruction_profile: ReviewDelegateInstructionProfile::PostTurnCompletionReview,
             },

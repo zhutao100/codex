@@ -600,7 +600,7 @@ impl HistoryCell for StatusHistoryCell {
 fn sandbox_status_label(policy: &SandboxPolicy) -> String {
     match policy {
         SandboxPolicy::DangerFullAccess => "danger-full-access".to_string(),
-        SandboxPolicy::ReadOnly => "read-only".to_string(),
+        SandboxPolicy::ReadOnly { .. } => "read-only".to_string(),
         SandboxPolicy::WorkspaceWrite { .. } => "workspace-write".to_string(),
         SandboxPolicy::ExternalSandbox { network_access } => {
             if matches!(network_access, NetworkAccess::Enabled) {

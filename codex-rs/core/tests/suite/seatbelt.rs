@@ -11,6 +11,7 @@ use codex_core::protocol::SandboxPolicy;
 use codex_core::seatbelt::spawn_command_under_seatbelt;
 use codex_core::spawn::CODEX_SANDBOX_ENV_VAR;
 use codex_core::spawn::StdioPolicy;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use tempfile::TempDir;
 
 struct TestScenario {
@@ -145,7 +146,7 @@ async fn danger_full_access_allows_all_writes() {
 async fn read_only_forbids_all_writes() {
     let tmp = TempDir::new().expect("should be able to create temp dir");
     let test_scenario = create_test_scenario(&tmp);
-    let policy = SandboxPolicy::ReadOnly;
+    let policy = SandboxPolicy::new_read_only_policy();
 
     test_scenario
         .run_test(
@@ -160,6 +161,27 @@ async fn read_only_forbids_all_writes() {
 }
 
 #[tokio::test]
+async fn read_only_temp_root_allows_only_dedicated_child_writes() {
+    let temp_parent = TempDir::new().expect("should be able to create temp parent");
+    let writable_child = temp_parent.path().join("codex-readonly-test");
+    std::fs::create_dir(&writable_child).expect("create writable child");
+    let canonical_child = writable_child
+        .canonicalize()
+        .expect("canonicalize writable child");
+    let policy = SandboxPolicy::read_only_with_temp_writable_roots(vec![
+        AbsolutePathBuf::from_absolute_path(&canonical_child).expect("absolute writable child"),
+    ]);
+
+    let inside_child = canonical_child.join("inside.txt");
+    assert!(touch(&inside_child, &policy).await);
+    assert!(inside_child.exists());
+
+    let sibling = temp_parent.path().join("sibling.txt");
+    assert!(!touch(&sibling, &policy).await);
+    assert!(!sibling.exists());
+}
+
+#[tokio::test]
 async fn openpty_works_under_seatbelt() {
     if std::env::var(CODEX_SANDBOX_ENV_VAR) == Ok("seatbelt".to_string()) {
         eprintln!("{CODEX_SANDBOX_ENV_VAR} is set to 'seatbelt', skipping test.");
@@ -171,7 +193,7 @@ async fn openpty_works_under_seatbelt() {
         return;
     }
 
-    let policy = SandboxPolicy::ReadOnly;
+    let policy = SandboxPolicy::new_read_only_policy();
     let command_cwd = std::env::current_dir().expect("getcwd");
     let sandbox_cwd = command_cwd.clone();
 
@@ -228,7 +250,7 @@ async fn java_home_finds_runtime_under_seatbelt() {
         return;
     }
 
-    let policy = SandboxPolicy::ReadOnly;
+    let policy = SandboxPolicy::new_read_only_policy();
     let command_cwd = std::env::current_dir().expect("getcwd");
     let sandbox_cwd = command_cwd.clone();
 

@@ -4,7 +4,7 @@ use codex_core::protocol::SandboxPolicy;
 pub fn summarize_sandbox_policy(sandbox_policy: &SandboxPolicy) -> String {
     match sandbox_policy {
         SandboxPolicy::DangerFullAccess => "danger-full-access".to_string(),
-        SandboxPolicy::ReadOnly => "read-only".to_string(),
+        SandboxPolicy::ReadOnly { .. } => "read-only".to_string(),
         SandboxPolicy::ExternalSandbox { network_access } => {
             let mut summary = "external-sandbox".to_string();
             if matches!(network_access, NetworkAccess::Enabled) {

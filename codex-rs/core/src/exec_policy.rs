@@ -306,7 +306,7 @@ pub fn render_decision_for_unmatched_command(
     // On Windows, ReadOnly sandbox is not a real sandbox, so special-case it
     // here.
     let runtime_sandbox_provides_safety =
-        cfg!(windows) && matches!(sandbox_policy, SandboxPolicy::ReadOnly);
+        cfg!(windows) && matches!(sandbox_policy, SandboxPolicy::ReadOnly { .. });
 
     // If the command is flagged as dangerous or we have no sandbox protection,
     // we should never allow it to run without user approval.
@@ -341,7 +341,7 @@ pub fn render_decision_for_unmatched_command(
                     // command has not been flagged as dangerous.
                     Decision::Allow
                 }
-                SandboxPolicy::ReadOnly | SandboxPolicy::WorkspaceWrite { .. } => {
+                SandboxPolicy::ReadOnly { .. } | SandboxPolicy::WorkspaceWrite { .. } => {
                     // In restricted sandboxes (ReadOnly/WorkspaceWrite), do not prompt for
                     // non‑escalated, non‑dangerous commands — let the sandbox enforce
                     // restrictions (e.g., block network/write) without a user prompt.
@@ -936,7 +936,7 @@ prefix_rule(
                 features: &Features::with_defaults(),
                 command: &command,
                 approval_policy: AskForApproval::UnlessTrusted,
-                sandbox_policy: &SandboxPolicy::ReadOnly,
+                sandbox_policy: &SandboxPolicy::new_read_only_policy(),
                 sandbox_permissions: SandboxPermissions::UseDefault,
                 prefix_rule: None,
             })
@@ -967,7 +967,7 @@ prefix_rule(
                 features: &features,
                 command: &command,
                 approval_policy: AskForApproval::OnRequest,
-                sandbox_policy: &SandboxPolicy::ReadOnly,
+                sandbox_policy: &SandboxPolicy::new_read_only_policy(),
                 sandbox_permissions: SandboxPermissions::RequireEscalated,
                 prefix_rule: Some(vec!["cargo".to_string(), "install".to_string()]),
             })
@@ -1080,7 +1080,7 @@ prefix_rule(
                 features: &Features::with_defaults(),
                 command: &command,
                 approval_policy: AskForApproval::UnlessTrusted,
-                sandbox_policy: &SandboxPolicy::ReadOnly,
+                sandbox_policy: &SandboxPolicy::new_read_only_policy(),
                 sandbox_permissions: SandboxPermissions::UseDefault,
                 prefix_rule: None,
             })
@@ -1108,7 +1108,7 @@ prefix_rule(
                 features: &features,
                 command: &command,
                 approval_policy: AskForApproval::UnlessTrusted,
-                sandbox_policy: &SandboxPolicy::ReadOnly,
+                sandbox_policy: &SandboxPolicy::new_read_only_policy(),
                 sandbox_permissions: SandboxPermissions::UseDefault,
                 prefix_rule: None,
             })
@@ -1167,7 +1167,7 @@ prefix_rule(
                 features: &Features::with_defaults(),
                 command: &command,
                 approval_policy: AskForApproval::UnlessTrusted,
-                sandbox_policy: &SandboxPolicy::ReadOnly,
+                sandbox_policy: &SandboxPolicy::new_read_only_policy(),
                 sandbox_permissions: SandboxPermissions::UseDefault,
                 prefix_rule: None,
             })
@@ -1206,7 +1206,7 @@ prefix_rule(
                     features: &Features::with_defaults(),
                     command: &command,
                     approval_policy: AskForApproval::UnlessTrusted,
-                    sandbox_policy: &SandboxPolicy::ReadOnly,
+                    sandbox_policy: &SandboxPolicy::new_read_only_policy(),
                     sandbox_permissions: SandboxPermissions::UseDefault,
                     prefix_rule: None,
                 })
@@ -1230,7 +1230,7 @@ prefix_rule(
                 features: &Features::with_defaults(),
                 command: &command,
                 approval_policy: AskForApproval::OnRequest,
-                sandbox_policy: &SandboxPolicy::ReadOnly,
+                sandbox_policy: &SandboxPolicy::new_read_only_policy(),
                 sandbox_permissions: SandboxPermissions::UseDefault,
                 prefix_rule: None,
             })
@@ -1261,7 +1261,7 @@ prefix_rule(
                 features: &Features::with_defaults(),
                 command: &command,
                 approval_policy: AskForApproval::OnRequest,
-                sandbox_policy: &SandboxPolicy::ReadOnly,
+                sandbox_policy: &SandboxPolicy::new_read_only_policy(),
                 sandbox_permissions: SandboxPermissions::UseDefault,
                 prefix_rule: None,
             })
@@ -1353,7 +1353,7 @@ prefix_rule(
                     features: &features,
                     command: &sneaky_command,
                     approval_policy: AskForApproval::OnRequest,
-                    sandbox_policy: &SandboxPolicy::ReadOnly,
+                    sandbox_policy: &SandboxPolicy::new_read_only_policy(),
                     sandbox_permissions: permissions,
                     prefix_rule: None,
                 })
@@ -1377,7 +1377,7 @@ prefix_rule(
                     features: &features,
                     command: &dangerous_command,
                     approval_policy: AskForApproval::OnRequest,
-                    sandbox_policy: &SandboxPolicy::ReadOnly,
+                    sandbox_policy: &SandboxPolicy::new_read_only_policy(),
                     sandbox_permissions: permissions,
                     prefix_rule: None,
                 })
@@ -1397,7 +1397,7 @@ prefix_rule(
                     features: &features,
                     command: &dangerous_command,
                     approval_policy: AskForApproval::Never,
-                    sandbox_policy: &SandboxPolicy::ReadOnly,
+                    sandbox_policy: &SandboxPolicy::new_read_only_policy(),
                     sandbox_permissions: permissions,
                     prefix_rule: None,
                 })

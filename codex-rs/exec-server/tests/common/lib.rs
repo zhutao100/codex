@@ -105,7 +105,7 @@ where
     S: Service<RoleClient> + ClientHandler,
 {
     let sandbox_state = SandboxState {
-        sandbox_policy: SandboxPolicy::ReadOnly,
+        sandbox_policy: SandboxPolicy::new_read_only_policy(),
         codex_linux_sandbox_exe,
         sandbox_cwd: sandbox_cwd.as_ref().to_path_buf(),
         use_linux_sandbox_bwrap: false,

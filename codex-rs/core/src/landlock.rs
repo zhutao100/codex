@@ -96,7 +96,7 @@ mod tests {
     fn bwrap_flags_are_feature_gated() {
         let command = vec!["/bin/true".to_string()];
         let cwd = Path::new("/tmp");
-        let policy = SandboxPolicy::ReadOnly;
+        let policy = SandboxPolicy::new_read_only_policy();
 
         let with_bwrap = create_linux_sandbox_command_args(command.clone(), &policy, cwd, true);
         assert_eq!(

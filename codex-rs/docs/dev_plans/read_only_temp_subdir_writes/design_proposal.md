@@ -93,13 +93,13 @@ Keep the external mode name as `read-only`, but allow the runtime policy to carr
 
 ```rust
 SandboxPolicy::ReadOnly {
-    temp_writable_roots: Vec<WritableRoot>,
+    temp_writable_roots: Vec<AbsolutePathBuf>,
 }
 ```
 
 The empty vector preserves existing behavior.
 
-The dedicated temp roots should use the same low-level root representation and macOS Seatbelt emission path as `WorkspaceWrite` roots where possible. This avoids introducing a second write-policy generator.
+The dedicated temp roots should be converted into the same low-level `WritableRoot` representation and macOS Seatbelt emission path as `WorkspaceWrite` roots where possible. This avoids introducing a second write-policy generator while keeping the serialized policy compact; read-only temp roots do not need nested read-only subpaths.
 
 Conceptually:
 
@@ -183,7 +183,7 @@ Recommended minimal implementation sequence:
 
 2. Add `sandbox_read_only: SandboxReadOnlyConfig` to the root config type and parsing path in `core/src/config/mod.rs`.
 3. During session/config materialization, if effective mode is `ReadOnly`, create the requested per-session directories and attach their canonical paths to the runtime `SandboxPolicy::ReadOnly` value.
-4. Extend `protocol/src/protocol.rs` policy helpers so `ReadOnly` can return only these temp writable roots for Seatbelt emission without inheriting `WorkspaceWrite` defaults.
+4. Extend `protocol/src/protocol.rs` policy helpers so `ReadOnly` can return only these temp writable roots, converted to `WritableRoot`s, for Seatbelt emission without inheriting `WorkspaceWrite` defaults.
 5. Extend `core/src/seatbelt.rs` so `ReadOnly` with non-empty temp writable roots emits the same shape of `file-write*` rule used for exact root writes.
 6. Update the `<permissions instructions>` rendering path to enumerate the exact roots from the runtime policy.
 7. Add focused macOS tests.

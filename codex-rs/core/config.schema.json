@@ -1337,6 +1337,20 @@
       ],
       "type": "string"
     },
+    "SandboxReadOnlyConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "writeable_slash_tmp_subdir": {
+          "default": false,
+          "type": "boolean"
+        },
+        "writeable_tmpdir_env_var_subdir": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
     "SandboxWorkspaceWrite": {
       "additionalProperties": false,
       "properties": {
@@ -2116,6 +2130,18 @@
         }
       ],
       "description": "Sandbox mode to use."
+    },
+    "sandbox_read_only": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/SandboxReadOnlyConfig"
+        }
+      ],
+      "default": {
+        "writeable_slash_tmp_subdir": false,
+        "writeable_tmpdir_env_var_subdir": false
+      },
+      "description": "ReadOnly sandbox configuration for dedicated temporary writable subdirectories."
     },
     "sandbox_workspace_write": {
       "allOf": [

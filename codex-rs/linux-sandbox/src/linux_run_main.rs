@@ -340,7 +340,7 @@ mod tests {
     fn inserts_bwrap_argv0_before_command_separator() {
         let argv = build_bwrap_argv(
             vec!["/bin/true".to_string()],
-            &SandboxPolicy::ReadOnly,
+            &SandboxPolicy::new_read_only_policy(),
             Path::new("/"),
             BwrapOptions { mount_proc: true },
         );

@@ -127,7 +127,7 @@ async fn start_post_turn_completion_review_conversation(
         ctx.model_info.slug.as_str(),
         ReviewDelegateConfigParams {
             base_instructions: ctx.config.post_turn_completion_review_prompt(),
-            sandbox_policy: SandboxPolicy::ReadOnly,
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
             disable_collab: true,
             instruction_profile,
         },

@@ -410,9 +410,15 @@ pub enum SandboxPolicy {
     #[serde(rename = "danger-full-access")]
     DangerFullAccess,
 
-    /// Read-only access to the entire file-system.
+    /// Read-only access to the entire file-system, with optional per-session
+    /// temporary writable roots.
     #[serde(rename = "read-only")]
-    ReadOnly,
+    ReadOnly {
+        /// Dedicated temporary directories that remain writable in an otherwise
+        /// read-only sandbox. Parent temporary directories are not writable.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        temp_writable_roots: Vec<AbsolutePathBuf>,
+    },
 
     /// Indicates the process is already in an external sandbox. Allows full
     /// disk access while honoring the provided network setting.
@@ -492,7 +498,16 @@ impl FromStr for SandboxPolicy {
 impl SandboxPolicy {
     /// Returns a policy with read-only disk access and no network.
     pub fn new_read_only_policy() -> Self {
-        SandboxPolicy::ReadOnly
+        SandboxPolicy::ReadOnly {
+            temp_writable_roots: Vec::new(),
+        }
+    }
+
+    /// Returns a read-only policy with dedicated temporary writable roots.
+    pub fn read_only_with_temp_writable_roots(temp_writable_roots: Vec<AbsolutePathBuf>) -> Self {
+        SandboxPolicy::ReadOnly {
+            temp_writable_roots,
+        }
     }
 
     /// Returns a policy that can read the entire disk, but can only write to
@@ -516,7 +531,7 @@ impl SandboxPolicy {
         match self {
             SandboxPolicy::DangerFullAccess => true,
             SandboxPolicy::ExternalSandbox { .. } => true,
-            SandboxPolicy::ReadOnly => false,
+            SandboxPolicy::ReadOnly { .. } => false,
             SandboxPolicy::WorkspaceWrite { .. } => false,
         }
     }
@@ -525,7 +540,7 @@ impl SandboxPolicy {
         match self {
             SandboxPolicy::DangerFullAccess => true,
             SandboxPolicy::ExternalSandbox { network_access } => network_access.is_enabled(),
-            SandboxPolicy::ReadOnly => false,
+            SandboxPolicy::ReadOnly { .. } => false,
             SandboxPolicy::WorkspaceWrite { network_access, .. } => *network_access,
         }
     }
@@ -537,7 +552,16 @@ impl SandboxPolicy {
         match self {
             SandboxPolicy::DangerFullAccess => Vec::new(),
             SandboxPolicy::ExternalSandbox { .. } => Vec::new(),
-            SandboxPolicy::ReadOnly => Vec::new(),
+            SandboxPolicy::ReadOnly {
+                temp_writable_roots,
+            } => temp_writable_roots
+                .iter()
+                .cloned()
+                .map(|root| WritableRoot {
+                    root,
+                    read_only_subpaths: Vec::new(),
+                })
+                .collect(),
             SandboxPolicy::WorkspaceWrite {
                 writable_roots,
                 exclude_tmpdir_env_var,
@@ -2893,7 +2917,7 @@ mod tests {
                 model: "codex-mini-latest".to_string(),
                 model_provider_id: "openai".to_string(),
                 approval_policy: AskForApproval::Never,
-                sandbox_policy: SandboxPolicy::ReadOnly,
+                sandbox_policy: SandboxPolicy::new_read_only_policy(),
                 cwd: PathBuf::from("/home/user/project"),
                 reasoning_effort: Some(ReasoningEffortConfig::default()),
                 history_log_id: 0,

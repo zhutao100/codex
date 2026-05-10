@@ -241,6 +241,7 @@ use tokio::sync::watch;
 
 mod handlers;
 mod mcp;
+mod read_only_temp;
 mod review;
 #[allow(clippy::module_inception)]
 pub(crate) mod session;

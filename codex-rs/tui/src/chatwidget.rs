@@ -7495,15 +7495,16 @@ impl ChatWidget {
         }
         matches!(
             (&preset.sandbox, current_sandbox),
-            (SandboxPolicy::ReadOnly, SandboxPolicy::ReadOnly)
-                | (
-                    SandboxPolicy::DangerFullAccess,
-                    SandboxPolicy::DangerFullAccess
-                )
-                | (
-                    SandboxPolicy::WorkspaceWrite { .. },
-                    SandboxPolicy::WorkspaceWrite { .. }
-                )
+            (
+                SandboxPolicy::ReadOnly { .. },
+                SandboxPolicy::ReadOnly { .. }
+            ) | (
+                SandboxPolicy::DangerFullAccess,
+                SandboxPolicy::DangerFullAccess
+            ) | (
+                SandboxPolicy::WorkspaceWrite { .. },
+                SandboxPolicy::WorkspaceWrite { .. }
+            )
         )
     }
 
@@ -7624,7 +7625,7 @@ impl ChatWidget {
         let mut header_children: Vec<Box<dyn Renderable>> = Vec::new();
         let describe_policy = |policy: &SandboxPolicy| match policy {
             SandboxPolicy::WorkspaceWrite { .. } => "Agent mode",
-            SandboxPolicy::ReadOnly => "Read-Only mode",
+            SandboxPolicy::ReadOnly { .. } => "Read-Only mode",
             _ => "Agent mode",
         };
         let mode_label = preset
@@ -8036,7 +8037,7 @@ impl ChatWidget {
     /// Set the sandbox policy in the widget's config copy.
     pub(crate) fn set_sandbox_policy(&mut self, policy: SandboxPolicy) -> ConstraintResult<()> {
         #[cfg(target_os = "windows")]
-        let should_clear_downgrade = !matches!(&policy, SandboxPolicy::ReadOnly)
+        let should_clear_downgrade = !matches!(&policy, SandboxPolicy::ReadOnly { .. })
             || WindowsSandboxLevel::from_config(&self.config) != WindowsSandboxLevel::Disabled;
 
         self.config.sandbox_policy.set(policy)?;
