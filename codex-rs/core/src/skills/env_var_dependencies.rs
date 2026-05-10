@@ -8,8 +8,8 @@ use codex_protocol::request_user_input::RequestUserInputQuestion;
 use codex_protocol::request_user_input::RequestUserInputResponse;
 use tracing::warn;
 
-use crate::codex::Session;
-use crate::codex::TurnContext;
+use crate::session::session::Session;
+use crate::session::turn_context::TurnContext;
 use crate::skills::SkillMetadata;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -9,8 +9,6 @@ use tokio::time::Sleep;
 
 use super::UnifiedExecContext;
 use super::process::UnifiedExecProcess;
-use crate::codex::Session;
-use crate::codex::TurnContext;
 use crate::exec::ExecToolCallOutput;
 use crate::exec::MAX_EXEC_OUTPUT_DELTAS_PER_CALL;
 use crate::exec::StreamOutput;
@@ -18,6 +16,8 @@ use crate::protocol::EventMsg;
 use crate::protocol::ExecCommandOutputDeltaEvent;
 use crate::protocol::ExecCommandSource;
 use crate::protocol::ExecOutputStream;
+use crate::session::session::Session;
+use crate::session::turn_context::TurnContext;
 use crate::tools::events::ToolEmitter;
 use crate::tools::events::ToolEventCtx;
 use crate::tools::events::ToolEventStage;

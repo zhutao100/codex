@@ -1,11 +1,11 @@
 use crate::agent::AgentStatus;
 use crate::agent::exceeds_thread_spawn_depth_limit;
-use crate::codex::Session;
-use crate::codex::TurnContext;
 use crate::config::Config;
 use crate::error::CodexErr;
 use crate::features::Feature;
 use crate::function_tool::FunctionCallError;
+use crate::session::session::Session;
+use crate::session::turn_context::TurnContext;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
@@ -628,7 +628,6 @@ mod tests {
     use crate::ThreadManager;
     use crate::agent::MAX_THREAD_SPAWN_DEPTH;
     use crate::built_in_model_providers;
-    use crate::codex::make_session_and_context;
     use crate::config::types::ShellEnvironmentPolicy;
     use crate::function_tool::FunctionCallError;
     use crate::protocol::AskForApproval;
@@ -636,6 +635,7 @@ mod tests {
     use crate::protocol::SandboxPolicy;
     use crate::protocol::SessionSource;
     use crate::protocol::SubAgentSource;
+    use crate::session::tests::make_session_and_context;
     use crate::turn_diff_tracker::TurnDiffTracker;
     use codex_protocol::ThreadId;
     use pretty_assertions::assert_eq;
@@ -649,7 +649,7 @@ mod tests {
     use tokio::time::timeout;
 
     fn invocation(
-        session: Arc<crate::codex::Session>,
+        session: Arc<crate::session::session::Session>,
         turn: Arc<TurnContext>,
         tool_name: &str,
         payload: ToolPayload,

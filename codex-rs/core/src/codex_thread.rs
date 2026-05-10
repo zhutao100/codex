@@ -1,9 +1,9 @@
 use crate::agent::AgentStatus;
-use crate::codex::Codex;
 use crate::error::Result as CodexResult;
 use crate::protocol::Event;
 use crate::protocol::Op;
 use crate::protocol::Submission;
+use crate::session::Codex;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::openai_models::ReasoningEffort;

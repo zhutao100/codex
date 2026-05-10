@@ -4,13 +4,13 @@
 //! `ApprovalCtx`, `Approvable`) together with the sandbox orchestration traits
 //! and helpers (`Sandboxable`, `ToolRuntime`, `SandboxAttempt`, etc.).
 
-use crate::codex::Session;
-use crate::codex::TurnContext;
 use crate::error::CodexErr;
 use crate::protocol::SandboxPolicy;
 use crate::sandboxing::CommandSpec;
 use crate::sandboxing::SandboxManager;
 use crate::sandboxing::SandboxTransformError;
+use crate::session::session::Session;
+use crate::session::turn_context::TurnContext;
 use crate::state::SessionServices;
 use codex_protocol::approvals::ExecPolicyAmendment;
 use codex_protocol::protocol::AskForApproval;

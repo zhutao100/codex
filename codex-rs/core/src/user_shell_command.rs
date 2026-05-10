@@ -3,8 +3,8 @@ use std::time::Duration;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 
-use crate::codex::TurnContext;
 use crate::exec::ExecToolCallOutput;
+use crate::session::turn_context::TurnContext;
 use crate::tools::format_exec_output_str;
 
 pub const USER_SHELL_COMMAND_OPEN: &str = "<user_shell_command>";
@@ -70,8 +70,8 @@ pub fn user_shell_command_record_item(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codex::make_session_and_context;
     use crate::exec::StreamOutput;
+    use crate::session::tests::make_session_and_context;
     use pretty_assertions::assert_eq;
 
     #[test]

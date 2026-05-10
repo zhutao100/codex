@@ -21,8 +21,6 @@ use tracing::trace;
 use tracing::warn;
 
 use crate::AuthManager;
-use crate::codex::Session;
-use crate::codex::TurnContext;
 use crate::features::Feature;
 use crate::models_manager::manager::ModelsManager;
 use crate::protocol::CodexErrorInfo;
@@ -37,6 +35,8 @@ use crate::protocol::TurnCompleteEvent;
 use crate::protocol::TurnContinuationSource;
 use crate::protocol::TurnPauseReason;
 use crate::protocol::TurnPausedEvent;
+use crate::session::session::Session;
+use crate::session::turn_context::TurnContext;
 use crate::session_prefix::TURN_ABORTED_OPEN_TAG;
 use crate::state::ActiveTurn;
 use crate::state::PendingContinuation;

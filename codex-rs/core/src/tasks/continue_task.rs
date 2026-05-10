@@ -2,9 +2,9 @@ use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::codex::Session;
-use crate::codex::TurnContext;
-use crate::codex::continue_turn;
+use crate::session::session::Session;
+use crate::session::turn::continue_turn;
+use crate::session::turn_context::TurnContext;
 use crate::state::PendingContinuation;
 use crate::state::TaskKind;
 use crate::tasks::SessionTask;

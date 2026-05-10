@@ -8,7 +8,6 @@ use tokio_util::sync::CancellationToken;
 use tracing::error;
 use uuid::Uuid;
 
-use crate::codex::TurnContext;
 use crate::exec::ExecToolCallOutput;
 use crate::exec::SandboxType;
 use crate::exec::StdoutStream;
@@ -24,6 +23,7 @@ use crate::protocol::SandboxPolicy;
 use crate::protocol::TurnStartedEvent;
 use crate::sandboxing::ExecEnv;
 use crate::sandboxing::SandboxPermissions;
+use crate::session::turn_context::TurnContext;
 use crate::state::TaskKind;
 use crate::tools::format_exec_output_str;
 use crate::tools::runtimes::maybe_wrap_shell_lc_with_snapshot;
@@ -31,7 +31,7 @@ use crate::user_shell_command::user_shell_command_record_item;
 
 use super::SessionTask;
 use super::SessionTaskContext;
-use crate::codex::Session;
+use crate::session::session::Session;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 

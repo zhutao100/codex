@@ -18,11 +18,11 @@ use codex_protocol::protocol::TurnContinuationSource;
 use codex_protocol::user_input::UserInput;
 use tokio_util::sync::CancellationToken;
 
-use crate::codex::Session;
-use crate::codex::TurnContext;
 use crate::codex_delegate::DelegateRuntimeContextParams;
 use crate::codex_delegate::run_codex_thread_one_shot;
 use crate::error::CodexErr;
+use crate::session::session::Session;
+use crate::session::turn_context::TurnContext;
 use crate::state::CompletedTurnForReview;
 use crate::state::PendingContinuation;
 use crate::state::TaskKind;

@@ -13,8 +13,8 @@ use codex_protocol::models::ResponseInputItem;
 use codex_protocol::request_user_input::RequestUserInputResponse;
 use tokio::sync::oneshot;
 
-use crate::codex::TurnContext;
 use crate::protocol::ReviewDecision;
+use crate::session::turn_context::TurnContext;
 use crate::tasks::AnySessionTask;
 
 /// Metadata about the currently running turn.

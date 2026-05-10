@@ -4,9 +4,6 @@ use crate::CodexAuth;
 #[cfg(any(test, feature = "test-support"))]
 use crate::ModelProviderInfo;
 use crate::agent::AgentControl;
-use crate::codex::Codex;
-use crate::codex::CodexSpawnOk;
-use crate::codex::INITIAL_SUBMIT_ID;
 use crate::codex_thread::CodexThread;
 use crate::config::Config;
 use crate::error::CodexErr;
@@ -19,6 +16,9 @@ use crate::protocol::EventMsg;
 use crate::protocol::SessionConfiguredEvent;
 use crate::rollout::RolloutRecorder;
 use crate::rollout::truncation;
+use crate::session::Codex;
+use crate::session::CodexSpawnOk;
+use crate::session::INITIAL_SUBMIT_ID;
 use crate::skills::SkillsManager;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::CollaborationModeMask;
@@ -503,7 +503,7 @@ fn truncate_before_nth_user_message(history: InitialHistory, n: usize) -> Initia
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codex::make_session_and_context;
+    use crate::session::tests::make_session_and_context;
     use assert_matches::assert_matches;
     use codex_protocol::models::ContentItem;
     use codex_protocol::models::ReasoningItemReasoningSummary;

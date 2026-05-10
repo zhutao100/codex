@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use crate::codex::TurnContext;
-use crate::codex::run_turn;
+use crate::session::turn::run_turn;
+use crate::session::turn_context::TurnContext;
 use crate::state::TaskKind;
 use codex_protocol::user_input::UserInput;
 use tokio_util::sync::CancellationToken;

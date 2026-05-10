@@ -31,9 +31,9 @@ use rand::Rng;
 use rand::rng;
 use tokio::sync::Mutex;
 
-use crate::codex::Session;
-use crate::codex::TurnContext;
 use crate::sandboxing::SandboxPermissions;
+use crate::session::session::Session;
+use crate::session::turn_context::TurnContext;
 
 mod async_watcher;
 mod errors;
@@ -161,11 +161,11 @@ pub(crate) fn generate_chunk_id() -> String {
 mod tests {
     use super::head_tail_buffer::HeadTailBuffer;
     use super::*;
-    use crate::codex::Session;
-    use crate::codex::TurnContext;
-    use crate::codex::make_session_and_context;
     use crate::protocol::AskForApproval;
     use crate::protocol::SandboxPolicy;
+    use crate::session::session::Session;
+    use crate::session::tests::make_session_and_context;
+    use crate::session::turn_context::TurnContext;
     use crate::unified_exec::ExecCommandRequest;
     use crate::unified_exec::WriteStdinRequest;
     use core_test_support::skip_if_sandbox;

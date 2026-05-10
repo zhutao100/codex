@@ -14,8 +14,6 @@ use tracing::warn;
 use super::auth::McpOAuthLoginSupport;
 use super::auth::oauth_login_support;
 use super::effective_mcp_servers;
-use crate::codex::Session;
-use crate::codex::TurnContext;
 use crate::config::Config;
 use crate::config::edit::ConfigEditsBuilder;
 use crate::config::load_global_mcp_servers;
@@ -24,6 +22,8 @@ use crate::config::types::McpServerTransportConfig;
 use crate::default_client::is_first_party_originator;
 use crate::default_client::originator;
 use crate::features::Feature;
+use crate::session::session::Session;
+use crate::session::turn_context::TurnContext;
 use crate::skills::SkillMetadata;
 use crate::skills::model::SkillToolDependency;
 

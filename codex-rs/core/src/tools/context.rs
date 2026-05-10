@@ -1,5 +1,5 @@
-use crate::codex::Session;
-use crate::codex::TurnContext;
+use crate::session::session::Session;
+use crate::session::turn_context::TurnContext;
 use crate::tools::TELEMETRY_PREVIEW_MAX_BYTES;
 use crate::tools::TELEMETRY_PREVIEW_MAX_LINES;
 use crate::tools::TELEMETRY_PREVIEW_TRUNCATION_NOTICE;

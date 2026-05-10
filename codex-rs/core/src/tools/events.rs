@@ -1,5 +1,3 @@
-use crate::codex::Session;
-use crate::codex::TurnContext;
 use crate::error::CodexErr;
 use crate::error::SandboxErr;
 use crate::exec::ExecToolCallOutput;
@@ -15,6 +13,8 @@ use crate::protocol::PatchApplyEndEvent;
 use crate::protocol::ProgressTraceCategory;
 use crate::protocol::ProgressTraceState;
 use crate::protocol::TurnDiffEvent;
+use crate::session::session::Session;
+use crate::session::turn_context::TurnContext;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::sandboxing::ToolError;
 use codex_protocol::parse_command::ParsedCommand;

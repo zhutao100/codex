@@ -5,12 +5,12 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use crate::codex::SessionConfiguration;
 use crate::context_manager::ContextManager;
 use crate::protocol::RateLimitSnapshot;
 use crate::protocol::TokenUsage;
 use crate::protocol::TokenUsageInfo;
 use crate::protocol::TurnContinuationSource;
+use crate::session::session::SessionConfiguration;
 use crate::truncate::TruncationPolicy;
 
 #[derive(Clone, Debug, PartialEq, Eq)]

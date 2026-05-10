@@ -1,7 +1,7 @@
-use crate::codex::TurnContext;
 use crate::context_manager::normalize;
 use crate::instructions::SkillInstructions;
 use crate::instructions::UserInstructions;
+use crate::session::turn_context::TurnContext;
 use crate::session_prefix::is_session_prefix;
 use crate::truncate::TruncationPolicy;
 use crate::truncate::approx_token_count;

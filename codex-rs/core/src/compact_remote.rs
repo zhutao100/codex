@@ -1,8 +1,6 @@
 use std::sync::Arc;
 
 use crate::Prompt;
-use crate::codex::Session;
-use crate::codex::TurnContext;
 use crate::compact::PreparedCompactionInput;
 use crate::compact::prepare_history_for_compaction;
 use crate::compact::preserved_work_notes_message;
@@ -13,6 +11,8 @@ use crate::protocol::CompactedItem;
 use crate::protocol::EventMsg;
 use crate::protocol::RolloutItem;
 use crate::protocol::TurnStartedEvent;
+use crate::session::session::Session;
+use crate::session::turn_context::TurnContext;
 use codex_protocol::items::ContextCompactionItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::BaseInstructions;

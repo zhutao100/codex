@@ -68,9 +68,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::instrument;
 use tracing::warn;
 
-use crate::codex::INITIAL_SUBMIT_ID;
 use crate::config::types::McpServerConfig;
 use crate::config::types::McpServerTransportConfig;
+use crate::session::INITIAL_SUBMIT_ID;
 
 /// Delimiter used to separate the server name from the tool name in a fully
 /// qualified tool name.

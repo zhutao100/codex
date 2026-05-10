@@ -5,13 +5,13 @@ use codex_protocol::config_types::ModeKind;
 use codex_protocol::items::TurnItem;
 use tokio_util::sync::CancellationToken;
 
-use crate::codex::Session;
-use crate::codex::TurnContext;
 use crate::error::CodexErr;
 use crate::error::Result;
 use crate::function_tool::FunctionCallError;
 use crate::parse_turn_item;
 use crate::proposed_plan_parser::strip_proposed_plan_blocks;
+use crate::session::session::Session;
+use crate::session::turn_context::TurnContext;
 use crate::tools::parallel::ToolCallRuntime;
 use crate::tools::router::ToolRouter;
 use codex_protocol::models::FunctionCallOutputBody;

@@ -17,8 +17,6 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-use crate::codex::Session;
-use crate::codex::TurnContext;
 use crate::function_tool::FunctionCallError;
 use crate::protocol::EventMsg;
 use crate::protocol::McpInvocation;
@@ -26,6 +24,8 @@ use crate::protocol::McpToolCallBeginEvent;
 use crate::protocol::McpToolCallEndEvent;
 use crate::protocol::ProgressTraceCategory;
 use crate::protocol::ProgressTraceState;
+use crate::session::session::Session;
+use crate::session::turn_context::TurnContext;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
