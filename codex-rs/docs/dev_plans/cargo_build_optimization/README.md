@@ -13,8 +13,10 @@ Implemented inputs already present in this branch:
 - a `release-fast` profile for release-like developer builds.
 - a repeatable measurement script, `measure.sh`, that uses the repo-local Cargo
   wrapper and writes absolute-path-heavy captures outside the repository.
+- hidden `responses-api-proxy` and `stdio-to-uds` commands dispatch to sidecar
+  binaries instead of linking their libraries into the primary `codex` binary.
 
-Remaining scope is the larger `cargo build --release --bin codex` latency problem caused by the final `codex` binary's dependency closure and production release profile.
+Remaining scope is the larger `cargo build --release --bin codex` latency problem caused by the final `codex` binary's dependency closure and production release profile, especially still-linked public or semi-public command surfaces such as MCP, app-server tooling, cloud tasks, and OSS provider helpers.
 
 ## Target Base
 

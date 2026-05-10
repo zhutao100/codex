@@ -54,6 +54,11 @@ BINARY_COMPONENTS = {
         dest_dir="codex-responses-api-proxy",
         binary_basename="codex-responses-api-proxy",
     ),
+    "codex-stdio-to-uds": BinaryComponent(
+        artifact_prefix="codex-stdio-to-uds",
+        dest_dir="codex-stdio-to-uds",
+        binary_basename="codex-stdio-to-uds",
+    ),
     "codex-windows-sandbox-setup": BinaryComponent(
         artifact_prefix="codex-windows-sandbox-setup",
         dest_dir="codex",
@@ -135,7 +140,8 @@ def parse_args() -> argparse.Namespace:
         choices=tuple(list(BINARY_COMPONENTS) + ["rg"]),
         help=(
             "Limit installation to the specified components."
-            " May be repeated. Defaults to codex, codex-windows-sandbox-setup,"
+            " May be repeated. Defaults to codex, codex-responses-api-proxy,"
+            " codex-stdio-to-uds, codex-windows-sandbox-setup,"
             " codex-command-runner, and rg."
         ),
     )
@@ -160,6 +166,8 @@ def main() -> int:
 
     components = args.components or [
         "codex",
+        "codex-responses-api-proxy",
+        "codex-stdio-to-uds",
         "codex-windows-sandbox-setup",
         "codex-command-runner",
         "rg",

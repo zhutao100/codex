@@ -95,6 +95,8 @@ Acceptance:
 
 ## Phase 3: Split Hidden Proxy Sidecars
 
+Status: completed for `responses-api-proxy` and `stdio-to-uds`.
+
 Start with commands that already have separate packages and standalone binary targets:
 
 - `responses-api-proxy/Cargo.toml` provides `codex-responses-api-proxy`;

@@ -16,7 +16,7 @@ RESPONSES_API_PROXY_NPM_ROOT = REPO_ROOT / "codex-rs" / "responses-api-proxy" / 
 CODEX_SDK_ROOT = REPO_ROOT / "sdk" / "typescript"
 
 PACKAGE_NATIVE_COMPONENTS: dict[str, list[str]] = {
-    "codex": ["codex", "rg"],
+    "codex": ["codex", "codex-responses-api-proxy", "codex-stdio-to-uds", "rg"],
     "codex-responses-api-proxy": ["codex-responses-api-proxy"],
     "codex-sdk": ["codex"],
 }
@@ -26,6 +26,7 @@ WINDOWS_ONLY_COMPONENTS: dict[str, list[str]] = {
 COMPONENT_DEST_DIR: dict[str, str] = {
     "codex": "codex",
     "codex-responses-api-proxy": "codex-responses-api-proxy",
+    "codex-stdio-to-uds": "codex-stdio-to-uds",
     "codex-windows-sandbox-setup": "codex",
     "codex-command-runner": "codex",
     "rg": "path",

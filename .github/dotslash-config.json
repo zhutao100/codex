@@ -56,6 +56,34 @@
         }
       }
     },
+    "codex-stdio-to-uds": {
+      "platforms": {
+        "macos-aarch64": {
+          "regex": "^codex-stdio-to-uds-aarch64-apple-darwin\\.zst$",
+          "path": "codex-stdio-to-uds"
+        },
+        "macos-x86_64": {
+          "regex": "^codex-stdio-to-uds-x86_64-apple-darwin\\.zst$",
+          "path": "codex-stdio-to-uds"
+        },
+        "linux-x86_64": {
+          "regex": "^codex-stdio-to-uds-x86_64-unknown-linux-musl\\.zst$",
+          "path": "codex-stdio-to-uds"
+        },
+        "linux-aarch64": {
+          "regex": "^codex-stdio-to-uds-aarch64-unknown-linux-musl\\.zst$",
+          "path": "codex-stdio-to-uds"
+        },
+        "windows-x86_64": {
+          "regex": "^codex-stdio-to-uds-x86_64-pc-windows-msvc\\.exe\\.zst$",
+          "path": "codex-stdio-to-uds.exe"
+        },
+        "windows-aarch64": {
+          "regex": "^codex-stdio-to-uds-aarch64-pc-windows-msvc\\.exe\\.zst$",
+          "path": "codex-stdio-to-uds.exe"
+        }
+      }
+    },
     "codex-command-runner": {
       "platforms": {
         "windows-x86_64": {

@@ -22,17 +22,18 @@ use codex_exec::Cli as ExecCli;
 use codex_exec::Command as ExecCommand;
 use codex_exec::ReviewArgs;
 use codex_execpolicy::ExecPolicyCheckCommand;
-use codex_responses_api_proxy::Args as ResponsesApiProxyArgs;
 use codex_tui::AppExitInfo;
 use codex_tui::Cli as TuiCli;
 use codex_tui::ExitReason;
 use codex_tui::update_action::UpdateAction;
 use owo_colors::OwoColorize;
+use std::ffi::OsString;
 use std::fs;
 use std::io::IsTerminal;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
+use std::process::ExitStatus;
 use supports_color::Stream;
 
 #[cfg(target_os = "macos")]
@@ -139,11 +140,11 @@ enum Subcommand {
 
     /// Internal: run the responses API proxy.
     #[clap(hide = true)]
-    ResponsesApiProxy(ResponsesApiProxyArgs),
+    ResponsesApiProxy(SidecarCommand),
 
     /// Internal: relay stdio to a Unix domain socket.
     #[clap(hide = true, name = "stdio-to-uds")]
-    StdioToUds(StdioToUdsCommand),
+    StdioToUds(SidecarCommand),
 
     /// Inspect feature flags.
     Features(FeaturesCli),
@@ -403,10 +404,15 @@ struct CodexdRunCommand {
 }
 
 #[derive(Debug, Parser)]
-struct StdioToUdsCommand {
-    /// Path to the Unix domain socket to connect to.
-    #[arg(value_name = "SOCKET_PATH")]
-    socket_path: PathBuf,
+#[command(disable_help_flag = true, disable_version_flag = true)]
+struct SidecarCommand {
+    #[arg(
+        value_name = "ARGS",
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        num_args = 0..
+    )]
+    args: Vec<OsString>,
 }
 
 fn format_exit_messages(exit_info: AppExitInfo, color_enabled: bool) -> Vec<String> {
@@ -504,6 +510,96 @@ fn run_debug_app_server_command(cmd: DebugAppServerCommand) -> anyhow::Result<()
             codex_app_server_test_client::send_message_v2(&codex_bin, &[], cmd.user_message, &None)
         }
     }
+}
+
+fn run_sidecar(binary_name: &str, args: Vec<OsString>) -> anyhow::Result<()> {
+    let sidecar_path = find_sidecar_executable(binary_name)?;
+    let status = ProcessCommand::new(&sidecar_path)
+        .args(args)
+        .status()
+        .map_err(|err| {
+            anyhow::anyhow!(
+                "failed to run sidecar `{binary_name}` at {}: {err}",
+                sidecar_path.display()
+            )
+        })?;
+
+    if !status.success() {
+        exit_with_status(status);
+    }
+
+    Ok(())
+}
+
+fn find_sidecar_executable(binary_name: &str) -> anyhow::Result<PathBuf> {
+    let current_exe = std::env::current_exe()
+        .map_err(|err| anyhow::anyhow!("failed to determine current executable path: {err}"))?;
+    let candidates = sidecar_executable_candidates(binary_name, &current_exe);
+
+    for candidate in &candidates {
+        if candidate.is_file() {
+            return Ok(candidate.clone());
+        }
+    }
+
+    let checked_paths = candidates
+        .iter()
+        .map(|path| format!("  - {}", path.display()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    anyhow::bail!(
+        "required sidecar executable `{binary_name}` was not found. Build or install `{binary_name}` next to `codex`, or ensure it is on PATH.\nChecked:\n{checked_paths}"
+    );
+}
+
+fn sidecar_executable_candidates(binary_name: &str, current_exe: &Path) -> Vec<PathBuf> {
+    let binary_file = sidecar_executable_file_name(binary_name);
+    let binary_file_path = Path::new(&binary_file);
+    let current_exe_dir = current_exe.parent();
+    let mut candidates = Vec::new();
+
+    if let Some(exe_dir) = current_exe_dir {
+        candidates.push(exe_dir.join(binary_file_path));
+    }
+
+    if let Some(container_dir) = current_exe_dir.and_then(Path::parent) {
+        candidates.push(container_dir.join(binary_name).join(binary_file_path));
+    }
+
+    if let Some(path) = std::env::var_os("PATH") {
+        candidates.extend(std::env::split_paths(&path).map(|dir| dir.join(binary_file_path)));
+    }
+
+    let mut unique = Vec::new();
+    for candidate in candidates {
+        if !unique.contains(&candidate) {
+            unique.push(candidate);
+        }
+    }
+    unique
+}
+
+fn sidecar_executable_file_name(binary_name: &str) -> OsString {
+    let mut file_name = OsString::from(binary_name);
+    file_name.push(std::env::consts::EXE_SUFFIX);
+    file_name
+}
+
+fn exit_with_status(status: ExitStatus) -> ! {
+    if let Some(code) = status.code() {
+        std::process::exit(code);
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+
+        if let Some(signal) = status.signal() {
+            std::process::exit(128 + signal);
+        }
+    }
+
+    std::process::exit(1);
 }
 
 async fn run_codexd_command(cmd: CodexdCommand) -> anyhow::Result<()> {
@@ -1008,13 +1104,10 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
             run_apply_command(apply_cli, None).await?;
         }
         Some(Subcommand::ResponsesApiProxy(args)) => {
-            tokio::task::spawn_blocking(move || codex_responses_api_proxy::run_main(args))
-                .await??;
+            run_sidecar("codex-responses-api-proxy", args.args)?;
         }
         Some(Subcommand::StdioToUds(cmd)) => {
-            let socket_path = cmd.socket_path;
-            tokio::task::spawn_blocking(move || codex_stdio_to_uds::run(socket_path.as_path()))
-                .await??;
+            run_sidecar("codex-stdio-to-uds", cmd.args)?;
         }
         Some(Subcommand::Features(FeaturesCli { sub })) => match sub {
             FeaturesSubcommand::List => {

@@ -1,19 +1,19 @@
-use std::env;
 use std::path::PathBuf;
-use std::process;
+
+use clap::Parser;
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "codex-stdio-to-uds",
+    about = "Relay standard input and output to a Unix domain socket."
+)]
+struct Args {
+    /// Path to the Unix domain socket to connect to.
+    #[arg(value_name = "SOCKET_PATH")]
+    socket_path: PathBuf,
+}
 
 fn main() -> anyhow::Result<()> {
-    let mut args = env::args_os().skip(1);
-    let Some(socket_path) = args.next() else {
-        eprintln!("Usage: codex-stdio-to-uds <socket-path>");
-        process::exit(1);
-    };
-
-    if args.next().is_some() {
-        eprintln!("Expected exactly one argument: <socket-path>");
-        process::exit(1);
-    }
-
-    let socket_path = PathBuf::from(socket_path);
-    codex_stdio_to_uds::run(&socket_path)
+    let args = Args::parse();
+    codex_stdio_to_uds::run(&args.socket_path)
 }

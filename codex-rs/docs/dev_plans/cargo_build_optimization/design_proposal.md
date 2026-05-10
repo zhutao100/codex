@@ -18,10 +18,10 @@ Partially implemented. This proposal records the completed compile-time/profile 
 |---|---|---|---|
 |P0|Native async `ToolHandler` and `SessionTask` adapters|Implemented|Low, already landed|
 |P0|`dev`, `dev-small`, `release-fast`, and release split-debug profile work|Implemented|Low, already landed|
-|P1|Make `release-fast` the documented developer release-like build path|Proposed documentation/process change|Low|
-|P1|Add a repeatable measurement protocol for release vs release-fast and dependency closure|Proposed|Low|
+|P1|Make `release-fast` the documented developer release-like build path|Implemented|Low|
+|P1|Add a repeatable measurement protocol for release vs release-fast and dependency closure|Implemented|Low|
 |P2|Document opt-in local cache/linker accelerators|Proposed|Low if opt-in only|
-|P3|Split cold/internal subcommands out of the primary `codex` binary|Proposed|Medium/high|
+|P3|Split cold/internal subcommands out of the primary `codex` binary|Partially implemented for hidden proxy sidecars; remaining candidates are measurement-gated|Medium/high|
 |P4|Isolate OSS provider readiness from `codex-common` when not needed|Proposed, measurement-gated|Medium|
 |P5|Split embedded skills/assets or macro-heavy subsystems only after attribution|Proposed, measurement-gated|Medium/high|
 
@@ -137,8 +137,8 @@ Acceptance:
 |Current command surface|Current dependency pressure|Possible split|
 |---|---|---|
 |`codex app-server generate-ts` and `generate-json-schema`|`codex-app-server-protocol`, codegen/schema dependencies, test-client adjacency|move protocol generation to a separate developer/codegen binary|
-|hidden `responses-api-proxy`|`codex-responses-api-proxy` in `codex-cli`|dispatch to existing `codex-responses-api-proxy` sidecar binary|
-|hidden `stdio-to-uds`|`codex-stdio-to-uds` in `codex-cli`|dispatch to existing `codex-stdio-to-uds` sidecar binary|
+|hidden `responses-api-proxy`|removed from `codex-cli` dependency closure|dispatches to existing `codex-responses-api-proxy` sidecar binary|
+|hidden `stdio-to-uds`|removed from `codex-cli` dependency closure|dispatches to existing `codex-stdio-to-uds` sidecar binary|
 |`mcp-server`|`codex-mcp-server` in `codex-cli`|dispatch to existing `codex-mcp-server` sidecar binary if packaging already includes it|
 |`cloud` / `cloud-tasks`|`codex-cloud-tasks`, TUI, login/core closure|move to an optional sidecar if cloud task UX does not require the primary binary|
 |debug app-server tooling|debug/test-client dependencies|move to a developer-only binary or gate behind non-release packaging|
