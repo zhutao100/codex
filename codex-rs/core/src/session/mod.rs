@@ -1034,15 +1034,15 @@ impl Session {
 
     /// Persist the event to rollout and send it to clients.
     pub(crate) async fn send_event(&self, turn_context: &TurnContext, msg: EventMsg) {
-        let legacy_source = msg.clone();
+        let show_raw_agent_reasoning = self.show_raw_agent_reasoning();
+        let legacy_events = msg.as_legacy_events(show_raw_agent_reasoning);
         let event = Event {
             id: turn_context.sub_id.clone(),
             msg,
         };
         self.send_event_raw(event).await;
 
-        let show_raw_agent_reasoning = self.show_raw_agent_reasoning();
-        for legacy in legacy_source.as_legacy_events(show_raw_agent_reasoning) {
+        for legacy in legacy_events {
             let legacy_event = Event {
                 id: turn_context.sub_id.clone(),
                 msg: legacy,
@@ -1056,15 +1056,15 @@ impl Session {
     /// Use this for events whose canonical persistence belongs to another
     /// session, such as forwarded delegate events.
     pub(crate) async fn send_event_transient(&self, turn_context: &TurnContext, msg: EventMsg) {
-        let legacy_source = msg.clone();
+        let show_raw_agent_reasoning = self.show_raw_agent_reasoning();
+        let legacy_events = msg.as_legacy_events(show_raw_agent_reasoning);
         let event = Event {
             id: turn_context.sub_id.clone(),
             msg,
         };
         self.send_event_raw_transient(event).await;
 
-        let show_raw_agent_reasoning = self.show_raw_agent_reasoning();
-        for legacy in legacy_source.as_legacy_events(show_raw_agent_reasoning) {
+        for legacy in legacy_events {
             let legacy_event = Event {
                 id: turn_context.sub_id.clone(),
                 msg: legacy,
@@ -1641,6 +1641,14 @@ impl Session {
         state.clone_history()
     }
 
+    pub(crate) async fn prompt_history(&self) -> Vec<ResponseItem> {
+        let items = {
+            let state = self.state.lock().await;
+            state.history.raw_items().to_vec()
+        };
+        ContextManager::prepare_items_for_prompt(items)
+    }
+
     pub(crate) async fn update_token_usage_info(
         &self,
         turn_context: &TurnContext,
@@ -1657,11 +1665,14 @@ impl Session {
     }
 
     pub(crate) async fn recompute_token_usage(&self, turn_context: &TurnContext) {
-        let history = self.clone_history().await;
         let base_instructions = self.get_base_instructions().await;
-        let Some(estimated_total_tokens) =
-            history.estimate_token_count_with_base_instructions(&base_instructions)
-        else {
+        let estimated_total_tokens = {
+            let state = self.state.lock().await;
+            state
+                .history
+                .estimate_token_count_with_base_instructions(&base_instructions)
+        };
+        let Some(estimated_total_tokens) = estimated_total_tokens else {
             return;
         };
         {

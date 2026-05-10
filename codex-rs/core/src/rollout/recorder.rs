@@ -15,6 +15,7 @@ use time::OffsetDateTime;
 use time::format_description::FormatItem;
 use time::macros::format_description;
 use tokio::io::AsyncWriteExt;
+use tokio::io::BufWriter;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::mpsc::{self};
 use tokio::sync::oneshot;
@@ -55,8 +56,8 @@ use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_state::ThreadMetadataBuilder;
 
-/// Records all [`ResponseItem`]s for a session and flushes them to disk after
-/// every update.
+/// Records all [`ResponseItem`]s for a session and flushes them to disk at
+/// explicit durability boundaries.
 ///
 /// Rollouts are recorded as JSONL and can be inspected with tools such as:
 ///
@@ -643,7 +644,9 @@ async fn rollout_writer(
     mut state_builder: Option<ThreadMetadataBuilder>,
     default_provider: String,
 ) -> std::io::Result<()> {
-    let mut writer = JsonlWriter { file };
+    let mut writer = JsonlWriter {
+        file: BufWriter::new(file),
+    };
     if let Some(builder) = state_builder.as_mut() {
         builder.rollout_path = rollout_path.clone();
     }
@@ -678,15 +681,11 @@ async fn rollout_writer(
     while let Some(cmd) = rx.recv().await {
         match cmd {
             RolloutCmd::AddItems(items) => {
-                let mut persisted_items = Vec::new();
-                for item in items {
-                    if is_persisted_response_item(&item) {
-                        writer.write_rollout_item(&item).await?;
-                        persisted_items.push(item);
-                    }
-                }
-                if persisted_items.is_empty() {
+                if items.is_empty() {
                     continue;
+                }
+                for item in &items {
+                    writer.write_rollout_item(item).await?;
                 }
                 if let Some(builder) = state_builder.as_mut() {
                     builder.rollout_path = rollout_path.clone();
@@ -696,7 +695,7 @@ async fn rollout_writer(
                     rollout_path.as_path(),
                     default_provider.as_str(),
                     state_builder.as_ref(),
-                    persisted_items.as_slice(),
+                    items.as_slice(),
                     "rollout_writer",
                 )
                 .await;
@@ -710,16 +709,22 @@ async fn rollout_writer(
                 let _ = ack.send(());
             }
             RolloutCmd::Shutdown { ack } => {
+                if let Err(e) = writer.file.flush().await {
+                    let _ = ack.send(());
+                    return Err(e);
+                }
                 let _ = ack.send(());
             }
         }
     }
 
+    writer.file.flush().await?;
+
     Ok(())
 }
 
 struct JsonlWriter {
-    file: tokio::fs::File,
+    file: BufWriter<tokio::fs::File>,
 }
 
 #[derive(serde::Serialize)]
@@ -748,7 +753,6 @@ impl JsonlWriter {
         let mut json = serde_json::to_string(item)?;
         json.push('\n');
         self.file.write_all(json.as_bytes()).await?;
-        self.file.flush().await?;
         Ok(())
     }
 }

@@ -35,6 +35,7 @@ fn create_history_with_items(items: Vec<ResponseItem>) -> ContextManager {
     // Use a generous but fixed token budget; tests only rely on truncation
     // behavior, not on a specific model's token limit.
     h.record_items(items.iter(), TruncationPolicy::Tokens(10_000));
+    assert_token_cache_matches(&h);
     h
 }
 
@@ -106,6 +107,20 @@ fn truncate_exec_output(content: &str) -> String {
 
 fn approx_token_count_for_text(text: &str) -> i64 {
     i64::try_from(text.len().saturating_add(3) / 4).unwrap_or(i64::MAX)
+}
+
+fn assert_token_cache_matches(history: &ContextManager) {
+    let expected_estimates: Vec<i64> = history
+        .raw_items()
+        .iter()
+        .map(estimate_item_token_count)
+        .collect();
+    let expected_total = expected_estimates
+        .iter()
+        .fold(0i64, |acc, estimate| acc.saturating_add(*estimate));
+
+    assert_eq!(history.item_token_estimates, expected_estimates);
+    assert_eq!(history.total_item_tokens, expected_total);
 }
 
 #[test]
@@ -294,6 +309,7 @@ fn remove_first_item_removes_matching_output_for_function_call() {
     let mut h = create_history_with_items(items);
     h.remove_first_item();
     assert_eq!(h.raw_items(), vec![]);
+    assert_token_cache_matches(&h);
 }
 
 #[test]
@@ -313,6 +329,7 @@ fn remove_first_item_removes_matching_call_for_output() {
     let mut h = create_history_with_items(items);
     h.remove_first_item();
     assert_eq!(h.raw_items(), vec![]);
+    assert_token_cache_matches(&h);
 }
 
 #[test]
@@ -334,6 +351,7 @@ fn remove_last_item_removes_matching_call_for_output() {
 
     assert!(h.remove_last_item());
     assert_eq!(h.raw_items(), vec![user_msg("before tool call")]);
+    assert_token_cache_matches(&h);
 }
 
 #[test]
@@ -373,6 +391,7 @@ fn replace_last_turn_images_replaces_tool_output_images() {
             },
         ]
     );
+    assert_token_cache_matches(&history);
 }
 
 #[test]
@@ -415,6 +434,7 @@ fn remove_first_item_handles_local_shell_pair() {
     let mut h = create_history_with_items(items);
     h.remove_first_item();
     assert_eq!(h.raw_items(), vec![]);
+    assert_token_cache_matches(&h);
 }
 
 #[test]
@@ -556,6 +576,7 @@ fn remove_first_item_handles_custom_tool_pair() {
     let mut h = create_history_with_items(items);
     h.remove_first_item();
     assert_eq!(h.raw_items(), vec![]);
+    assert_token_cache_matches(&h);
 }
 
 #[test]
@@ -603,6 +624,7 @@ fn record_items_truncates_function_call_output_content() {
     history.record_items([&item], policy);
 
     assert_eq!(history.items.len(), 1);
+    assert_token_cache_matches(&history);
     match &history.items[0] {
         ResponseItem::FunctionCallOutput { output, .. } => {
             let content = output.text_content().unwrap_or_default();
@@ -634,6 +656,7 @@ fn record_items_truncates_custom_tool_call_output_content() {
     history.record_items([&item], policy);
 
     assert_eq!(history.items.len(), 1);
+    assert_token_cache_matches(&history);
     match &history.items[0] {
         ResponseItem::CustomToolCallOutput { output, .. } => {
             assert_ne!(output, &long_output);
@@ -664,6 +687,7 @@ fn record_items_respects_custom_token_limit() {
     };
 
     history.record_items([&item], policy);
+    assert_token_cache_matches(&history);
 
     let stored = match &history.items[0] {
         ResponseItem::FunctionCallOutput { output, .. } => output,
@@ -783,6 +807,7 @@ fn normalize_adds_missing_output_for_function_call() {
     let mut h = create_history_with_items(items);
 
     h.normalize_history();
+    assert_token_cache_matches(&h);
 
     assert_eq!(
         h.raw_items(),

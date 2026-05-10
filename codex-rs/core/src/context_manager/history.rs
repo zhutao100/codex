@@ -24,6 +24,8 @@ use std::ops::Deref;
 pub(crate) struct ContextManager {
     /// The oldest items are at the beginning of the vector.
     items: Vec<ResponseItem>,
+    item_token_estimates: Vec<i64>,
+    total_item_tokens: i64,
     token_info: Option<TokenUsageInfo>,
 }
 
@@ -31,6 +33,8 @@ impl ContextManager {
     pub(crate) fn new() -> Self {
         Self {
             items: Vec::new(),
+            item_token_estimates: Vec::new(),
+            total_item_tokens: 0,
             token_info: TokenUsageInfo::new_or_append(&None, &None, None),
         }
     }
@@ -66,17 +70,20 @@ impl ContextManager {
             }
 
             let processed = self.process_item(item_ref, policy);
-            self.items.push(processed);
+            self.push_item(processed);
         }
     }
 
     /// Returns the history prepared for sending to the model. This applies a proper
     /// normalization and drop un-suited items.
-    pub(crate) fn for_prompt(mut self) -> Vec<ResponseItem> {
-        self.normalize_history();
-        self.items
-            .retain(|item| !matches!(item, ResponseItem::GhostSnapshot { .. }));
-        self.items
+    pub(crate) fn for_prompt(self) -> Vec<ResponseItem> {
+        Self::prepare_items_for_prompt(self.items)
+    }
+
+    pub(crate) fn prepare_items_for_prompt(mut items: Vec<ResponseItem>) -> Vec<ResponseItem> {
+        normalize::normalize_history(&mut items);
+        items.retain(|item| !matches!(item, ResponseItem::GhostSnapshot { .. }));
+        items
     }
 
     /// Returns raw items in the history.
@@ -100,28 +107,24 @@ impl ContextManager {
         let base_tokens =
             i64::try_from(approx_token_count(&base_instructions.text)).unwrap_or(i64::MAX);
 
-        let items_tokens = self.items.iter().fold(0i64, |acc, item| {
-            acc.saturating_add(estimate_item_token_count(item))
-        });
-
-        Some(base_tokens.saturating_add(items_tokens))
+        Some(base_tokens.saturating_add(self.total_item_tokens))
     }
 
     pub(crate) fn remove_first_item(&mut self) {
         if !self.items.is_empty() {
             // Remove the oldest item (front of the list). Items are ordered from
             // oldest → newest, so index 0 is the first entry recorded.
-            let removed = self.items.remove(0);
+            let removed = self.remove_item_at(0);
             // If the removed item participates in a call/output pair, also remove
             // its corresponding counterpart to keep the invariants intact without
             // running a full normalization pass.
-            normalize::remove_corresponding_for(&mut self.items, &removed);
+            self.remove_corresponding_for(&removed);
         }
     }
 
     pub(crate) fn remove_last_item(&mut self) -> bool {
-        if let Some(removed) = self.items.pop() {
-            normalize::remove_corresponding_for(&mut self.items, &removed);
+        if let Some(removed) = self.pop_item() {
+            self.remove_corresponding_for(&removed);
             true
         } else {
             false
@@ -129,7 +132,7 @@ impl ContextManager {
     }
 
     pub(crate) fn replace(&mut self, items: Vec<ResponseItem>) {
-        self.items = items;
+        self.replace_items(items);
     }
 
     /// Replace image content in the last turn if it originated from a tool output.
@@ -157,6 +160,9 @@ impl ContextManager {
                         replaced = true;
                     }
                 }
+                if replaced {
+                    self.update_item_token_estimate(index);
+                }
                 replaced
             }
             ResponseItem::Message { role, .. } if role == "user" => false,
@@ -178,10 +184,8 @@ impl ContextManager {
             return;
         }
 
-        let snapshot = self.items.clone();
-        let user_positions = user_message_positions(&snapshot);
+        let user_positions = user_message_positions(&self.items);
         let Some(&first_user_idx) = user_positions.first() else {
-            self.replace(snapshot);
             return;
         };
 
@@ -192,7 +196,7 @@ impl ContextManager {
             user_positions[user_positions.len() - n_from_end]
         };
 
-        self.replace(snapshot[..cut_idx].to_vec());
+        self.truncate_items(cut_idx);
     }
 
     pub(crate) fn update_token_info(
@@ -219,28 +223,27 @@ impl ContextManager {
 
         self.items
             .iter()
+            .zip(&self.item_token_estimates)
             .take(last_user_index)
             .filter(|item| {
                 matches!(
-                    item,
+                    item.0,
                     ResponseItem::Reasoning {
                         encrypted_content: Some(_),
                         ..
                     }
                 )
             })
-            .fold(0i64, |acc, item| {
-                acc.saturating_add(estimate_item_token_count(item))
-            })
+            .fold(0i64, |acc, (_, estimate)| acc.saturating_add(*estimate))
     }
 
     fn get_trailing_codex_generated_items_tokens(&self) -> i64 {
         let mut total = 0i64;
-        for item in self.items.iter().rev() {
+        for (item, estimate) in self.items.iter().zip(&self.item_token_estimates).rev() {
             if !is_codex_generated_item(item) {
                 break;
             }
-            total = total.saturating_add(estimate_item_token_count(item));
+            total = total.saturating_add(*estimate);
         }
         total
     }
@@ -266,12 +269,70 @@ impl ContextManager {
     /// This function enforces a couple of invariants on the in-memory history:
     /// 1. every call (function/custom) has a corresponding output entry
     /// 2. every output has a corresponding call entry
+    #[cfg(test)]
     fn normalize_history(&mut self) {
-        // all function/tool calls must have a corresponding output
-        normalize::ensure_call_outputs_present(&mut self.items);
+        normalize::normalize_history(&mut self.items);
+        self.rebuild_token_estimates();
+    }
 
-        // all outputs must have a corresponding function/tool call
-        normalize::remove_orphan_outputs(&mut self.items);
+    fn push_item(&mut self, item: ResponseItem) {
+        let token_estimate = estimate_item_token_count(&item);
+        self.total_item_tokens = self.total_item_tokens.saturating_add(token_estimate);
+        self.item_token_estimates.push(token_estimate);
+        self.items.push(item);
+    }
+
+    fn pop_item(&mut self) -> Option<ResponseItem> {
+        let index = self.items.len().checked_sub(1)?;
+        let token_estimate = self.item_token_estimates.remove(index);
+        let item = self.items.remove(index);
+        self.total_item_tokens = self.total_item_tokens.saturating_sub(token_estimate);
+        Some(item)
+    }
+
+    fn remove_item_at(&mut self, index: usize) -> ResponseItem {
+        let token_estimate = self.item_token_estimates.remove(index);
+        let item = self.items.remove(index);
+        self.total_item_tokens = self.total_item_tokens.saturating_sub(token_estimate);
+        item
+    }
+
+    fn remove_corresponding_for(&mut self, item: &ResponseItem) {
+        if let Some(pos) = normalize::corresponding_position_for(&self.items, item) {
+            self.remove_item_at(pos);
+        }
+    }
+
+    fn replace_items(&mut self, items: Vec<ResponseItem>) {
+        self.items = items;
+        self.rebuild_token_estimates();
+    }
+
+    fn truncate_items(&mut self, len: usize) {
+        self.items.truncate(len);
+        self.item_token_estimates.truncate(len);
+        self.total_item_tokens = self
+            .item_token_estimates
+            .iter()
+            .fold(0i64, |acc, estimate| acc.saturating_add(*estimate));
+    }
+
+    fn update_item_token_estimate(&mut self, index: usize) {
+        let previous = self.item_token_estimates[index];
+        let updated = estimate_item_token_count(&self.items[index]);
+        self.item_token_estimates[index] = updated;
+        self.total_item_tokens = self
+            .total_item_tokens
+            .saturating_sub(previous)
+            .saturating_add(updated);
+    }
+
+    fn rebuild_token_estimates(&mut self) {
+        self.item_token_estimates = self.items.iter().map(estimate_item_token_count).collect();
+        self.total_item_tokens = self
+            .item_token_estimates
+            .iter()
+            .fold(0i64, |acc, estimate| acc.saturating_add(*estimate));
     }
 
     fn process_item(&self, item: &ResponseItem, policy: TruncationPolicy) -> ResponseItem {

@@ -136,8 +136,7 @@ async fn run_turn_inner(
                 let mut client_session = sess.services.model_client.new_session();
 
                 loop {
-                    let sampling_request_input: Vec<ResponseItem> =
-                        { sess.clone_history().await.for_prompt() };
+                    let sampling_request_input: Vec<ResponseItem> = sess.prompt_history().await;
                     let tool_selection = SamplingRequestToolSelection {
                         explicit_app_paths: &explicit_app_paths,
                         skill_name_counts_lower: &skill_name_counts_lower,
@@ -333,7 +332,7 @@ async fn run_turn_inner(
         }
 
         // Construct the input that we will send to the model.
-        let sampling_request_input: Vec<ResponseItem> = { sess.clone_history().await.for_prompt() };
+        let sampling_request_input: Vec<ResponseItem> = sess.prompt_history().await;
 
         let sampling_request_input_messages = sampling_request_input
             .iter()
