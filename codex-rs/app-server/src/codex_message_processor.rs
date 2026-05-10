@@ -1943,7 +1943,7 @@ impl CodexMessageProcessor {
         base_instructions: Option<String>,
         developer_instructions: Option<String>,
         personality: Option<Personality>,
-        service_tier: Option<codex_protocol::config_types::ServiceTier>,
+        service_tier: Option<String>,
     ) -> ConfigOverrides {
         ConfigOverrides {
             model,

@@ -25,7 +25,7 @@ pub(crate) struct SessionConfiguration {
 
     pub(super) collaboration_mode: CollaborationMode,
     pub(super) model_reasoning_summary: ReasoningSummaryConfig,
-    pub(super) service_tier: Option<ServiceTier>,
+    pub(super) service_tier: Option<String>,
 
     /// Developer instructions that supplement the base instructions.
     pub(super) developer_instructions: Option<String>,
@@ -81,7 +81,7 @@ impl SessionConfiguration {
             sandbox_policy: self.sandbox_policy.get().clone(),
             cwd: self.cwd.clone(),
             reasoning_effort: self.collaboration_mode.reasoning_effort(),
-            service_tier: self.service_tier,
+            service_tier: self.service_tier.clone(),
             personality: self.personality,
             session_source: self.session_source.clone(),
         }
@@ -95,8 +95,9 @@ impl SessionConfiguration {
         if let Some(summary) = updates.reasoning_summary {
             next_configuration.model_reasoning_summary = summary;
         }
-        if let Some(service_tier) = updates.service_tier {
-            next_configuration.service_tier = Some(service_tier);
+        if let Some(service_tier) = updates.service_tier.clone() {
+            next_configuration.service_tier =
+                Some(ServiceTier::normalize_request_value(service_tier));
         }
         if let Some(personality) = updates.personality {
             next_configuration.personality = Some(personality);
@@ -125,7 +126,7 @@ pub(crate) struct SessionSettingsUpdate {
     pub(crate) windows_sandbox_level: Option<WindowsSandboxLevel>,
     pub(crate) collaboration_mode: Option<CollaborationMode>,
     pub(crate) reasoning_summary: Option<ReasoningSummaryConfig>,
-    pub(crate) service_tier: Option<ServiceTier>,
+    pub(crate) service_tier: Option<String>,
     pub(crate) final_output_json_schema: Option<Option<Value>>,
     pub(crate) personality: Option<Personality>,
 }
@@ -432,7 +433,7 @@ impl Session {
                 sandbox_policy: session_configuration.sandbox_policy.get().clone(),
                 cwd: session_configuration.cwd.clone(),
                 reasoning_effort: session_configuration.collaboration_mode.reasoning_effort(),
-                service_tier: session_configuration.service_tier,
+                service_tier: session_configuration.service_tier.clone(),
                 history_log_id,
                 history_entry_count,
                 initial_messages,

@@ -5,7 +5,6 @@ import type { CollaborationMode } from "../CollaborationMode";
 import type { Personality } from "../Personality";
 import type { ReasoningEffort } from "../ReasoningEffort";
 import type { ReasoningSummary } from "../ReasoningSummary";
-import type { ServiceTier } from "../ServiceTier";
 import type { JsonValue } from "../serde_json/JsonValue";
 import type { AskForApproval } from "./AskForApproval";
 import type { SandboxPolicy } from "./SandboxPolicy";
@@ -43,7 +42,7 @@ personality?: Personality | null,
 /**
  * Override the service tier for this turn and subsequent turns.
  */
-serviceTier?: ServiceTier | null, 
+serviceTier?: string | null, 
 /**
  * Optional JSON Schema used to constrain the final assistant message for this turn.
  */

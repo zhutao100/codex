@@ -64,7 +64,7 @@ pub(super) async fn spawn_review_thread(
     let otel_manager_for_context = otel_manager.clone();
     let reasoning_effort = per_turn_config.model_reasoning_effort;
     let reasoning_summary = per_turn_config.model_reasoning_summary;
-    let service_tier = per_turn_config.service_tier;
+    let service_tier = per_turn_config.service_tier.clone();
     let session_source = parent_turn_context.session_source.clone();
 
     let per_turn_config = Arc::new(per_turn_config);

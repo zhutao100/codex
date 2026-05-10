@@ -43,7 +43,6 @@ use codex_core::protocol_config_types::ReasoningSummary;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Personality;
-use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::Settings;
 use codex_protocol::openai_models::ReasoningEffort;
 use core_test_support::responses;
@@ -561,7 +560,7 @@ async fn turn_start_service_tier_override_is_sticky_v2() -> Result<()> {
                 text: "Fast tier".to_string(),
                 text_elements: Vec::new(),
             }],
-            service_tier: Some(ServiceTier::Fast),
+            service_tier: Some("fast".to_string()),
             ..Default::default()
         })
         .await?;

@@ -6,6 +6,7 @@ use crate::path_utils::resolve_symlink_write_paths;
 use crate::path_utils::write_atomically;
 use anyhow::Context;
 use codex_protocol::config_types::Personality;
+use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::TrustLevel;
 use codex_protocol::openai_models::ReasoningEffort;
 use std::collections::BTreeMap;
@@ -26,6 +27,8 @@ pub enum ConfigEdit {
         model: Option<String>,
         effort: Option<ReasoningEffort>,
     },
+    /// Update the service tier preference for future turns.
+    SetServiceTier { service_tier: Option<String> },
     /// Update the active (or default) model personality.
     SetModelPersonality { personality: Option<Personality> },
     /// Toggle the acknowledgement flag under `[notice]`.
@@ -297,6 +300,13 @@ impl ConfigDocument {
                 );
                 mutated
             }),
+            ConfigEdit::SetServiceTier { service_tier } => Ok(self.write_profile_value(
+                &["service_tier"],
+                service_tier
+                    .as_deref()
+                    .map(ServiceTier::normalize_config_value)
+                    .map(value),
+            )),
             ConfigEdit::SetModelPersonality { personality } => Ok(self.write_profile_value(
                 &["personality"],
                 personality.map(|personality| value(personality.to_string())),
@@ -744,6 +754,11 @@ impl ConfigEditsBuilder {
         self
     }
 
+    pub fn set_service_tier(mut self, service_tier: Option<String>) -> Self {
+        self.edits.push(ConfigEdit::SetServiceTier { service_tier });
+        self
+    }
+
     pub fn set_personality(mut self, personality: Option<Personality>) -> Self {
         self.edits
             .push(ConfigEdit::SetModelPersonality { personality });
@@ -873,6 +888,36 @@ mod tests {
 model_reasoning_effort = "high"
 "#;
         assert_eq!(contents, expected);
+    }
+
+    #[test]
+    fn set_service_tier_saves_priority_as_fast() {
+        let tmp = tempdir().expect("tmpdir");
+        let codex_home = tmp.path();
+
+        ConfigEditsBuilder::new(codex_home)
+            .set_service_tier(Some(ServiceTier::Fast.request_value().to_string()))
+            .apply_blocking()
+            .expect("persist");
+
+        let contents =
+            std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
+        assert_eq!(contents, "service_tier = \"fast\"\n");
+    }
+
+    #[test]
+    fn set_service_tier_preserves_unknown_service_tier() {
+        let tmp = tempdir().expect("tmpdir");
+        let codex_home = tmp.path();
+
+        ConfigEditsBuilder::new(codex_home)
+            .set_service_tier(Some("experimental-tier-id".to_string()))
+            .apply_blocking()
+            .expect("persist");
+
+        let contents =
+            std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
+        assert_eq!(contents, "service_tier = \"experimental-tier-id\"\n");
     }
 
     #[test]

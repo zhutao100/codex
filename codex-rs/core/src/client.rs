@@ -401,7 +401,7 @@ impl ModelClientSession {
         model_info: &ModelInfo,
         effort: Option<ReasoningEffortConfig>,
         summary: ReasoningSummaryConfig,
-        service_tier: Option<ServiceTier>,
+        service_tier: Option<String>,
         turn_metadata_header: Option<&str>,
         compression: Compression,
     ) -> ApiResponsesOptions {
@@ -640,7 +640,7 @@ impl ModelClientSession {
         otel_manager: &OtelManager,
         effort: Option<ReasoningEffortConfig>,
         summary: ReasoningSummaryConfig,
-        service_tier: Option<ServiceTier>,
+        service_tier: Option<String>,
         turn_metadata_header: Option<&str>,
     ) -> Result<ResponseStream> {
         if let Some(path) = &*CODEX_RS_SSE_FIXTURE {
@@ -687,7 +687,7 @@ impl ModelClientSession {
                 model_info,
                 effort,
                 summary,
-                service_tier,
+                service_tier.clone(),
                 turn_metadata_header,
                 compression,
             );
@@ -722,7 +722,7 @@ impl ModelClientSession {
         otel_manager: &OtelManager,
         effort: Option<ReasoningEffortConfig>,
         summary: ReasoningSummaryConfig,
-        service_tier: Option<ServiceTier>,
+        service_tier: Option<String>,
         turn_metadata_header: Option<&str>,
     ) -> Result<WebsocketStreamOutcome> {
         let auth_manager = self.client.state.auth_manager.clone();
@@ -753,7 +753,7 @@ impl ModelClientSession {
                 model_info,
                 effort,
                 summary,
-                service_tier,
+                service_tier.clone(),
                 turn_metadata_header,
                 compression,
             );
@@ -832,7 +832,7 @@ impl ModelClientSession {
         otel_manager: &OtelManager,
         effort: Option<ReasoningEffortConfig>,
         summary: ReasoningSummaryConfig,
-        service_tier: Option<ServiceTier>,
+        service_tier: Option<String>,
         turn_metadata_header: Option<&str>,
     ) -> Result<ResponseStream> {
         let wire_api = self.client.state.provider.wire_api;
@@ -849,7 +849,7 @@ impl ModelClientSession {
                             otel_manager,
                             effort,
                             summary,
-                            service_tier,
+                            service_tier.clone(),
                             turn_metadata_header,
                         )
                         .await?
@@ -867,7 +867,7 @@ impl ModelClientSession {
                     otel_manager,
                     effort,
                     summary,
-                    service_tier,
+                    service_tier.clone(),
                     turn_metadata_header,
                 )
                 .await
@@ -972,16 +972,13 @@ fn build_responses_headers(
 
 fn service_tier_for_wire(
     provider: &ModelProviderInfo,
-    service_tier: Option<ServiceTier>,
+    service_tier: Option<String>,
 ) -> Option<String> {
     if !provider.is_openai() {
         return None;
     }
 
-    service_tier.map(|service_tier| match service_tier {
-        ServiceTier::Fast => "priority".to_string(),
-        ServiceTier::Flex => "flex".to_string(),
-    })
+    service_tier.map(ServiceTier::normalize_request_value)
 }
 
 fn map_response_stream<S>(
@@ -1162,14 +1159,21 @@ mod tests {
             .expect("ollama provider");
 
         assert_eq!(
-            service_tier_for_wire(openai, Some(ServiceTier::Flex)),
+            service_tier_for_wire(openai, Some("flex".to_string())),
             Some("flex".to_string())
         );
         assert_eq!(
-            service_tier_for_wire(openai, Some(ServiceTier::Fast)),
+            service_tier_for_wire(openai, Some("fast".to_string())),
             Some("priority".to_string())
         );
+        assert_eq!(
+            service_tier_for_wire(openai, Some("experimental-tier-id".to_string())),
+            Some("experimental-tier-id".to_string())
+        );
         assert_eq!(service_tier_for_wire(openai, None), None);
-        assert_eq!(service_tier_for_wire(ollama, Some(ServiceTier::Flex)), None);
+        assert_eq!(
+            service_tier_for_wire(ollama, Some("flex".to_string())),
+            None
+        );
     }
 }

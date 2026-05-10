@@ -2992,15 +2992,11 @@
               "description": "How to sandbox commands executed in the system"
             },
             "service_tier": {
-              "anyOf": [
-                {
-                  "$ref": "#/definitions/v2/ServiceTier"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Effective service tier used for Responses requests in this session."
+              "description": "Effective service tier used for Responses requests in this session.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "session_id": {
               "$ref": "#/definitions/v2/ThreadId"
@@ -7757,13 +7753,9 @@
           "type": "string"
         },
         "service_tier": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/ServiceTier"
-            },
-            {
-              "type": "null"
-            }
+          "type": [
+            "string",
+            "null"
           ]
         },
         "session_id": {
@@ -8867,14 +8859,6 @@
         }
       ],
       "title": "ServerRequest"
-    },
-    "ServiceTier": {
-      "description": "Controls the service tier requested from the Responses API.",
-      "enum": [
-        "fast",
-        "flex"
-      ],
-      "type": "string"
     },
     "SessionConfiguredNotification": {
       "$schema": "http://json-schema.org/draft-07/schema#",
@@ -11031,13 +11015,9 @@
             ]
           },
           "service_tier": {
-            "anyOf": [
-              {
-                "$ref": "#/definitions/v2/ServiceTier"
-              },
-              {
-                "type": "null"
-              }
+            "type": [
+              "string",
+              "null"
             ]
           },
           "tools": {
@@ -12837,13 +12817,9 @@
             ]
           },
           "service_tier": {
-            "anyOf": [
-              {
-                "$ref": "#/definitions/v2/ServiceTier"
-              },
-              {
-                "type": "null"
-              }
+            "type": [
+              "string",
+              "null"
             ]
           },
           "web_search": {
@@ -13909,14 +13885,6 @@
         },
         "type": "object"
       },
-      "ServiceTier": {
-        "description": "Controls the service tier requested from the Responses API.",
-        "enum": [
-          "fast",
-          "flex"
-        ],
-        "type": "string"
-      },
       "SessionSource": {
         "oneOf": [
           {
@@ -14621,13 +14589,9 @@
             ]
           },
           "serviceTier": {
-            "anyOf": [
-              {
-                "$ref": "#/definitions/v2/ServiceTier"
-              },
-              {
-                "type": "null"
-              }
+            "type": [
+              "string",
+              "null"
             ]
           },
           "threadId": {
@@ -14669,13 +14633,9 @@
             "$ref": "#/definitions/v2/SandboxPolicy"
           },
           "serviceTier": {
-            "anyOf": [
-              {
-                "$ref": "#/definitions/v2/ServiceTier"
-              },
-              {
-                "type": "null"
-              }
+            "type": [
+              "string",
+              "null"
             ]
           },
           "thread": {
@@ -15439,13 +15399,9 @@
             ]
           },
           "serviceTier": {
-            "anyOf": [
-              {
-                "$ref": "#/definitions/v2/ServiceTier"
-              },
-              {
-                "type": "null"
-              }
+            "type": [
+              "string",
+              "null"
             ]
           },
           "threadId": {
@@ -15487,13 +15443,9 @@
             "$ref": "#/definitions/v2/SandboxPolicy"
           },
           "serviceTier": {
-            "anyOf": [
-              {
-                "$ref": "#/definitions/v2/ServiceTier"
-              },
-              {
-                "type": "null"
-              }
+            "type": [
+              "string",
+              "null"
             ]
           },
           "thread": {
@@ -15675,13 +15627,9 @@
             ]
           },
           "serviceTier": {
-            "anyOf": [
-              {
-                "$ref": "#/definitions/v2/ServiceTier"
-              },
-              {
-                "type": "null"
-              }
+            "type": [
+              "string",
+              "null"
             ]
           }
         },
@@ -15717,13 +15665,9 @@
             "$ref": "#/definitions/v2/SandboxPolicy"
           },
           "serviceTier": {
-            "anyOf": [
-              {
-                "$ref": "#/definitions/v2/ServiceTier"
-              },
-              {
-                "type": "null"
-              }
+            "type": [
+              "string",
+              "null"
             ]
           },
           "thread": {
@@ -16225,15 +16169,11 @@
             "description": "Override the sandbox policy for this turn and subsequent turns."
           },
           "serviceTier": {
-            "anyOf": [
-              {
-                "$ref": "#/definitions/v2/ServiceTier"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "description": "Override the service tier for this turn and subsequent turns."
+            "description": "Override the service tier for this turn and subsequent turns.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "summary": {
             "anyOf": [

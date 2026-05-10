@@ -58,6 +58,44 @@ pub enum ServiceTier {
     Flex,
 }
 
+impl ServiceTier {
+    pub const fn request_value(self) -> &'static str {
+        match self {
+            Self::Fast => "priority",
+            Self::Flex => "flex",
+        }
+    }
+
+    pub const fn config_value(self) -> &'static str {
+        match self {
+            Self::Fast => "fast",
+            Self::Flex => "flex",
+        }
+    }
+
+    pub fn from_request_value(value: &str) -> Option<Self> {
+        match value {
+            "fast" | "priority" => Some(Self::Fast),
+            "flex" => Some(Self::Flex),
+            _ => None,
+        }
+    }
+
+    pub fn normalize_request_value(value: String) -> String {
+        match Self::from_request_value(&value) {
+            Some(service_tier) => service_tier.request_value().to_string(),
+            None => value,
+        }
+    }
+
+    pub fn normalize_config_value(value: &str) -> &str {
+        match Self::from_request_value(value) {
+            Some(service_tier) => service_tier.config_value(),
+            None => value,
+        }
+    }
+}
+
 #[derive(
     Deserialize, Debug, Clone, Copy, PartialEq, Default, Serialize, Display, JsonSchema, TS,
 )]

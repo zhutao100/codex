@@ -185,13 +185,9 @@
           ]
         },
         "service_tier": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/ServiceTier"
-            },
-            {
-              "type": "null"
-            }
+          "type": [
+            "string",
+            "null"
           ]
         },
         "tools": {
@@ -480,13 +476,9 @@
           ]
         },
         "service_tier": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/ServiceTier"
-            },
-            {
-              "type": "null"
-            }
+          "type": [
+            "string",
+            "null"
           ]
         },
         "web_search": {
@@ -565,14 +557,6 @@
         }
       },
       "type": "object"
-    },
-    "ServiceTier": {
-      "description": "Controls the service tier requested from the Responses API.",
-      "enum": [
-        "fast",
-        "flex"
-      ],
-      "type": "string"
     },
     "ToolsV2": {
       "properties": {

@@ -979,15 +979,11 @@
               "description": "How to sandbox commands executed in the system"
             },
             "service_tier": {
-              "anyOf": [
-                {
-                  "$ref": "#/definitions/ServiceTier"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Effective service tier used for Responses requests in this session."
+              "description": "Effective service tier used for Responses requests in this session.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "session_id": {
               "$ref": "#/definitions/ThreadId"
@@ -4514,13 +4510,9 @@
           "type": "string"
         },
         "service_tier": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/ServiceTier"
-            },
-            {
-              "type": "null"
-            }
+          "type": [
+            "string",
+            "null"
           ]
         },
         "session_id": {
@@ -4668,14 +4660,6 @@
           "type": "object"
         }
       ]
-    },
-    "ServiceTier": {
-      "description": "Controls the service tier requested from the Responses API.",
-      "enum": [
-        "fast",
-        "flex"
-      ],
-      "type": "string"
     },
     "SessionSource": {
       "oneOf": [

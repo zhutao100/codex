@@ -2129,14 +2129,6 @@
       ],
       "type": "object"
     },
-    "ServiceTier": {
-      "description": "Controls the service tier requested from the Responses API.",
-      "enum": [
-        "fast",
-        "flex"
-      ],
-      "type": "string"
-    },
     "SetDefaultModelParams": {
       "properties": {
         "model": {
@@ -2349,13 +2341,9 @@
           ]
         },
         "serviceTier": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/ServiceTier"
-            },
-            {
-              "type": "null"
-            }
+          "type": [
+            "string",
+            "null"
           ]
         },
         "threadId": {
@@ -2555,13 +2543,9 @@
           ]
         },
         "serviceTier": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/ServiceTier"
-            },
-            {
-              "type": "null"
-            }
+          "type": [
+            "string",
+            "null"
           ]
         },
         "threadId": {
@@ -2709,13 +2693,9 @@
           ]
         },
         "serviceTier": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/ServiceTier"
-            },
-            {
-              "type": "null"
-            }
+          "type": [
+            "string",
+            "null"
           ]
         }
       },
@@ -2831,15 +2811,11 @@
           "description": "Override the sandbox policy for this turn and subsequent turns."
         },
         "serviceTier": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/ServiceTier"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Override the service tier for this turn and subsequent turns."
+          "description": "Override the service tier for this turn and subsequent turns.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "summary": {
           "anyOf": [

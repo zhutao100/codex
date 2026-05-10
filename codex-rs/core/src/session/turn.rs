@@ -1539,7 +1539,7 @@ async fn try_run_sampling_request(
             &turn_context.otel_manager,
             turn_context.reasoning_effort,
             turn_context.reasoning_summary,
-            turn_context.service_tier,
+            turn_context.service_tier.clone(),
             turn_metadata_header,
         )
         .instrument(trace_span!("stream_request"))

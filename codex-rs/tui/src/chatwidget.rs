@@ -4287,7 +4287,7 @@ impl ChatWidget {
             final_output_json_schema: None,
             collaboration_mode,
             personality,
-            service_tier: self.config.service_tier,
+            service_tier: self.config.service_tier.clone(),
         };
 
         if !self.agent_turn_running {

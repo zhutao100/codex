@@ -17,7 +17,6 @@ use crate::config_types::CollaborationMode;
 use crate::config_types::ModeKind;
 use crate::config_types::Personality;
 use crate::config_types::ReasoningSummary as ReasoningSummaryConfig;
-use crate::config_types::ServiceTier;
 use crate::config_types::WindowsSandboxLevel;
 use crate::custom_prompts::CustomPrompt;
 use crate::dynamic_tools::DynamicToolCallRequest;
@@ -156,7 +155,7 @@ pub enum Op {
 
         /// Optional service tier override for this turn.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        service_tier: Option<ServiceTier>,
+        service_tier: Option<String>,
     },
 
     /// Override parts of the persistent turn context for subsequent turns.
@@ -209,7 +208,7 @@ pub enum Op {
 
         /// Updated service tier preference.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        service_tier: Option<ServiceTier>,
+        service_tier: Option<String>,
     },
 
     /// Approve a command execution
@@ -1342,7 +1341,7 @@ pub struct RuntimeContextSnapshot {
     pub reasoning_effort: Option<ReasoningEffortConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
-    pub service_tier: Option<ServiceTier>,
+    pub service_tier: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub model_context_window: Option<i64>,
@@ -2438,7 +2437,7 @@ pub struct SessionConfiguredEvent {
 
     /// Effective service tier used for Responses requests in this session.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub service_tier: Option<ServiceTier>,
+    pub service_tier: Option<String>,
 
     /// Identifier of the history log file (inode on Unix, 0 otherwise).
     pub history_log_id: u64,

@@ -11,7 +11,7 @@ pub(crate) struct TurnContext {
     pub(crate) provider: ModelProviderInfo,
     pub(crate) reasoning_effort: Option<ReasoningEffortConfig>,
     pub(crate) reasoning_summary: ReasoningSummaryConfig,
-    pub(crate) service_tier: Option<ServiceTier>,
+    pub(crate) service_tier: Option<String>,
     pub(crate) session_source: SessionSource,
     /// The session's current working directory. All relative paths provided by
     /// the model as well as sandbox policies are resolved against this path
@@ -107,7 +107,7 @@ impl Session {
         per_turn_config.model_reasoning_effort =
             session_configuration.collaboration_mode.reasoning_effort();
         per_turn_config.model_reasoning_summary = session_configuration.model_reasoning_summary;
-        per_turn_config.service_tier = session_configuration.service_tier;
+        per_turn_config.service_tier = session_configuration.service_tier.clone();
         per_turn_config.personality = session_configuration.personality;
         per_turn_config.web_search_mode = Some(resolve_web_search_mode_for_turn(
             per_turn_config.web_search_mode,
@@ -157,7 +157,7 @@ impl Session {
             provider: provider_for_context,
             reasoning_effort,
             reasoning_summary,
-            service_tier: session_configuration.service_tier,
+            service_tier: session_configuration.service_tier.clone(),
             session_source,
             cwd,
             developer_instructions: session_configuration.developer_instructions.clone(),

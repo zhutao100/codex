@@ -397,7 +397,7 @@ impl Codex {
             provider: config.model_provider.clone(),
             collaboration_mode,
             model_reasoning_summary: config.model_reasoning_summary,
-            service_tier: config.service_tier,
+            service_tier: config.service_tier.clone(),
             developer_instructions: config.developer_instructions.clone(),
             user_instructions,
             personality: config.personality,

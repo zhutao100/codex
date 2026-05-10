@@ -148,8 +148,8 @@ pub struct Config {
     /// Optional local metadata/instruction overlays for bundled, remote, or custom models.
     pub model_overlay: Option<ModelOverlay>,
 
-    /// Optional service tier for OpenAI Responses requests.
-    pub service_tier: Option<ServiceTier>,
+    /// Explicit service tier request id for OpenAI Responses requests.
+    pub service_tier: Option<String>,
 
     /// Key into the model_providers map that specifies which provider to use.
     pub model_provider_id: String,
@@ -922,8 +922,9 @@ pub struct ConfigToml {
     /// Optional local metadata/instruction overlays for bundled, remote, or custom models.
     pub model_overlay: Option<ModelOverlayToml>,
 
-    /// Service tier for OpenAI Responses requests.
-    pub service_tier: Option<ServiceTier>,
+    /// Optional service tier request id for OpenAI Responses requests. Recognized values
+    /// include `priority`, `fast`, and `flex`; unknown values are passed through.
+    pub service_tier: Option<String>,
 
     /// Default approval policy for executing commands.
     pub approval_policy: Option<AskForApproval>,
@@ -1340,7 +1341,7 @@ pub struct ConfigOverrides {
     pub review_model: Option<String>,
     pub review_model_provider: Option<String>,
     pub cwd: Option<PathBuf>,
-    pub service_tier: Option<ServiceTier>,
+    pub service_tier: Option<String>,
     pub approval_policy: Option<AskForApproval>,
     pub sandbox_mode: Option<SandboxMode>,
     pub model_provider: Option<String>,
@@ -1717,7 +1718,8 @@ impl Config {
 
         let service_tier = service_tier
             .or(config_profile.service_tier)
-            .or(cfg.service_tier);
+            .or(cfg.service_tier)
+            .map(ServiceTier::normalize_request_value);
 
         let check_for_update_on_startup = cfg.check_for_update_on_startup.unwrap_or(true);
 
@@ -4117,13 +4119,13 @@ model = "gpt-5.1-codex"
         let codex_home = TempDir::new()?;
         let global_config = Config::load_from_base_config_with_overrides(
             ConfigToml {
-                service_tier: Some(ServiceTier::Fast),
+                service_tier: Some("fast".to_string()),
                 ..Default::default()
             },
             ConfigOverrides::default(),
             codex_home.path().to_path_buf(),
         )?;
-        assert_eq!(global_config.service_tier, Some(ServiceTier::Fast));
+        assert_eq!(global_config.service_tier, Some("priority".to_string()));
 
         let cfg: ConfigToml = toml::from_str(
             r#"
@@ -4141,27 +4143,49 @@ service_tier = "flex"
             ConfigOverrides::default(),
             codex_home.path().to_path_buf(),
         )?;
-        assert_eq!(profile_config.service_tier, Some(ServiceTier::Flex));
+        assert_eq!(profile_config.service_tier, Some("flex".to_string()));
 
         let override_config = Config::load_from_base_config_with_overrides(
             cfg,
             ConfigOverrides {
-                service_tier: Some(ServiceTier::Fast),
+                service_tier: Some("fast".to_string()),
                 ..Default::default()
             },
             codex_home.path().to_path_buf(),
         )?;
-        assert_eq!(override_config.service_tier, Some(ServiceTier::Fast));
+        assert_eq!(override_config.service_tier, Some("priority".to_string()));
 
         Ok(())
     }
 
     #[test]
-    fn service_tier_rejects_invalid_values() {
-        let err = toml::from_str::<ConfigToml>(r#"service_tier = "standard""#)
-            .expect_err("invalid service tier should fail TOML deserialization");
+    fn service_tier_accepts_priority_and_arbitrary_strings() -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
 
-        assert!(err.to_string().contains("unknown variant"));
+        let priority_config = Config::load_from_base_config_with_overrides(
+            ConfigToml {
+                service_tier: Some("priority".to_string()),
+                ..Default::default()
+            },
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )?;
+        assert_eq!(priority_config.service_tier, Some("priority".to_string()));
+
+        let arbitrary_config = Config::load_from_base_config_with_overrides(
+            ConfigToml {
+                service_tier: Some("experimental-tier-id".to_string()),
+                ..Default::default()
+            },
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )?;
+        assert_eq!(
+            arbitrary_config.service_tier,
+            Some("experimental-tier-id".to_string())
+        );
+
+        Ok(())
     }
 
     #[test]

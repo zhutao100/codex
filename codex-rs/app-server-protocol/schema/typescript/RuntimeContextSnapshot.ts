@@ -5,9 +5,8 @@ import type { AskForApproval } from "./AskForApproval";
 import type { ReasoningEffort } from "./ReasoningEffort";
 import type { RuntimeContextScope } from "./RuntimeContextScope";
 import type { SandboxPolicy } from "./SandboxPolicy";
-import type { ServiceTier } from "./ServiceTier";
 import type { SessionSource } from "./SessionSource";
 import type { ThreadId } from "./ThreadId";
 import type { TokenUsageInfo } from "./TokenUsageInfo";
 
-export type RuntimeContextSnapshot = { scope_id: string, scope: RuntimeContextScope, task_kind?: string, session_source: SessionSource, session_id: ThreadId, parent_session_id?: ThreadId, parent_turn_id?: string, thread_name?: string, rollout_path?: string, cwd: string, model: string, model_provider_id: string, approval_policy: AskForApproval, sandbox_policy: SandboxPolicy, reasoning_effort?: ReasoningEffort, service_tier?: ServiceTier, model_context_window?: bigint, agents_summary?: string, token_info?: TokenUsageInfo, };
+export type RuntimeContextSnapshot = { scope_id: string, scope: RuntimeContextScope, task_kind?: string, session_source: SessionSource, session_id: ThreadId, parent_session_id?: ThreadId, parent_turn_id?: string, thread_name?: string, rollout_path?: string, cwd: string, model: string, model_provider_id: string, approval_policy: AskForApproval, sandbox_policy: SandboxPolicy, reasoning_effort?: ReasoningEffort, service_tier?: string, model_context_window?: bigint, agents_summary?: string, token_info?: TokenUsageInfo, };

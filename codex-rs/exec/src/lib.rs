@@ -321,7 +321,7 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
     let default_sandbox_policy = config.sandbox_policy.get();
     let default_effort = config.model_reasoning_effort;
     let default_summary = config.model_reasoning_summary;
-    let default_service_tier = config.service_tier;
+    let default_service_tier = config.service_tier.clone();
 
     // When --yolo (dangerously_bypass_approvals_and_sandbox) is set, also skip the git repo check
     // since the user is explicitly running in an externally sandboxed environment.

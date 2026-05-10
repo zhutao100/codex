@@ -76,7 +76,6 @@ use codex_protocol::account::PlanType;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Personality;
-use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::Settings;
 use codex_protocol::items::PlanItem;
 use codex_protocol::items::TurnItem;
@@ -1344,13 +1343,13 @@ async fn submit_user_message_omits_unconfigured_service_tier() {
 async fn submit_user_message_carries_configured_service_tier() {
     let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(None).await;
     chat.thread_id = Some(ThreadId::new());
-    chat.config.service_tier = Some(ServiceTier::Fast);
+    chat.config.service_tier = Some("priority".to_string());
 
     chat.submit_user_message("hello".to_string().into());
 
     match next_submit_op(&mut op_rx) {
         Op::UserTurn { service_tier, .. } => {
-            assert_eq!(service_tier, Some(ServiceTier::Fast));
+            assert_eq!(service_tier, Some("priority".to_string()));
         }
         other => panic!("expected Op::UserTurn, got {other:?}"),
     }
