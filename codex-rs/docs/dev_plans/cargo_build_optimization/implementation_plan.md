@@ -29,18 +29,18 @@ Run from the project root on a development host with the normal Rust toolchain i
 Dependency closure:
 
 ```bash
-cargo tree -p codex-cli -e normal > /tmp/codex-cli-tree-normal.txt
-cargo tree -p codex-cli -e features > /tmp/codex-cli-tree-features.txt
-cargo tree -p codex-cli --duplicates > /tmp/codex-cli-tree-duplicates.txt
+scripts/cargo-local tree -p codex-cli -e normal > /tmp/codex-cli-tree-normal.txt
+scripts/cargo-local tree -p codex-cli -e features > /tmp/codex-cli-tree-features.txt
+scripts/cargo-local tree -p codex-cli --duplicates > /tmp/codex-cli-tree-duplicates.txt
 ```
 
 Production release baseline:
 
 ```bash
-cargo clean -p codex-cli --release >/dev/null
+scripts/cargo-local clean -p codex-cli --release >/dev/null
 RUSTC_WRAPPER= CODEX_SANDBOX_NETWORK_DISABLED=1 \
   /usr/bin/time -p \
-  cargo build -p codex-cli --bin codex --release --timings \
+  scripts/cargo-local build -p codex-cli --bin codex --release --timings \
   >/tmp/codex-release.stdout \
   2>/tmp/codex-release.stderr
 ```
@@ -48,10 +48,10 @@ RUSTC_WRAPPER= CODEX_SANDBOX_NETWORK_DISABLED=1 \
 Fast release-like baseline:
 
 ```bash
-cargo clean -p codex-cli --profile release-fast >/dev/null
+scripts/cargo-local clean -p codex-cli --profile release-fast >/dev/null
 RUSTC_WRAPPER= CODEX_SANDBOX_NETWORK_DISABLED=1 \
   /usr/bin/time -p \
-  cargo build -p codex-cli --bin codex --profile release-fast --timings \
+  scripts/cargo-local build -p codex-cli --bin codex --profile release-fast --timings \
   >/tmp/codex-release-fast.stdout \
   2>/tmp/codex-release-fast.stderr
 ```
@@ -67,7 +67,7 @@ Acceptance:
 Update developer-facing docs or scripts to prefer:
 
 ```bash
-cargo build -p codex-cli --bin codex --profile release-fast
+CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local build -p codex-cli --bin codex --profile release-fast
 ```
 
 for release-like local validation.
@@ -75,15 +75,16 @@ for release-like local validation.
 Keep production release packaging on:
 
 ```bash
-cargo build -p codex-cli --bin codex --release
+CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local build -p codex-cli --bin codex --release
 ```
 
 Smoke checks:
 
 ```bash
-target/release-fast/codex --help
-target/release-fast/codex exec --help
-target/release-fast/codex features list --help
+release_fast_bin="$(scripts/cargo-local --print-target-dir)/release-fast/codex"
+"${release_fast_bin}" --help
+"${release_fast_bin}" exec --help
+"${release_fast_bin}" features list --help
 ```
 
 Acceptance:
@@ -110,10 +111,10 @@ Implementation outline:
 Smoke checks:
 
 ```bash
-cargo build -p codex-cli --bin codex --profile release-fast
-cargo build -p codex-responses-api-proxy --bin codex-responses-api-proxy --profile release-fast
-cargo build -p codex-stdio-to-uds --bin codex-stdio-to-uds --profile release-fast
-cargo tree -p codex-cli -e normal | rg "codex-responses-api-proxy|codex-stdio-to-uds" || true
+CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local build -p codex-cli --bin codex --profile release-fast
+CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local build -p codex-responses-api-proxy --bin codex-responses-api-proxy --profile release-fast
+CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local build -p codex-stdio-to-uds --bin codex-stdio-to-uds --profile release-fast
+scripts/cargo-local tree -p codex-cli -e normal | rg "codex-responses-api-proxy|codex-stdio-to-uds" || true
 ```
 
 Acceptance:
@@ -141,9 +142,10 @@ For each candidate:
 Smoke checks should include both primary and sidecar help output:
 
 ```bash
-target/release-fast/codex --help
-target/release-fast/codex mcp-server --help
-target/release-fast/codex-mcp-server --help
+release_fast_dir="$(scripts/cargo-local --print-target-dir)/release-fast"
+"${release_fast_dir}/codex" --help
+"${release_fast_dir}/codex" mcp-server --help
+"${release_fast_dir}/codex-mcp-server" --help
 ```
 
 Acceptance:
@@ -157,7 +159,7 @@ Acceptance:
 Baseline:
 
 ```bash
-cargo tree -p codex-cli -e normal | rg "codex-(lmstudio|ollama|common)"
+scripts/cargo-local tree -p codex-cli -e normal | rg "codex-(lmstudio|ollama|common)"
 ```
 
 Preferred implementation direction:
@@ -185,9 +187,9 @@ Acceptance:
 Run compiler-attribution commands only when the remaining bottleneck is clearly inside `codex-core` or another high-fanout crate:
 
 ```bash
-cargo +nightly rustc -p codex-core --lib -- -Z time-passes -Z time-passes-format=json
-cargo +nightly rustc -p codex-core --lib -- -Z self-profile=/tmp/codex-core-self-profile
-cargo +nightly rustc -p codex-core --lib -- -Z macro-stats
+scripts/cargo-local +nightly rustc -p codex-core --lib -- -Z time-passes -Z time-passes-format=json
+scripts/cargo-local +nightly rustc -p codex-core --lib -- -Z self-profile=/tmp/codex-core-self-profile
+scripts/cargo-local +nightly rustc -p codex-core --lib -- -Z macro-stats
 ```
 
 Candidate follow-ups:
@@ -215,9 +217,9 @@ Acceptance:
 
 ## Final Acceptance for the Umbrella Plan
 
-- `cargo build -p codex-cli --bin codex --profile release-fast` is the documented local release-like path.
-- `cargo build -p codex-cli --bin codex --release` remains the production path.
-- Every dependency-closure reduction is proven by `cargo tree -p codex-cli -e normal` before/after output.
+- `scripts/cargo-local build -p codex-cli --bin codex --profile release-fast` is the documented local release-like path.
+- `scripts/cargo-local build -p codex-cli --bin codex --release` remains the production path.
+- Every dependency-closure reduction is proven by `scripts/cargo-local tree -p codex-cli -e normal` before/after output.
 - Every timing claim is backed by `--timings` and wall-clock captures.
 - Primary user flows remain smoke-tested after each split.
 - Sidecar-based commands have explicit packaging and missing-binary behavior.

@@ -11,6 +11,8 @@ Implemented inputs already present in this branch:
 - local dev profiles in the workspace root `Cargo.toml`;
 - production release `split-debuginfo = "off"`;
 - a `release-fast` profile for release-like developer builds.
+- a repeatable measurement script, `measure.sh`, that uses the repo-local Cargo
+  wrapper and writes absolute-path-heavy captures outside the repository.
 
 Remaining scope is the larger `cargo build --release --bin codex` latency problem caused by the final `codex` binary's dependency closure and production release profile.
 

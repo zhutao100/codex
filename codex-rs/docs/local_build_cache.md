@@ -6,8 +6,13 @@ artifacts:
 ```bash
 CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local check -p codex-cli --bin codex
 CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local build -p codex-cli --bin codex --profile dev-small
+CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local build -p codex-cli --bin codex --profile release-fast
 CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-core --lib
 ```
+
+Use `--profile release-fast` for release-like local smoke testing. Keep
+`--release` for production packaging because the release profile intentionally
+uses slower artifact-quality settings such as FatLTO.
 
 The repo `just` recipes and `scripts/debug-codex.sh` call this wrapper.
 The workspace VS Code rust-analyzer settings also call it for diagnostics,
