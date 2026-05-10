@@ -124,7 +124,10 @@ async fn run_turn_inner(
     } else {
         if total_usage_tokens >= auto_compact_limit {
             if turn_context.final_output_json_schema.is_some() {
-                run_auto_compact(&sess, &turn_context, None).await;
+                if let Err(e) = run_auto_compact(&sess, &turn_context, None).await {
+                    info!("Auto-compaction failed before turn sampling: {e:#}");
+                    return None;
+                }
             } else {
                 inject_pre_compact_work_notes_request(&sess, &turn_context).await;
 
@@ -136,7 +139,8 @@ async fn run_turn_inner(
                 let mut client_session = sess.services.model_client.new_session();
 
                 loop {
-                    let sampling_request_input: Vec<ResponseItem> = sess.prompt_history().await;
+                    let sampling_request_input: Vec<ResponseItem> =
+                        sess.prompt_history(turn_context.as_ref()).await;
                     let tool_selection = SamplingRequestToolSelection {
                         explicit_app_paths: &explicit_app_paths,
                         skill_name_counts_lower: &skill_name_counts_lower,
@@ -161,7 +165,12 @@ async fn run_turn_inner(
                             if let Some(notes) = output.last_agent_message
                                 && is_auto_compact_work_notes_message(&notes)
                             {
-                                run_auto_compact(&sess, &turn_context, Some(notes)).await;
+                                if let Err(e) =
+                                    run_auto_compact(&sess, &turn_context, Some(notes)).await
+                                {
+                                    info!("Auto-compaction failed after work-notes capture: {e:#}");
+                                    return None;
+                                }
                                 break;
                             }
 
@@ -170,7 +179,12 @@ async fn run_turn_inner(
                                 info!(
                                     "Work-notes capture yielded no notes; compacting without notes after {attempts} attempts"
                                 );
-                                run_auto_compact(&sess, &turn_context, None).await;
+                                if let Err(e) = run_auto_compact(&sess, &turn_context, None).await {
+                                    info!(
+                                        "Auto-compaction failed after work-notes capture attempts: {e:#}"
+                                    );
+                                    return None;
+                                }
                                 break;
                             }
 
@@ -182,7 +196,14 @@ async fn run_turn_inner(
                             info!(
                                 "Work-notes capture failed during pre-turn compaction; compacting without notes: {e:#}"
                             );
-                            run_auto_compact(&sess, &turn_context, None).await;
+                            if let Err(compact_err) =
+                                run_auto_compact(&sess, &turn_context, None).await
+                            {
+                                info!(
+                                    "Auto-compaction failed after work-notes capture error: {compact_err:#}"
+                                );
+                                return None;
+                            }
                             break;
                         }
                     }
@@ -332,7 +353,8 @@ async fn run_turn_inner(
         }
 
         // Construct the input that we will send to the model.
-        let sampling_request_input: Vec<ResponseItem> = sess.prompt_history().await;
+        let sampling_request_input: Vec<ResponseItem> =
+            sess.prompt_history(turn_context.as_ref()).await;
 
         let sampling_request_input_messages = sampling_request_input
             .iter()
@@ -390,7 +412,15 @@ async fn run_turn_inner(
                     if let Some(notes) = sampling_request_last_agent_message
                         && is_auto_compact_work_notes_message(&notes)
                     {
-                        run_auto_compact(&sess, &turn_context, Some(notes)).await;
+                        match run_auto_compact(&sess, &turn_context, Some(notes)).await {
+                            Ok(compacted) => {
+                                reset_client_session_if_compacted(&mut client_session, compacted);
+                            }
+                            Err(e) => {
+                                info!("Auto-compaction failed after work-notes capture: {e:#}");
+                                return None;
+                            }
+                        }
                         pre_compact_notes_state = PreCompactNotesState::Idle;
                         pre_compact_notes_attempts = 0;
                         continue;
@@ -401,7 +431,17 @@ async fn run_turn_inner(
                         info!(
                             "Work-notes capture yielded no notes; compacting without notes after {pre_compact_notes_attempts} attempts"
                         );
-                        run_auto_compact(&sess, &turn_context, None).await;
+                        match run_auto_compact(&sess, &turn_context, None).await {
+                            Ok(compacted) => {
+                                reset_client_session_if_compacted(&mut client_session, compacted);
+                            }
+                            Err(e) => {
+                                info!(
+                                    "Auto-compaction failed after work-notes capture attempts: {e:#}"
+                                );
+                                return None;
+                            }
+                        }
                         pre_compact_notes_state = PreCompactNotesState::Idle;
                         pre_compact_notes_attempts = 0;
                         continue;
@@ -417,7 +457,15 @@ async fn run_turn_inner(
                 // shouldn't worry about being in an infinite loop.
                 if token_limit_reached && needs_follow_up {
                     if turn_context.final_output_json_schema.is_some() {
-                        run_auto_compact(&sess, &turn_context, None).await;
+                        match run_auto_compact(&sess, &turn_context, None).await {
+                            Ok(compacted) => {
+                                reset_client_session_if_compacted(&mut client_session, compacted);
+                            }
+                            Err(e) => {
+                                info!("Auto-compaction failed during follow-up: {e:#}");
+                                return None;
+                            }
+                        }
                         continue;
                     }
 
@@ -454,7 +502,17 @@ async fn run_turn_inner(
             }
             Err(e) if matches!(pre_compact_notes_state, PreCompactNotesState::AwaitingNotes) => {
                 info!("Work-notes capture failed; compacting without notes: {e:#}");
-                run_auto_compact(&sess, &turn_context, None).await;
+                match run_auto_compact(&sess, &turn_context, None).await {
+                    Ok(compacted) => {
+                        reset_client_session_if_compacted(&mut client_session, compacted);
+                    }
+                    Err(compact_err) => {
+                        info!(
+                            "Auto-compaction failed after work-notes capture error: {compact_err:#}"
+                        );
+                        return None;
+                    }
+                }
                 pre_compact_notes_state = PreCompactNotesState::Idle;
                 pre_compact_notes_attempts = 0;
                 continue;
@@ -488,25 +546,31 @@ async fn run_turn_inner(
     last_agent_message
 }
 
+fn reset_client_session_if_compacted(client_session: &mut ModelClientSession, compacted: bool) {
+    if compacted {
+        client_session.reset_websocket_session();
+    }
+}
+
 async fn run_auto_compact(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
     preserved_work_notes: Option<String>,
-) {
+) -> CodexResult<bool> {
     if should_use_remote_compact_task(sess.as_ref(), &turn_context.provider) {
         run_inline_remote_auto_compact_task(
             Arc::clone(sess),
             Arc::clone(turn_context),
             preserved_work_notes,
         )
-        .await;
+        .await
     } else {
         run_inline_auto_compact_task(
             Arc::clone(sess),
             Arc::clone(turn_context),
             preserved_work_notes,
         )
-        .await;
+        .await
     }
 }
 

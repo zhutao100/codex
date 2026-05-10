@@ -1,20 +1,19 @@
 use crate::context_manager::normalize;
-use crate::instructions::SkillInstructions;
-use crate::instructions::UserInstructions;
+use crate::event_mapping::is_contextual_dev_message_content;
+use crate::event_mapping::is_contextual_user_message_content;
 use crate::session::turn_context::TurnContext;
-use crate::session_prefix::is_session_prefix;
 use crate::truncate::TruncationPolicy;
 use crate::truncate::approx_token_count;
 use crate::truncate::approx_tokens_from_byte_count;
 use crate::truncate::truncate_function_output_items_with_policy;
 use crate::truncate::truncate_text;
-use crate::user_shell_command::is_user_shell_command_text;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::openai_models::InputModality;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TokenUsageInfo;
 use std::ops::Deref;
@@ -75,13 +74,33 @@ impl ContextManager {
     }
 
     /// Returns the history prepared for sending to the model. This applies a proper
-    /// normalization and drop un-suited items.
+    /// normalization and drops un-suited items.
+    #[cfg(test)]
     pub(crate) fn for_prompt(self) -> Vec<ResponseItem> {
         Self::prepare_items_for_prompt(self.items)
     }
 
-    pub(crate) fn prepare_items_for_prompt(mut items: Vec<ResponseItem>) -> Vec<ResponseItem> {
+    #[cfg(test)]
+    pub(crate) fn prepare_items_for_prompt(items: Vec<ResponseItem>) -> Vec<ResponseItem> {
+        Self::prepare_items_for_prompt_with_modalities(
+            items,
+            &[InputModality::Text, InputModality::Image],
+        )
+    }
+
+    pub(crate) fn for_prompt_with_modalities(
+        self,
+        input_modalities: &[InputModality],
+    ) -> Vec<ResponseItem> {
+        Self::prepare_items_for_prompt_with_modalities(self.items, input_modalities)
+    }
+
+    pub(crate) fn prepare_items_for_prompt_with_modalities(
+        mut items: Vec<ResponseItem>,
+        input_modalities: &[InputModality],
+    ) -> Vec<ResponseItem> {
         normalize::normalize_history(&mut items);
+        normalize::strip_images_when_unsupported(input_modalities, &mut items);
         items.retain(|item| !matches!(item, ResponseItem::GhostSnapshot { .. }));
         items
     }
@@ -196,6 +215,7 @@ impl ContextManager {
             user_positions[user_positions.len() - n_from_end]
         };
 
+        let cut_idx = self.trim_pre_turn_context_updates(first_user_idx, cut_idx);
         self.truncate_items(cut_idx);
     }
 
@@ -212,12 +232,8 @@ impl ContextManager {
     }
 
     fn get_non_last_reasoning_items_tokens(&self) -> i64 {
-        // Get reasoning items excluding all the ones after the last user message.
-        let Some(last_user_index) = self
-            .items
-            .iter()
-            .rposition(|item| matches!(item, ResponseItem::Message { role, .. } if role == "user"))
-        else {
+        // Get reasoning items excluding all the ones after the last user turn boundary.
+        let Some(last_user_index) = self.items.iter().rposition(is_user_turn_boundary) else {
             return 0;
         };
 
@@ -237,15 +253,13 @@ impl ContextManager {
             .fold(0i64, |acc, (_, estimate)| acc.saturating_add(*estimate))
     }
 
-    fn get_trailing_codex_generated_items_tokens(&self) -> i64 {
-        let mut total = 0i64;
-        for (item, estimate) in self.items.iter().zip(&self.item_token_estimates).rev() {
-            if !is_codex_generated_item(item) {
-                break;
-            }
-            total = total.saturating_add(*estimate);
-        }
-        total
+    fn items_after_last_model_generated_item(&self) -> &[ResponseItem] {
+        let start = self
+            .items
+            .iter()
+            .rposition(is_model_generated_item)
+            .map_or(self.items.len(), |index| index.saturating_add(1));
+        &self.items[start..]
     }
 
     /// When true, the server already accounted for past reasoning tokens and
@@ -256,14 +270,43 @@ impl ContextManager {
             .as_ref()
             .map(|info| info.last_token_usage.total_tokens)
             .unwrap_or(0);
-        let trailing_codex_generated_tokens = self.get_trailing_codex_generated_items_tokens();
+        let after_last_model_generated_start =
+            self.items.len() - self.items_after_last_model_generated_item().len();
+        let items_after_last_model_generated_tokens = self.item_token_estimates
+            [after_last_model_generated_start..]
+            .iter()
+            .fold(0i64, |acc, estimate| acc.saturating_add(*estimate));
         if server_reasoning_included {
-            last_tokens.saturating_add(trailing_codex_generated_tokens)
+            last_tokens.saturating_add(items_after_last_model_generated_tokens)
         } else {
             last_tokens
                 .saturating_add(self.get_non_last_reasoning_items_tokens())
-                .saturating_add(trailing_codex_generated_tokens)
+                .saturating_add(items_after_last_model_generated_tokens)
         }
+    }
+
+    /// Walk backward from a rollback cut and trim contiguous pre-turn context-update items.
+    fn trim_pre_turn_context_updates(
+        &self,
+        first_user_turn_idx: usize,
+        mut cut_idx: usize,
+    ) -> usize {
+        while cut_idx > first_user_turn_idx {
+            match &self.items[cut_idx - 1] {
+                ResponseItem::Message { role, content, .. }
+                    if role == "developer" && is_contextual_dev_message_content(content) =>
+                {
+                    cut_idx -= 1;
+                }
+                ResponseItem::Message { role, content, .. }
+                    if role == "user" && is_contextual_user_message_content(content) =>
+                {
+                    cut_idx -= 1;
+                }
+                _ => break,
+            }
+        }
+        cut_idx
     }
 
     /// This function enforces a couple of invariants on the in-memory history:
@@ -407,6 +450,19 @@ fn estimate_reasoning_length(encoded_len: usize) -> usize {
 }
 
 fn estimate_item_token_count(item: &ResponseItem) -> i64 {
+    let model_visible_bytes = estimate_response_item_model_visible_bytes(item);
+    let model_visible_bytes = usize::try_from(model_visible_bytes).unwrap_or(usize::MAX);
+    i64::try_from(approx_tokens_from_byte_count(model_visible_bytes)).unwrap_or(i64::MAX)
+}
+
+/// Approximate model-visible byte cost for one image input.
+///
+/// Inline base64 transport bytes are not model-visible text. Replace each
+/// base64 image payload with a fixed image estimate while preserving the data
+/// URL prefix and JSON wrapper bytes already counted in the serialized item.
+const RESIZED_IMAGE_BYTES_ESTIMATE: i64 = 7373;
+
+fn estimate_response_item_model_visible_bytes(item: &ResponseItem) -> i64 {
     match item {
         ResponseItem::GhostSnapshot { .. } => 0,
         ResponseItem::Reasoning {
@@ -415,15 +471,111 @@ fn estimate_item_token_count(item: &ResponseItem) -> i64 {
         }
         | ResponseItem::Compaction {
             encrypted_content: content,
-        } => {
-            let reasoning_bytes = estimate_reasoning_length(content.len());
-            i64::try_from(approx_tokens_from_byte_count(reasoning_bytes)).unwrap_or(i64::MAX)
-        }
+        } => i64::try_from(estimate_reasoning_length(content.len())).unwrap_or(i64::MAX),
         item => {
-            let serialized = serde_json::to_string(item).unwrap_or_default();
-            i64::try_from(approx_token_count(&serialized)).unwrap_or(i64::MAX)
+            let raw = serde_json::to_string(item)
+                .map(|serialized| i64::try_from(serialized.len()).unwrap_or(i64::MAX))
+                .unwrap_or_default();
+            let (payload_bytes, replacement_bytes) = image_data_url_estimate_adjustment(item);
+            if payload_bytes == 0 || replacement_bytes == 0 {
+                raw
+            } else {
+                raw.saturating_sub(payload_bytes)
+                    .saturating_add(replacement_bytes)
+            }
         }
     }
+}
+
+/// Returns the base64 payload for inline image data URLs that are eligible for
+/// token-estimation discounting.
+fn parse_base64_image_data_url(url: &str) -> Option<&str> {
+    if !url
+        .get(.."data:".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:"))
+    {
+        return None;
+    }
+
+    let comma_index = url.find(',')?;
+    let metadata = &url[..comma_index];
+    let payload = &url[comma_index + 1..];
+    let metadata_without_scheme = &metadata["data:".len()..];
+    let mut metadata_parts = metadata_without_scheme.split(';');
+    let mime_type = metadata_parts.next().unwrap_or_default();
+    let has_base64_marker = metadata_parts.any(|part| part.eq_ignore_ascii_case("base64"));
+    if !mime_type
+        .get(.."image/".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("image/"))
+    {
+        return None;
+    }
+    if !has_base64_marker {
+        return None;
+    }
+    Some(payload)
+}
+
+/// Scans one response item for discount-eligible inline image data URLs and
+/// returns:
+/// - total base64 payload bytes to subtract from raw serialized size
+/// - total replacement byte estimate for those images
+fn image_data_url_estimate_adjustment(item: &ResponseItem) -> (i64, i64) {
+    let mut payload_bytes = 0i64;
+    let mut replacement_bytes = 0i64;
+
+    let mut accumulate = |image_url: &str| {
+        if let Some(payload_len) = parse_base64_image_data_url(image_url).map(str::len) {
+            payload_bytes =
+                payload_bytes.saturating_add(i64::try_from(payload_len).unwrap_or(i64::MAX));
+            replacement_bytes = replacement_bytes.saturating_add(RESIZED_IMAGE_BYTES_ESTIMATE);
+        }
+    };
+
+    match item {
+        ResponseItem::Message { content, .. } => {
+            for content_item in content {
+                if let ContentItem::InputImage { image_url } = content_item {
+                    accumulate(image_url);
+                }
+            }
+        }
+        ResponseItem::FunctionCallOutput { output, .. } => {
+            if let FunctionCallOutputBody::ContentItems(items) = &output.body {
+                for content_item in items {
+                    if let FunctionCallOutputContentItem::InputImage { image_url } = content_item {
+                        accumulate(image_url);
+                    }
+                }
+            }
+        }
+        ResponseItem::CustomToolCallOutput { .. }
+        | ResponseItem::GhostSnapshot { .. }
+        | ResponseItem::Reasoning { .. }
+        | ResponseItem::LocalShellCall { .. }
+        | ResponseItem::FunctionCall { .. }
+        | ResponseItem::WebSearchCall { .. }
+        | ResponseItem::CustomToolCall { .. }
+        | ResponseItem::Compaction { .. }
+        | ResponseItem::Other => {}
+    }
+
+    (payload_bytes, replacement_bytes)
+}
+
+fn is_model_generated_item(item: &ResponseItem) -> bool {
+    matches!(
+        item,
+        ResponseItem::Message { role, .. } if role == "assistant"
+    ) || matches!(
+        item,
+        ResponseItem::Reasoning { .. }
+            | ResponseItem::LocalShellCall { .. }
+            | ResponseItem::FunctionCall { .. }
+            | ResponseItem::WebSearchCall { .. }
+            | ResponseItem::CustomToolCall { .. }
+            | ResponseItem::Compaction { .. }
+    )
 }
 
 pub(crate) fn is_codex_generated_item(item: &ResponseItem) -> bool {
@@ -438,33 +590,7 @@ pub(crate) fn is_user_turn_boundary(item: &ResponseItem) -> bool {
         return false;
     };
 
-    if role != "user" {
-        return false;
-    }
-
-    if UserInstructions::is_user_instructions(content)
-        || SkillInstructions::is_skill_instructions(content)
-    {
-        return false;
-    }
-
-    for content_item in content {
-        match content_item {
-            ContentItem::InputText { text } => {
-                if is_session_prefix(text) || is_user_shell_command_text(text) {
-                    return false;
-                }
-            }
-            ContentItem::OutputText { text } => {
-                if is_session_prefix(text) {
-                    return false;
-                }
-            }
-            ContentItem::InputImage { .. } => {}
-        }
-    }
-
-    true
+    role == "user" && !is_contextual_user_message_content(content)
 }
 
 fn user_message_positions(items: &[ResponseItem]) -> Vec<usize> {

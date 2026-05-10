@@ -1,11 +1,17 @@
 use std::collections::HashSet;
 
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputBody;
+use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::openai_models::InputModality;
 
 use crate::util::error_or_panic;
 use tracing::info;
+
+pub(crate) const IMAGE_CONTENT_OMITTED_PLACEHOLDER: &str =
+    "image content omitted because you do not support image input";
 
 pub(crate) fn ensure_call_outputs_present(items: &mut Vec<ResponseItem>) {
     // Collect synthetic outputs to insert immediately after their calls.
@@ -167,6 +173,68 @@ pub(crate) fn remove_orphan_outputs(items: &mut Vec<ResponseItem>) {
 pub(crate) fn normalize_history(items: &mut Vec<ResponseItem>) {
     ensure_call_outputs_present(items);
     remove_orphan_outputs(items);
+}
+
+/// Strip image content from messages and tool outputs when the model does not
+/// support images. When `input_modalities` contains `InputModality::Image`, no
+/// stripping is performed.
+pub(crate) fn strip_images_when_unsupported(
+    input_modalities: &[InputModality],
+    items: &mut [ResponseItem],
+) {
+    if input_modalities.contains(&InputModality::Image) {
+        return;
+    }
+
+    for item in items.iter_mut() {
+        match item {
+            ResponseItem::Message { content, .. } => {
+                let mut normalized_content = Vec::with_capacity(content.len());
+                for content_item in content.iter() {
+                    match content_item {
+                        ContentItem::InputImage { .. } => {
+                            normalized_content.push(ContentItem::InputText {
+                                text: IMAGE_CONTENT_OMITTED_PLACEHOLDER.to_string(),
+                            });
+                        }
+                        ContentItem::InputText { .. } | ContentItem::OutputText { .. } => {
+                            normalized_content.push(content_item.clone());
+                        }
+                    }
+                }
+                *content = normalized_content;
+            }
+            ResponseItem::FunctionCallOutput { output, .. } => {
+                if let Some(content_items) = output.content_items_mut() {
+                    let mut normalized_content_items = Vec::with_capacity(content_items.len());
+                    for content_item in content_items.iter() {
+                        match content_item {
+                            FunctionCallOutputContentItem::InputImage { .. } => {
+                                normalized_content_items.push(
+                                    FunctionCallOutputContentItem::InputText {
+                                        text: IMAGE_CONTENT_OMITTED_PLACEHOLDER.to_string(),
+                                    },
+                                );
+                            }
+                            FunctionCallOutputContentItem::InputText { .. } => {
+                                normalized_content_items.push(content_item.clone());
+                            }
+                        }
+                    }
+                    *content_items = normalized_content_items;
+                }
+            }
+            ResponseItem::Reasoning { .. }
+            | ResponseItem::LocalShellCall { .. }
+            | ResponseItem::FunctionCall { .. }
+            | ResponseItem::CustomToolCall { .. }
+            | ResponseItem::CustomToolCallOutput { .. }
+            | ResponseItem::WebSearchCall { .. }
+            | ResponseItem::Compaction { .. }
+            | ResponseItem::GhostSnapshot { .. }
+            | ResponseItem::Other => {}
+        }
+    }
 }
 
 pub(crate) fn corresponding_position_for(

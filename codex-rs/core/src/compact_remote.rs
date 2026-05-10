@@ -23,25 +23,29 @@ pub(crate) async fn run_inline_remote_auto_compact_task(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
     preserved_work_notes: Option<String>,
-) {
-    run_remote_compact_task_inner(&sess, &turn_context, preserved_work_notes).await;
+) -> CodexResult<bool> {
+    run_remote_compact_task_inner(&sess, &turn_context, preserved_work_notes).await?;
+    Ok(true)
 }
 
-pub(crate) async fn run_remote_compact_task(sess: Arc<Session>, turn_context: Arc<TurnContext>) {
+pub(crate) async fn run_remote_compact_task(
+    sess: Arc<Session>,
+    turn_context: Arc<TurnContext>,
+) -> CodexResult<()> {
     let start_event = EventMsg::TurnStarted(TurnStartedEvent {
         model_context_window: turn_context.model_context_window(),
         collaboration_mode_kind: turn_context.collaboration_mode.mode,
     });
     sess.send_event(&turn_context, start_event).await;
 
-    run_remote_compact_task_inner(&sess, &turn_context, None).await;
+    run_remote_compact_task_inner(&sess, &turn_context, None).await
 }
 
 async fn run_remote_compact_task_inner(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
     preserved_work_notes: Option<String>,
-) {
+) -> CodexResult<()> {
     if let Err(err) =
         run_remote_compact_task_inner_impl(sess, turn_context, preserved_work_notes).await
     {
@@ -49,7 +53,9 @@ async fn run_remote_compact_task_inner(
             err.to_error_event(Some("Error running remote compact task".to_string())),
         );
         sess.send_event(turn_context, event).await;
+        return Err(err);
     }
+    Ok(())
 }
 
 async fn run_remote_compact_task_inner_impl(
@@ -87,7 +93,7 @@ async fn run_remote_compact_task_inner_impl(
         .collect();
 
     let prompt = Prompt {
-        input: source_history.for_prompt(),
+        input: source_history.for_prompt_with_modalities(&turn_context.model_info.input_modalities),
         tools: vec![],
         parallel_tool_calls: false,
         base_instructions,

@@ -13,6 +13,7 @@ use codex_protocol::models::is_image_close_tag_text;
 use codex_protocol::models::is_image_open_tag_text;
 use codex_protocol::models::is_local_image_close_tag_text;
 use codex_protocol::models::is_local_image_open_tag_text;
+use codex_protocol::protocol::COLLABORATION_MODE_OPEN_TAG;
 use codex_protocol::user_input::UserInput;
 use tracing::warn;
 use uuid::Uuid;
@@ -23,10 +24,48 @@ use crate::session_prefix::is_session_prefix;
 use crate::user_shell_command::is_user_shell_command_text;
 use crate::web_search::web_search_action_detail;
 
-fn parse_user_message(message: &[ContentItem]) -> Option<UserMessageItem> {
-    if UserInstructions::is_user_instructions(message)
+const CONTEXTUAL_DEVELOPER_PREFIXES: &[&str] = &[
+    "<permissions instructions>",
+    "<model_switch>",
+    COLLABORATION_MODE_OPEN_TAG,
+    "<personality_spec>",
+];
+
+pub(crate) fn is_contextual_user_message_content(message: &[ContentItem]) -> bool {
+    UserInstructions::is_user_instructions(message)
         || SkillInstructions::is_skill_instructions(message)
-    {
+        || message.iter().any(is_contextual_user_fragment)
+}
+
+pub(crate) fn is_contextual_dev_message_content(message: &[ContentItem]) -> bool {
+    message.iter().any(is_contextual_dev_fragment)
+}
+
+fn is_contextual_user_fragment(content_item: &ContentItem) -> bool {
+    match content_item {
+        ContentItem::InputText { text } => {
+            is_session_prefix(text) || is_user_shell_command_text(text)
+        }
+        ContentItem::OutputText { text } => is_session_prefix(text),
+        ContentItem::InputImage { .. } => false,
+    }
+}
+
+fn is_contextual_dev_fragment(content_item: &ContentItem) -> bool {
+    let ContentItem::InputText { text } = content_item else {
+        return false;
+    };
+
+    let trimmed = text.trim_start();
+    CONTEXTUAL_DEVELOPER_PREFIXES.iter().any(|prefix| {
+        trimmed
+            .get(..prefix.len())
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix))
+    })
+}
+
+fn parse_user_message(message: &[ContentItem]) -> Option<UserMessageItem> {
+    if is_contextual_user_message_content(message) {
         return None;
     }
 
@@ -43,9 +82,6 @@ fn parse_user_message(message: &[ContentItem]) -> Option<UserMessageItem> {
                 {
                     continue;
                 }
-                if is_session_prefix(text) || is_user_shell_command_text(text) {
-                    return None;
-                }
                 content.push(UserInput::Text {
                     text: text.clone(),
                     // Model input content does not carry UI element ranges.
@@ -58,9 +94,6 @@ fn parse_user_message(message: &[ContentItem]) -> Option<UserMessageItem> {
                 });
             }
             ContentItem::OutputText { text } => {
-                if is_session_prefix(text) {
-                    return None;
-                }
                 warn!("Output text in user message: {}", text);
             }
         }

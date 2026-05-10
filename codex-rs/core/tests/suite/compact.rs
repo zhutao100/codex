@@ -304,6 +304,10 @@ async fn summarize_context_three_requests_and_instructions() {
             }
             RolloutItem::Compacted(ci) => {
                 if ci.message == expected_summary_message {
+                    assert!(
+                        ci.replacement_history.is_some(),
+                        "expected local compaction to persist replacement history"
+                    );
                     saw_compacted_summary = true;
                 }
             }

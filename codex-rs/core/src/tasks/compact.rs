@@ -28,13 +28,13 @@ impl SessionTask for CompactTask {
                 .services
                 .otel_manager
                 .counter("codex.task.compact", 1, &[("type", "remote")]);
-            crate::compact_remote::run_remote_compact_task(session, ctx).await
+            let _ = crate::compact_remote::run_remote_compact_task(session, ctx).await;
         } else {
             session
                 .services
                 .otel_manager
                 .counter("codex.task.compact", 1, &[("type", "local")]);
-            crate::compact::run_compact_task(session, ctx, input).await
+            let _ = crate::compact::run_compact_task(session, ctx, input).await;
         }
 
         None

@@ -369,6 +369,12 @@ impl ModelClient {
 }
 
 impl ModelClientSession {
+    pub(crate) fn reset_websocket_session(&mut self) {
+        self.connection = None;
+        self.websocket_last_request = None;
+        self.websocket_last_response_rx = None;
+    }
+
     fn disable_websockets(&self) -> bool {
         self.client.state.disable_websockets.load(Ordering::Relaxed)
     }

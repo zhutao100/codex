@@ -1,4 +1,5 @@
 use super::*;
+use crate::context_manager::normalize;
 use crate::truncate;
 use crate::truncate::TruncationPolicy;
 use codex_git::GhostCommit;
@@ -12,6 +13,7 @@ use codex_protocol::models::LocalShellExecAction;
 use codex_protocol::models::LocalShellStatus;
 use codex_protocol::models::ReasoningItemContent;
 use codex_protocol::models::ReasoningItemReasoningSummary;
+use codex_protocol::openai_models::InputModality;
 use pretty_assertions::assert_eq;
 use regex_lite::Regex;
 
@@ -60,13 +62,6 @@ fn user_input_text_msg(text: &str) -> ResponseItem {
         }],
         end_turn: None,
         phase: None,
-    }
-}
-
-fn function_call_output(call_id: &str, content: &str) -> ResponseItem {
-    ResponseItem::FunctionCallOutput {
-        call_id: call_id.to_string(),
-        output: FunctionCallOutputPayload::from_text(content.to_string()),
     }
 }
 
@@ -204,46 +199,40 @@ fn non_last_reasoning_tokens_ignore_entries_after_last_user() {
 }
 
 #[test]
-fn trailing_codex_generated_tokens_stop_at_first_non_generated_item() {
-    let earlier_output = function_call_output("call-earlier", "earlier output");
-    let trailing_function_output = function_call_output("call-tail-1", "tail function output");
-    let trailing_custom_output = custom_tool_call_output("call-tail-2", "tail custom output");
-    let history = create_history_with_items(vec![
-        earlier_output,
-        user_msg("boundary item"),
-        trailing_function_output.clone(),
-        trailing_custom_output.clone(),
-    ]);
-    let expected_tokens = estimate_item_token_count(&trailing_function_output)
-        .saturating_add(estimate_item_token_count(&trailing_custom_output));
+fn items_after_last_model_generated_item_include_local_tail() {
+    let assistant = assistant_msg("assistant boundary");
+    let user = user_msg("next user message");
+    let output = custom_tool_call_output("call-tail", "tail custom output");
+    let history = create_history_with_items(vec![assistant, user.clone(), output.clone()]);
+    let expected = vec![user, output];
 
     assert_eq!(
-        history.get_trailing_codex_generated_items_tokens(),
-        expected_tokens
+        history.items_after_last_model_generated_item(),
+        expected.as_slice()
     );
 }
 
 #[test]
-fn trailing_codex_generated_tokens_exclude_function_call_tail() {
+fn items_after_last_model_generated_item_exclude_model_tail() {
     let history = create_history_with_items(vec![ResponseItem::FunctionCall {
         id: None,
-        name: "not-generated".to_string(),
+        name: "model-generated".to_string(),
         arguments: "{}".to_string(),
         call_id: "call-tail".to_string(),
     }]);
 
-    assert_eq!(history.get_trailing_codex_generated_items_tokens(), 0);
+    assert!(history.items_after_last_model_generated_item().is_empty());
 }
 
 #[test]
-fn total_token_usage_includes_only_trailing_codex_generated_items() {
-    let non_trailing_output = function_call_output("call-before-message", "not trailing");
-    let trailing_assistant = assistant_msg("assistant boundary");
+fn total_token_usage_includes_all_items_after_last_model_generated_item() {
+    let assistant = assistant_msg("assistant boundary");
+    let trailing_user = user_msg("tail user message");
     let trailing_output = custom_tool_call_output("tool-tail", "trailing output");
     let mut history = create_history_with_items(vec![
-        non_trailing_output,
-        user_msg("boundary"),
-        trailing_assistant,
+        user_msg("previous boundary"),
+        assistant,
+        trailing_user.clone(),
         trailing_output.clone(),
     ]);
     history.update_token_info(
@@ -256,7 +245,8 @@ fn total_token_usage_includes_only_trailing_codex_generated_items() {
 
     assert_eq!(
         history.get_total_token_usage(true),
-        100 + estimate_item_token_count(&trailing_output)
+        100 + estimate_item_token_count(&trailing_user)
+            + estimate_item_token_count(&trailing_output)
     );
 }
 
@@ -268,6 +258,110 @@ fn get_history_for_prompt_drops_ghost_commits() {
     let history = create_history_with_items(items);
     let filtered = history.for_prompt();
     assert_eq!(filtered, vec![]);
+}
+
+#[test]
+fn for_prompt_strips_images_for_text_only_models() {
+    let user_with_image = ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![
+            ContentItem::InputText {
+                text: "inspect this".to_string(),
+            },
+            ContentItem::InputImage {
+                image_url: "data:image/png;base64,AAA".to_string(),
+            },
+        ],
+        end_turn: None,
+        phase: None,
+    };
+    let call = ResponseItem::FunctionCall {
+        id: None,
+        name: "view_image".to_string(),
+        arguments: "{}".to_string(),
+        call_id: "call-image".to_string(),
+    };
+    let output_with_image = ResponseItem::FunctionCallOutput {
+        call_id: "call-image".to_string(),
+        output: FunctionCallOutputPayload {
+            body: FunctionCallOutputBody::ContentItems(vec![
+                FunctionCallOutputContentItem::InputImage {
+                    image_url: "data:image/png;base64,BBB".to_string(),
+                },
+                FunctionCallOutputContentItem::InputText {
+                    text: "visible text".to_string(),
+                },
+            ]),
+            success: Some(true),
+        },
+    };
+    let history = create_history_with_items(vec![user_with_image, call, output_with_image]);
+
+    let filtered = history.for_prompt_with_modalities(&[InputModality::Text]);
+
+    assert_eq!(
+        filtered,
+        vec![
+            ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![
+                    ContentItem::InputText {
+                        text: "inspect this".to_string(),
+                    },
+                    ContentItem::InputText {
+                        text: normalize::IMAGE_CONTENT_OMITTED_PLACEHOLDER.to_string(),
+                    },
+                ],
+                end_turn: None,
+                phase: None,
+            },
+            ResponseItem::FunctionCall {
+                id: None,
+                name: "view_image".to_string(),
+                arguments: "{}".to_string(),
+                call_id: "call-image".to_string(),
+            },
+            ResponseItem::FunctionCallOutput {
+                call_id: "call-image".to_string(),
+                output: FunctionCallOutputPayload {
+                    body: FunctionCallOutputBody::ContentItems(vec![
+                        FunctionCallOutputContentItem::InputText {
+                            text: normalize::IMAGE_CONTENT_OMITTED_PLACEHOLDER.to_string(),
+                        },
+                        FunctionCallOutputContentItem::InputText {
+                            text: "visible text".to_string(),
+                        },
+                    ]),
+                    success: Some(true),
+                },
+            },
+        ]
+    );
+}
+
+#[test]
+fn image_data_url_payload_is_discounted_in_token_estimates() {
+    let payload = "a".repeat(40_000);
+    let image_item = ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputImage {
+            image_url: format!("data:image/png;base64,{payload}"),
+        }],
+        end_turn: None,
+        phase: None,
+    };
+    let text_item = ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText { text: payload }],
+        end_turn: None,
+        phase: None,
+    };
+
+    assert!(estimate_item_token_count(&image_item) < estimate_item_token_count(&text_item) / 2);
 }
 
 #[test]
@@ -469,6 +563,42 @@ fn drop_last_n_user_turns_preserves_prefix() {
     assert_eq!(
         history.for_prompt(),
         vec![assistant_msg("session prefix item")]
+    );
+}
+
+#[test]
+fn drop_last_n_user_turns_trims_context_updates_before_rolled_back_turn() {
+    let environment_update =
+        user_input_text_msg("<environment_context>new cwd</environment_context>");
+    let permissions_update = ResponseItem::Message {
+        id: None,
+        role: "developer".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "<permissions instructions>\nupdated\n</permissions instructions>".to_string(),
+        }],
+        end_turn: None,
+        phase: None,
+    };
+    let items = vec![
+        user_input_text_msg("<environment_context>initial</environment_context>"),
+        user_input_text_msg("turn 1 user"),
+        assistant_msg("turn 1 assistant"),
+        permissions_update,
+        environment_update,
+        user_input_text_msg("turn 2 user"),
+        assistant_msg("turn 2 assistant"),
+    ];
+
+    let mut history = create_history_with_items(items);
+    history.drop_last_n_user_turns(1);
+
+    assert_eq!(
+        history.for_prompt(),
+        vec![
+            user_input_text_msg("<environment_context>initial</environment_context>"),
+            user_input_text_msg("turn 1 user"),
+            assistant_msg("turn 1 assistant"),
+        ]
     );
 }
 

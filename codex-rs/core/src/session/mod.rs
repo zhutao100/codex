@@ -1642,12 +1642,15 @@ impl Session {
         state.clone_history()
     }
 
-    pub(crate) async fn prompt_history(&self) -> Vec<ResponseItem> {
+    pub(crate) async fn prompt_history(&self, turn_context: &TurnContext) -> Vec<ResponseItem> {
         let items = {
             let state = self.state.lock().await;
             state.history.raw_items().to_vec()
         };
-        ContextManager::prepare_items_for_prompt(items)
+        ContextManager::prepare_items_for_prompt_with_modalities(
+            items,
+            &turn_context.model_info.input_modalities,
+        )
     }
 
     pub(crate) async fn update_token_usage_info(
