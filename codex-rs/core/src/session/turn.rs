@@ -1,4 +1,9 @@
 use super::*;
+use crate::context_manager::estimate_item_token_count;
+use crate::truncate::approx_token_count;
+use crate::truncate::truncate_function_output_items_with_policy;
+use crate::truncate::truncate_text;
+use codex_protocol::models::FunctionCallOutputBody;
 
 #[derive(Clone, Copy, Debug, Default)]
 enum PreCompactNotesState {
@@ -10,6 +15,10 @@ enum PreCompactNotesState {
 const AUTO_COMPACT_WORK_NOTES_CAPTURE_MAX_ATTEMPTS: u8 = 2;
 const AUTO_COMPACT_WORK_NOTES_TOOL_REJECT_REASON: &str =
     "tool use disabled during auto-compact work-notes capture";
+const AUTO_COMPACT_WORK_NOTES_OUTPUT_TOKEN_RESERVE_MAX: i64 = 4_096;
+const AUTO_COMPACT_WORK_NOTES_OUTPUT_TOKEN_RESERVE_FRACTION: i64 = 20;
+const AUTO_COMPACT_WORK_NOTES_MIN_TOOL_OUTPUT_TOKENS: i64 = 128;
+const AUTO_COMPACT_WORK_NOTES_TOOL_OUTPUT_WRAPPER_TOKEN_ESTIMATE: usize = 256;
 
 fn is_auto_compact_work_notes_message(message: &str) -> bool {
     message
@@ -44,6 +53,186 @@ Begin with: {AUTO_COMPACT_WORK_NOTES_TAG}\n\
     let message: ResponseItem = DeveloperInstructions::new(request).into();
     sess.record_conversation_items(turn_context, std::slice::from_ref(&message))
         .await;
+}
+
+async fn sampling_input_for_pre_compact_work_notes(
+    sess: &Session,
+    turn_context: &TurnContext,
+) -> Vec<ResponseItem> {
+    let mut input = sess.prompt_history(turn_context).await;
+    let base_instructions = sess.get_base_instructions().await;
+    if let Some(stats) = trim_pre_compact_work_notes_input_to_headroom(
+        &mut input,
+        &base_instructions,
+        // Use the literal context window here; work_notes_input_token_target
+        // already reserves output headroom for the final work notes.
+        turn_context.model_info.context_window,
+    ) {
+        info!(
+            turn_id = %turn_context.sub_id,
+            estimated_tokens_before = stats.estimated_tokens_before,
+            estimated_tokens_after = stats.estimated_tokens_after,
+            target_input_tokens = stats.target_input_tokens,
+            "trimmed auto-compact work-notes prompt to reserve output headroom"
+        );
+    }
+    input
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WorkNotesPromptTrimStats {
+    estimated_tokens_before: i64,
+    estimated_tokens_after: i64,
+    target_input_tokens: i64,
+}
+
+fn trim_pre_compact_work_notes_input_to_headroom(
+    input: &mut [ResponseItem],
+    base_instructions: &BaseInstructions,
+    context_window: Option<i64>,
+) -> Option<WorkNotesPromptTrimStats> {
+    let context_window = context_window?;
+    let target_input_tokens = work_notes_input_token_target(context_window)?;
+    let estimated_tokens_before = estimate_work_notes_prompt_tokens(input, base_instructions);
+    if estimated_tokens_before <= target_input_tokens {
+        return None;
+    }
+
+    let trim_end = input
+        .iter()
+        .rposition(is_work_notes_request_response_item)
+        .unwrap_or(input.len());
+    let mut estimated_tokens_after = estimated_tokens_before;
+    let mut changed = false;
+
+    for idx in (0..trim_end).rev() {
+        let mut item_was_trimmed = false;
+        while estimated_tokens_after > target_input_tokens {
+            let item_tokens = estimate_item_token_count(&input[idx]);
+            let minimum_item_tokens = if item_was_trimmed {
+                1
+            } else {
+                AUTO_COMPACT_WORK_NOTES_MIN_TOOL_OUTPUT_TOKENS
+            };
+            if item_tokens <= minimum_item_tokens {
+                break;
+            }
+
+            let excess_tokens = estimated_tokens_after.saturating_sub(target_input_tokens);
+            let target_item_tokens = item_tokens
+                .saturating_sub(excess_tokens)
+                .max(minimum_item_tokens);
+            if target_item_tokens >= item_tokens {
+                break;
+            }
+
+            if !truncate_generated_output_item_for_work_notes(
+                &mut input[idx],
+                usize::try_from(target_item_tokens).unwrap_or(usize::MAX),
+            ) {
+                break;
+            }
+
+            let new_estimate = estimate_work_notes_prompt_tokens(input, base_instructions);
+            changed = true;
+            item_was_trimmed = true;
+            if new_estimate >= estimated_tokens_after {
+                estimated_tokens_after = new_estimate;
+                break;
+            }
+            estimated_tokens_after = new_estimate;
+        }
+    }
+
+    changed.then_some(WorkNotesPromptTrimStats {
+        estimated_tokens_before,
+        estimated_tokens_after,
+        target_input_tokens,
+    })
+}
+
+fn work_notes_input_token_target(context_window: i64) -> Option<i64> {
+    if context_window <= 1 {
+        return None;
+    }
+    let reserve = if context_window < 1_024 {
+        (context_window / 4).max(1)
+    } else {
+        (context_window / AUTO_COMPACT_WORK_NOTES_OUTPUT_TOKEN_RESERVE_FRACTION)
+            .clamp(256, AUTO_COMPACT_WORK_NOTES_OUTPUT_TOKEN_RESERVE_MAX)
+    };
+    Some(context_window.saturating_sub(reserve).max(1))
+}
+
+fn estimate_work_notes_prompt_tokens(
+    input: &[ResponseItem],
+    base_instructions: &BaseInstructions,
+) -> i64 {
+    let base_tokens =
+        i64::try_from(approx_token_count(&base_instructions.text)).unwrap_or(i64::MAX);
+    input
+        .iter()
+        .map(estimate_item_token_count)
+        .fold(base_tokens, i64::saturating_add)
+}
+
+fn is_work_notes_request_response_item(item: &ResponseItem) -> bool {
+    let ResponseItem::Message { role, content, .. } = item else {
+        return false;
+    };
+    if role != "developer" {
+        return false;
+    }
+    compact::content_items_to_text(content)
+        .is_some_and(|text| text.contains(AUTO_COMPACT_WORK_NOTES_REQUEST_TAG))
+}
+
+fn truncate_generated_output_item_for_work_notes(
+    item: &mut ResponseItem,
+    target_item_tokens: usize,
+) -> bool {
+    let target_output_tokens = target_item_tokens
+        .saturating_sub(AUTO_COMPACT_WORK_NOTES_TOOL_OUTPUT_WRAPPER_TOKEN_ESTIMATE)
+        .max(1);
+    match item {
+        ResponseItem::FunctionCallOutput { output, .. } => match &mut output.body {
+            FunctionCallOutputBody::Text(text) => {
+                truncate_text_for_work_notes(text, target_output_tokens)
+            }
+            FunctionCallOutputBody::ContentItems(items) => {
+                let previous = items.clone();
+                *items = truncate_function_output_items_with_policy(
+                    items,
+                    TruncationPolicy::Tokens(target_output_tokens),
+                );
+                *items != previous
+            }
+        },
+        ResponseItem::CustomToolCallOutput { output, .. } => {
+            truncate_text_for_work_notes(output, target_output_tokens)
+        }
+        ResponseItem::Message { .. }
+        | ResponseItem::Reasoning { .. }
+        | ResponseItem::LocalShellCall { .. }
+        | ResponseItem::FunctionCall { .. }
+        | ResponseItem::WebSearchCall { .. }
+        | ResponseItem::CustomToolCall { .. }
+        | ResponseItem::Compaction { .. }
+        | ResponseItem::GhostSnapshot { .. }
+        | ResponseItem::Other => false,
+    }
+}
+
+fn truncate_text_for_work_notes(text: &mut String, target_tokens: usize) -> bool {
+    if approx_token_count(text) <= target_tokens {
+        return false;
+    }
+    let truncated = truncate_text(text, TruncationPolicy::Tokens(target_tokens));
+    if truncated == *text {
+        return false;
+    }
+    *text = truncated;
+    true
 }
 
 /// Takes a user message as input and runs a loop where, at each sampling request, the model
@@ -160,7 +349,7 @@ async fn run_turn_inner(
 
                 loop {
                     let sampling_request_input: Vec<ResponseItem> =
-                        sess.prompt_history(turn_context.as_ref()).await;
+                        sampling_input_for_pre_compact_work_notes(&sess, &turn_context).await;
                     let tool_selection = SamplingRequestToolSelection {
                         explicit_app_paths: &explicit_app_paths,
                         skill_name_counts_lower: &skill_name_counts_lower,
@@ -397,7 +586,11 @@ async fn run_turn_inner(
 
         // Construct the input that we will send to the model.
         let sampling_request_input: Vec<ResponseItem> =
-            sess.prompt_history(turn_context.as_ref()).await;
+            if matches!(pre_compact_notes_state, PreCompactNotesState::AwaitingNotes) {
+                sampling_input_for_pre_compact_work_notes(&sess, &turn_context).await
+            } else {
+                sess.prompt_history(turn_context.as_ref()).await
+            };
 
         let sampling_request_input_messages = sampling_request_input
             .iter()
@@ -2092,7 +2285,17 @@ pub(crate) fn get_last_assistant_message_from_turn(responses: &[ResponseItem]) -
 
 #[cfg(test)]
 mod tests {
+    use super::AUTO_COMPACT_WORK_NOTES_REQUEST_TAG;
+    use super::estimate_work_notes_prompt_tokens;
     use super::should_compact_with_previous_model;
+    use super::trim_pre_compact_work_notes_input_to_headroom;
+    use super::work_notes_input_token_target;
+    use codex_protocol::models::BaseInstructions;
+    use codex_protocol::models::ContentItem;
+    use codex_protocol::models::FunctionCallOutputBody;
+    use codex_protocol::models::FunctionCallOutputPayload;
+    use codex_protocol::models::ResponseItem;
+    use pretty_assertions::assert_eq;
 
     #[test]
     fn model_downshift_decision_requires_larger_previous_context_window() {
@@ -2134,5 +2337,145 @@ mod tests {
             Some(128_000),
             Some(32_000),
         ));
+    }
+
+    #[test]
+    fn work_notes_prompt_trimming_reserves_output_headroom() {
+        let context_window = 4_000;
+        let target = work_notes_input_token_target(context_window).expect("target");
+        let large_output = "tool output line\n".repeat(8_000);
+        let mut input = vec![
+            ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "initial user request".to_string(),
+                }],
+                end_turn: None,
+                phase: None,
+            },
+            ResponseItem::FunctionCall {
+                id: None,
+                name: "shell".to_string(),
+                arguments: "{}".to_string(),
+                call_id: "call-1".to_string(),
+            },
+            ResponseItem::FunctionCallOutput {
+                call_id: "call-1".to_string(),
+                output: FunctionCallOutputPayload {
+                    body: FunctionCallOutputBody::Text(large_output),
+                    ..Default::default()
+                },
+            },
+            ResponseItem::Message {
+                id: None,
+                role: "developer".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: format!("{AUTO_COMPACT_WORK_NOTES_REQUEST_TAG}\nrequest notes"),
+                }],
+                end_turn: None,
+                phase: None,
+            },
+        ];
+        let base_instructions = BaseInstructions {
+            text: "base instructions".to_string(),
+        };
+        let before = estimate_work_notes_prompt_tokens(&input, &base_instructions);
+        assert!(
+            before > target,
+            "fixture must exceed the target input budget before trimming"
+        );
+
+        let stats = trim_pre_compact_work_notes_input_to_headroom(
+            &mut input,
+            &base_instructions,
+            Some(context_window),
+        )
+        .expect("expected trimming");
+
+        assert_eq!(stats.estimated_tokens_before, before);
+        assert!(
+            stats.estimated_tokens_after <= target,
+            "after={} target={} before={}",
+            stats.estimated_tokens_after,
+            target,
+            before
+        );
+        assert_eq!(
+            input.last(),
+            Some(&ResponseItem::Message {
+                id: None,
+                role: "developer".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: format!("{AUTO_COMPACT_WORK_NOTES_REQUEST_TAG}\nrequest notes"),
+                }],
+                end_turn: None,
+                phase: None,
+            })
+        );
+        let ResponseItem::FunctionCallOutput { output, .. } = &input[2] else {
+            panic!("expected function call output");
+        };
+        let FunctionCallOutputBody::Text(text) = &output.body else {
+            panic!("expected text output");
+        };
+        assert!(text.contains("tokens truncated"));
+    }
+
+    #[test]
+    fn work_notes_prompt_trimming_counts_base_instructions() {
+        let context_window = 1_000;
+        let target = work_notes_input_token_target(context_window).expect("target");
+        let empty_base = BaseInstructions {
+            text: String::new(),
+        };
+        let base_instructions = BaseInstructions {
+            text: "base instructions line\n".repeat(40),
+        };
+        let mut input = vec![
+            ResponseItem::FunctionCallOutput {
+                call_id: "call-1".to_string(),
+                output: FunctionCallOutputPayload {
+                    body: FunctionCallOutputBody::Text("tool output line\n".repeat(130)),
+                    ..Default::default()
+                },
+            },
+            ResponseItem::Message {
+                id: None,
+                role: "developer".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: format!("{AUTO_COMPACT_WORK_NOTES_REQUEST_TAG}\nrequest notes"),
+                }],
+                end_turn: None,
+                phase: None,
+            },
+        ];
+        let input_only = estimate_work_notes_prompt_tokens(&input, &empty_base);
+        assert!(
+            input_only <= target,
+            "fixture input_only={input_only} target={target}"
+        );
+        let before = estimate_work_notes_prompt_tokens(&input, &base_instructions);
+        assert!(
+            before > target,
+            "fixture with base instructions must exceed the target input budget"
+        );
+
+        let stats = trim_pre_compact_work_notes_input_to_headroom(
+            &mut input,
+            &base_instructions,
+            Some(context_window),
+        )
+        .expect("expected trimming");
+
+        assert_eq!(stats.estimated_tokens_before, before);
+        assert_eq!(stats.target_input_tokens, target);
+        assert!(
+            stats.estimated_tokens_after <= target,
+            "after={} target={} before={}",
+            stats.estimated_tokens_after,
+            target,
+            before
+        );
     }
 }

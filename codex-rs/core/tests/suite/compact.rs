@@ -1704,6 +1704,7 @@ async fn auto_compact_persists_rollout_entries() {
     });
 
     let mut turn_context_count = 0usize;
+    let mut saw_preserved_work_notes = false;
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -1716,7 +1717,17 @@ async fn auto_compact_persists_rollout_entries() {
             RolloutItem::TurnContext(_) => {
                 turn_context_count += 1;
             }
-            RolloutItem::Compacted(_) => {}
+            RolloutItem::Compacted(compacted) => {
+                if let Some(replacement_history) = compacted.replacement_history.as_ref() {
+                    let replacement_text = serde_json::to_string(replacement_history)
+                        .expect("serialize replacement history");
+                    if replacement_text.contains(WORK_NOTES_TEXT)
+                        && replacement_text.contains("preserved session work notes")
+                    {
+                        saw_preserved_work_notes = true;
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -1724,6 +1735,10 @@ async fn auto_compact_persists_rollout_entries() {
     assert!(
         turn_context_count >= 2,
         "expected at least two turn context entries, got {turn_context_count}"
+    );
+    assert!(
+        saw_preserved_work_notes,
+        "expected auto compact rollout replacement history to preserve work notes"
     );
 }
 

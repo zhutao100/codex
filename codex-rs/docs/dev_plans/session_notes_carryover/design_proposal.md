@@ -16,6 +16,7 @@ The goal is to preserve high-value session state across auto-compaction without 
 - Add one extra ordinary sampling round immediately before auto-compaction.
 - Use that round to emit structured session work notes.
 - Keep the prompt tool list unchanged, but reject tool execution at runtime during the note round.
+- Reserve output headroom for the note round by trimming oversized generated tool outputs in the transient prompt copy only.
 - Compact from prepared history that excludes the transient work-notes request/response suffix.
 - Inject preserved work notes verbatim after compaction.
 - Reuse the same prepared-history logic for both local and remote compaction.
@@ -142,6 +143,13 @@ The extra round should reuse the existing prompt surface:
 The only additional prompt content should be one synthetic developer message appended at the end of history.
 
 This is the key design choice that preserves prefix cache reuse for the large historical prefix.
+
+If the active prompt is already close to the model context window, the note round must still leave
+enough output budget for a useful assistant message. Trim oversized Codex-generated tool outputs in
+the note-round prompt copy before sampling. Do not mutate session history for this trimming, and do
+not remove the work-notes request suffix. This keeps compaction based on the original work history
+while avoiding an empty or cutoff notes response when the prior tool output consumed nearly all
+remaining context.
 
 ## 3. Inject the work-notes request as a synthetic developer message
 

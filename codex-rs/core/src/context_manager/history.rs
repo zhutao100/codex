@@ -460,7 +460,7 @@ fn estimate_reasoning_length(encoded_len: usize) -> usize {
         .saturating_sub(650)
 }
 
-fn estimate_item_token_count(item: &ResponseItem) -> i64 {
+pub(crate) fn estimate_item_token_count(item: &ResponseItem) -> i64 {
     let model_visible_bytes = estimate_response_item_model_visible_bytes(item);
     let model_visible_bytes = usize::try_from(model_visible_bytes).unwrap_or(usize::MAX);
     i64::try_from(approx_tokens_from_byte_count(model_visible_bytes)).unwrap_or(i64::MAX)
