@@ -1065,6 +1065,23 @@ impl Session {
         update_items
     }
 
+    async fn build_full_context_with_model_switch_if_needed(
+        &self,
+        previous_context: &TurnContextItem,
+        previous_turn_settings: Option<&PreviousTurnSettings>,
+        current_context: &TurnContext,
+    ) -> Vec<ResponseItem> {
+        let mut update_items = self.build_initial_context(current_context).await;
+        if let Some(model_instructions_item) = self.build_model_instructions_update_item(
+            previous_context,
+            previous_turn_settings,
+            current_context,
+        ) {
+            update_items.insert(0, model_instructions_item);
+        }
+        update_items
+    }
+
     /// Persist the event to rollout and send it to clients.
     pub(crate) async fn send_event(&self, turn_context: &TurnContext, msg: EventMsg) {
         let show_raw_agent_reasoning = self.show_raw_agent_reasoning();
@@ -1572,7 +1589,12 @@ impl Session {
                     turn_context,
                 )
             } else {
-                self.build_initial_context(turn_context).await
+                self.build_full_context_with_model_switch_if_needed(
+                    reference_context_item,
+                    previous_turn_settings.as_ref(),
+                    turn_context,
+                )
+                .await
             }
         } else {
             self.build_initial_context(turn_context).await

@@ -77,6 +77,21 @@ fn assistant_message(text: &str) -> ResponseItem {
     }
 }
 
+fn developer_texts(items: &[ResponseItem]) -> Vec<&str> {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            ResponseItem::Message { role, content, .. } if role == "developer" => {
+                let [ContentItem::InputText { text }] = content.as_slice() else {
+                    return None;
+                };
+                Some(text.as_str())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 fn make_connector(id: &str, name: &str) -> AppInfo {
     AppInfo {
         id: id.to_string(),
@@ -676,6 +691,44 @@ async fn record_context_updates_and_set_reference_context_item_persists_baseline
 }
 
 #[tokio::test]
+async fn record_context_updates_keeps_model_switch_when_legacy_baseline_needs_full_context() {
+    let (session, turn_context) = make_session_and_context().await;
+    let mut previous = turn_context.to_turn_context_item();
+    previous.model = "previous-model".to_string();
+    previous.collaboration_mode = None;
+
+    {
+        let mut state = session.state.lock().await;
+        state
+            .history
+            .set_reference_context_item(Some(previous.clone()));
+        state.previous_turn_settings = Some(PreviousTurnSettings {
+            model: previous.model.clone(),
+        });
+        state.initial_context_seeded = true;
+    }
+
+    session
+        .record_context_updates_and_set_reference_context_item(&turn_context)
+        .await;
+
+    let history = session.clone_history().await;
+    let developer_texts = developer_texts(history.raw_items());
+    let model_switch_count = developer_texts
+        .iter()
+        .filter(|text| text.contains("<model_switch>"))
+        .count();
+    assert_eq!(model_switch_count, 1);
+    assert!(developer_texts[0].starts_with("<model_switch>"));
+    assert!(
+        developer_texts
+            .iter()
+            .any(|text| text.starts_with("<permissions instructions>")),
+        "expected full context permissions message, got {developer_texts:?}"
+    );
+}
+
+#[tokio::test]
 async fn build_settings_update_items_emits_model_switch_before_other_developer_diffs() {
     use crate::protocol::AskForApproval;
 
@@ -694,18 +747,7 @@ async fn build_settings_update_items_emits_model_switch_before_other_developer_d
 
     let update_items =
         session.build_settings_update_items(&previous, Some(&previous_settings), &turn_context);
-    let developer_texts = update_items
-        .iter()
-        .filter_map(|item| match item {
-            ResponseItem::Message { role, content, .. } if role == "developer" => {
-                let [ContentItem::InputText { text }] = content.as_slice() else {
-                    return None;
-                };
-                Some(text.as_str())
-            }
-            _ => None,
-        })
-        .collect::<Vec<_>>();
+    let developer_texts = developer_texts(&update_items);
 
     assert!(
         developer_texts.len() >= 2,
