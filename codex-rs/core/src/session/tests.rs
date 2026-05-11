@@ -477,6 +477,13 @@ fn history_needs_continuation_ignores_preserved_work_notes() {
 }
 
 #[test]
+fn preserved_work_notes_are_not_user_turn_boundaries() {
+    let work_notes = crate::compact::preserved_work_notes_message("notes");
+
+    assert!(!turn::is_user_turn_boundary_response_item(&work_notes));
+}
+
+#[test]
 fn trims_dangling_tool_call_before_continuation() {
     let mut history = vec![
         user_message("run a tool"),
@@ -886,6 +893,36 @@ async fn thread_rollback_drops_last_turn_from_history() {
 
     let history = sess.clone_history().await;
     assert_eq!(expected, history.raw_items());
+}
+
+#[tokio::test]
+async fn thread_rollback_clears_reference_context_item_when_rollback_crosses_baseline() {
+    let (sess, tc, rx) = make_session_and_context_with_rx().await;
+    let context_item = tc.to_turn_context_item();
+
+    {
+        let mut state = sess.state.lock().await;
+        state
+            .history
+            .set_reference_context_item(Some(context_item.clone()));
+        state.previous_turn_settings = Some(PreviousTurnSettings {
+            model: context_item.model,
+        });
+        state.initial_context_seeded = true;
+    }
+
+    let turn = vec![
+        user_message("turn user"),
+        assistant_message("turn assistant"),
+    ];
+    sess.record_into_history(&turn, tc.as_ref()).await;
+
+    handlers::thread_rollback(&sess, "sub-1".to_string(), 1).await;
+
+    let rollback_event = wait_for_thread_rolled_back(&rx).await;
+    assert_eq!(rollback_event.num_turns, 1);
+    assert_eq!(sess.reference_context_item().await, None);
+    assert_eq!(sess.previous_turn_settings().await, None);
 }
 
 #[tokio::test]

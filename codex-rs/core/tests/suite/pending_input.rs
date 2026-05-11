@@ -1,8 +1,13 @@
+use codex_core::compact::SUMMARIZATION_PROMPT;
+use codex_core::features::Feature;
 use codex_core::protocol::EventMsg;
 use codex_core::protocol::Op;
 use codex_protocol::user_input::UserInput;
 use core_test_support::responses;
+use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
+use core_test_support::responses::ev_completed_with_tokens;
+use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_message_item_added;
 use core_test_support::responses::ev_output_text_delta;
 use core_test_support::responses::ev_response_created;
@@ -42,6 +47,11 @@ fn message_input_texts(body: &Value, role: &str) -> Vec<String> {
         .filter(|span| span.get("type").and_then(Value::as_str) == Some("input_text"))
         .filter_map(|span| span.get("text").and_then(Value::as_str).map(str::to_owned))
         .collect()
+}
+
+fn request_body(requests: &[Vec<u8>], index: usize) -> Value {
+    serde_json::from_slice(&requests[index])
+        .unwrap_or_else(|err| panic!("parse request body: {err}"))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -145,6 +155,250 @@ async fn injected_user_input_triggers_follow_up_request_with_deltas() {
     let second_texts = message_input_texts(&second_body, "user");
     assert!(second_texts.iter().any(|text| text == "first prompt"));
     assert!(second_texts.iter().any(|text| text == "second prompt"));
+
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_prompt_samples_before_pending_input() {
+    let (first_completed_tx, first_completed_rx) = oneshot::channel();
+
+    let first_chunks = vec![
+        StreamingSseChunk {
+            gate: None,
+            body: sse_event(ev_response_created("resp-1")),
+        },
+        StreamingSseChunk {
+            gate: Some(first_completed_rx),
+            body: sse_event(ev_completed("resp-1")),
+        },
+    ];
+    let second_chunks = vec![
+        StreamingSseChunk {
+            gate: None,
+            body: sse_event(ev_response_created("resp-2")),
+        },
+        StreamingSseChunk {
+            gate: None,
+            body: sse_event(ev_completed("resp-2")),
+        },
+    ];
+    let (server, _completions) =
+        start_streaming_sse_server(vec![first_chunks, second_chunks]).await;
+
+    let codex = test_codex()
+        .with_model("gpt-5.1")
+        .build_with_streaming_server(&server)
+        .await
+        .unwrap()
+        .codex;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "fresh prompt".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await
+        .unwrap();
+
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnStarted(_))).await;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "queued pending input".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await
+        .unwrap();
+
+    let _ = first_completed_tx.send(());
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+
+    let requests = server.requests().await;
+    assert_eq!(requests.len(), 2);
+
+    let first_body = request_body(&requests, 0);
+    let first_texts = message_input_texts(&first_body, "user");
+    assert!(first_texts.iter().any(|text| text == "fresh prompt"));
+    assert!(
+        !first_texts
+            .iter()
+            .any(|text| text == "queued pending input")
+    );
+
+    let second_body = request_body(&requests, 1);
+    let second_texts = message_input_texts(&second_body, "user");
+    assert!(second_texts.iter().any(|text| text == "fresh prompt"));
+    assert!(
+        second_texts
+            .iter()
+            .any(|text| text == "queued pending input")
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mid_turn_compaction_defers_pending_input_until_model_follow_up_finishes() {
+    let (work_notes_completed_tx, work_notes_completed_rx) = oneshot::channel();
+    let pending_text = "queued during work-notes capture";
+    let call_id = "call-pending-compact";
+    let function_name = "unsupported_tool";
+    let work_notes_text =
+        "<AUTO_COMPACT_WORK_NOTES>\nObjective: test pending input ordering.\nStatus: ready.";
+
+    let first_chunks = vec![
+        StreamingSseChunk {
+            gate: None,
+            body: sse_event(ev_response_created("resp-1")),
+        },
+        StreamingSseChunk {
+            gate: None,
+            body: sse_event(ev_function_call(call_id, function_name, "{}")),
+        },
+        StreamingSseChunk {
+            gate: None,
+            body: sse_event(ev_completed_with_tokens("resp-1", 96)),
+        },
+    ];
+    let work_notes_chunks = vec![
+        StreamingSseChunk {
+            gate: None,
+            body: sse_event(ev_response_created("resp-2")),
+        },
+        StreamingSseChunk {
+            gate: None,
+            body: sse_event(ev_assistant_message("msg-work-notes", work_notes_text)),
+        },
+        StreamingSseChunk {
+            gate: Some(work_notes_completed_rx),
+            body: sse_event(ev_completed_with_tokens("resp-2", 10)),
+        },
+    ];
+    let compact_chunks = vec![
+        StreamingSseChunk {
+            gate: None,
+            body: sse_event(ev_response_created("resp-3")),
+        },
+        StreamingSseChunk {
+            gate: None,
+            body: sse_event(ev_assistant_message("msg-summary", "COMPACTED SUMMARY")),
+        },
+        StreamingSseChunk {
+            gate: None,
+            body: sse_event(ev_completed_with_tokens("resp-3", 10)),
+        },
+    ];
+    let model_follow_up_chunks = vec![
+        StreamingSseChunk {
+            gate: None,
+            body: sse_event(ev_response_created("resp-4")),
+        },
+        StreamingSseChunk {
+            gate: None,
+            body: sse_event(ev_assistant_message("msg-follow-up", "follow-up done")),
+        },
+        StreamingSseChunk {
+            gate: None,
+            body: sse_event(ev_completed_with_tokens("resp-4", 10)),
+        },
+    ];
+    let pending_chunks = vec![
+        StreamingSseChunk {
+            gate: None,
+            body: sse_event(ev_response_created("resp-5")),
+        },
+        StreamingSseChunk {
+            gate: None,
+            body: sse_event(ev_completed("resp-5")),
+        },
+    ];
+    let (server, _completions) = start_streaming_sse_server(vec![
+        first_chunks,
+        work_notes_chunks,
+        compact_chunks,
+        model_follow_up_chunks,
+        pending_chunks,
+    ])
+    .await;
+
+    let codex = test_codex()
+        .with_model("gpt-5.1")
+        .with_config(|config| {
+            config.compact_prompt = Some(SUMMARIZATION_PROMPT.to_string());
+            config.model_context_window = Some(100);
+            config.model_auto_compact_token_limit = Some(90);
+            config.features.disable(Feature::RemoteCompaction);
+        })
+        .build_with_streaming_server(&server)
+        .await
+        .unwrap()
+        .codex;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "trigger tool and compaction".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await
+        .unwrap();
+
+    wait_for_event(&codex, |event| {
+        matches!(event, EventMsg::AgentMessage(message) if message.message == work_notes_text)
+    })
+    .await;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: pending_text.into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await
+        .unwrap();
+
+    let _ = work_notes_completed_tx.send(());
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+
+    let requests = server.requests().await;
+    assert_eq!(requests.len(), 5);
+
+    let bodies = (0..requests.len())
+        .map(|index| request_body(&requests, index))
+        .collect::<Vec<_>>();
+    assert!(
+        message_input_texts(&bodies[2], "user")
+            .iter()
+            .any(|text| text == SUMMARIZATION_PROMPT),
+        "expected third request to be compaction"
+    );
+
+    for (index, body) in bodies.iter().take(4).enumerate() {
+        let user_texts = message_input_texts(body, "user");
+        assert!(
+            !user_texts.iter().any(|text| text == pending_text),
+            "request {index} should not include pending input before model follow-up finishes"
+        );
+    }
+
+    let pending_request_texts = message_input_texts(&bodies[4], "user");
+    assert!(
+        pending_request_texts
+            .iter()
+            .any(|text| text == pending_text),
+        "pending input should be sampled after the model follow-up"
+    );
 
     server.shutdown().await;
 }
