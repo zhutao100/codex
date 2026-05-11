@@ -13,6 +13,12 @@ The repo `just` recipes and `scripts/debug-codex.sh` call this wrapper.
 The workspace VS Code rust-analyzer settings also call it for diagnostics,
 build-script/proc-macro loading, and runnables.
 
+`scripts/cargo-local test` defaults to agent-oriented output. It still runs
+Cargo with quiet short diagnostics, then filters successful libtest progress
+blocks into one compact summary while preserving warnings, errors, failure
+details, and sanitized local paths. Set
+`CODEX_RS_CARGO_LOCAL_TEST_OUTPUT=raw` when exact Cargo/libtest output is needed.
+
 Target-dir selection:
 
 1. Existing `CARGO_TARGET_DIR`.
