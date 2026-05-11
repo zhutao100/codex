@@ -343,6 +343,7 @@ async fn run_turn_inner(
     sess.maybe_start_ghost_snapshot(Arc::clone(&turn_context), cancellation_token.child_token())
         .await;
     let mut last_agent_message: Option<String> = None;
+    let mut can_drain_pending_input = input.is_empty();
     // Although from the perspective of codex.rs, TurnDiffTracker has the lifecycle of a Task which contains
     // many turns, from the perspective of the user, it is a single turn.
     let turn_diff_tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
@@ -362,7 +363,9 @@ async fn run_turn_inner(
         //
         // During pre-compact work-notes capture, defer pending input until after compaction so
         // the notes reflect the pre-interruption history and ordering is preserved.
-        let pending_input = if matches!(pre_compact_notes_state, PreCompactNotesState::Idle) {
+        let pending_input = if can_drain_pending_input
+            && matches!(pre_compact_notes_state, PreCompactNotesState::Idle)
+        {
             sess.get_pending_input().await
         } else {
             Vec::new()
@@ -430,8 +433,10 @@ async fn run_turn_inner(
             Ok(sampling_request_output) => {
                 let SamplingRequestResult {
                     needs_follow_up,
+                    model_needs_follow_up,
                     last_agent_message: sampling_request_last_agent_message,
                 } = sampling_request_output;
+                can_drain_pending_input = true;
                 let total_usage_tokens = sess.get_total_token_usage().await;
                 let token_limit_reached = total_usage_tokens >= auto_compact_limit;
 
@@ -468,6 +473,7 @@ async fn run_turn_inner(
                                 return None;
                             }
                         }
+                        can_drain_pending_input = false;
                         pre_compact_notes_state = PreCompactNotesState::Idle;
                         pre_compact_notes_attempts = 0;
                         continue;
@@ -496,6 +502,7 @@ async fn run_turn_inner(
                                 return None;
                             }
                         }
+                        can_drain_pending_input = false;
                         pre_compact_notes_state = PreCompactNotesState::Idle;
                         pre_compact_notes_attempts = 0;
                         continue;
@@ -527,6 +534,7 @@ async fn run_turn_inner(
                                 return None;
                             }
                         }
+                        can_drain_pending_input = !model_needs_follow_up;
                         continue;
                     }
 
@@ -581,6 +589,7 @@ async fn run_turn_inner(
                         return None;
                     }
                 }
+                can_drain_pending_input = false;
                 pre_compact_notes_state = PreCompactNotesState::Idle;
                 pre_compact_notes_attempts = 0;
                 continue;
@@ -1196,6 +1205,7 @@ async fn run_sampling_request(
 #[derive(Debug)]
 struct SamplingRequestResult {
     needs_follow_up: bool,
+    model_needs_follow_up: bool,
     last_agent_message: Option<String>,
 }
 
@@ -1775,6 +1785,7 @@ async fn try_run_sampling_request(
     let mut in_flight: FuturesOrdered<BoxFuture<'static, CodexResult<ResponseInputItem>>> =
         FuturesOrdered::new();
     let mut needs_follow_up = false;
+    let mut model_needs_follow_up = false;
     let mut last_agent_message: Option<String> = None;
     let mut active_item: Option<TurnItem> = None;
     let mut should_emit_turn_diff = false;
@@ -1878,7 +1889,10 @@ async fn try_run_sampling_request(
                 if let Some(agent_message) = output_result.last_agent_message {
                     last_agent_message = Some(agent_message);
                 }
-                needs_follow_up |= output_result.needs_follow_up;
+                if output_result.needs_follow_up {
+                    model_needs_follow_up = true;
+                    needs_follow_up = true;
+                }
             }
             ResponseEvent::OutputItemAdded(item) => {
                 if let Some(turn_item) = handle_non_tool_response_item(&item, plan_mode).await {
@@ -1938,12 +1952,14 @@ async fn try_run_sampling_request(
                 should_emit_turn_diff = true;
 
                 if let Some(false) = end_turn {
+                    model_needs_follow_up = true;
                     needs_follow_up = true;
                 }
                 needs_follow_up |= sess.has_pending_input().await;
 
                 break Ok(SamplingRequestResult {
                     needs_follow_up,
+                    model_needs_follow_up,
                     last_agent_message,
                 });
             }
