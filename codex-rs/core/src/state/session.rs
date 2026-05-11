@@ -45,8 +45,6 @@ pub(crate) struct SessionState {
     /// TODO(owen): This is a temporary solution to avoid updating a thread's updated_at
     /// timestamp when resuming a session. Remove this once SQLite is in place.
     pub(crate) initial_context_seeded: bool,
-    /// Previous rollout model for one-shot model-switch handling on first turn after resume.
-    pub(crate) pending_resume_previous_model: Option<String>,
     /// Settings from the latest surviving real user turn.
     pub(crate) previous_turn_settings: Option<PreviousTurnSettings>,
     /// Most recent paused/interrupted turn that can be continued without a new user input.
@@ -73,7 +71,6 @@ impl SessionState {
             dependency_env: HashMap::new(),
             mcp_dependency_prompted: HashSet::new(),
             initial_context_seeded: false,
-            pending_resume_previous_model: None,
             previous_turn_settings: None,
             pending_continuation: None,
             last_completed_regular_turn_for_review: None,

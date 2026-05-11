@@ -213,7 +213,141 @@ async fn reconstruct_history_matches_live_compactions() {
         .reconstruct_history_from_rollout(&turn_context, &rollout_items)
         .await;
 
-    assert_eq!(expected, reconstructed);
+    assert_eq!(expected, reconstructed.history);
+}
+
+#[tokio::test]
+async fn rollout_reconstruction_restores_reference_context_item_after_regular_turn() {
+    let (session, turn_context) = make_session_and_context().await;
+    let context_item = turn_context.to_turn_context_item();
+    let history = vec![user_message("hello"), assistant_message("hi")];
+    let rollout_items = vec![
+        RolloutItem::TurnContext(context_item.clone()),
+        RolloutItem::ResponseItem(history[0].clone()),
+        RolloutItem::ResponseItem(history[1].clone()),
+    ];
+
+    let reconstructed = session
+        .reconstruct_history_from_rollout(&turn_context, &rollout_items)
+        .await;
+
+    assert_eq!(
+        reconstructed,
+        ReconstructedRollout {
+            history,
+            reference_context_item: Some(context_item.clone()),
+            previous_turn_settings: Some(PreviousTurnSettings {
+                model: context_item.model
+            }),
+            pending_continuation: None,
+        }
+    );
+}
+
+#[tokio::test]
+async fn rollout_reconstruction_clears_reference_context_item_after_legacy_compaction() {
+    let (session, turn_context) = make_session_and_context().await;
+    let context_item = turn_context.to_turn_context_item();
+    let rollout_items = vec![
+        RolloutItem::TurnContext(context_item),
+        RolloutItem::ResponseItem(user_message("hello")),
+        RolloutItem::ResponseItem(assistant_message("hi")),
+        RolloutItem::Compacted(CompactedItem {
+            message: "summary".to_string(),
+            replacement_history: None,
+        }),
+    ];
+    let expected_history = compact::build_compacted_history(
+        session.build_initial_context(&turn_context).await,
+        &["hello".to_string()],
+        "summary",
+    );
+
+    let reconstructed = session
+        .reconstruct_history_from_rollout(&turn_context, &rollout_items)
+        .await;
+
+    assert_eq!(
+        reconstructed,
+        ReconstructedRollout {
+            history: expected_history,
+            reference_context_item: None,
+            previous_turn_settings: None,
+            pending_continuation: Some(PendingContinuation {
+                source: TurnContinuationSource::Interrupted,
+                continued_from_turn_id: None,
+            }),
+        }
+    );
+}
+
+#[tokio::test]
+async fn rollout_reconstruction_restores_reference_context_item_after_replacement_history() {
+    let (session, turn_context) = make_session_and_context().await;
+    let context_item = turn_context.to_turn_context_item();
+    let replacement_history = vec![user_message("summary")];
+    let rollout_items = vec![
+        RolloutItem::Compacted(CompactedItem {
+            message: "summary".to_string(),
+            replacement_history: Some(replacement_history.clone()),
+        }),
+        RolloutItem::TurnContext(context_item.clone()),
+    ];
+
+    let reconstructed = session
+        .reconstruct_history_from_rollout(&turn_context, &rollout_items)
+        .await;
+
+    assert_eq!(
+        reconstructed,
+        ReconstructedRollout {
+            history: replacement_history,
+            reference_context_item: Some(context_item.clone()),
+            previous_turn_settings: Some(PreviousTurnSettings {
+                model: context_item.model
+            }),
+            pending_continuation: Some(PendingContinuation {
+                source: TurnContinuationSource::Interrupted,
+                continued_from_turn_id: None,
+            }),
+        }
+    );
+}
+
+#[tokio::test]
+async fn rollout_reconstruction_thread_rollback_recomputes_reference_context_item() {
+    let (session, turn_context) = make_session_and_context().await;
+    let first_context = turn_context.to_turn_context_item();
+    let mut second_context = first_context.clone();
+    second_context.model = "next-model".to_string();
+    let surviving_history = vec![user_message("first"), assistant_message("first reply")];
+    let rollout_items = vec![
+        RolloutItem::TurnContext(first_context.clone()),
+        RolloutItem::ResponseItem(surviving_history[0].clone()),
+        RolloutItem::ResponseItem(surviving_history[1].clone()),
+        RolloutItem::TurnContext(second_context),
+        RolloutItem::ResponseItem(user_message("second")),
+        RolloutItem::ResponseItem(assistant_message("second reply")),
+        RolloutItem::EventMsg(EventMsg::ThreadRolledBack(ThreadRolledBackEvent {
+            num_turns: 1,
+        })),
+    ];
+
+    let reconstructed = session
+        .reconstruct_history_from_rollout(&turn_context, &rollout_items)
+        .await;
+
+    assert_eq!(
+        reconstructed,
+        ReconstructedRollout {
+            history: surviving_history,
+            reference_context_item: Some(first_context.clone()),
+            previous_turn_settings: Some(PreviousTurnSettings {
+                model: first_context.model
+            }),
+            pending_continuation: None,
+        }
+    );
 }
 
 #[tokio::test]
@@ -231,6 +365,36 @@ async fn record_initial_history_reconstructs_resumed_transcript() {
 
     let history = session.state.lock().await.clone_history();
     assert_eq!(expected, history.raw_items());
+}
+
+#[tokio::test]
+async fn record_initial_history_restores_resumed_reference_context_item() {
+    let (session, turn_context) = make_session_and_context().await;
+    let context_item = turn_context.to_turn_context_item();
+    let rollout_items = vec![
+        RolloutItem::TurnContext(context_item.clone()),
+        RolloutItem::ResponseItem(user_message("hello")),
+        RolloutItem::ResponseItem(assistant_message("hi")),
+    ];
+
+    session
+        .record_initial_history(InitialHistory::Resumed(ResumedHistory {
+            conversation_id: ThreadId::default(),
+            history: rollout_items,
+            rollout_path: PathBuf::from("/tmp/resume.jsonl"),
+        }))
+        .await;
+
+    assert_eq!(
+        session.reference_context_item().await,
+        Some(context_item.clone())
+    );
+    assert_eq!(
+        session.previous_turn_settings().await,
+        Some(PreviousTurnSettings {
+            model: context_item.model
+        })
+    );
 }
 
 #[test]
@@ -554,13 +718,12 @@ async fn build_settings_update_items_emits_model_switch_before_other_developer_d
 #[tokio::test]
 async fn record_initial_history_reconstructs_forked_transcript() {
     let (session, turn_context) = make_session_and_context().await;
-    let (rollout_items, mut expected) = sample_rollout(&session, &turn_context).await;
+    let (rollout_items, expected) = sample_rollout(&session, &turn_context).await;
 
     session
         .record_initial_history(InitialHistory::Forked(rollout_items))
         .await;
 
-    expected.extend(session.build_initial_context(&turn_context).await);
     let history = session.state.lock().await.clone_history();
     assert_eq!(expected, history.raw_items());
 }

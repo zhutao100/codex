@@ -169,6 +169,7 @@ use crate::protocol::SkillMetadata as ProtocolSkillMetadata;
 use crate::protocol::SkillToolDependency as ProtocolSkillToolDependency;
 use crate::protocol::StreamErrorEvent;
 use crate::protocol::Submission;
+use crate::protocol::ThreadRolledBackEvent;
 use crate::protocol::TokenCountEvent;
 use crate::protocol::TokenUsage;
 use crate::protocol::TokenUsageInfo;
@@ -244,12 +245,14 @@ mod handlers;
 mod mcp;
 mod read_only_temp;
 mod review;
+mod rollout_reconstruction;
 #[allow(clippy::module_inception)]
 pub(crate) mod session;
 pub(crate) mod turn;
 pub(crate) mod turn_context;
 
 use self::handlers::submission_loop;
+use self::rollout_reconstruction::ReconstructedRollout;
 use self::session::Session;
 use self::session::SessionConfiguration;
 pub(crate) use self::session::SessionSettingsUpdate;
@@ -614,6 +617,43 @@ impl Session {
         }
     }
 
+    pub(crate) async fn load_current_rollout_items(&self) -> Option<Vec<RolloutItem>> {
+        self.flush_rollout().await;
+        let rollout_path = {
+            let guard = self.services.rollout.lock().await;
+            guard
+                .as_ref()
+                .map(|recorder| recorder.rollout_path().to_path_buf())
+        }?;
+
+        match RolloutRecorder::load_rollout_items(&rollout_path).await {
+            Ok((items, _thread_id, _parse_errors)) => Some(items),
+            Err(err) => {
+                warn!(
+                    "failed to load rollout for reconstruction from {}: {err}",
+                    rollout_path.display()
+                );
+                None
+            }
+        }
+    }
+
+    pub(crate) async fn reconstruct_for_thread_rollback(
+        &self,
+        turn_context: &TurnContext,
+        rollback: ThreadRolledBackEvent,
+    ) -> bool {
+        let Some(mut rollout_items) = self.load_current_rollout_items().await else {
+            return false;
+        };
+        rollout_items.push(RolloutItem::EventMsg(EventMsg::ThreadRolledBack(rollback)));
+        let reconstructed = self
+            .reconstruct_history_from_rollout(turn_context, &rollout_items)
+            .await;
+        self.replace_with_reconstructed_rollout(reconstructed).await;
+        true
+    }
+
     pub(crate) async fn set_thread_name(&self, name: String) -> std::io::Result<()> {
         let Some(name) = crate::util::normalize_thread_name(&name) else {
             return Err(std::io::Error::other("thread name cannot be empty"));
@@ -687,15 +727,18 @@ impl Session {
             }
             InitialHistory::Resumed(resumed_history) => {
                 let rollout_items = resumed_history.history;
-                {
-                    let mut state = self.state.lock().await;
-                    state.initial_context_seeded = false;
-                    state.pending_resume_previous_model = None;
-                }
+                let reconstructed = self
+                    .reconstruct_history_from_rollout(&turn_context, &rollout_items)
+                    .await;
 
                 // If resuming, warn when the last recorded model differs from the current one.
                 let curr = turn_context.model_info.slug.as_str();
-                if let Some(prev) = Self::last_model_name(&rollout_items, curr) {
+                if let Some(prev) = reconstructed
+                    .previous_turn_settings
+                    .as_ref()
+                    .map(|settings| settings.model.as_str())
+                    .filter(|prev| *prev != curr)
+                {
                     warn!("resuming session with different model: previous={prev}, current={curr}");
                     self.send_event(
                         &turn_context,
@@ -707,25 +750,9 @@ impl Session {
                         }),
                     )
                     .await;
-
-                    let mut state = self.state.lock().await;
-                    state.pending_resume_previous_model = Some(prev.to_string());
                 }
 
-                // Always add response items to conversation history
-                let reconstructed_history = self
-                    .reconstruct_history_from_rollout(&turn_context, &rollout_items)
-                    .await;
-                let pending_continuation =
-                    Self::pending_continuation_from_rollout(&rollout_items, &reconstructed_history);
-                if !reconstructed_history.is_empty() {
-                    self.record_into_history(&reconstructed_history, &turn_context)
-                        .await;
-                }
-                {
-                    let mut state = self.state.lock().await;
-                    state.pending_continuation = pending_continuation;
-                }
+                self.replace_with_reconstructed_rollout(reconstructed).await;
 
                 // Seed usage info from the recorded rollout so UIs can show token counts
                 // immediately on resume/fork.
@@ -739,20 +766,10 @@ impl Session {
                 self.flush_rollout().await;
             }
             InitialHistory::Forked(rollout_items) => {
-                // Always add response items to conversation history
-                let reconstructed_history = self
+                let reconstructed = self
                     .reconstruct_history_from_rollout(&turn_context, &rollout_items)
                     .await;
-                let pending_continuation =
-                    Self::pending_continuation_from_rollout(&rollout_items, &reconstructed_history);
-                if !reconstructed_history.is_empty() {
-                    self.record_into_history(&reconstructed_history, &turn_context)
-                        .await;
-                }
-                {
-                    let mut state = self.state.lock().await;
-                    state.pending_continuation = pending_continuation;
-                }
+                self.replace_with_reconstructed_rollout(reconstructed).await;
 
                 // Seed usage info from the recorded rollout so UIs can show token counts
                 // immediately on resume/fork.
@@ -766,33 +783,21 @@ impl Session {
                     self.persist_rollout_items(&rollout_items).await;
                 }
 
-                // Append the current session's initial context after the reconstructed history.
-                let initial_context = self.build_initial_context(&turn_context).await;
-                self.record_conversation_items(&turn_context, &initial_context)
-                    .await;
-                {
-                    let mut state = self.state.lock().await;
-                    state.initial_context_seeded = true;
-                }
                 // Flush after seeding history and any persisted rollout copy.
                 self.flush_rollout().await;
             }
         }
     }
 
-    fn last_model_name<'a>(rollout_items: &'a [RolloutItem], current: &str) -> Option<&'a str> {
-        let previous = rollout_items.iter().rev().find_map(|it| {
-            if let RolloutItem::TurnContext(ctx) = it {
-                Some(ctx.model.as_str())
-            } else {
-                None
-            }
-        })?;
-        if previous == current {
-            None
-        } else {
-            Some(previous)
-        }
+    async fn replace_with_reconstructed_rollout(&self, reconstructed: ReconstructedRollout) {
+        let mut state = self.state.lock().await;
+        state.replace_history(reconstructed.history);
+        state
+            .history
+            .set_reference_context_item(reconstructed.reference_context_item.clone());
+        state.previous_turn_settings = reconstructed.previous_turn_settings;
+        state.pending_continuation = reconstructed.pending_continuation;
+        state.initial_context_seeded = reconstructed.reference_context_item.is_some();
     }
 
     fn last_token_info_from_rollout(rollout_items: &[RolloutItem]) -> Option<TokenUsageInfo> {
@@ -802,6 +807,7 @@ impl Session {
         })
     }
 
+    #[cfg(test)]
     fn pending_continuation_from_rollout(
         rollout_items: &[RolloutItem],
         reconstructed_history: &[ResponseItem],
@@ -1470,42 +1476,6 @@ impl Session {
         self.send_raw_response_items(turn_context, items).await;
     }
 
-    async fn reconstruct_history_from_rollout(
-        &self,
-        turn_context: &TurnContext,
-        rollout_items: &[RolloutItem],
-    ) -> Vec<ResponseItem> {
-        let mut history = ContextManager::new();
-        for item in rollout_items {
-            match item {
-                RolloutItem::ResponseItem(response_item) => {
-                    history.record_items(
-                        std::iter::once(response_item),
-                        turn_context.truncation_policy,
-                    );
-                }
-                RolloutItem::Compacted(compacted) => {
-                    if let Some(replacement) = &compacted.replacement_history {
-                        history.replace(replacement.clone());
-                    } else {
-                        let user_messages = collect_user_messages(history.raw_items());
-                        let rebuilt = compact::build_compacted_history(
-                            self.build_initial_context(turn_context).await,
-                            &user_messages,
-                            &compacted.message,
-                        );
-                        history.replace(rebuilt);
-                    }
-                }
-                RolloutItem::EventMsg(EventMsg::ThreadRolledBack(rollback)) => {
-                    history.drop_last_n_user_turns(rollback.num_turns);
-                }
-                _ => {}
-            }
-        }
-        history.raw_items().to_vec()
-    }
-
     /// Append ResponseItems to the in-memory conversation history only.
     pub(crate) async fn record_into_history(
         &self,
@@ -1546,6 +1516,13 @@ impl Session {
     pub(crate) async fn previous_turn_settings(&self) -> Option<PreviousTurnSettings> {
         let state = self.state.lock().await;
         state.previous_turn_settings.clone()
+    }
+
+    pub(crate) async fn clear_turn_context_baseline(&self) {
+        let mut state = self.state.lock().await;
+        state.history.set_reference_context_item(None);
+        state.previous_turn_settings = None;
+        state.initial_context_seeded = false;
     }
 
     pub(crate) async fn record_context_updates_and_set_reference_context_item(

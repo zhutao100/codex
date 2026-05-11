@@ -662,6 +662,20 @@ pub async fn thread_rollback(sess: &Arc<Session>, sub_id: String, num_turns: u32
     }
 
     let turn_context = sess.new_default_turn_with_sub_id(sub_id).await;
+    let rollback = ThreadRolledBackEvent { num_turns };
+
+    if sess
+        .reconstruct_for_thread_rollback(turn_context.as_ref(), rollback.clone())
+        .await
+    {
+        sess.recompute_token_usage(turn_context.as_ref()).await;
+        sess.send_event_raw_flushed(Event {
+            id: turn_context.sub_id.clone(),
+            msg: EventMsg::ThreadRolledBack(rollback),
+        })
+        .await;
+        return;
+    }
 
     let mut history = sess.clone_history().await;
     history.drop_last_n_user_turns(num_turns);
@@ -669,11 +683,12 @@ pub async fn thread_rollback(sess: &Arc<Session>, sub_id: String, num_turns: u32
     // Replace with the raw items. We don't want to replace with a normalized
     // version of the history.
     sess.replace_history(history.raw_items().to_vec()).await;
+    sess.clear_turn_context_baseline().await;
     sess.recompute_token_usage(turn_context.as_ref()).await;
 
     sess.send_event_raw_flushed(Event {
         id: turn_context.sub_id.clone(),
-        msg: EventMsg::ThreadRolledBack(ThreadRolledBackEvent { num_turns }),
+        msg: EventMsg::ThreadRolledBack(rollback),
     })
     .await;
 }
