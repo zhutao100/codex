@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 use crate::instructions::SkillInstructions;
 use crate::instructions::UserInstructions;
+use crate::preserved_work_notes::is_preserved_work_notes_message;
 use crate::session_prefix::is_session_prefix;
 use crate::user_shell_command::is_user_shell_command_text;
 use crate::web_search::web_search_action_detail;
@@ -44,9 +45,13 @@ pub(crate) fn is_contextual_dev_message_content(message: &[ContentItem]) -> bool
 fn is_contextual_user_fragment(content_item: &ContentItem) -> bool {
     match content_item {
         ContentItem::InputText { text } => {
-            is_session_prefix(text) || is_user_shell_command_text(text)
+            is_session_prefix(text)
+                || is_user_shell_command_text(text)
+                || is_preserved_work_notes_message(text)
         }
-        ContentItem::OutputText { text } => is_session_prefix(text),
+        ContentItem::OutputText { text } => {
+            is_session_prefix(text) || is_preserved_work_notes_message(text)
+        }
         ContentItem::InputImage { .. } => false,
     }
 }
@@ -229,6 +234,15 @@ mod tests {
             }
             other => panic!("expected TurnItem::UserMessage, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn preserved_work_notes_are_not_user_turn_items() {
+        let item = crate::compact::preserved_work_notes_message("notes");
+
+        let turn_item = parse_turn_item(&item);
+
+        assert!(turn_item.is_none());
     }
 
     #[test]

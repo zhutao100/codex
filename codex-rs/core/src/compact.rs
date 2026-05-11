@@ -8,6 +8,7 @@ use crate::context_manager::ContextManager;
 use crate::error::CodexErr;
 use crate::error::Result as CodexResult;
 use crate::features::Feature;
+use crate::preserved_work_notes::PRESERVED_WORK_NOTES_MESSAGE_PREFIX;
 use crate::protocol::CompactedItem;
 use crate::protocol::EventMsg;
 use crate::protocol::TurnContextItem;
@@ -35,7 +36,6 @@ pub const SUMMARIZATION_PROMPT: &str = include_str!("../templates/compact/prompt
 pub const SUMMARY_PREFIX: &str = include_str!("../templates/compact/summary_prefix.md");
 pub(crate) const AUTO_COMPACT_WORK_NOTES_REQUEST_TAG: &str = "<AUTO_COMPACT_WORK_NOTES_REQUEST>";
 pub(crate) const AUTO_COMPACT_WORK_NOTES_TAG: &str = "<AUTO_COMPACT_WORK_NOTES>";
-const PRESERVED_WORK_NOTES_MESSAGE_PREFIX: &str = "Immediately before compaction, the previous model emitted the following preserved session work notes.\nThese notes are verbatim and are intended to prevent duplicate work and repeated dead ends:\n\n";
 const COMPACT_USER_MESSAGE_MAX_TOKENS: usize = 20_000;
 
 pub(crate) struct PreparedCompactionInput {
@@ -304,7 +304,7 @@ pub(crate) fn is_summary_message(message: &str) -> bool {
 }
 
 pub(crate) fn is_preserved_work_notes_message(message: &str) -> bool {
-    message.starts_with(PRESERVED_WORK_NOTES_MESSAGE_PREFIX)
+    crate::preserved_work_notes::is_preserved_work_notes_message(message)
 }
 
 pub(crate) fn preserved_work_notes_message(work_notes: &str) -> ResponseItem {

@@ -287,6 +287,17 @@ fn history_needs_continuation_after_tool_output_without_final_message() {
 }
 
 #[test]
+fn history_needs_continuation_ignores_preserved_work_notes() {
+    let history = vec![
+        user_message("complete request"),
+        assistant_message("done"),
+        crate::compact::preserved_work_notes_message("notes"),
+    ];
+
+    assert!(!history_needs_continuation(&history));
+}
+
+#[test]
 fn trims_dangling_tool_call_before_continuation() {
     let mut history = vec![
         user_message("run a tool"),

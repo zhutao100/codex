@@ -689,6 +689,21 @@ fn drop_last_n_user_turns_ignores_session_prefix_user_messages() {
 }
 
 #[test]
+fn drop_last_n_user_turns_skips_preserved_work_notes() {
+    let work_notes = crate::compact::preserved_work_notes_message("notes to keep");
+    let items = vec![
+        user_input_text_msg("turn 1 user"),
+        assistant_msg("turn 1 assistant"),
+        work_notes,
+    ];
+
+    let mut history = create_history_with_items(items);
+    history.drop_last_n_user_turns(1);
+
+    assert_eq!(history.for_prompt(), Vec::<ResponseItem>::new());
+}
+
+#[test]
 fn remove_first_item_handles_custom_tool_pair() {
     let items = vec![
         ResponseItem::CustomToolCall {
