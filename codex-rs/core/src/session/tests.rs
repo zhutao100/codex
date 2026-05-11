@@ -729,6 +729,59 @@ async fn record_initial_history_reconstructs_forked_transcript() {
 }
 
 #[tokio::test]
+async fn replace_compacted_history_sets_reference_context_item() {
+    let (session, turn_context) = make_session_and_context().await;
+    let reference_context_item = turn_context.to_turn_context_item();
+    let replacement_history = vec![user_message("summary")];
+    let compacted_item = CompactedItem {
+        message: "summary".to_string(),
+        replacement_history: Some(replacement_history.clone()),
+    };
+
+    session
+        .replace_compacted_history(
+            &turn_context,
+            replacement_history.clone(),
+            Some(reference_context_item.clone()),
+            compacted_item,
+        )
+        .await;
+
+    let history = session.clone_history().await;
+    assert_eq!(replacement_history.as_slice(), history.raw_items());
+    assert_eq!(
+        session.reference_context_item().await,
+        Some(reference_context_item.clone())
+    );
+    assert_eq!(
+        session.previous_turn_settings().await,
+        Some(PreviousTurnSettings {
+            model: reference_context_item.model
+        })
+    );
+}
+
+#[tokio::test]
+async fn replace_compacted_history_clears_reference_context_item() {
+    let (session, turn_context) = make_session_and_context().await;
+    session
+        .record_context_updates_and_set_reference_context_item(&turn_context)
+        .await;
+    let replacement_history = vec![user_message("summary")];
+    let compacted_item = CompactedItem {
+        message: "summary".to_string(),
+        replacement_history: Some(replacement_history.clone()),
+    };
+
+    session
+        .replace_compacted_history(&turn_context, replacement_history, None, compacted_item)
+        .await;
+
+    assert_eq!(session.reference_context_item().await, None);
+    assert_eq!(session.previous_turn_settings().await, None);
+}
+
+#[tokio::test]
 async fn thread_rollback_drops_last_turn_from_history() {
     let (sess, tc, rx) = make_session_and_context_with_rx().await;
 

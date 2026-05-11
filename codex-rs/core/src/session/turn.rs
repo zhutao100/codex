@@ -124,7 +124,14 @@ async fn run_turn_inner(
     } else {
         if total_usage_tokens >= auto_compact_limit {
             if turn_context.final_output_json_schema.is_some() {
-                if let Err(e) = run_auto_compact(&sess, &turn_context, None).await {
+                if let Err(e) = run_auto_compact(
+                    &sess,
+                    &turn_context,
+                    None,
+                    InitialContextInjection::DoNotInject,
+                )
+                .await
+                {
                     info!("Auto-compaction failed before turn sampling: {e:#}");
                     return None;
                 }
@@ -165,8 +172,13 @@ async fn run_turn_inner(
                             if let Some(notes) = output.last_agent_message
                                 && is_auto_compact_work_notes_message(&notes)
                             {
-                                if let Err(e) =
-                                    run_auto_compact(&sess, &turn_context, Some(notes)).await
+                                if let Err(e) = run_auto_compact(
+                                    &sess,
+                                    &turn_context,
+                                    Some(notes),
+                                    InitialContextInjection::DoNotInject,
+                                )
+                                .await
                                 {
                                     info!("Auto-compaction failed after work-notes capture: {e:#}");
                                     return None;
@@ -179,7 +191,14 @@ async fn run_turn_inner(
                                 info!(
                                     "Work-notes capture yielded no notes; compacting without notes after {attempts} attempts"
                                 );
-                                if let Err(e) = run_auto_compact(&sess, &turn_context, None).await {
+                                if let Err(e) = run_auto_compact(
+                                    &sess,
+                                    &turn_context,
+                                    None,
+                                    InitialContextInjection::DoNotInject,
+                                )
+                                .await
+                                {
                                     info!(
                                         "Auto-compaction failed after work-notes capture attempts: {e:#}"
                                     );
@@ -196,8 +215,13 @@ async fn run_turn_inner(
                             info!(
                                 "Work-notes capture failed during pre-turn compaction; compacting without notes: {e:#}"
                             );
-                            if let Err(compact_err) =
-                                run_auto_compact(&sess, &turn_context, None).await
+                            if let Err(compact_err) = run_auto_compact(
+                                &sess,
+                                &turn_context,
+                                None,
+                                InitialContextInjection::DoNotInject,
+                            )
+                            .await
                             {
                                 info!(
                                     "Auto-compaction failed after work-notes capture error: {compact_err:#}"
@@ -415,7 +439,14 @@ async fn run_turn_inner(
                     if let Some(notes) = sampling_request_last_agent_message
                         && is_auto_compact_work_notes_message(&notes)
                     {
-                        match run_auto_compact(&sess, &turn_context, Some(notes)).await {
+                        match run_auto_compact(
+                            &sess,
+                            &turn_context,
+                            Some(notes),
+                            InitialContextInjection::BeforeLastUserMessage,
+                        )
+                        .await
+                        {
                             Ok(compacted) => {
                                 reset_client_session_if_compacted(&mut client_session, compacted);
                             }
@@ -434,7 +465,14 @@ async fn run_turn_inner(
                         info!(
                             "Work-notes capture yielded no notes; compacting without notes after {pre_compact_notes_attempts} attempts"
                         );
-                        match run_auto_compact(&sess, &turn_context, None).await {
+                        match run_auto_compact(
+                            &sess,
+                            &turn_context,
+                            None,
+                            InitialContextInjection::BeforeLastUserMessage,
+                        )
+                        .await
+                        {
                             Ok(compacted) => {
                                 reset_client_session_if_compacted(&mut client_session, compacted);
                             }
@@ -460,7 +498,14 @@ async fn run_turn_inner(
                 // shouldn't worry about being in an infinite loop.
                 if token_limit_reached && needs_follow_up {
                     if turn_context.final_output_json_schema.is_some() {
-                        match run_auto_compact(&sess, &turn_context, None).await {
+                        match run_auto_compact(
+                            &sess,
+                            &turn_context,
+                            None,
+                            InitialContextInjection::BeforeLastUserMessage,
+                        )
+                        .await
+                        {
                             Ok(compacted) => {
                                 reset_client_session_if_compacted(&mut client_session, compacted);
                             }
@@ -505,7 +550,14 @@ async fn run_turn_inner(
             }
             Err(e) if matches!(pre_compact_notes_state, PreCompactNotesState::AwaitingNotes) => {
                 info!("Work-notes capture failed; compacting without notes: {e:#}");
-                match run_auto_compact(&sess, &turn_context, None).await {
+                match run_auto_compact(
+                    &sess,
+                    &turn_context,
+                    None,
+                    InitialContextInjection::BeforeLastUserMessage,
+                )
+                .await
+                {
                     Ok(compacted) => {
                         reset_client_session_if_compacted(&mut client_session, compacted);
                     }
@@ -559,12 +611,14 @@ async fn run_auto_compact(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
     preserved_work_notes: Option<String>,
+    initial_context_injection: InitialContextInjection,
 ) -> CodexResult<bool> {
     if should_use_remote_compact_task(sess.as_ref(), &turn_context.provider) {
         run_inline_remote_auto_compact_task(
             Arc::clone(sess),
             Arc::clone(turn_context),
             preserved_work_notes,
+            initial_context_injection,
         )
         .await
     } else {
@@ -572,6 +626,7 @@ async fn run_auto_compact(
             Arc::clone(sess),
             Arc::clone(turn_context),
             preserved_work_notes,
+            initial_context_injection,
         )
         .await
     }

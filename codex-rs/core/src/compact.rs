@@ -42,6 +42,12 @@ pub(crate) struct PreparedCompactionInput {
     pub(crate) preserved_work_notes: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InitialContextInjection {
+    DoNotInject,
+    BeforeLastUserMessage,
+}
+
 pub(crate) fn should_use_remote_compact_task(
     session: &Session,
     provider: &ModelProviderInfo,
@@ -53,6 +59,7 @@ pub(crate) async fn run_inline_auto_compact_task(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
     preserved_work_notes: Option<String>,
+    initial_context_injection: InitialContextInjection,
 ) -> CodexResult<bool> {
     let prompt = turn_context.compact_prompt().to_string();
     let input = vec![UserInput::Text {
@@ -61,7 +68,14 @@ pub(crate) async fn run_inline_auto_compact_task(
         text_elements: Vec::new(),
     }];
 
-    run_compact_task_inner(sess, turn_context, input, preserved_work_notes).await?;
+    run_compact_task_inner(
+        sess,
+        turn_context,
+        input,
+        preserved_work_notes,
+        initial_context_injection,
+    )
+    .await?;
     Ok(true)
 }
 
@@ -75,7 +89,14 @@ pub(crate) async fn run_compact_task(
         collaboration_mode_kind: turn_context.collaboration_mode.mode,
     });
     sess.send_event(&turn_context, start_event).await;
-    run_compact_task_inner(sess.clone(), turn_context, input, None).await
+    run_compact_task_inner(
+        sess.clone(),
+        turn_context,
+        input,
+        None,
+        InitialContextInjection::DoNotInject,
+    )
+    .await
 }
 
 async fn run_compact_task_inner(
@@ -83,6 +104,7 @@ async fn run_compact_task_inner(
     turn_context: Arc<TurnContext>,
     input: Vec<UserInput>,
     preserved_work_notes: Option<String>,
+    initial_context_injection: InitialContextInjection,
 ) -> CodexResult<()> {
     let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
     sess.emit_turn_item_started(&turn_context, &compaction_item)
@@ -191,8 +213,15 @@ async fn run_compact_task_inner(
     let summary_text = format!("{SUMMARY_PREFIX}\n{summary_suffix}");
     let user_messages = collect_user_messages(history_items);
 
-    let initial_context = sess.build_initial_context(turn_context.as_ref()).await;
-    let mut new_history = build_compacted_history(initial_context, &user_messages, &summary_text);
+    let mut new_history = build_compacted_history(Vec::new(), &user_messages, &summary_text);
+    let reference_context_item = match initial_context_injection {
+        InitialContextInjection::DoNotInject => None,
+        InitialContextInjection::BeforeLastUserMessage => {
+            let initial_context = sess.build_initial_context(turn_context.as_ref()).await;
+            insert_initial_context_before_last_real_user_message(&mut new_history, initial_context);
+            Some(turn_context.to_turn_context_item())
+        }
+    };
     if let Some(notes) = preserved_work_notes.as_ref() {
         new_history.push(preserved_work_notes_message(notes));
     }
@@ -203,16 +232,19 @@ async fn run_compact_task_inner(
         .collect();
     new_history.extend(ghost_snapshots);
     let replacement_history = Some(new_history.clone());
-    sess.replace_history(new_history).await;
     client_session.reset_websocket_session();
-    sess.recompute_token_usage(&turn_context).await;
 
     let compacted_item = CompactedItem {
         message: summary_text.clone(),
         replacement_history,
     };
-    let rollout_item = RolloutItem::Compacted(compacted_item);
-    sess.persist_rollout_items(&[rollout_item]).await;
+    sess.replace_compacted_history(
+        turn_context.as_ref(),
+        new_history,
+        reference_context_item,
+        compacted_item,
+    )
+    .await;
 
     sess.emit_turn_item_completed(&turn_context, compaction_item)
         .await;
@@ -310,6 +342,34 @@ pub(crate) fn build_compacted_history(
         summary_text,
         COMPACT_USER_MESSAGE_MAX_TOKENS,
     )
+}
+
+pub(crate) fn insert_initial_context_before_last_real_user_message(
+    history: &mut Vec<ResponseItem>,
+    initial_context: Vec<ResponseItem>,
+) {
+    if initial_context.is_empty() {
+        return;
+    }
+
+    let insert_idx = history
+        .iter()
+        .rposition(is_real_user_message_for_compaction)
+        .unwrap_or(0);
+    history.splice(insert_idx..insert_idx, initial_context);
+}
+
+fn is_real_user_message_for_compaction(item: &ResponseItem) -> bool {
+    let ResponseItem::Message { role, content, .. } = item else {
+        return false;
+    };
+    if role != "user" {
+        return false;
+    }
+    let Some(text) = content_items_to_text(content) else {
+        return false;
+    };
+    !is_summary_message(&text) && !is_preserved_work_notes_message(&text)
 }
 
 fn build_compacted_history_with_limit(
@@ -587,6 +647,66 @@ mod tests {
         let collected = collect_user_messages(&items);
 
         assert_eq!(vec!["real user message".to_string()], collected);
+    }
+
+    #[test]
+    fn insert_initial_context_before_last_real_user_message_ignores_summary_and_work_notes() {
+        let initial_context = vec![ResponseItem::Message {
+            id: None,
+            role: "developer".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "context".to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        }];
+        let first_user = ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "first user".to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        };
+        let last_user = ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "last user".to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        };
+        let summary = ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: format!("{SUMMARY_PREFIX}\nsummary"),
+            }],
+            end_turn: None,
+            phase: None,
+        };
+        let work_notes = preserved_work_notes_message("notes");
+        let mut history = vec![
+            first_user.clone(),
+            last_user.clone(),
+            summary.clone(),
+            work_notes.clone(),
+        ];
+
+        insert_initial_context_before_last_real_user_message(&mut history, initial_context.clone());
+
+        assert_eq!(
+            history,
+            vec![
+                first_user,
+                initial_context[0].clone(),
+                last_user,
+                summary,
+                work_notes,
+            ]
+        );
     }
 
     #[test]

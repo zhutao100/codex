@@ -108,6 +108,7 @@ use crate::client::ModelClientSession;
 use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
 use crate::codex_thread::ThreadConfigSnapshot;
+use crate::compact::InitialContextInjection;
 use crate::compact::collect_user_messages;
 use crate::config::Config;
 use crate::config::Constrained;
@@ -235,6 +236,7 @@ use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::protocol::CodexErrorInfo;
+use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::user_input::UserInput;
 use codex_utils_readiness::Readiness;
@@ -1506,6 +1508,36 @@ impl Session {
     pub(crate) async fn replace_history(&self, items: Vec<ResponseItem>) {
         let mut state = self.state.lock().await;
         state.replace_history(items);
+    }
+
+    pub(crate) async fn replace_compacted_history(
+        &self,
+        turn_context: &TurnContext,
+        items: Vec<ResponseItem>,
+        reference_context_item: Option<TurnContextItem>,
+        compacted_item: CompactedItem,
+    ) {
+        {
+            let mut state = self.state.lock().await;
+            state.replace_history(items);
+            state
+                .history
+                .set_reference_context_item(reference_context_item.clone());
+            state.previous_turn_settings =
+                reference_context_item
+                    .as_ref()
+                    .map(|item| PreviousTurnSettings {
+                        model: item.model.clone(),
+                    });
+            state.initial_context_seeded = reference_context_item.is_some();
+        }
+
+        let mut rollout_items = vec![RolloutItem::Compacted(compacted_item)];
+        if let Some(reference_context_item) = reference_context_item {
+            rollout_items.push(RolloutItem::TurnContext(reference_context_item));
+        }
+        self.persist_rollout_items(&rollout_items).await;
+        self.recompute_token_usage(turn_context).await;
     }
 
     pub(crate) async fn reference_context_item(&self) -> Option<TurnContextItem> {
