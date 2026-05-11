@@ -318,4 +318,25 @@ impl Session {
         self.new_turn_from_configuration(sub_id, session_configuration, None, false)
             .await
     }
+
+    pub(crate) async fn turn_context_with_model(
+        &self,
+        source: &TurnContext,
+        model: &str,
+    ) -> Arc<TurnContext> {
+        let mut session_configuration = {
+            let state = self.state.lock().await;
+            state.session_configuration.clone()
+        };
+        session_configuration.collaboration_mode = session_configuration
+            .collaboration_mode
+            .with_updates(Some(model.to_string()), None, None);
+        self.new_turn_from_configuration(
+            source.sub_id.clone(),
+            session_configuration,
+            Some(source.final_output_json_schema.clone()),
+            false,
+        )
+        .await
+    }
 }

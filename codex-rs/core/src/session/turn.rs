@@ -98,7 +98,7 @@ async fn run_turn_inner(
 ) -> Option<String> {
     let model_info = turn_context.model_info.clone();
     let auto_compact_limit = model_info.auto_compact_token_limit().unwrap_or(i64::MAX);
-    let total_usage_tokens = sess.get_total_token_usage().await;
+    let mut total_usage_tokens = sess.get_total_token_usage().await;
 
     let event = EventMsg::TurnStarted(TurnStartedEvent {
         model_context_window: turn_context.model_context_window(),
@@ -122,6 +122,19 @@ async fn run_turn_inner(
         .await;
         (Vec::new(), HashMap::new())
     } else {
+        match maybe_run_previous_model_inline_compact(&sess, &turn_context, total_usage_tokens)
+            .await
+        {
+            Ok(true) => {
+                total_usage_tokens = sess.get_total_token_usage().await;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                info!("Previous-model compaction failed before turn sampling: {e:#}");
+                return None;
+            }
+        }
+
         if total_usage_tokens >= auto_compact_limit {
             if turn_context.final_output_json_schema.is_some() {
                 if let Err(e) = run_auto_compact(
@@ -605,6 +618,92 @@ fn reset_client_session_if_compacted(client_session: &mut ModelClientSession, co
     if compacted {
         client_session.reset_websocket_session();
     }
+}
+
+async fn maybe_run_previous_model_inline_compact(
+    sess: &Arc<Session>,
+    turn_context: &Arc<TurnContext>,
+    total_usage_tokens: i64,
+) -> CodexResult<bool> {
+    let Some(previous_turn_settings) = sess.previous_turn_settings().await else {
+        return Ok(false);
+    };
+    let current_model = turn_context.model_info.slug.as_str();
+    let current_auto_compact_limit = turn_context
+        .model_info
+        .auto_compact_token_limit()
+        .unwrap_or(i64::MAX);
+    if previous_turn_settings.model == current_model
+        || total_usage_tokens <= current_auto_compact_limit
+    {
+        info!(
+            turn_id = %turn_context.sub_id,
+            previous_model = previous_turn_settings.model.as_str(),
+            current_model,
+            total_usage_tokens,
+            current_auto_compact_limit,
+            should_compact = false,
+            "model downshift compaction decision"
+        );
+        return Ok(false);
+    }
+
+    let previous_context = sess
+        .turn_context_with_model(turn_context.as_ref(), &previous_turn_settings.model)
+        .await;
+    let previous_model = previous_context.model_info.slug.as_str();
+    let previous_context_window = previous_context.model_context_window();
+    let current_context_window = turn_context.model_context_window();
+    let should_compact = should_compact_with_previous_model(
+        previous_model,
+        current_model,
+        total_usage_tokens,
+        current_auto_compact_limit,
+        previous_context_window,
+        current_context_window,
+    );
+
+    info!(
+        turn_id = %turn_context.sub_id,
+        previous_model,
+        current_model,
+        previous_context_window,
+        current_context_window,
+        total_usage_tokens,
+        current_auto_compact_limit,
+        should_compact,
+        "model downshift compaction decision"
+    );
+
+    if !should_compact {
+        return Ok(false);
+    }
+
+    run_auto_compact(
+        sess,
+        &previous_context,
+        None,
+        InitialContextInjection::DoNotInject,
+    )
+    .await
+}
+
+fn should_compact_with_previous_model(
+    previous_model: &str,
+    current_model: &str,
+    total_usage_tokens: i64,
+    current_auto_compact_limit: i64,
+    previous_context_window: Option<i64>,
+    current_context_window: Option<i64>,
+) -> bool {
+    if previous_model == current_model || total_usage_tokens <= current_auto_compact_limit {
+        return false;
+    }
+
+    matches!(
+        (previous_context_window, current_context_window),
+        (Some(previous), Some(current)) if previous > current
+    )
 }
 
 async fn run_auto_compact(
@@ -1973,4 +2072,51 @@ pub(crate) fn get_last_assistant_message_from_turn(responses: &[ResponseItem]) -
             None
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_compact_with_previous_model;
+
+    #[test]
+    fn model_downshift_decision_requires_larger_previous_context_window() {
+        assert!(should_compact_with_previous_model(
+            "larger-model",
+            "smaller-model",
+            9_000,
+            8_000,
+            Some(128_000),
+            Some(32_000),
+        ));
+
+        assert!(!should_compact_with_previous_model(
+            "same-window-a",
+            "same-window-b",
+            9_000,
+            8_000,
+            Some(32_000),
+            Some(32_000),
+        ));
+    }
+
+    #[test]
+    fn model_downshift_decision_requires_different_model_and_over_limit_history() {
+        assert!(!should_compact_with_previous_model(
+            "same-model",
+            "same-model",
+            9_000,
+            8_000,
+            Some(128_000),
+            Some(32_000),
+        ));
+
+        assert!(!should_compact_with_previous_model(
+            "larger-model",
+            "smaller-model",
+            7_000,
+            8_000,
+            Some(128_000),
+            Some(32_000),
+        ));
+    }
 }
