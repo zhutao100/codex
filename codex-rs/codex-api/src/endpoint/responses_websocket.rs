@@ -30,6 +30,7 @@ use tokio::sync::oneshot;
 use tokio::time::Instant;
 use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::connect_async_tls_with_config;
 use tokio_tungstenite::tungstenite::Error as WsError;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -37,6 +38,9 @@ use tracing::debug;
 use tracing::error;
 use tracing::info;
 use tracing::trace;
+use tungstenite::extensions::ExtensionsConfig;
+use tungstenite::extensions::compression::deflate::DeflateConfig;
+use tungstenite::protocol::WebSocketConfig;
 use url::Url;
 
 struct WsStream {
@@ -334,7 +338,13 @@ async fn connect_websocket(
         .map_err(|err| ApiError::Stream(format!("failed to build websocket request: {err}")))?;
     request.headers_mut().extend(headers);
 
-    let response = tokio_tungstenite::connect_async(request).await;
+    let response = connect_async_tls_with_config(
+        request,
+        Some(websocket_config()),
+        false, // `false` means "do not disable Nagle", which is tungstenite's recommended default.
+        None,
+    )
+    .await;
 
     let (stream, response) = match response {
         Ok((stream, response)) => {
@@ -375,6 +385,15 @@ async fn connect_websocket(
         models_etag,
         server_model,
     ))
+}
+
+fn websocket_config() -> WebSocketConfig {
+    let mut extensions = ExtensionsConfig::default();
+    extensions.permessage_deflate = Some(DeflateConfig::default());
+
+    let mut config = WebSocketConfig::default();
+    config.extensions = extensions;
+    config
 }
 
 fn map_ws_error(err: WsError, url: &Url) -> ApiError {
@@ -631,6 +650,12 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
     use serde_json::json;
+
+    #[test]
+    fn websocket_config_enables_permessage_deflate() {
+        let config = websocket_config();
+        assert!(config.extensions.permessage_deflate.is_some());
+    }
 
     #[test]
     fn parse_wrapped_websocket_error_event_maps_to_transport_http() {
