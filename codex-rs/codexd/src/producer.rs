@@ -98,6 +98,23 @@ impl CodexdProducerClient {
         }
     }
 
+    pub fn try_publish_hub_notification(&self, notification: HubNotification) -> bool {
+        match self
+            .sender
+            .try_send(ProducerCommand::PublishNotification(notification))
+        {
+            Ok(()) => true,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                warn!("codexd producer channel full; dropped notification");
+                false
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                debug!("codexd producer task stopped before notification could be queued");
+                false
+            }
+        }
+    }
+
     pub async fn publish_server_notification(&self, notification: &ServerNotification) {
         if let Some(hub_notification) = hub_notification_from_server_notification(notification) {
             self.publish_hub_notification(hub_notification).await;
@@ -282,4 +299,84 @@ fn socket_path_too_long(socket_path: &Path) -> bool {
 
 fn max_unix_socket_path_len() -> usize {
     std::mem::size_of::<libc::sockaddr_un>() - std::mem::offset_of!(libc::sockaddr_un, sun_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value as JsonValue;
+    use std::time::SystemTime;
+    use std::time::UNIX_EPOCH;
+    use tokio::io::AsyncBufReadExt;
+    use tokio::io::BufReader;
+    use tokio::net::UnixListener;
+    use tokio::time::Duration;
+    use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn try_publish_hub_notification_preserves_call_order() {
+        let socket_path = test_socket_path("ordered");
+        let _ = tokio::fs::remove_file(&socket_path).await;
+        let listener = UnixListener::bind(&socket_path).expect("bind test listener");
+        let client = CodexdProducerClient::spawn_with_socket_path(
+            socket_path.clone(),
+            RuntimeMetadata {
+                runtime_id: "rt-test".to_string(),
+                pid: Some(123),
+                session_source: Some("test".to_string()),
+                cwd: Some("/tmp".to_string()),
+                display_name: Some("test-producer".to_string()),
+            },
+        );
+
+        assert!(client.try_publish_hub_notification(HubNotification {
+            method: "turn/started".to_string(),
+            params: Some(serde_json::json!({ "index": 1 })),
+        }));
+        assert!(client.try_publish_hub_notification(HubNotification {
+            method: "turn/completed".to_string(),
+            params: Some(serde_json::json!({ "index": 2 })),
+        }));
+
+        let (stream, _) = timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .expect("producer should connect")
+            .expect("accept producer connection");
+        let mut lines = BufReader::new(stream).lines();
+
+        let register = read_json_line(&mut lines).await;
+        assert_eq!(register["method"], "codexd/runtime/register");
+
+        let first = read_json_line(&mut lines).await;
+        let second = read_json_line(&mut lines).await;
+        assert_eq!(first["method"], "codexd/runtime/event");
+        assert_eq!(first["params"]["notification"]["method"], "turn/started");
+        assert_eq!(first["params"]["notification"]["params"]["index"], 1);
+        assert_eq!(second["method"], "codexd/runtime/event");
+        assert_eq!(second["params"]["notification"]["method"], "turn/completed");
+        assert_eq!(second["params"]["notification"]["params"]["index"], 2);
+
+        client.shutdown().await;
+        let _ = tokio::fs::remove_file(&socket_path).await;
+    }
+
+    async fn read_json_line(
+        lines: &mut tokio::io::Lines<BufReader<tokio::net::UnixStream>>,
+    ) -> JsonValue {
+        let line = timeout(Duration::from_secs(2), lines.next_line())
+            .await
+            .expect("expected line before timeout")
+            .expect("read line")
+            .expect("line should be present");
+        serde_json::from_str(&line).expect("line should be json")
+    }
+
+    fn test_socket_path(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after unix epoch")
+            .as_nanos();
+        let pid = std::process::id();
+        std::env::temp_dir().join(format!("codexd-producer-{pid}-{nanos}-{label}.sock"))
+    }
 }

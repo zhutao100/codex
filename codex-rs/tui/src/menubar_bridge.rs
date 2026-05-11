@@ -251,10 +251,9 @@ mod imp {
             }
 
             for notification in notifications {
-                let producer = self.producer.clone();
-                tokio::spawn(async move {
-                    producer.publish_hub_notification(notification).await;
-                });
+                // Preserve lifecycle ordering. Spawning each notification independently
+                // can let a completion reach codexd before its matching start.
+                self.producer.try_publish_hub_notification(notification);
             }
         }
 

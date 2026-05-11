@@ -53,6 +53,10 @@ pub mod producer {
 
         pub async fn publish_hub_notification(&self, _notification: HubNotification) {}
 
+        pub fn try_publish_hub_notification(&self, _notification: HubNotification) -> bool {
+            true
+        }
+
         pub async fn publish_server_notification(&self, _notification: &ServerNotification) {}
 
         pub async fn shutdown(&self) {}

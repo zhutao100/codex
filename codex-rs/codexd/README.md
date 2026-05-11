@@ -144,3 +144,7 @@ Runtimes connect to the same socket and send:
 - `codexd/runtime/unregister` (optional; disconnect also unregisters claimed runtimes)
 
 In Rust, prefer using `codex_codexd::producer::CodexdProducerClient` instead of writing to the socket directly.
+Publish lifecycle notifications in observed order for a runtime. In synchronous
+UI event paths, enqueue notifications with `try_publish_hub_notification`
+rather than spawning one task per notification; if `turn/completed` reaches
+`codexd` before its matching `turn/started`, active-turn state can remain stale.
