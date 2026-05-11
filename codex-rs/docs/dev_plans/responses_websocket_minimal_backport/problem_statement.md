@@ -48,10 +48,12 @@ This project has already incorporated a substantial subset of the upstream proje
 |---|---|---|---|
 |`response.processed` acknowledgement|Adds `ResponseProcessedWsRequest`, `ResponsesWsRequest::ResponseProcessed`, `ResponsesWebsocketConnection::send_response_processed()`, a feature flag, and call sites after successful turn processing and remote compaction.|No `response.processed` request type or feature flag.|The server never receives an explicit processed acknowledgement from this project. This is the highest-value remaining protocol gap.|
 |Request send timeout|Wraps WebSocket request frame send in the stream idle timeout.|Sends request frames without a timeout; connect and receive are bounded, but a stuck send path is not.|A pathological or wedged WebSocket write can hang longer than intended.|
+|Consumer-drop cancellation|Cancels the stream-mapping task when the core `ResponseStream` consumer is dropped.|The mapping task keeps polling the provider stream until another event, error, or timeout.|A paused, interrupted, or cancelled turn can leave response processing alive longer than intended.|
 |Handshake `openai-model` handling|Reads `openai-model` from the handshake and emits `ResponseEvent::ServerModel`.|Ignores `openai-model`.|Server model reroute information is invisible.|
 |Streaming model metadata|`ResponsesStreamEvent` can extract model headers from stream payloads and emit deduplicated `ServerModel` events.|No stream-level model metadata extraction.|Model changes during or after request processing are invisible.|
 |Model verification recommendations|Parses `model_verifications` from stream metadata and emits `ResponseEvent::ModelVerifications`.|No event type or parser.|Account-verification recommendations are dropped.|
 |Custom-tool input delta|Parses `response.custom_tool_call_input.delta` into `ResponseEvent::ToolCallInputDelta`.|No event type or parser.|Large custom-tool input streams are not surfaced incrementally.|
+|Provider error classification|Maps `cyber_policy`, `server_is_overloaded`, and `slow_down` to dedicated stream errors.|Falls through to generic retryable stream handling.|Some non-retryable or overload conditions can get the wrong retry/user-facing behavior.|
 |Per-message deflate|Uses a WebSocket config with `permessage-deflate` enabled.|Uses default tungstenite config.|Higher bandwidth and less parity with the upstream transport. This may require the upstream tungstenite fork or equivalent dependency support.|
 |Custom CA for WebSocket TLS|Uses the upstream custom-CA rustls helper and `connect_async_tls_with_config`.|Uses `connect_async` with default TLS behavior.|Not a WebSocket-only bug in this project unless custom-CA support is ported generally; otherwise an optional enterprise parity feature.|
 |Cross-turn WebSocket cache|Caches a `WebsocketSession` in `ModelClient`, moves it into new turn sessions, and invalidates it on window-generation changes/fallback.|WebSocket sessions are turn-scoped by design.|Later turns cannot use active-socket continuation latency benefits. This interacts with `/pause` and `/continue`; keep it second-stage.|
@@ -67,9 +69,11 @@ This project has already incorporated a substantial subset of the upstream proje
 |---|---|---|
 |Unbounded WebSocket send|A `ws_stream.send(...)` is awaited directly. Connect and receive have timeouts, but send does not.|Add `send_websocket_request(...)` and wrap the send in `idle_timeout`, matching upstream behavior without pulling in the upstream telemetry/inference-trace refactor.|
 |No `response.processed` acknowledgement|No request type, API method, feature flag, or call site exists.|Backport the request type and method; gate call sites behind a new under-development feature. This is a small protocol extension with clear tests.|
+|Consumer-drop cancellation leak|The core mapper has no cancellation token tied to `ResponseStream::drop`.|Add a drop-triggered cancellation token so pause, interruption, and cancellation stop mapper polling promptly.|
 |Server model metadata dropped|Handshake `openai-model` and stream model headers are ignored.|Add `ResponseEvent::ServerModel`, handshake parsing, and stream metadata parsing. Initially log or forward through existing event plumbing; avoid importing unrelated upstream UX.|
 |Model verification metadata dropped|No `ModelVerifications` event exists.|Add parser/event support only if this project has a consumer or wants to preserve this server signal for later UI work.|
 |Custom-tool input deltas dropped|`response.custom_tool_call_input.delta` is ignored by shared stream parsing.|Add a parser and event. Route through core only when the consumer can use it; otherwise keep this optional.|
+|Underclassified stream errors|`cyber_policy`, `server_is_overloaded`, and `slow_down` use generic fallback handling.|Classify them in shared Responses parsing without importing broader upstream UX.|
 |No per-message deflate|Default WebSocket config is used.|Port only if dependency support is available with a small Cargo change. If the upstream tungstenite fork is required, treat it as a prerequisite decision, not an incidental patch.|
 |No WebSocket custom-CA parity|This project does not have the upstream custom-CA helper.|Do not make this a prerequisite for other WebSocket fixes. Port it only if enterprise/custom-CA support is desired globally.|
 
@@ -123,8 +127,8 @@ Do not include these in the minimal backport:
 
 |Level|Contents|Rationale|
 |---|---|---|
-|P0 correctness|Bound request send, add `response.processed` request support and feature-gated call sites|Fixes the remaining small correctness/protocol gaps with low dependency cost.|
-|P1 parser parity|`ServerModel`, model verification metadata, custom-tool input deltas|Preserves server signals currently dropped by this project.|
+|P0 correctness|Bound request send, add `response.processed` request support and feature-gated call sites, cancel mapped streams on consumer drop|Fixes the remaining small correctness/protocol gaps with low dependency cost.|
+|P1 parser and error parity|`ServerModel`, model verification metadata, custom-tool input deltas, provider stream error classification|Preserves server signals currently dropped by this project and keeps retry/user-facing behavior aligned with upstream.|
 |P2 transport hardening|`permessage-deflate`; custom CA only if the prerequisite custom-CA helper is intentionally ported|Improves transport parity without blocking P0/P1.|
 |P3 observability metadata|W3C trace metadata, installation/window IDs, request-start timestamp|Improves diagnostics; can be incremental and does not change prompt/history behavior.|
 |P4 acceleration|Preconnect, request prewarm, optional cross-turn cached WebSocket session with explicit invalidation|Adds latency wins after correctness and parser parity are stable.|

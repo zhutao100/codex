@@ -150,6 +150,37 @@ Risk:
 
 Moderate-low. The main risk is lifecycle ordering. Keep the call best-effort and feature-gated.
 
+### Patch 2a - Cancel mapped streams when consumers drop
+
+Scope:
+
+- `core/src/client_common.rs`
+- `core/src/client.rs`
+- focused core unit tests
+
+Problem:
+
+The core stream mapper currently keeps polling the provider stream even after the consumer drops the mapped `ResponseStream`. During `/pause`, interruption, or cancellation, that can keep a provider/WebSocket stream alive until a later event, error, or timeout.
+
+Minimal change:
+
+1. Add a `CancellationToken` field to the core `ResponseStream`.
+
+2. Cancel the token in `Drop` for `ResponseStream`.
+
+3. In `map_response_stream(...)`, create the token and use `tokio::select!` to stop the mapper when the consumer is dropped.
+
+4. Keep WebSocket previous-response state unchanged: only a completed response still populates the last-response receiver.
+
+Tests:
+
+- dropping the mapped stream stops polling a pending provider stream;
+- completed streams still populate last-response state.
+
+Risk:
+
+Low. The cancellation is local to the mapper and only shortens abandoned work.
+
 ### Patch 3 - Preserve server model metadata
 
 Scope:
@@ -279,6 +310,40 @@ Tests:
 Risk:
 
 Medium. The event is safe to parse, but surfacing it may require UI/tool-call state changes.
+
+### Patch 5a - Classify provider stream errors
+
+Scope:
+
+- `codex-api/src/error.rs`
+- `codex-api/src/sse/responses.rs`
+- `core/src/api_bridge.rs`
+- `core/src/error.rs`, only if a dedicated core error is needed
+
+Problem:
+
+The upstream project distinguishes `cyber_policy`, `server_is_overloaded`, and `slow_down` response failures. This project currently falls through to generic retryable stream errors for these codes.
+
+Minimal change:
+
+1. Add `ApiError` variants for the provider classifications.
+
+2. In `process_responses_event(...)`, map:
+
+- `cyber_policy` to a non-retryable policy error with a fallback message when the server message is empty;
+- `server_is_overloaded` and `slow_down` to an overload classification.
+
+3. Map the new API errors into existing core errors unless this project already has a dedicated user-facing variant.
+
+Tests:
+
+- `cyber_policy` does not become a generic retryable stream error;
+- blank `cyber_policy` messages use the fallback;
+- `server_is_overloaded` and `slow_down` map to overload handling.
+
+Risk:
+
+Low. The parser already handles provider failure events; this only avoids over-broad retry behavior.
 
 ### Patch 6 - Transport config parity: `permessage-deflate`
 
@@ -583,17 +648,17 @@ High. This is the main place where the upstream project architecture differs fro
 Run the smallest deterministic checks after each patch:
 
 ```bash
-cargo test -p codex-api responses_websocket
-cargo test -p codex-api sse::responses
-cargo test -p codex-core --test all client_websockets
-cargo test -p codex-core --test all websocket_fallback
+CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-api responses_websocket
+CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-api sse::responses
+CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-core --test all client_websockets
+CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-core --test all websocket_fallback
 ```
 
 For patches that touch features or schema:
 
 ```bash
-cargo test -p codex-core features
-cargo test -p codex-core config
+CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-core features
+CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-core config
 ```
 
 Expected regression constraints:
@@ -608,10 +673,12 @@ Expected regression constraints:
 
 1. Patch 1: bound WebSocket request sends.
 2. Patch 2: `response.processed` acknowledgement behind a feature flag.
-3. Patch 3: `ServerModel` metadata.
-4. Patch 4 and Patch 5: model verifications and custom-tool input deltas, if consumers are ready or parser parity is desired.
-5. Patch 6: `permessage-deflate`, only after dependency feasibility is confirmed.
-6. Patch 7: custom CA only if custom-CA support is wanted globally.
-7. Patch 8: observability metadata, starting with trace fields and request-start timestamp.
-8. Patch 9 and Patch 10: preconnect and request prewarm.
-9. Patch 11: cross-turn cache, only after explicit invalidation tests are in place.
+3. Patch 2a: consumer-drop cancellation for mapped streams.
+4. Patch 3: `ServerModel` metadata.
+5. Patch 4 and Patch 5: model verifications and custom-tool input deltas, if consumers are ready or parser parity is desired.
+6. Patch 5a: provider stream error classification.
+7. Patch 6: `permessage-deflate`, only after dependency feasibility is confirmed.
+8. Patch 7: custom CA only if custom-CA support is wanted globally.
+9. Patch 8: observability metadata, starting with trace fields and request-start timestamp.
+10. Patch 9 and Patch 10: preconnect and request prewarm.
+11. Patch 11: cross-turn cache, only after explicit invalidation tests are in place.

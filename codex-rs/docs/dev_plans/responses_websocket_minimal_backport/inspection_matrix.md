@@ -36,9 +36,11 @@
 |---|---|---|---|
 |Bound send timeout|Correctness|Yes, P0|Small local helper. No upstream refactor needed.|
 |`response.processed`|Protocol parity|Yes, P0|Feature-gated; call only after successful completed-response processing.|
+|Consumer-drop cancellation|Correctness|Yes, P0|Needed for prompt cleanup after `/pause`, interruption, or cancellation; no protocol changes required.|
 |Handshake `openai-model` and stream model metadata|Parser parity|Yes, P1|Add `ServerModel` event. Defer UX.|
 |Model verification metadata|Parser parity|Maybe, P1|Useful server signal; may require protocol type.|
 |Custom-tool input delta|Parser parity|Maybe, P1|Useful only if a consumer can apply deltas.|
+|Provider stream error classification|Error parity|Yes, P1|Classify `cyber_policy`, `server_is_overloaded`, and `slow_down` instead of treating all unknown failures as retryable.|
 |`permessage-deflate`|Transport parity|Maybe, P2|Dependency feasibility first; likely needs direct/forked tungstenite support.|
 |WebSocket custom CA|Enterprise transport parity|Optional, P2|This project lacks the upstream custom-CA helper, so this should not block other work.|
 |Trace/install/window metadata|Observability|Maybe, P3|Trace can be narrow; install/window IDs require extra session state.|
@@ -56,9 +58,11 @@
 |`responses_websocket_omits_response_processed_without_feature`|Patch 2|
 |`responses_websocket_sends_response_processed_after_remote_compaction_v2`|Patch 2, if remote compaction v2 call site is present|
 |send-timeout/terminal-error behavior without close-handshake|Patch 1; terminal-error close-handshake behavior is already backported and should remain covered|
+|mapper exits when `ResponseStream` is dropped|Patch 2a|
 |server model emitted from handshake/stream metadata|Patch 3|
 |model verification field emitted|Patch 4|
 |custom-tool input delta emitted|Patch 5|
+|`cyber_policy`, `server_is_overloaded`, and `slow_down` are classified|Patch 5a|
 |`websocket_config_enables_permessage_deflate`|Patch 6|
 |preconnect reuses connection|Patch 9|
 |request prewarm sends `generate:false` and chains correctly|Patch 10|
@@ -72,3 +76,4 @@
 - Do not treat warmup completion as assistant output.
 - Do not reuse WebSocket previous-response state across `/pause`, `/continue`, stream errors, compaction, rollback, or fallback without explicit tests.
 - Do not make custom CA or `permessage-deflate` prerequisites for `response.processed` or send timeout.
+- Do not leave a mapped provider stream running after the core response consumer is dropped.
