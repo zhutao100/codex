@@ -1,3 +1,4 @@
+use crate::common::ModelVerification;
 use crate::common::ResponseEvent;
 use crate::common::ResponseStream;
 use crate::error::ApiError;
@@ -26,6 +27,8 @@ use tracing::debug;
 use tracing::trace;
 
 const X_REASONING_INCLUDED_HEADER: &str = "x-reasoning-included";
+const OPENAI_MODEL_HEADER: &str = "openai-model";
+const TRUSTED_ACCESS_FOR_CYBER_VERIFICATION: &str = "trusted_access_for_cyber";
 
 /// Streams SSE events from an on-disk fixture for tests.
 pub fn stream_from_fixture(
@@ -60,6 +63,11 @@ pub fn spawn_response_stream(
         .get("X-Models-Etag")
         .and_then(|v| v.to_str().ok())
         .map(ToString::to_string);
+    let server_model = stream_response
+        .headers
+        .get(OPENAI_MODEL_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string);
     let reasoning_included = stream_response
         .headers
         .get(X_REASONING_INCLUDED_HEADER)
@@ -74,6 +82,9 @@ pub fn spawn_response_stream(
     }
     let (tx_event, rx_event) = mpsc::channel::<Result<ResponseEvent, ApiError>>(1600);
     tokio::spawn(async move {
+        if let Some(model) = server_model {
+            let _ = tx_event.send(Ok(ResponseEvent::ServerModel(model))).await;
+        }
         if let Some(snapshot) = rate_limits {
             let _ = tx_event.send(Ok(ResponseEvent::RateLimits(snapshot))).await;
         }
@@ -160,8 +171,12 @@ struct ResponseCompletedOutputTokensDetails {
 pub struct ResponsesStreamEvent {
     #[serde(rename = "type")]
     pub(crate) kind: String,
+    headers: Option<Value>,
+    metadata: Option<Value>,
     response: Option<Value>,
     item: Option<Value>,
+    item_id: Option<String>,
+    call_id: Option<String>,
     delta: Option<String>,
     summary_index: Option<i64>,
     content_index: Option<i64>,
@@ -170,6 +185,83 @@ pub struct ResponsesStreamEvent {
 impl ResponsesStreamEvent {
     pub fn kind(&self) -> &str {
         &self.kind
+    }
+
+    pub fn response_model(&self) -> Option<String> {
+        let response_headers_model = self
+            .response
+            .as_ref()
+            .and_then(|response| response.get("headers"))
+            .and_then(header_openai_model_value_from_json);
+
+        response_headers_model.or_else(|| {
+            self.headers
+                .as_ref()
+                .and_then(header_openai_model_value_from_json)
+        })
+    }
+
+    pub(crate) fn model_verifications(&self) -> Option<Vec<ModelVerification>> {
+        if self.kind() != "response.metadata" {
+            return None;
+        }
+
+        self.metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("openai_verification_recommendation"))
+            .and_then(model_verifications_from_json_value)
+    }
+}
+
+fn header_openai_model_value_from_json(value: &Value) -> Option<String> {
+    let headers = value.as_object()?;
+    headers.iter().find_map(|(name, value)| {
+        if name.eq_ignore_ascii_case("openai-model") || name.eq_ignore_ascii_case("x-openai-model")
+        {
+            json_value_as_string(value)
+        } else {
+            None
+        }
+    })
+}
+
+fn model_verifications_from_json_value(value: &Value) -> Option<Vec<ModelVerification>> {
+    let verifications = value
+        .as_array()
+        .map(|items| {
+            let mut verifications = Vec::new();
+            for verification in items
+                .iter()
+                .filter_map(Value::as_str)
+                .filter_map(parse_model_verification)
+            {
+                if !verifications.contains(&verification) {
+                    verifications.push(verification);
+                }
+            }
+            verifications
+        })
+        .unwrap_or_default();
+
+    if verifications.is_empty() {
+        None
+    } else {
+        Some(verifications)
+    }
+}
+
+fn parse_model_verification(value: &str) -> Option<ModelVerification> {
+    match value {
+        TRUSTED_ACCESS_FOR_CYBER_VERIFICATION => Some(ModelVerification::TrustedAccessForCyber),
+        _ => None,
+    }
+}
+
+fn json_value_as_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => Some(value.clone()),
+        Value::Array(items) => items.first().and_then(json_value_as_string),
+        _ => None,
     }
 }
 
@@ -201,6 +293,18 @@ pub fn process_responses_event(
         "response.output_text.delta" => {
             if let Some(delta) = event.delta {
                 return Ok(Some(ResponseEvent::OutputTextDelta(delta)));
+            }
+        }
+        "response.custom_tool_call_input.delta" => {
+            if let Some(delta) = event.delta {
+                let item_id = event.item_id.or_else(|| event.call_id.clone());
+                if let Some(item_id) = item_id {
+                    return Ok(Some(ResponseEvent::ToolCallInputDelta {
+                        item_id,
+                        call_id: event.call_id,
+                        delta,
+                    }));
+                }
             }
         }
         "response.reasoning_summary_text.delta" => {
@@ -236,11 +340,17 @@ pub fn process_responses_event(
                         response_error = ApiError::QuotaExceeded;
                     } else if is_usage_not_included(&error) {
                         response_error = ApiError::UsageNotIncluded;
+                    } else if is_cyber_policy_error(&error) {
+                        response_error = ApiError::CyberPolicy {
+                            message: cyber_policy_message(error.message),
+                        };
                     } else if is_invalid_prompt_error(&error) {
                         let message = error
                             .message
                             .unwrap_or_else(|| "Invalid request.".to_string());
                         response_error = ApiError::InvalidRequest { message };
+                    } else if is_server_overloaded_error(&error) {
+                        response_error = ApiError::ServerOverloaded;
                     } else {
                         let delay = try_parse_retry_after(&error);
                         let message = error.message.unwrap_or_default();
@@ -339,6 +449,7 @@ pub async fn process_sse(
 ) {
     let mut stream = stream.eventsource();
     let mut response_error: Option<ApiError> = None;
+    let mut last_server_model: Option<String> = None;
 
     loop {
         let start = Instant::now();
@@ -377,6 +488,28 @@ pub async fn process_sse(
                 continue;
             }
         };
+        let model_verifications = event.model_verifications();
+
+        if let Some(model) = event.response_model()
+            && last_server_model.as_deref() != Some(model.as_str())
+        {
+            if tx_event
+                .send(Ok(ResponseEvent::ServerModel(model.clone())))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            last_server_model = Some(model);
+        }
+        if let Some(verifications) = model_verifications
+            && tx_event
+                .send(Ok(ResponseEvent::ModelVerifications(verifications)))
+                .await
+                .is_err()
+        {
+            return;
+        }
 
         match process_responses_event(event) {
             Ok(Some(event)) => {
@@ -436,6 +569,25 @@ fn is_usage_not_included(error: &Error) -> bool {
 
 fn is_invalid_prompt_error(error: &Error) -> bool {
     error.code.as_deref() == Some("invalid_prompt")
+}
+
+fn is_cyber_policy_error(error: &Error) -> bool {
+    error.code.as_deref() == Some("cyber_policy")
+}
+
+fn is_server_overloaded_error(error: &Error) -> bool {
+    error.code.as_deref() == Some("server_is_overloaded")
+        || error.code.as_deref() == Some("slow_down")
+}
+
+fn cyber_policy_fallback_message() -> String {
+    "This request has been flagged for possible cybersecurity risk.".to_string()
+}
+
+fn cyber_policy_message(message: Option<String>) -> String {
+    message
+        .filter(|message| !message.trim().is_empty())
+        .unwrap_or_else(cyber_policy_fallback_message)
 }
 
 fn rate_limit_regex() -> &'static regex_lite::Regex {
@@ -666,6 +818,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parses_tool_call_input_deltas() {
+        let events = run_sse(vec![
+            json!({
+                "type": "response.custom_tool_call_input.delta",
+                "item_id": "ctc_1",
+                "call_id": "call_1",
+                "delta": "*** Begin",
+            }),
+            json!({
+                "type": "response.function_call_arguments.delta",
+                "item_id": "fc_1",
+                "delta": "{\"input\":\"",
+            }),
+            json!({
+                "type": "response.completed",
+                "response": { "id": "resp1" }
+            }),
+        ])
+        .await;
+
+        assert_matches!(
+            &events[0],
+            ResponseEvent::ToolCallInputDelta {
+                item_id,
+                call_id: Some(call_id),
+                delta,
+            } if item_id == "ctc_1" && call_id == "call_1" && delta == "*** Begin"
+        );
+        assert_matches!(&events[1], ResponseEvent::Completed { .. });
+    }
+
+    #[tokio::test]
     async fn response_completed_preserves_end_turn_false() {
         let completed = json!({
             "type": "response.completed",
@@ -824,6 +1008,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cyber_policy_error_is_fatal() {
+        let raw_error = r#"{"type":"response.failed","sequence_number":3,"response":{"id":"resp_fatal_policy","object":"response","created_at":1759771626,"status":"failed","background":false,"error":{"code":"cyber_policy","message":"This request was flagged."},"incomplete_details":null}}"#;
+
+        let sse1 = format!("event: response.failed\ndata: {raw_error}\n\n");
+
+        let events = collect_events(&[sse1.as_bytes()]).await;
+
+        assert_eq!(events.len(), 1);
+
+        match &events[0] {
+            Err(ApiError::CyberPolicy { message }) => {
+                assert_eq!(message, "This request was flagged.");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cyber_policy_error_uses_fallback_for_empty_message() {
+        let raw_error = r#"{"type":"response.failed","sequence_number":3,"response":{"id":"resp_fatal_policy","object":"response","created_at":1759771626,"status":"failed","background":false,"error":{"code":"cyber_policy","message":"   "},"incomplete_details":null}}"#;
+
+        let sse1 = format!("event: response.failed\ndata: {raw_error}\n\n");
+
+        let events = collect_events(&[sse1.as_bytes()]).await;
+
+        assert_eq!(events.len(), 1);
+
+        match &events[0] {
+            Err(ApiError::CyberPolicy { message }) => {
+                assert_eq!(
+                    message,
+                    "This request has been flagged for possible cybersecurity risk."
+                );
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn server_overloaded_error_is_classified() {
+        for code in ["server_is_overloaded", "slow_down"] {
+            let raw_error = json!({
+                "type": "response.failed",
+                "response": {
+                    "error": {
+                        "code": code,
+                        "message": "try later"
+                    }
+                }
+            })
+            .to_string();
+            let sse1 = format!("event: response.failed\ndata: {raw_error}\n\n");
+
+            let events = collect_events(&[sse1.as_bytes()]).await;
+
+            assert_eq!(events.len(), 1);
+            assert_matches!(events[0], Err(ApiError::ServerOverloaded));
+        }
+    }
+
+    #[tokio::test]
     async fn invalid_prompt_without_type_is_invalid_request() {
         let raw_error = r#"{"type":"response.failed","sequence_number":3,"response":{"id":"resp_invalid_prompt_no_type","object":"response","created_at":1759771628,"status":"failed","background":false,"error":{"code":"invalid_prompt","message":"Invalid prompt: we've limited access to this content for safety reasons."},"incomplete_details":null}}"#;
 
@@ -922,6 +1167,174 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn process_sse_ignores_response_model_field_in_payload() {
+        let events = run_sse(vec![
+            json!({
+                "type": "response.created",
+                "response": {
+                    "id": "resp-1",
+                    "model": CYBER_RESTRICTED_MODEL_FOR_TESTS
+                }
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp-1",
+                    "model": CYBER_RESTRICTED_MODEL_FOR_TESTS
+                }
+            }),
+        ])
+        .await;
+
+        assert_eq!(events.len(), 2);
+        assert_matches!(&events[0], ResponseEvent::Created);
+        assert_matches!(&events[1], ResponseEvent::Completed { .. });
+    }
+
+    #[tokio::test]
+    async fn process_sse_emits_server_model_from_response_headers_payload() {
+        let events = run_sse(vec![
+            json!({
+                "type": "response.created",
+                "response": {
+                    "id": "resp-1",
+                    "headers": {
+                        "OpenAI-Model": CYBER_RESTRICTED_MODEL_FOR_TESTS
+                    }
+                }
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp-1"
+                }
+            }),
+        ])
+        .await;
+
+        assert_eq!(events.len(), 3);
+        assert_matches!(
+            &events[0],
+            ResponseEvent::ServerModel(model) if model == CYBER_RESTRICTED_MODEL_FOR_TESTS
+        );
+        assert_matches!(&events[1], ResponseEvent::Created);
+        assert_matches!(&events[2], ResponseEvent::Completed { .. });
+    }
+
+    #[tokio::test]
+    async fn process_sse_emits_model_verification_field() {
+        let events = run_sse(vec![
+            json!({
+                "type": "response.metadata",
+                "sequence_number": 1,
+                "response_id": "resp-1",
+                "metadata": {
+                    "openai_verification_recommendation": [TRUSTED_ACCESS_FOR_CYBER_VERIFICATION]
+                }
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp-1"
+                }
+            }),
+        ])
+        .await;
+
+        assert_matches!(
+            &events[0],
+            ResponseEvent::ModelVerifications(verifications)
+                if verifications == &vec![ModelVerification::TrustedAccessForCyber]
+        );
+        assert_matches!(&events[1], ResponseEvent::Completed { .. });
+    }
+
+    #[test]
+    fn responses_stream_event_response_model_reads_top_level_headers() {
+        let ev: ResponsesStreamEvent = serde_json::from_value(json!({
+            "type": "response.metadata",
+            "headers": {
+                "openai-model": CYBER_RESTRICTED_MODEL_FOR_TESTS,
+            }
+        }))
+        .expect("expected event to deserialize");
+
+        assert_eq!(
+            ev.response_model().as_deref(),
+            Some(CYBER_RESTRICTED_MODEL_FOR_TESTS)
+        );
+    }
+
+    #[test]
+    fn responses_stream_event_response_model_prefers_response_headers() {
+        let ev: ResponsesStreamEvent = serde_json::from_value(json!({
+            "type": "response.created",
+            "headers": {
+                "openai-model": "top-level-model"
+            },
+            "response": {
+                "id": "resp-1",
+                "headers": {
+                    "openai-model": CYBER_RESTRICTED_MODEL_FOR_TESTS
+                }
+            }
+        }))
+        .expect("expected event to deserialize");
+
+        assert_eq!(
+            ev.response_model().as_deref(),
+            Some(CYBER_RESTRICTED_MODEL_FOR_TESTS)
+        );
+    }
+
+    #[test]
+    fn responses_stream_event_model_verification_reads_metadata_field() {
+        let event = json!({
+            "type": "response.metadata",
+            "sequence_number": 1,
+            "response_id": "resp-1",
+            "metadata": {
+                "openai_verification_recommendation": [TRUSTED_ACCESS_FOR_CYBER_VERIFICATION]
+            }
+        });
+        let event: ResponsesStreamEvent =
+            serde_json::from_value(event).expect("expected event to deserialize");
+
+        assert_eq!(
+            event.model_verifications(),
+            Some(vec![ModelVerification::TrustedAccessForCyber])
+        );
+    }
+
+    #[test]
+    fn responses_stream_event_model_verification_ignores_unknown_field() {
+        let event = json!({
+            "type": "response.metadata",
+            "metadata": {
+                "openai_verification_recommendation": ["unknown"]
+            }
+        });
+        let event: ResponsesStreamEvent =
+            serde_json::from_value(event).expect("expected event to deserialize");
+
+        assert_eq!(event.model_verifications(), None);
+    }
+
+    #[test]
+    fn responses_stream_event_model_verification_ignores_non_array_field() {
+        let event = json!({
+            "type": "response.metadata",
+            "metadata": {
+                "openai_verification_recommendation": TRUSTED_ACCESS_FOR_CYBER_VERIFICATION
+            }
+        });
+        let event: ResponsesStreamEvent =
+            serde_json::from_value(event).expect("expected event to deserialize");
+
+        assert_eq!(event.model_verifications(), None);
+    }
+
     #[test]
     fn test_try_parse_retry_after() {
         let err = Error {
@@ -961,4 +1374,6 @@ mod tests {
         let delay = try_parse_retry_after(&err);
         assert_eq!(delay, Some(Duration::from_secs(35)));
     }
+
+    const CYBER_RESTRICTED_MODEL_FOR_TESTS: &str = "gpt-5.3-codex";
 }

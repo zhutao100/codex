@@ -15,6 +15,11 @@ use std::task::Context;
 use std::task::Poll;
 use tokio::sync::mpsc;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelVerification {
+    TrustedAccessForCyber,
+}
+
 /// Canonical prompt input for Responses endpoints.
 #[derive(Debug, Clone)]
 pub struct Prompt {
@@ -71,6 +76,10 @@ pub enum ResponseEvent {
     Created,
     OutputItemDone(ResponseItem),
     OutputItemAdded(ResponseItem),
+    /// Emitted when the server reports the effective model for the stream.
+    ServerModel(String),
+    /// Emitted when the server recommends additional model/account verification.
+    ModelVerifications(Vec<ModelVerification>),
     /// Emitted when `X-Reasoning-Included: true` is present on the response,
     /// meaning the server already accounted for past reasoning tokens and the
     /// client should not re-estimate them.
@@ -83,6 +92,11 @@ pub enum ResponseEvent {
         end_turn: Option<bool>,
     },
     OutputTextDelta(String),
+    ToolCallInputDelta {
+        item_id: String,
+        call_id: Option<String>,
+        delta: String,
+    },
     ReasoningSummaryDelta {
         delta: String,
         summary_index: i64,

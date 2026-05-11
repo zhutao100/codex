@@ -19,6 +19,7 @@ pub use crate::common::MemoryTrace;
 pub use crate::common::MemoryTraceMetadata;
 pub use crate::common::MemoryTraceSummarizeInput;
 pub use crate::common::MemoryTraceSummaryOutput;
+pub use crate::common::ModelVerification;
 pub use crate::common::Prompt;
 pub use crate::common::ResponseAppendWsRequest;
 pub use crate::common::ResponseCreateWsRequest;

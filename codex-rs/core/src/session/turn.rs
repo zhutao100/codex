@@ -2119,6 +2119,11 @@ async fn try_run_sampling_request(
             ResponseEvent::ServerReasoningIncluded(included) => {
                 sess.set_server_reasoning_included(included).await;
             }
+            ResponseEvent::ServerModel(model) => {
+                debug!(server_model = %model, "server reported effective model");
+            }
+            ResponseEvent::ModelVerifications(_verifications) => {}
+            ResponseEvent::ToolCallInputDelta { .. } => {}
             ResponseEvent::RateLimits(snapshot) => {
                 // Update internal state with latest rate limits, but defer sending until
                 // token usage is available to avoid duplicate TokenCount events.

@@ -144,6 +144,7 @@ impl Drop for WsStream {
 const X_CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
 const X_MODELS_ETAG_HEADER: &str = "x-models-etag";
 const X_REASONING_INCLUDED_HEADER: &str = "x-reasoning-included";
+const OPENAI_MODEL_HEADER: &str = "openai-model";
 const WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE: &str = "websocket_connection_limit_reached";
 const WEBSOCKET_CONNECTION_LIMIT_REACHED_MESSAGE: &str = "Responses websocket connection limit reached (60 minutes). Create a new websocket connection to continue.";
 
@@ -153,6 +154,7 @@ pub struct ResponsesWebsocketConnection {
     idle_timeout: Duration,
     server_reasoning_included: bool,
     models_etag: Option<String>,
+    server_model: Option<String>,
     telemetry: Option<Arc<dyn WebsocketTelemetry>>,
 }
 
@@ -162,6 +164,7 @@ impl ResponsesWebsocketConnection {
         idle_timeout: Duration,
         server_reasoning_included: bool,
         models_etag: Option<String>,
+        server_model: Option<String>,
         telemetry: Option<Arc<dyn WebsocketTelemetry>>,
     ) -> Self {
         Self {
@@ -169,6 +172,7 @@ impl ResponsesWebsocketConnection {
             idle_timeout,
             server_reasoning_included,
             models_etag,
+            server_model,
             telemetry,
         }
     }
@@ -210,12 +214,16 @@ impl ResponsesWebsocketConnection {
         let idle_timeout = self.idle_timeout;
         let server_reasoning_included = self.server_reasoning_included;
         let models_etag = self.models_etag.clone();
+        let server_model = self.server_model.clone();
         let telemetry = self.telemetry.clone();
         let request_body = serde_json::to_value(&request).map_err(|err| {
             ApiError::Stream(format!("failed to encode websocket request: {err}"))
         })?;
 
         tokio::spawn(async move {
+            if let Some(model) = server_model {
+                let _ = tx_event.send(Ok(ResponseEvent::ServerModel(model))).await;
+            }
             if let Some(etag) = models_etag {
                 let _ = tx_event.send(Ok(ResponseEvent::ModelsEtag(etag))).await;
             }
@@ -285,13 +293,14 @@ impl<A: AuthProvider> ResponsesWebsocketClient<A> {
             merge_request_headers(&self.provider.headers, extra_headers, default_headers);
         add_auth_headers_to_header_map(&self.auth, &mut headers);
 
-        let (stream, server_reasoning_included, models_etag) =
+        let (stream, server_reasoning_included, models_etag, server_model) =
             connect_websocket(ws_url, headers, turn_state.clone()).await?;
         Ok(ResponsesWebsocketConnection::new(
             stream,
             self.provider.stream_idle_timeout,
             server_reasoning_included,
             models_etag,
+            server_model,
             telemetry,
         ))
     }
@@ -316,7 +325,7 @@ async fn connect_websocket(
     url: Url,
     headers: HeaderMap,
     turn_state: Option<Arc<OnceLock<String>>>,
-) -> Result<(WsStream, bool, Option<String>), ApiError> {
+) -> Result<(WsStream, bool, Option<String>, Option<String>), ApiError> {
     info!("connecting to websocket: {url}");
 
     let mut request = url
@@ -347,6 +356,11 @@ async fn connect_websocket(
         .get(X_MODELS_ETAG_HEADER)
         .and_then(|value| value.to_str().ok())
         .map(ToString::to_string);
+    let server_model = response
+        .headers()
+        .get(OPENAI_MODEL_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(ToString::to_string);
     if let Some(turn_state) = turn_state
         && let Some(header_value) = response
             .headers()
@@ -355,7 +369,12 @@ async fn connect_websocket(
     {
         let _ = turn_state.set(header_value.to_string());
     }
-    Ok((WsStream::new(stream), reasoning_included, models_etag))
+    Ok((
+        WsStream::new(stream),
+        reasoning_included,
+        models_etag,
+        server_model,
+    ))
 }
 
 fn map_ws_error(err: WsError, url: &Url) -> ApiError {
@@ -476,6 +495,7 @@ async fn run_websocket_response_stream(
     idle_timeout: Duration,
     telemetry: Option<Arc<dyn WebsocketTelemetry>>,
 ) -> Result<(), ApiError> {
+    let mut last_server_model: Option<String> = None;
     send_websocket_request(ws_stream, request_body, idle_timeout, telemetry.as_ref()).await?;
 
     loop {
@@ -523,6 +543,25 @@ async fn run_websocket_response_stream(
                         let _ = tx_event.send(Ok(ResponseEvent::RateLimits(snapshot))).await;
                     }
                     continue;
+                }
+                let model_verifications = event.model_verifications();
+                if let Some(model) = event.response_model()
+                    && last_server_model.as_deref() != Some(model.as_str())
+                {
+                    let _ = tx_event
+                        .send(Ok(ResponseEvent::ServerModel(model.clone())))
+                        .await;
+                    last_server_model = Some(model);
+                }
+                if let Some(verifications) = model_verifications
+                    && tx_event
+                        .send(Ok(ResponseEvent::ModelVerifications(verifications)))
+                        .await
+                        .is_err()
+                {
+                    return Err(ApiError::Stream(
+                        "response event consumer dropped".to_string(),
+                    ));
                 }
                 match process_responses_event(event) {
                     Ok(Some(event)) => {

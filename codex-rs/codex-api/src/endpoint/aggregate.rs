@@ -133,6 +133,23 @@ impl Stream for AggregatedStream {
                 Poll::Ready(Some(Ok(ResponseEvent::OutputItemAdded(item)))) => {
                     return Poll::Ready(Some(Ok(ResponseEvent::OutputItemAdded(item))));
                 }
+                Poll::Ready(Some(Ok(ResponseEvent::ServerModel(model)))) => {
+                    return Poll::Ready(Some(Ok(ResponseEvent::ServerModel(model))));
+                }
+                Poll::Ready(Some(Ok(ResponseEvent::ModelVerifications(verifications)))) => {
+                    return Poll::Ready(Some(Ok(ResponseEvent::ModelVerifications(verifications))));
+                }
+                Poll::Ready(Some(Ok(ResponseEvent::ToolCallInputDelta {
+                    item_id,
+                    call_id,
+                    delta,
+                }))) => {
+                    return Poll::Ready(Some(Ok(ResponseEvent::ToolCallInputDelta {
+                        item_id,
+                        call_id,
+                        delta,
+                    })));
+                }
             }
         }
     }

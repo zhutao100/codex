@@ -304,6 +304,46 @@ async fn responses_websocket_emits_reasoning_included_event() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_websocket_emits_server_model_event() {
+    let server = start_websocket_server_with_headers(vec![WebSocketConnectionConfig {
+        requests: vec![vec![ev_response_created("resp-1"), ev_completed("resp-1")]],
+        response_headers: vec![("OpenAI-Model".to_string(), "gpt-5.3-codex".to_string())],
+    }])
+    .await;
+
+    let harness = websocket_harness(&server).await;
+    let mut client_session = harness.client.new_session();
+    let prompt = prompt_with_input(vec![message_item("hello")]);
+
+    let mut stream = client_session
+        .stream(
+            &prompt,
+            &harness.model_info,
+            &harness.otel_manager,
+            harness.effort,
+            harness.summary,
+            None,
+            None,
+        )
+        .await
+        .expect("websocket stream failed");
+
+    let mut saw_server_model = None;
+    while let Some(event) = stream.next().await {
+        match event.expect("event") {
+            ResponseEvent::ServerModel(model) => {
+                saw_server_model = Some(model);
+            }
+            ResponseEvent::Completed { .. } => break,
+            _ => {}
+        }
+    }
+
+    assert_eq!(saw_server_model.as_deref(), Some("gpt-5.3-codex"));
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_websocket_emits_rate_limit_events() {
     skip_if_no_network!();
 
