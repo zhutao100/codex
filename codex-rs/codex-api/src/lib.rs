@@ -23,6 +23,7 @@ pub use crate::common::Prompt;
 pub use crate::common::ResponseAppendWsRequest;
 pub use crate::common::ResponseCreateWsRequest;
 pub use crate::common::ResponseEvent;
+pub use crate::common::ResponseProcessedWsRequest;
 pub use crate::common::ResponseStream;
 pub use crate::common::ResponsesApiRequest;
 pub use crate::common::create_text_param_for_request;

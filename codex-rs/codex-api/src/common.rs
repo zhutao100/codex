@@ -205,6 +205,12 @@ pub struct ResponseCreateWsRequest {
 pub struct ResponseAppendWsRequest {
     pub input: Vec<ResponseItem>,
 }
+
+#[derive(Debug, Serialize)]
+pub struct ResponseProcessedWsRequest {
+    pub response_id: String,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(tag = "type")]
 #[allow(clippy::large_enum_variant)]
@@ -213,6 +219,8 @@ pub enum ResponsesWsRequest {
     ResponseCreate(ResponseCreateWsRequest),
     #[serde(rename = "response.append")]
     ResponseAppend(ResponseAppendWsRequest),
+    #[serde(rename = "response.processed")]
+    ResponseProcessed(ResponseProcessedWsRequest),
 }
 
 pub fn create_text_param_for_request(

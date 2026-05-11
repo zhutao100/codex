@@ -1,6 +1,7 @@
 use crate::auth::AuthProvider;
 use crate::auth::add_auth_headers_to_header_map;
 use crate::common::ResponseEvent;
+use crate::common::ResponseProcessedWsRequest;
 use crate::common::ResponseStream;
 use crate::common::ResponsesWsRequest;
 use crate::error::ApiError;
@@ -174,6 +175,29 @@ impl ResponsesWebsocketConnection {
 
     pub async fn is_closed(&self) -> bool {
         self.stream.lock().await.is_none()
+    }
+
+    pub async fn send_response_processed(&self, response_id: String) -> Result<(), ApiError> {
+        let request =
+            ResponsesWsRequest::ResponseProcessed(ResponseProcessedWsRequest { response_id });
+        let request_body = serde_json::to_value(&request).map_err(|err| {
+            ApiError::Stream(format!("failed to encode websocket request: {err}"))
+        })?;
+
+        let mut guard = self.stream.lock().await;
+        let Some(ws_stream) = guard.as_mut() else {
+            return Err(ApiError::Stream(
+                "websocket connection is closed".to_string(),
+            ));
+        };
+
+        send_websocket_request(
+            ws_stream,
+            request_body,
+            self.idle_timeout,
+            self.telemetry.as_ref(),
+        )
+        .await
     }
 
     pub async fn stream_request(
@@ -452,26 +476,7 @@ async fn run_websocket_response_stream(
     idle_timeout: Duration,
     telemetry: Option<Arc<dyn WebsocketTelemetry>>,
 ) -> Result<(), ApiError> {
-    let request_text = match serde_json::to_string(&request_body) {
-        Ok(text) => text,
-        Err(err) => {
-            return Err(ApiError::Stream(format!(
-                "failed to encode websocket request: {err}"
-            )));
-        }
-    };
-
-    let request_start = Instant::now();
-    let result = ws_stream
-        .send(Message::Text(request_text.into()))
-        .await
-        .map_err(|err| ApiError::Stream(format!("failed to send websocket request: {err}")));
-
-    if let Some(t) = telemetry.as_ref() {
-        t.on_ws_request(request_start.elapsed(), result.as_ref().err());
-    }
-
-    result?;
+    send_websocket_request(ws_stream, request_body, idle_timeout, telemetry.as_ref()).await?;
 
     loop {
         let poll_start = Instant::now();
@@ -552,6 +557,34 @@ async fn run_websocket_response_stream(
     }
 
     Ok(())
+}
+
+async fn send_websocket_request(
+    ws_stream: &WsStream,
+    request_body: Value,
+    idle_timeout: Duration,
+    telemetry: Option<&Arc<dyn WebsocketTelemetry>>,
+) -> Result<(), ApiError> {
+    let request_text = serde_json::to_string(&request_body)
+        .map_err(|err| ApiError::Stream(format!("failed to encode websocket request: {err}")))?;
+    trace!("websocket request: {request_text}");
+
+    let request_start = Instant::now();
+    let result = tokio::time::timeout(
+        idle_timeout,
+        ws_stream.send(Message::Text(request_text.into())),
+    )
+    .await
+    .map_err(|_| ApiError::Stream("idle timeout sending websocket request".into()))
+    .and_then(|result| {
+        result.map_err(|err| ApiError::Stream(format!("failed to send websocket request: {err}")))
+    });
+
+    if let Some(t) = telemetry.as_ref() {
+        t.on_ws_request(request_start.elapsed(), result.as_ref().err());
+    }
+
+    result
 }
 
 #[cfg(test)]
