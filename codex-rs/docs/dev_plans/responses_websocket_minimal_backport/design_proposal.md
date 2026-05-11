@@ -2,454 +2,322 @@
 
 ## Design Principle
 
-Patch this branch in place.
+Patch this project in place and keep the current architecture:
 
-Keep these current-branch shapes:
+- `codex-api/src/endpoint/responses_websocket.rs` owns WebSocket connect, request send, and WebSocket event parsing.
+- `codex-api/src/sse/responses.rs` owns shared Responses stream-event parsing.
+- `core/src/client.rs` owns transport selection, retries, WebSocket request construction, incremental state, and HTTP fallback.
+- `core/src/session/*` owns turn lifecycle, rollout durability, `/pause`, and `/continue` behavior.
 
-- `codex-api/src/endpoint/responses_websocket.rs` owns WebSocket connect and stream parsing.
-- `codex-api/src/sse/responses.rs` owns shared Responses stream event parsing.
-- `core/src/client.rs` owns transport selection, retries, WebSocket request construction, and fallback.
-- `core/src/codex.rs` owns turn sampling and `/pause` / `/continue` semantics.
+Use the upstream project as a behavioral reference, not a source tree to import wholesale.
 
-Do not port the upstream branch's `core/src/session/*` refactor. Use the upstream branch as a behavioral reference.
+## Patch Sequence
 
-## Proposed Patch Sequence
-
-Cross-validation against the alternative draft changes the order of the first patches:
-
-- Suppress WebSockets when `CODEX_RS_SSE_FIXTURE` is set before adding more WebSocket behavior.
-- Treat WebSocket connect `426 Upgrade Required` as immediate HTTP fallback instead of spending stream retry budget.
-- Add body-level `client_metadata` with the first protocol patch because handshake headers are not resent per `response.create`.
-- After adding `generate` and `client_metadata`, exclude both WebSocket-only fields from incremental eligibility comparisons unless a larger canonical request refactor is being ported.
-- Treat connect timeout, custom CA, and `permessage-deflate` as transport hardening. `permessage-deflate` is low risk only if the pinned tungstenite API exposes the same extension config; custom CA should be skipped unless this branch has or receives a small standalone helper.
-- Do not blindly cache cross-turn WebSocket state. Store/reuse only completed response chains, and reset on pause, interruption, fallback, compaction, rollback, or any stream error.
-
-### Patch 0 - Fixture and fallback guardrails
-
-Scope:
-
-- `core/src/client.rs`
-- `core/tests/suite/websocket_fallback.rs`
-
-Changes:
-
-1. Disable WebSocket transport while an SSE fixture is active:
-
-```rust
-fn responses_websocket_enabled(&self) -> bool {
-    self.client.state.provider.supports_websockets
-        && self.client.state.enable_responses_websockets
-        && (*CODEX_RS_SSE_FIXTURE).is_none()
-}
-```
-
-2. Add a small local outcome enum instead of porting the upstream branch session result model:
-
-```rust
-enum WebsocketStreamOutcome {
-    Stream(ResponseStream),
-    FallbackToHttp,
-}
-```
-
-3. Map WebSocket connect `426 Upgrade Required` to `FallbackToHttp`, then call `try_switch_fallback_transport(...)` and stream the same request over HTTP.
-
-Tests to add:
-
-- `websocket_fallback_switches_to_http_on_upgrade_required_connect`
-- fixture suppression coverage if it can be done without mutating process-wide environment in an in-process test
-
-### Patch 1 - Terminal error and wrapped-error correctness
+### Patch 1 - Bound WebSocket request sends
 
 Scope:
 
 - `codex-api/src/endpoint/responses_websocket.rs`
 - `core/tests/suite/client_websockets.rs`
 
-Changes:
+Problem:
 
-1. Add wrapped error event parsing before ordinary `ResponsesStreamEvent` parsing:
+This project bounds WebSocket connect and response receive, but `run_websocket_response_stream(...)` directly awaits `ws_stream.send(...)`. The upstream project factors sends into `send_websocket_request(...)` and wraps the send with `tokio::time::timeout(idle_timeout, ...)`.
 
-```rust
-#[derive(Debug, Deserialize)]
-struct WrappedWebsocketError {
-    code: Option<String>,
-    message: Option<String>,
-}
+Minimal change:
 
-#[derive(Debug, Deserialize)]
-struct WrappedWebsocketErrorEvent {
-    #[serde(rename = "type")]
-    kind: String,
-    #[serde(alias = "status_code")]
-    status: Option<u16>,
-    #[serde(default)]
-    error: Option<WrappedWebsocketError>,
-    #[serde(default)]
-    headers: Option<serde_json::Map<String, serde_json::Value>>,
-}
-```
-
-2. Map `websocket_connection_limit_reached` to:
+1. Add a helper near `run_websocket_response_stream(...)`:
 
 ```rust
-ApiError::Retryable { message, delay: None }
-```
+async fn send_websocket_request(
+    ws_stream: &WsStream,
+    request_body: Value,
+    idle_timeout: Duration,
+    telemetry: Option<&Arc<dyn WebsocketTelemetry>>,
+) -> Result<(), ApiError> {
+    let request_text = serde_json::to_string(&request_body).map_err(|err| {
+        ApiError::Stream(format!("failed to encode websocket request: {err}"))
+    })?;
 
-3. Map other non-success wrapped statuses to:
+    let request_start = Instant::now();
+    let result = tokio::time::timeout(
+        idle_timeout,
+        ws_stream.send(Message::Text(request_text.into())),
+    )
+    .await
+    .map_err(|_| ApiError::Stream("idle timeout sending websocket request".into()))
+    .and_then(|result| {
+        result.map_err(|err| ApiError::Stream(format!("failed to send websocket request: {err}")))
+    });
 
-```rust
-ApiError::Transport(TransportError::Http {
-    status,
-    url: None,
-    headers: Some(mapped_headers),
-    body: Some(original_payload),
-})
-```
+    if let Some(t) = telemetry.as_ref() {
+        t.on_ws_request(request_start.elapsed(), result.as_ref().err());
+    }
 
-4. On `run_websocket_response_stream(...)` error, do not call `close(None).await`. Drop the failed stream and send the original error:
-
-```rust
-let result = run_websocket_response_stream(...).await;
-if let Err(err) = result {
-    let failed_stream = guard.take();
-    drop(guard);
-    drop(failed_stream);
-    let _ = tx_event.send(Err(err)).await;
+    result
 }
 ```
 
-5. Ensure a terminal error clears `websocket_last_request` and `websocket_last_response_rx` before the next request can compute an incremental delta. In the current this branch this can be done either:
+2. Replace the direct send block in `run_websocket_response_stream(...)` with the helper.
 
-- by clearing in `ModelClientSession::try_switch_fallback_transport(...)`; and
-- by clearing when `websocket_connection(...)` sees the stored connection is closed;
+3. Do not port the upstream project's `connection_reused` telemetry argument yet; that belongs with Patch 7 or Patch 8.
 
-or by adding a small helper:
+Tests:
 
-```rust
-fn reset_websocket_incremental_state(&mut self) {
-    self.connection = None;
-    self.websocket_last_request = None;
-    self.websocket_last_response_rx = None;
-}
-```
+- Add a unit or harness test that injects a stalled send path and expects `idle timeout sending websocket request`.
+- Keep existing wrapped-error and connection-limit tests unchanged.
 
-Tests to add:
+Risk:
 
-- `responses_websocket_usage_limit_error_emits_rate_limit_event`
-- `responses_websocket_invalid_request_error_with_status_is_forwarded`
-- `responses_websocket_connection_limit_error_reconnects_and_completes`
-- `responses_websocket_v2_surfaces_terminal_error_without_close_handshake`
-- `responses_websocket_v2_after_error_uses_full_create_without_previous_response_id`
+Low. The helper preserves the same error type and telemetry callback shape already used by this project.
 
-Notes:
-
-- This branch already maps `ApiError::Retryable` to retryable `CodexErr::Stream`; use that instead of inventing new retry plumbing.
-- Do not make `previous_response_not_found` retryable. It means the connection-local state is unavailable. The safe fallback is a full `response.create` without `previous_response_id`.
-
-### Patch 2 - Shared Responses stream parser parity
+### Patch 2 - Add `response.processed` acknowledgement
 
 Scope:
 
 - `codex-api/src/common.rs`
-- `codex-api/src/sse/responses.rs`
+- `codex-api/src/endpoint/responses_websocket.rs`
+- `core/src/features.rs`
+- `core/config.schema.json`
 - `core/src/client.rs`
-- `core/src/codex.rs`
-
-Changes:
-
-1. Extend `ResponseEvent::Completed`:
-
-```rust
-Completed {
-    response_id: String,
-    token_usage: Option<TokenUsage>,
-    end_turn: Option<bool>,
-}
-```
-
-2. Parse `end_turn` from `response.completed.response.end_turn`.
-
-3. Carry `end_turn` through `map_response_stream(...)`.
-
-4. In `core/src/codex.rs`, treat `Some(false)` as follow-up-needed:
-
-```rust
-if let Some(false) = end_turn {
-    needs_follow_up = true;
-}
-```
-
-5. Add `response.incomplete` handling:
-
-```rust
-"response.incomplete" => {
-    let reason = event.response.as_ref()
-        .and_then(|response| response.get("incomplete_details"))
-        .and_then(|details| details.get("reason"))
-        .and_then(Value::as_str)
-        .unwrap_or("unknown");
-    return Err(ResponsesEventError::Api(ApiError::Stream(
-        format!("Incomplete response returned, reason: {reason}")
-    )));
-}
-```
-
-6. Optionally add explicit `ApiError::ServerOverloaded` and `ApiError::CyberPolicy { message }`. This is parser parity but not required for WebSocket correctness if this branch does not have the upstream branch’s user-facing cyber/trusted-access UX.
-
-Required mechanical updates:
-
-- Update all current-branch tests and constructors that match or build `ResponseEvent::Completed`.
-- Update `codex-api/src/endpoint/aggregate.rs` and any fixture helpers to pass `end_turn: None`.
-
-Tests to add:
-
-- `response_completed_preserves_end_turn_false`
-- `response_incomplete_is_stream_error`
-- existing response-completed tests updated for `end_turn: None`
-
-### Patch 3 - v2 `response.create` only for OpenAI WebSocket
-
-Scope:
-
-- `codex-api/src/common.rs`
-- `core/src/client.rs`
+- `core/src/session/turn.rs`
+- `core/src/compact_remote_v2.rs`, only if this project has the same remote-compaction v2 call shape at the target revision
 - `core/tests/suite/client_websockets.rs`
 
-Changes:
+Problem:
 
-1. Add fields to `ResponseCreateWsRequest`:
+The upstream project can send a WebSocket `response.processed` message after a successful turn and after remote compaction. This project has no request type or call site for that acknowledgement.
 
-```rust
-#[serde(skip_serializing_if = "String::is_empty")]
-pub instructions: String,
+Minimal change:
 
-#[serde(skip_serializing_if = "Option::is_none")]
-pub generate: Option<bool>,
-
-#[serde(skip_serializing_if = "Option::is_none")]
-pub client_metadata: Option<HashMap<String, String>>,
-```
-
-If this branch already has `instructions`, only add the skip attribute; do not duplicate the field.
-
-2. Populate `client_metadata` on every `response.create` payload before changing incremental behavior:
+1. Add the API request shape:
 
 ```rust
-fn websocket_client_metadata(
-    turn_metadata_header: Option<&str>,
-    session_source: &SessionSource,
-) -> Option<HashMap<String, String>> {
-    let mut metadata = HashMap::new();
-    if let Some(value) = turn_metadata_header {
-        metadata.insert("x-codex-turn-metadata".to_string(), value.to_string());
-    }
-    // Add subagent and parent-thread fields when available.
-    (!metadata.is_empty()).then_some(metadata)
+#[derive(Debug, Serialize)]
+pub struct ResponseProcessedWsRequest {
+    pub response_id: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type")]
+#[allow(clippy::large_enum_variant)]
+pub enum ResponsesWsRequest {
+    #[serde(rename = "response.create")]
+    ResponseCreate(ResponseCreateWsRequest),
+    #[serde(rename = "response.append")]
+    ResponseAppend(ResponseAppendWsRequest),
+    #[serde(rename = "response.processed")]
+    ResponseProcessed(ResponseProcessedWsRequest),
 }
 ```
 
-3. When checking incremental eligibility, ignore WebSocket-only fields:
+Keep `ResponseAppend` initially because this project's API crate still exports it and private-provider or downstream tests may depend on the type, even though the OpenAI path should not construct it.
+
+2. Add `ResponsesWebsocketConnection::send_response_processed(response_id: String) -> Result<(), ApiError>`.
+
+3. Reuse the Patch 1 `send_websocket_request(...)` helper so acknowledgement sends are also bounded.
+
+4. Add `ModelClientSession::send_response_processed(&self, response_id: &str)` that:
+
+- returns immediately if no WebSocket connection exists;
+- logs at debug level on failure;
+- does not fail the completed user turn if the acknowledgement send fails.
+
+5. Add an under-development feature flag:
 
 ```rust
-let mut previous_without_input = previous_request.clone();
-previous_without_input.input.clear();
-previous_without_input.generate = None;
-previous_without_input.client_metadata = None;
-
-let mut request_without_input = request.clone();
-request_without_input.input.clear();
-request_without_input.generate = None;
-request_without_input.client_metadata = None;
+Feature::ResponsesWebsocketResponseProcessed
+key: "responses_websocket_response_processed"
+default_enabled: false
 ```
 
-4. Keep `ResponseAppendWsRequest` and `ResponsesWsRequest::ResponseAppend` only if private provider tests still depend on it. Codex's OpenAI path should stop constructing it.
+6. In the turn loop, after assistant text/tool streams are flushed and only when the turn outcome is successful, send the acknowledgement if the feature is enabled and a completed response ID exists.
 
-5. In `ModelClientSession::prepare_websocket_request(...)`, remove the v1 append branch for OpenAI Responses WebSocket:
+7. In remote compaction v2, send the acknowledgement after the compacted history has been durably integrated, only if the feature is enabled and the active `ModelClientSession` has a WebSocket connection.
 
-```rust
-let Some(last_response) = self.get_last_response() else {
-    return (ResponsesWsRequest::ResponseCreate(payload.clone()), payload);
-};
-let Some(delta) = self.get_incremental_items(&payload, Some(&last_response), true) else {
-    return (ResponsesWsRequest::ResponseCreate(payload.clone()), payload);
-};
-if last_response.response_id.is_empty() {
-    return (ResponsesWsRequest::ResponseCreate(payload.clone()), payload);
-}
-let incremental = ResponseCreateWsRequest {
-    previous_response_id: Some(last_response.response_id),
-    input: delta,
-    ..payload.clone()
-};
-(ResponsesWsRequest::ResponseCreate(incremental), payload)
-```
+Ordering rule:
 
-6. Always send the v2 beta header value for OpenAI Responses WebSocket:
+Do not send `response.processed` for a stream that ended before `response.completed`, for a cancelled/paused/interrupted turn, or before rollout/history state has consumed the completed response.
 
-```rust
-headers.insert(
-    OPENAI_BETA_HEADER,
-    HeaderValue::from_static(RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE),
-);
-```
+Tests:
 
-7. Preserve the old feature flags as compatibility gates if needed, but make v2 the only emitted OpenAI WebSocket protocol.
+- `responses_websocket_sends_response_processed_when_feature_enabled`
+- `responses_websocket_omits_response_processed_without_feature`
+- `responses_websocket_sends_response_processed_after_remote_compaction_v2`, if remote compaction v2 exists in the target source shape
+- a negative test for cancelled/errored turns if the harness can express it without flaky timing
 
-Tests to update/add:
+Risk:
 
-- Replace `responses_websocket_appends_on_prefix` with `responses_websocket_uses_incremental_create_on_prefix`.
-- Keep `responses_websocket_creates_on_non_prefix`.
-- Keep `responses_websocket_v2_creates_with_previous_response_id_on_prefix` as a regression test.
-- Add `responses_websocket_v2_after_error_uses_full_create_without_previous_response_id`.
+Moderate-low. The main risk is lifecycle ordering. Keep the call best-effort and feature-gated.
 
-Pause/continue rule:
-
-- `/continue` starts from durable history. If the previous stream was paused/cancelled before `response.completed`, `last_response_rx` will not contain a valid completed response. The next request must be full `response.create` without `previous_response_id`.
-
-### Patch 4 - Header and metadata parity
+### Patch 3 - Preserve server model metadata
 
 Scope:
 
-- `codex-api/src/endpoint/responses_websocket.rs`
 - `codex-api/src/common.rs`
-- `core/src/client.rs`
+- `codex-api/src/endpoint/responses_websocket.rs`
+- `codex-api/src/sse/responses.rs`
+- `core/src/client_common.rs` and any event mapping path that mirrors `ResponseEvent`
+- UI/app-server event paths only if this project already has a suitable event surface
 
-Changes:
+Problem:
 
-1. Add `merge_request_headers(provider_headers, extra_headers, default_headers)` in the WebSocket endpoint module:
+The upstream project emits `ResponseEvent::ServerModel` when the server reports an effective model through handshake or stream headers. This project ignores those signals.
+
+Minimal change:
+
+1. Add:
 
 ```rust
-fn merge_request_headers(
-    provider_headers: &HeaderMap,
-    extra_headers: HeaderMap,
-    default_headers: HeaderMap,
-) -> HeaderMap {
-    let mut headers = provider_headers.clone();
-    headers.extend(extra_headers);
-    for (name, value) in &default_headers {
-        if let http::header::Entry::Vacant(entry) = headers.entry(name) {
-            entry.insert(value.clone());
-        }
-    }
-    headers
-}
+ResponseEvent::ServerModel(String)
 ```
 
-2. Change `ResponsesWebsocketClient::connect(...)` to accept `default_headers: HeaderMap` and use the helper.
+2. In `ResponsesWebsocketConnection`, store `server_model: Option<String>`.
 
-3. If this branch has a default-header builder equivalent to upstream branch's `codex_login::default_client::default_headers()`, pass it. If not, add only the minimal defaults the HTTP path already uses, especially user-agent/originator if present.
+3. In `connect_websocket(...)`, read the `openai-model` handshake header.
 
-4. Add `client_metadata` support to `ResponseCreateWsRequest` and populate fields available in this branch:
+4. At the start of `stream_request(...)`, emit `ResponseEvent::ServerModel(model)` before other server-state events when present.
 
-|Metadata key|Current-branch source|Required?|
-|---|---|---|
-|`x-codex-turn-metadata`|`turn_metadata_header` argument|Yes|
-|`x-openai-subagent`|existing `build_subagent_headers()` / `SessionSource::SubAgent`|Yes for subagents|
-|`x-codex-parent-thread-id`|`SessionSource::SubAgent(ThreadSpawn { parent_thread_id, .. })`|Yes if available|
-|`x-codex-installation-id`|only if old config/state has it|Optional|
-|`x-codex-window-id`|only if cross-turn cache/window generation is added|Optional until Patch 8|
-|`traceparent`, `tracestate`|only if old telemetry exposes W3C trace context|Optional|
+5. Extend `ResponsesStreamEvent` with optional `headers: Option<Value>` and `metadata: Option<Value>` if not already present.
 
-5. Keep headers for sticky routing and transport-level controls. Do not move `x-codex-turn-state` into `client_metadata`; it remains a header contract.
+6. Add `ResponsesStreamEvent::response_model()` with this precedence:
 
-Tests to add:
+- response-level headers;
+- top-level headers;
+- metadata field used by the current service shape, if present.
 
-- `merge_request_headers_matches_http_precedence`
-- `responses_websocket_forwards_turn_metadata_on_initial_and_incremental_create`
-- `responses_websocket_preserves_custom_turn_metadata_fields`
-- subagent metadata test if `SessionSource::SubAgent` is active
+7. During stream processing, emit deduplicated `ServerModel` events when the effective model changes.
 
-### Patch 5 - Server model and verification event intake
+8. Initially map the event through core without importing the upstream project's full model-reroute/trusted-access UX. A debug log or existing raw event surface is enough for the minimal backport.
+
+Tests:
+
+- handshake `openai-model` emits `ServerModel` for WebSocket;
+- response headers payload emits `ServerModel`;
+- payload-level plain `response.model` is ignored if upstream behavior ignores it;
+- duplicate model events are not repeatedly emitted.
+
+Risk:
+
+Medium. Adding a core event variant can require mechanical updates to exhaustive matches. Keep user-facing behavior minimal unless this project already has a natural display path.
+
+### Patch 4 - Preserve model verification metadata
+
+Scope:
+
+- `protocol/src/protocol.rs`, if `ModelVerification` does not exist in this project
+- `codex-api/src/common.rs`
+- `codex-api/src/sse/responses.rs`
+- `codex-api/src/endpoint/responses_websocket.rs`
+- downstream event mapping paths only where required by exhaustive matching
+
+Problem:
+
+The upstream project parses server-provided model verification recommendations. This project drops them.
+
+Minimal change:
+
+1. Add or reuse a `ModelVerification` protocol enum/struct.
+
+2. Add:
+
+```rust
+ResponseEvent::ModelVerifications(Vec<ModelVerification>)
+```
+
+3. Add `ResponsesStreamEvent::model_verifications()` that parses only known values and ignores malformed or unknown shapes.
+
+4. Emit `ResponseEvent::ModelVerifications(...)` before ordinary `process_responses_event(...)` handling.
+
+5. Do not port the upstream account-verification UX as part of this patch.
+
+Tests:
+
+- known verification field emits the event;
+- unknown values are ignored;
+- non-array shapes are ignored;
+- ordinary stream processing still reaches `response.completed`.
+
+Risk:
+
+Medium. This may require protocol schema updates. If the current project has no consumer and no protocol type, this patch can be deferred behind Patch 3.
+
+### Patch 5 - Preserve custom-tool input deltas
 
 Scope:
 
 - `codex-api/src/common.rs`
 - `codex-api/src/sse/responses.rs`
-- `codex-api/src/endpoint/responses_websocket.rs`
-- optionally `protocol/src/protocol.rs`, `core/src/codex.rs`, TUI/app-server consumers
+- `core/src/client_common.rs` and UI/app-server mapping only if they can consume the event
 
-Changes:
+Problem:
 
-1. Read `openai-model` from WebSocket handshake response headers and store it on `ResponsesWebsocketConnection`.
+The upstream project parses `response.custom_tool_call_input.delta`. This project ignores it, so custom-tool input streams are only visible if they appear in final items.
 
-2. Emit `ResponseEvent::ServerModel(model)` at stream start when the handshake provided one.
+Minimal change:
 
-3. In `ResponsesStreamEvent`, add `headers: Option<Value>` and a helper that extracts `openai-model` / `x-openai-model` from:
-
-- `response.headers`
-- top-level `headers`
-
-4. Deduplicate server-model events per stream.
-
-5. Minimal surfaced behavior for this branch:
-
-- log a warning when server model differs from `turn_context.model_info.slug`; or
-- add a small `EventMsg::ModelReroute` equivalent if this branch needs upstream branch's user-visible cyber reroute warning.
-
-6. Optional model verification support:
+1. Add:
 
 ```rust
-#[serde(rename_all = "snake_case")]
-pub enum ModelVerification {
-    TrustedAccessForCyber,
-}
-
-pub struct ModelVerificationEvent {
-    pub verifications: Vec<ModelVerification>,
+ResponseEvent::ToolCallInputDelta {
+    item_id: String,
+    call_id: Option<String>,
+    delta: String,
 }
 ```
 
-Parse `response.metadata.openai_verification_recommendation` and emit at most once per turn.
+2. Parse only `response.custom_tool_call_input.delta`.
 
-Tests to add:
+3. Route it through core only if a consumer can apply the delta. Otherwise keep the parser/event addition local to `codex-api` and add tests.
 
-- `spawn_response_stream_emits_header_events`
-- `process_sse_emits_server_model_from_response_headers_payload`
-- `responses_stream_event_response_model_reads_top_level_headers`
-- `process_sse_emits_model_verification_field` if the surfaced event is added
+Tests:
 
-Porting note:
+- one delta event maps to `ToolCallInputDelta`;
+- missing `item_id` or `delta` is ignored;
+- normal `response.completed` still terminates the stream.
 
-- This patch is not a prerequisite for WebSocket correctness. Keep it after P0/P1 unless the product needs model reroute/trusted-access UX immediately.
+Risk:
 
-### Patch 6 - Pump-based WebSocket I/O and compression
+Medium. The event is safe to parse, but surfacing it may require UI/tool-call state changes.
+
+### Patch 6 - Transport config parity: `permessage-deflate`
 
 Scope:
 
+- root `Cargo.toml`
+- `codex-api/Cargo.toml`
 - `codex-api/src/endpoint/responses_websocket.rs`
-- `codex-api/Cargo.toml` if tungstenite extension features are missing
 
-Changes:
+Problem:
 
-1. Replace the raw alias:
+The upstream project enables WebSocket `permessage-deflate`. This project uses the default tungstenite config.
+
+Minimal change:
+
+1. First decide whether the dependency graph can support extension configuration without dragging in unrelated upstream patches.
+
+2. If supported, add a direct `tungstenite` dependency with the necessary compression/deflate feature, or use the upstream fork if that is the only compatible route for this revision.
+
+3. Switch connect from:
 
 ```rust
-type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
+tokio_tungstenite::connect_async(request).await
 ```
 
-with a wrapper that owns:
+to:
 
 ```rust
-struct WsStream {
-    tx_command: mpsc::Sender<WsCommand>,
-    rx_message: mpsc::UnboundedReceiver<Result<Message, WsError>>,
-    pump_task: tokio::task::JoinHandle<()>,
-}
+connect_async_tls_with_config(
+    request,
+    Some(websocket_config()),
+    false,
+    connector,
+).await
 ```
 
-2. The pump loop should:
+where `connector` is `None` unless Patch 7 is also applied.
 
-- receive commands for outbound sends;
-- continuously read inbound frames;
-- answer `Ping` with `Pong`;
-- drop `Pong`;
-- forward text/binary/close/errors to `rx_message`;
-- abort the pump in `Drop`.
-
-3. Change `run_websocket_response_stream(...)` to call wrapper `send(...)` and `next(...)`.
-
-4. Add `websocket_config()`:
+4. Add:
 
 ```rust
 fn websocket_config() -> WebSocketConfig {
@@ -462,101 +330,201 @@ fn websocket_config() -> WebSocketConfig {
 }
 ```
 
-5. Switch from `connect_async(request)` to `connect_async_tls_with_config(request, Some(websocket_config()), false, connector)`.
-
-6. Custom CA prerequisite:
-
-- If this branch already has `maybe_build_rustls_client_config_with_custom_ca()` and the rustls provider helper, call them here.
-- If not, do not import the whole upstream branch auth/provider stack. Either defer custom CA support or port only the helper plus its smallest dependency set.
-
-Tests to add:
+Tests:
 
 - `websocket_config_enables_permessage_deflate`
-- a fake-server ping test if the existing test harness can trigger ping frames
-- existing streaming tests should continue to pass
+- one handshake test that validates the connection still succeeds against the existing local WebSocket test server
 
-### Patch 7 - Request prewarm with `generate: false`
+Risk:
+
+Medium. The risk is dependency-level, not algorithmic. Do not let this patch force the upstream provider/auth/session refactors.
+
+### Patch 7 - Optional custom-CA parity for WebSocket TLS
+
+Scope:
+
+- `codex-client/src/custom_ca.rs`, if ported
+- `utils/rustls-provider`, if ported
+- `codex-api/Cargo.toml`
+- `codex-api/src/endpoint/responses_websocket.rs`
+
+Problem:
+
+The upstream project makes WebSocket TLS honor the same custom-CA policy as HTTPS. This project does not currently include the upstream custom-CA helper.
+
+Minimal stance:
+
+Do not make this a prerequisite for P0/P1. It is only a WebSocket-minimal backport if this project also wants custom-CA support generally.
+
+If ported, keep the prerequisite narrow:
+
+1. Add the upstream custom-CA helper and rustls provider utility without importing unrelated provider/auth changes.
+
+2. Call `ensure_rustls_crypto_provider()` before building the connection.
+
+3. Build an optional connector:
+
+```rust
+let connector = maybe_build_rustls_client_config_with_custom_ca()
+    .map_err(|err| ApiError::Stream(format!("failed to configure websocket TLS: {err}")))?
+    .map(tokio_tungstenite::Connector::Rustls);
+```
+
+4. Pass that connector to `connect_async_tls_with_config(...)`.
+
+Tests:
+
+- helper returns `None` when no custom CA is configured;
+- helper error maps to `ApiError::Stream`;
+- optional integration test only if a local custom-CA TLS fixture already exists.
+
+Risk:
+
+Medium-high. Custom CA is valuable for enterprise environments, but not necessary for the current WebSocket protocol correctness fixes.
+
+### Patch 8 - Observability metadata parity
+
+Scope:
+
+- `codex-api/src/common.rs`
+- `core/src/client.rs`
+- `codex-otel` only if this project already exposes W3C trace context helpers or the helper can be ported narrowly
+
+Problem:
+
+This project's `client_metadata` carries only a subset of the upstream fields. The upstream project also sends W3C trace context, installation ID, window ID, and a WebSocket request-start timestamp.
+
+Minimal change:
+
+1. Add trace metadata helper to `codex-api/src/common.rs` only if a W3C trace context type/helper exists or can be ported narrowly:
+
+```rust
+pub const WS_REQUEST_HEADER_TRACEPARENT_CLIENT_METADATA_KEY: &str = "ws_request_header_traceparent";
+pub const WS_REQUEST_HEADER_TRACESTATE_CLIENT_METADATA_KEY: &str = "ws_request_header_tracestate";
+```
+
+2. Add `response_create_client_metadata(...)` that merges existing metadata with trace fields.
+
+3. Add a request-start timestamp just before `stream_request(...)` sends the frame:
+
+```rust
+request.client_metadata
+    .get_or_insert_with(HashMap::new)
+    .insert("x-codex-ws-stream-request-start-ms".to_string(), now_ms.to_string());
+```
+
+Use this project's existing time helper if one exists; otherwise keep the timestamp field out of the minimal patch.
+
+4. Installation ID and window ID require durable session/window state. Add them only if those concepts already exist in this project or are introduced by Patch 10.
+
+Tests:
+
+- turn metadata is preserved;
+- traceparent/tracestate are included when supplied;
+- per-request timestamp changes between consecutive requests but does not block incremental reuse.
+
+Risk:
+
+Medium. The metadata itself is safe, but adding installation/window generation as new state is outside the minimal P0 scope.
+
+### Patch 9 - Preconnect without request prewarm
 
 Scope:
 
 - `core/src/client.rs`
-- `core/src/codex.rs`
+- call site chosen by the startup/prewarm path, if this project has one
 - `core/tests/suite/client_websockets.rs`
-- `core/tests/suite/abort_tasks.rs` or pause/continue-specific tests if available
 
-Prerequisites:
+Problem:
 
-- Patch 3 added `generate: Option<bool>`.
-- Patch 1 guarantees failed prewarm streams clear incremental state.
+This project opens the WebSocket lazily on the first generated request. The upstream project can preconnect before the first request.
 
-Changes:
+Minimal change:
 
-1. Add:
+1. Add `ModelClientSession::preconnect_websocket(...)` that:
 
-```rust
-pub async fn prewarm_websocket(
-    &mut self,
-    prompt: &Prompt,
-    model_info: &ModelInfo,
-    otel_manager: &OtelManager,
-    effort: Option<ReasoningEffortConfig>,
-    summary: ReasoningSummaryConfig,
-    service_tier: Option<ServiceTier>,
-    turn_metadata_header: Option<&str>,
-) -> Result<()> {
-    if !self.responses_websocket_enabled() || self.websocket_last_request.is_some() {
-        return Ok(());
-    }
-    // Call the same websocket stream path with generate = Some(false).
-    // Drain until ResponseEvent::Completed, then keep the completed response id for the real turn.
-}
-```
+- returns early if WebSockets are disabled or fallback is active;
+- returns early if a connection already exists;
+- resolves auth/provider through the existing current path;
+- calls the same `websocket_connection(...)`/connect logic used by `stream_responses_websocket(...)`;
+- never sends prompt payloads.
 
-2. Make the WebSocket stream helper accept a `warmup: bool` parameter that sets `ws_payload.generate = Some(false)` and suppresses rollout/usage side effects while draining the warmup stream.
+2. Do not add cross-turn connection caching in this patch.
 
-3. Call `prewarm_websocket(...)` best-effort immediately before the first generated sampling request in `core/src/codex.rs`, after prompt construction is stable and before the request that should benefit from warmup.
+3. Do not change `/pause` and `/continue` semantics.
 
-4. Do not add upstream branch's startup prewarm scheduler in the first patch. A just-in-time prewarm inside the turn has fewer lifetime interactions with `/pause` and rollout resume.
+Tests:
 
-5. If prewarm sees `426 Upgrade Required`, switch to HTTP fallback without surfacing a warning as a turn error.
+- preconnect opens exactly one connection;
+- a later generated request reuses that connection;
+- 426 during preconnect activates the same HTTP fallback behavior or is handled as a best-effort preconnect miss, depending on the chosen call site.
 
-6. If prewarm fails for a retryable stream reason, let the existing stream retry/fallback path handle the first generated request. Do not record warmup output to rollout.
+Risk:
 
-Tests to add:
+Medium-low. This only moves connection setup earlier; it does not alter prompt/history state.
 
-- `responses_websocket_request_prewarm_reuses_connection`
-- `responses_websocket_prewarm_uses_v2_when_provider_supports_websockets`
-- `websocket_first_turn_uses_request_prewarm_and_create`
-- `pause_during_websocket_prewarm_clears_incremental_state`
-
-Pause/continue rule:
-
-- If `/pause` cancels during warmup, drop the WebSocket session and clear `websocket_last_request` / `websocket_last_response_rx`. `/continue` should issue a full `response.create` from durable history.
-
-### Patch 8 - Optional cross-turn cached WebSocket session
+### Patch 10 - Request prewarm with `generate: false`
 
 Scope:
 
 - `core/src/client.rs`
-- compaction/rollback/session-history mutation sites in `core/src/codex.rs` and related modules
-- tests in `core/tests/suite/client_websockets.rs` and pause/continue tests
+- startup/prewarm caller, if this project has a compatible one
+- `core/tests/suite/client_websockets.rs`
 
-Prerequisite:
+Problem:
 
-- Do this only after P0/P1/P2 are stable. Cross-turn cache is an acceleration feature with more invalidation risk.
+The request type has `generate`, but this project never sends `generate: false` prewarm requests.
 
-Changes:
+Minimal change:
 
-1. Add a small cache to `ModelClientState`:
+1. Add `ModelClientSession::prewarm_websocket(...)` that calls the existing WebSocket stream path with `warmup = true`.
+
+2. When `warmup = true`, set `ResponseCreateWsRequest.generate = Some(false)`.
+
+3. Consume the resulting stream until `ResponseEvent::Completed`.
+
+4. Treat the warmup response as setup state only:
+
+- do not emit assistant output into rollout;
+- do not record an inference trace attempt if this project has tracing;
+- keep `websocket_last_request` and `websocket_last_response_rx` so the later generated request can use `previous_response_id` if its input extends the warmed request;
+- clear state on any error.
+
+5. Keep this turn-scoped initially.
+
+Tests:
+
+- prewarm sends `response.create` with `generate: false`;
+- the generated turn chains from the warmup response ID when the prompt is still compatible;
+- a changed prompt sends a full `response.create`;
+- prewarm failure does not corrupt subsequent HTTP fallback or `/continue` behavior.
+
+Risk:
+
+Medium. The key risk is accidentally treating warmup as model-visible history. Keep all rollout writes out of the prewarm path.
+
+### Patch 11 - Optional cross-turn WebSocket cache
+
+Scope:
+
+- `core/src/client.rs`
+- session lifecycle call sites
+- compaction/rollback/pause/continue paths that must invalidate the cache
+- tests for cache invalidation
+
+Problem:
+
+The upstream project can move a WebSocket session from one turn-scoped `ModelClientSession` to the next. This project intentionally creates a fresh WebSocket session per turn to avoid sticky turn-state leakage.
+
+Minimal stance:
+
+Do not include this in the first backport. Add it only after P0/P1/P2 are stable and after explicit invalidation points are audited.
+
+If implemented:
+
+1. Add a `WebsocketSession` struct containing:
 
 ```rust
-cached_websocket_session: std::sync::Mutex<WebsocketSession>,
-```
-
-2. Wrap the old per-session fields into:
-
-```rust
-#[derive(Default)]
 struct WebsocketSession {
     connection: Option<ApiWebSocketConnection>,
     last_request: Option<ResponseCreateWsRequest>,
@@ -565,148 +533,85 @@ struct WebsocketSession {
 }
 ```
 
-3. `ModelClient::new_session()` takes the cached session; `Drop for ModelClientSession` stores it back.
+2. Store it behind a `Mutex` in `ModelClient` and move it into new `ModelClientSession` instances.
 
-4. Add explicit invalidators:
+3. Remove or isolate `x-codex-turn-state` from cached cross-turn connection reuse. This project's current comments explicitly say the sticky token must not leak across turns.
 
-```rust
-pub(crate) fn reset_cached_websocket_session(&self) { ... }
-pub(crate) fn advance_window_generation(&self) { ... }
-```
+4. Add a window-generation or equivalent invalidation token before trusting cross-turn previous-response state.
 
-5. Call the invalidator on:
+5. Invalidate on:
 
-- standalone `/responses/compact` result adoption;
-- local auto-compaction history replacement;
-- thread rollback;
-- fallback to HTTP;
-- `/pause` and `/continue` cleanup if the prior stream did not complete;
-- any branch-specific history rewrite.
+- `/pause`;
+- `/continue` start and completion cleanup;
+- stream error;
+- cancellation/interruption;
+- compaction;
+- rollback;
+- HTTP fallback;
+- auth recovery that changes auth material;
+- any non-prefix request.
 
-6. Only reuse `previous_response_id` when the saved `last_response_rx` produced a completed response and the current request is an incremental extension of the saved request plus completed output items.
+Tests:
 
-Tests to add:
+- second normal turn can reuse a completed prior chain;
+- paused/interrupted turn does not reuse cached state;
+- compaction starts a new chain without `previous_response_id` unless using server-side compaction semantics that preserve the chain;
+- 426 fallback clears the cache;
+- closed connection clears last request/response state.
 
-- `responses_websocket_reuses_connection_after_session_drop`
-- `responses_websocket_v2_incremental_requests_are_reused_across_turns`
-- `compaction_resets_cached_websocket_session`
-- `pause_then_continue_does_not_reuse_partial_previous_response_id`
-- `rollback_resets_cached_websocket_session`
+Risk:
 
-Design caution:
-
-- This branch's comments correctly state that `x-codex-turn-state` is turn scoped. Do not reuse a stale `turn_state` header across new WebSocket handshakes. An already-open socket can be reused, but any reconnect for a new turn must use that turn's fresh `OnceLock`.
-
-### Patch 9 - Optional custom-tool input delta UI
-
-Scope:
-
-- `codex-api/src/common.rs`
-- `codex-api/src/sse/responses.rs`
-- `core/src/codex.rs`
-- UI protocol consumers if present
-
-Changes:
-
-1. Add:
-
-```rust
-ToolCallInputDelta {
-    item_id: String,
-    call_id: Option<String>,
-    delta: String,
-}
-```
-
-2. Parse only `response.custom_tool_call_input.delta`. Upstream branch does not emit an event for `response.function_call_arguments.delta` in this path.
-
-3. Wire into this branch only if it already has a tool-argument-diff consumer. Otherwise, parse and ignore is not worth a surfaced protocol change.
+High. This is the main place where the upstream project architecture differs from this project. Keep it separate from protocol correctness.
 
 ## Minimal Dependency Matrix
 
-|Desired change|Minimal prerequisite|Avoid porting|
+|Change|Required dependency scope|Avoid importing|
 |---|---|---|
-|Wrapped error mapping|`serde::Deserialize`, existing `ApiError` and `TransportError`|upstream branch session refactor|
-|Connection-limit retry|Wrapped error mapping|new retry subsystem|
-|Drop-on-error|None|close-handshake orchestration|
-|`response.incomplete`|Shared parser edit|upstream branch full error taxonomy|
-|`end_turn`|`ResponseEvent::Completed` signature update|upstream branch turn module split|
-|v2 create-only|Existing `previous_response_id` v2 fields|upstream branch's `ResponsesApiRequest` if too invasive|
-|`generate: false` prewarm|`generate` field, v2 create-only|startup prewarm scheduler|
-|`client_metadata`|`HashMap<String, String>` field on `ResponseCreateWsRequest`|upstream branch W3C trace plumbing if absent|
-|Header merge defaults|local helper + existing default-header function|upstream branch auth/provider stack|
-|Pump/ping-pong|local wrapper in endpoint module|core session refactor|
-|`permessage-deflate`|tungstenite extension config enabled in Cargo features|custom CA if helper unavailable|
-|Custom CA|port only the rustls helper and provider init|upstream branch login/provider rewrite|
-|Cross-turn cache|small `WebsocketSession` and explicit invalidators|upstream branch full window/session machinery|
-|Model verification UX|tiny protocol enum/event|full cyber/trusted-access UX if undesired|
+|Bound send timeout|None beyond current dependencies|Upstream telemetry refactor|
+|`response.processed`|New request struct/enum variant, feature flag, two call sites|Upstream session refactor|
+|`ServerModel`|One event variant, handshake header read, small stream helper|Trusted-access/model-reroute UX|
+|Model verifications|Protocol type only if absent; parser helper|Full account-verification UI|
+|Custom-tool input delta|Event variant and parser|Tool UI rewrite unless needed|
+|`permessage-deflate`|Direct/forked tungstenite support for extension config|Provider/auth/session rewrites|
+|Custom CA|Only the custom-CA helper and rustls provider utility|Global network stack refactor|
+|Trace metadata|Only W3C helper if available|Full inference trace subsystem|
+|Preconnect/prewarm|Current `ModelClientSession` plus one call site|Cross-turn cache|
+|Cross-turn cache|Explicit cache/invalidation state|Full upstream `core/src/session/*` refactor|
 
-## Test Plan
+## Validation Plan
 
-### Unit tests
+Run the smallest deterministic checks after each patch:
 
-Add or back-port focused tests in `codex-api`:
+```bash
+cargo test -p codex-api responses_websocket
+cargo test -p codex-api sse::responses
+cargo test -p codex-core --test all client_websockets
+cargo test -p codex-core --test all websocket_fallback
+```
 
-- `websocket_config_enables_permessage_deflate`
-- `parse_wrapped_websocket_error_event_maps_to_transport_http`
-- `parse_wrapped_websocket_error_event_with_connection_limit_maps_retryable`
-- `merge_request_headers_matches_http_precedence`
-- `response_incomplete_is_stream_error`
-- `response_completed_preserves_end_turn`
-- `responses_stream_event_response_model_reads_top_level_headers`
+For patches that touch features or schema:
 
-### Core WebSocket tests
+```bash
+cargo test -p codex-core features
+cargo test -p codex-core config
+```
 
-Extend `core/tests/suite/client_websockets.rs`:
+Expected regression constraints:
 
-- wrapped usage-limit error emits token/rate-limit data then an error;
-- invalid request error with `status` is forwarded;
-- connection-limit error reconnects and completes;
-- terminal `response.failed` surfaces without close-handshake delay;
-- after a stream error, the next request is a full `response.create` without `previous_response_id`;
-- initial and incremental creates carry turn metadata in `client_metadata`;
-- prewarm sends `generate: false`, drains to completion, and the real request chains from the warmup response;
-- `426 Upgrade Required` activates HTTP fallback immediately.
+- Existing `response.create` v2 tests still pass.
+- Existing 426 fallback tests still pass.
+- Existing wrapped-error and connection-limit tests still pass.
+- Existing `/pause` and `/continue` tests still pass.
+- No warmup or preconnect path writes assistant output or synthetic user prompts to rollout.
 
-### Pause/continue regression tests
+## Recommended Landing Order
 
-Add at least these branch-specific tests:
-
-- pause during an active WebSocket stream clears incremental state;
-- `/continue` after a paused WebSocket stream sends full durable history, not a `previous_response_id` from a partial stream;
-- `/continue` after a completed WebSocket turn may reuse previous response only if no history rewrite occurred;
-- pause during prewarm cancels/drops the warmup connection and does not write warmup output to rollout;
-- rollback or compaction after a prewarmed/cached connection invalidates the cache.
-
-### Manual smoke test
-
-Run a short conversation over a fake WebSocket server:
-
-1. initial `response.create` completes;
-2. tool call response triggers a second `response.create` with `previous_response_id` and delta input;
-3. send `websocket_connection_limit_reached`; verify reconnect;
-4. send `previous_response_not_found`; verify next request is full create;
-5. run `/pause`, then `/continue`; verify no synthetic user prompt and no stale previous response ID.
-
-## Rollout Strategy
-
-1. Land P0 correctness first with no feature-flag surface change.
-2. Land v2 create-only and metadata behind the existing WebSocket feature gate.
-3. Land transport parity (`permessage-deflate`, pump, optional custom CA).
-4. Land prewarm behind a new internal feature flag if this branch needs staged rollout.
-5. Land cross-turn cache only after pause/continue and compaction invalidation tests are passing.
-6. Land optional model-verification/model-reroute UI separately.
-
-## Acceptance Criteria
-
-The back-port is acceptable when:
-
-- no WebSocket stream error waits on a close handshake before reaching the caller;
-- wrapped WebSocket usage-limit and invalid-request errors produce the same user-visible classification as HTTP;
-- `websocket_connection_limit_reached` reconnects under the configured stream retry budget;
-- Codex's OpenAI WebSocket requests use `response.create` for both initial and incremental turns;
-- warmup, if enabled, uses `generate: false` and never persists model-visible rollout content;
-- `/pause` and `/continue` never reuse a partial or failed previous-response ID;
-- fallback to HTTP remains sticky after retry exhaustion or `426 Upgrade Required`;
-- compaction and rollback invalidate any cached connection-local previous-response state;
-- tests document all non-obvious invalidation paths.
+1. Patch 1: bound WebSocket request sends.
+2. Patch 2: `response.processed` acknowledgement behind a feature flag.
+3. Patch 3: `ServerModel` metadata.
+4. Patch 4 and Patch 5: model verifications and custom-tool input deltas, if consumers are ready or parser parity is desired.
+5. Patch 6: `permessage-deflate`, only after dependency feasibility is confirmed.
+6. Patch 7: custom CA only if custom-CA support is wanted globally.
+7. Patch 8: observability metadata, starting with trace fields and request-start timestamp.
+8. Patch 9 and Patch 10: preconnect and request prewarm.
+9. Patch 11: cross-turn cache, only after explicit invalidation tests are in place.
