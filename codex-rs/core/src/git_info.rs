@@ -71,7 +71,7 @@ pub async fn collect_git_info(cwd: &Path) -> Option<GitInfo> {
     let (commit_result, branch_result, url_result) = tokio::join!(
         run_git_command_with_timeout(&["rev-parse", "HEAD"], cwd),
         run_git_command_with_timeout(&["rev-parse", "--abbrev-ref", "HEAD"], cwd),
-        run_git_command_with_timeout(&["remote", "get-url", "origin"], cwd)
+        repository_url(cwd)
     );
 
     let mut git_info = GitInfo {
@@ -100,12 +100,7 @@ pub async fn collect_git_info(cwd: &Path) -> Option<GitInfo> {
     }
 
     // Process repository URL
-    if let Some(output) = url_result
-        && output.status.success()
-        && let Ok(url) = String::from_utf8(output.stdout)
-    {
-        git_info.repository_url = Some(url.trim().to_string());
-    }
+    git_info.repository_url = url_result;
 
     Some(git_info)
 }
@@ -273,21 +268,83 @@ async fn get_git_remotes(cwd: &Path) -> Option<Vec<String>> {
         .lines()
         .map(str::to_string)
         .collect();
+
+    let tracking_remote = current_branch_tracking_remote(cwd).await;
+    prioritize_remotes(&mut remotes, tracking_remote.as_deref());
+    Some(remotes)
+}
+
+async fn repository_url(cwd: &Path) -> Option<String> {
+    for remote in get_git_remotes(cwd).await? {
+        let Some(output) = run_git_command_with_timeout(&["remote", "get-url", &remote], cwd).await
+        else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        let Ok(url) = String::from_utf8(output.stdout) else {
+            continue;
+        };
+        let url = url.trim();
+        if !url.is_empty() {
+            return Some(url.to_string());
+        }
+    }
+    None
+}
+
+async fn current_branch_tracking_remote(cwd: &Path) -> Option<String> {
+    let branch = current_branch_name(cwd).await?;
+
+    let merge_key = format!("branch.{branch}.merge");
+    let merge_output = run_git_command_with_timeout(&["config", "--get", &merge_key], cwd).await?;
+    if !merge_output.status.success() {
+        return None;
+    }
+    let merge = String::from_utf8(merge_output.stdout).ok()?;
+    if merge.trim().is_empty() {
+        return None;
+    }
+
+    let key = format!("branch.{branch}.remote");
+    let remote_output = run_git_command_with_timeout(&["config", "--get", &key], cwd).await?;
+    if !remote_output.status.success() {
+        return None;
+    }
+    let remote = String::from_utf8(remote_output.stdout).ok()?;
+    let remote = remote.trim();
+    if remote.is_empty() || remote == "." {
+        None
+    } else {
+        Some(remote.to_string())
+    }
+}
+
+fn prioritize_remotes(remotes: &mut Vec<String>, preferred_remote: Option<&str>) {
+    if let Some(remote) = preferred_remote
+        && let Some(pos) = remotes.iter().position(|r| r == remote)
+    {
+        let remote = remotes.remove(pos);
+        remotes.insert(0, remote);
+        return;
+    }
+
     if let Some(pos) = remotes.iter().position(|r| r == "origin") {
         let origin = remotes.remove(pos);
         remotes.insert(0, origin);
     }
-    Some(remotes)
 }
 
 /// Attempt to determine the repository's default branch name.
 ///
 /// Preference order:
-/// 1) The symbolic ref at `refs/remotes/<remote>/HEAD` for the first remote (origin prioritized)
+/// 1) The symbolic ref at `refs/remotes/<remote>/HEAD` for the first remote
+///    (tracking remote, then origin)
 /// 2) `git remote show <remote>` parsed for "HEAD branch: <name>"
 /// 3) Local fallback to existing `main` or `master` if present
 async fn get_default_branch(cwd: &Path) -> Option<String> {
-    // Prefer the first remote (with origin prioritized)
+    // Prefer the first remote (current branch's tracking remote, then origin).
     let remotes = get_git_remotes(cwd).await.unwrap_or_default();
     for remote in remotes {
         // Try symbolic-ref, which returns something like: refs/remotes/origin/main
@@ -398,7 +455,7 @@ async fn branch_ancestry(cwd: &Path) -> Option<Vec<String>> {
     // Expand candidates: include any remote branches that already contain HEAD.
     // This addresses cases where we're on a new local-only branch forked from a
     // remote branch that isn't the repository default. We prioritize remotes in
-    // the order returned by get_git_remotes (origin first).
+    // the order returned by get_git_remotes (tracking remote, then origin).
     let remotes = get_git_remotes(cwd).await.unwrap_or_default();
     for remote in remotes {
         if let Some(output) = run_git_command_with_timeout(
@@ -441,7 +498,7 @@ async fn branch_remote_and_distance(
     branch: &str,
     remotes: &[String],
 ) -> Option<(Option<GitSha>, usize)> {
-    // Try to find the first remote ref that exists for this branch (origin prioritized by caller).
+    // Try to find the first remote ref that exists for this branch (caller priority order).
     let mut found_remote_sha: Option<GitSha> = None;
     let mut found_remote_ref: Option<String> = None;
     for remote in remotes {
@@ -667,7 +724,9 @@ mod tests {
     use super::*;
 
     use core_test_support::skip_if_sandbox;
+    use pretty_assertions::assert_eq;
     use std::fs;
+    use std::path::Path;
     use std::path::PathBuf;
     use tempfile::TempDir;
 
@@ -839,6 +898,41 @@ mod tests {
         (repo_path, branch)
     }
 
+    async fn run_git(cwd: &Path, args: &[&str]) -> std::process::Output {
+        Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .await
+            .unwrap_or_else(|err| panic!("Failed to run git {args:?}: {err}"))
+    }
+
+    async fn run_git_success(cwd: &Path, args: &[&str]) -> std::process::Output {
+        let output = run_git(cwd, args).await;
+        assert!(
+            output.status.success(),
+            "git {args:?} failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
+
+    async fn init_bare_remote(temp_dir: &TempDir, name: &str) -> PathBuf {
+        let remote_path = temp_dir.path().join(name);
+        let output = Command::new("git")
+            .args(["init", "--bare", remote_path.to_str().unwrap()])
+            .output()
+            .await
+            .unwrap_or_else(|err| panic!("Failed to init bare remote {name}: {err}"));
+        assert!(
+            output.status.success(),
+            "git init --bare {name} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        remote_path
+    }
+
     #[tokio::test]
     async fn test_collect_git_info_non_git_directory() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
@@ -906,6 +1000,61 @@ mod tests {
             .to_string();
 
         // Should have repository URL
+        assert_eq!(git_info.repository_url, Some(expected_remote));
+    }
+
+    #[tokio::test]
+    async fn test_collect_git_info_prefers_tracking_remote_url() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let repo_path = create_test_git_repo(&temp_dir).await;
+
+        run_git_success(
+            &repo_path,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/example/origin.git",
+            ],
+        )
+        .await;
+
+        run_git_success(
+            &repo_path,
+            &[
+                "remote",
+                "add",
+                "fork",
+                "https://github.com/example/fork.git",
+            ],
+        )
+        .await;
+        run_git_success(&repo_path, &["checkout", "-b", "feature-branch"]).await;
+        run_git_success(
+            &repo_path,
+            &["config", "branch.feature-branch.remote", "fork"],
+        )
+        .await;
+        run_git_success(
+            &repo_path,
+            &[
+                "config",
+                "branch.feature-branch.merge",
+                "refs/heads/feature-branch",
+            ],
+        )
+        .await;
+
+        let git_info = collect_git_info(&repo_path)
+            .await
+            .expect("Should collect git info from repo");
+
+        let expected_remote = run_git_success(&repo_path, &["remote", "get-url", "fork"]).await;
+        let expected_remote = String::from_utf8(expected_remote.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
         assert_eq!(git_info.repository_url, Some(expected_remote));
     }
 
@@ -1053,6 +1202,54 @@ mod tests {
             .await
             .expect("Should collect working tree state");
         assert_eq!(state.sha, GitSha::new(&remote_sha));
+    }
+
+    #[tokio::test]
+    async fn test_git_diff_to_remote_prefers_tracking_remote() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let repo_path = create_test_git_repo(&temp_dir).await;
+        let origin_path = init_bare_remote(&temp_dir, "origin.git").await;
+        let fork_path = init_bare_remote(&temp_dir, "fork.git").await;
+
+        let origin_path = origin_path.to_str().unwrap();
+        let fork_path = fork_path.to_str().unwrap();
+        run_git_success(&repo_path, &["remote", "add", "origin", origin_path]).await;
+        run_git_success(&repo_path, &["remote", "add", "fork", fork_path]).await;
+
+        let branch = run_git_success(&repo_path, &["rev-parse", "--abbrev-ref", "HEAD"]).await;
+        let branch = String::from_utf8(branch.stdout).unwrap().trim().to_string();
+        run_git_success(&repo_path, &["push", "origin", &branch]).await;
+        run_git_success(&repo_path, &["push", "fork", &branch]).await;
+
+        run_git_success(&repo_path, &["checkout", "-b", "feature"]).await;
+        fs::write(repo_path.join("test.txt"), "origin feature").unwrap();
+        run_git_success(&repo_path, &["add", "test.txt"]).await;
+        run_git_success(&repo_path, &["commit", "-m", "origin feature"]).await;
+        run_git_success(&repo_path, &["push", "origin", "feature"]).await;
+        let origin_sha = run_git_success(&repo_path, &["rev-parse", "HEAD"]).await;
+        let origin_sha = String::from_utf8(origin_sha.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        fs::write(repo_path.join("test.txt"), "fork feature").unwrap();
+        run_git_success(&repo_path, &["add", "test.txt"]).await;
+        run_git_success(&repo_path, &["commit", "-m", "fork feature"]).await;
+        run_git_success(&repo_path, &["push", "-u", "fork", "feature"]).await;
+        let fork_sha = run_git_success(&repo_path, &["rev-parse", "HEAD"]).await;
+        let fork_sha = String::from_utf8(fork_sha.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        assert_ne!(origin_sha, fork_sha);
+
+        let remotes = get_git_remotes(&repo_path).await.expect("git remotes");
+        assert_eq!(remotes.first().map(String::as_str), Some("fork"));
+
+        let state = git_diff_to_remote(&repo_path)
+            .await
+            .expect("Should collect working tree state");
+        assert_eq!(state.sha, GitSha::new(&fork_sha));
     }
 
     #[test]
