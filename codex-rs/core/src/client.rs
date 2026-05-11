@@ -165,7 +165,7 @@ pub struct ModelClientSession {
     turn_state: Arc<OnceLock<String>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct LastResponse {
     response_id: String,
     items_added: Vec<ResponseItem>,
@@ -1012,13 +1012,22 @@ where
 {
     let (tx_event, rx_event) = mpsc::channel::<Result<ResponseEvent>>(1600);
     let (tx_last_response, rx_last_response) = oneshot::channel::<LastResponse>();
+    let consumer_dropped = tokio_util::sync::CancellationToken::new();
+    let consumer_dropped_for_stream = consumer_dropped.clone();
 
     tokio::spawn(async move {
         let mut tx_last_response = Some(tx_last_response);
         let mut items_added = Vec::new();
         let mut logged_error = false;
         let mut api_stream = api_stream;
-        while let Some(event) = api_stream.next().await {
+        loop {
+            let event = tokio::select! {
+                _ = consumer_dropped.cancelled() => return,
+                event = api_stream.next() => event,
+            };
+            let Some(event) = event else {
+                break;
+            };
             match event {
                 Ok(ResponseEvent::OutputItemDone(item)) => {
                     items_added.push(item.clone());
@@ -1081,7 +1090,13 @@ where
         }
     });
 
-    (ResponseStream { rx_event }, rx_last_response)
+    (
+        ResponseStream {
+            rx_event,
+            consumer_dropped: consumer_dropped_for_stream,
+        },
+        rx_last_response,
+    )
 }
 
 /// Handles a 401 response by optionally refreshing ChatGPT tokens once.
@@ -1167,7 +1182,9 @@ mod tests {
     use super::*;
     use crate::model_provider_info::OLLAMA_OSS_PROVIDER_ID;
     use crate::model_provider_info::built_in_model_providers;
+    use codex_protocol::models::ContentItem;
     use pretty_assertions::assert_eq;
+    use tokio::sync::oneshot;
 
     #[test]
     fn service_tier_for_wire_maps_only_openai_provider() {
@@ -1194,5 +1211,98 @@ mod tests {
             service_tier_for_wire(ollama, Some("flex".to_string())),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn dropping_mapped_response_stream_cancels_provider_stream() {
+        struct PendingApiStream {
+            dropped: Option<oneshot::Sender<()>>,
+        }
+
+        impl futures::Stream for PendingApiStream {
+            type Item = std::result::Result<ResponseEvent, ApiError>;
+
+            fn poll_next(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Option<Self::Item>> {
+                std::task::Poll::Pending
+            }
+        }
+
+        impl Drop for PendingApiStream {
+            fn drop(&mut self) {
+                if let Some(dropped) = self.dropped.take() {
+                    let _ = dropped.send(());
+                }
+            }
+        }
+
+        let (dropped_tx, dropped_rx) = oneshot::channel();
+        let (stream, _last_response_rx) = map_response_stream(
+            PendingApiStream {
+                dropped: Some(dropped_tx),
+            },
+            test_otel_manager(),
+        );
+
+        drop(stream);
+
+        let drop_result = tokio::time::timeout(Duration::from_secs(1), dropped_rx).await;
+        assert!(matches!(drop_result, Ok(Ok(()))));
+    }
+
+    #[tokio::test]
+    async fn mapped_response_stream_completion_populates_last_response() {
+        let item = assistant_message_item("msg-1", "hello");
+        let api_stream = futures::stream::iter(vec![
+            Ok(ResponseEvent::OutputItemDone(item.clone())),
+            Ok(ResponseEvent::Completed {
+                response_id: "resp-1".to_string(),
+                token_usage: None,
+                end_turn: Some(true),
+            }),
+        ]);
+        let (mut stream, last_response_rx) = map_response_stream(api_stream, test_otel_manager());
+
+        while let Some(event) = stream.next().await {
+            if matches!(event, Ok(ResponseEvent::Completed { .. })) {
+                break;
+            }
+        }
+
+        assert_eq!(
+            last_response_rx.await.ok(),
+            Some(LastResponse {
+                response_id: "resp-1".to_string(),
+                items_added: vec![item],
+            })
+        );
+    }
+
+    fn assistant_message_item(id: &str, text: &str) -> ResponseItem {
+        ResponseItem::Message {
+            id: Some(id.to_string()),
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: text.to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        }
+    }
+
+    fn test_otel_manager() -> OtelManager {
+        OtelManager::new(
+            ThreadId::new(),
+            "test-model",
+            "test-model",
+            None,
+            None,
+            None,
+            false,
+            "test".to_string(),
+            SessionSource::Exec,
+        )
     }
 }
