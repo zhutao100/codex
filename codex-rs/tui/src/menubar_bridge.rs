@@ -225,6 +225,8 @@ mod imp {
                     ));
                 }
                 EventMsg::RuntimeContextDeactivated(event) => {
+                    let session_id = event.session_id.to_string();
+                    notifications.extend(self.complete_turns_for_thread(&session_id));
                     if self
                         .active_runtime_context
                         .as_ref()
@@ -441,37 +443,59 @@ mod imp {
                 && let Some(turn) = self.active_turns.remove(&key)
             {
                 self.turn_start_order.retain(|existing| existing != &key);
-                return vec![HubNotification {
-                    method: "turn/completed".to_string(),
-                    params: Some(json!({
-                        "threadId": turn.thread_id,
-                        "turn": {
-                            "id": turn_id,
-                            "key": key,
-                            "status": "completed",
-                        }
-                    })),
-                }];
+                return vec![Self::turn_completed_notification(key, turn)];
             }
 
             while let Some(key) = self.turn_start_order.pop() {
                 let Some(turn) = self.active_turns.remove(&key) else {
                     continue;
                 };
-                return vec![HubNotification {
-                    method: "turn/completed".to_string(),
-                    params: Some(json!({
-                        "threadId": turn.thread_id,
-                        "turn": {
-                            "id": turn.turn_id,
-                            "key": key,
-                            "status": "completed",
-                        }
-                    })),
-                }];
+                return vec![Self::turn_completed_notification(key, turn)];
             }
 
             Vec::new()
+        }
+
+        fn complete_turns_for_thread(&mut self, thread_id: &str) -> Vec<HubNotification> {
+            let keys = self
+                .turn_start_order
+                .iter()
+                .filter(|key| {
+                    self.active_turns
+                        .get(*key)
+                        .is_some_and(|turn| turn.thread_id == thread_id)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+
+            if keys.is_empty() {
+                return Vec::new();
+            }
+
+            self.turn_start_order
+                .retain(|existing| !keys.contains(existing));
+
+            keys.into_iter()
+                .filter_map(|key| {
+                    self.active_turns
+                        .remove(&key)
+                        .map(|turn| Self::turn_completed_notification(key, turn))
+                })
+                .collect()
+        }
+
+        fn turn_completed_notification(key: String, turn: ActiveTurnState) -> HubNotification {
+            HubNotification {
+                method: "turn/completed".to_string(),
+                params: Some(json!({
+                    "threadId": turn.thread_id,
+                    "turn": {
+                        "id": turn.turn_id,
+                        "key": key,
+                        "status": "completed",
+                    }
+                })),
+            }
         }
 
         pub async fn shutdown(self) {
@@ -616,6 +640,7 @@ mod imp {
         use codex_core::protocol::RuntimeContextScope;
         use codex_core::protocol::TokenUsage;
         use codex_protocol::ThreadId;
+        use pretty_assertions::assert_eq;
 
         fn test_bridge() -> MenuBarBridge {
             let producer = CodexdProducerClient::spawn_with_socket_path(
@@ -747,6 +772,42 @@ mod imp {
             assert_eq!(updates[0].params.as_ref().unwrap()["turnKey"], turn["key"]);
             assert_eq!(updates[1].method, "thread/tokenUsage/updated");
             assert_eq!(updates[1].params.as_ref().unwrap()["turnKey"], turn["key"]);
+
+            bridge.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn runtime_context_deactivation_completes_delegate_turns() {
+            let mut bridge = test_bridge();
+            let snapshot = runtime_context();
+            let thread_id = snapshot.session_id.to_string();
+            bridge.active_runtime_context = Some(snapshot);
+
+            let started = bridge.ensure_turn_started(
+                thread_id.clone(),
+                "post-turn-review-0".to_string(),
+                None,
+            );
+            assert_eq!(started.len(), 1);
+            assert_eq!(bridge.active_turns.len(), 1);
+
+            let completed = bridge.complete_turns_for_thread(&thread_id);
+            assert_eq!(completed.len(), 1);
+            assert_eq!(completed[0].method, "turn/completed");
+            assert_eq!(
+                completed[0].params.as_ref().unwrap()["threadId"],
+                json!(thread_id)
+            );
+            assert_eq!(
+                completed[0].params.as_ref().unwrap()["turn"]["id"],
+                json!("post-turn-review-0")
+            );
+            assert!(bridge.active_turns.is_empty());
+            assert!(
+                bridge
+                    .complete_turn(Some("post-turn-review-0".to_string()))
+                    .is_empty()
+            );
 
             bridge.shutdown().await;
         }
