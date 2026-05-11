@@ -2,7 +2,6 @@ use super::review::spawn_post_turn_completion_review;
 use super::review::spawn_review_thread;
 use super::session::Session;
 use super::session::SessionSettingsUpdate;
-use super::turn_context::TurnContext;
 use super::*;
 
 pub(super) async fn submission_loop(
@@ -10,9 +9,6 @@ pub(super) async fn submission_loop(
     config: Arc<Config>,
     rx_sub: Receiver<Submission>,
 ) {
-    // Seed with context in case there is an OverrideTurnContext first.
-    let mut previous_context: Option<Arc<TurnContext>> = Some(sess.new_default_turn().await);
-
     // To break out of this loop, send Op::Shutdown.
     while let Ok(sub) = rx_sub.recv().await {
         debug!(?sub, "Submission");
@@ -24,7 +20,7 @@ pub(super) async fn submission_loop(
                 pause(&sess).await;
             }
             Op::Continue => {
-                continue_last(&sess, sub.id.clone(), &mut previous_context).await;
+                continue_last(&sess, sub.id.clone()).await;
             }
             Op::OverrideTurnContext {
                 cwd,
@@ -66,7 +62,7 @@ pub(super) async fn submission_loop(
                 .await;
             }
             Op::UserInput { .. } | Op::UserTurn { .. } => {
-                user_input_or_turn(&sess, sub.id.clone(), sub.op, &mut previous_context).await;
+                user_input_or_turn(&sess, sub.id.clone(), sub.op).await;
             }
             Op::ExecApproval { id, decision } => {
                 exec_approval(&sess, id, decision).await;
@@ -124,7 +120,7 @@ pub(super) async fn submission_loop(
                 auto_rename_thread(&sess, sub.id.clone()).await;
             }
             Op::RunUserShellCommand { command } => {
-                run_user_shell_command(&sess, sub.id.clone(), command, &mut previous_context).await;
+                run_user_shell_command(&sess, sub.id.clone(), command).await;
             }
             Op::ResolveElicitation {
                 server_name,
@@ -206,11 +202,7 @@ pub async fn pause(sess: &Arc<Session>) {
     sess.pause_task().await;
 }
 
-pub async fn continue_last(
-    sess: &Arc<Session>,
-    sub_id: String,
-    previous_context: &mut Option<Arc<TurnContext>>,
-) {
+pub async fn continue_last(sess: &Arc<Session>, sub_id: String) {
     if sess.active_turn.lock().await.is_some() {
         sess.send_event_raw(Event {
             id: sub_id,
@@ -242,7 +234,6 @@ pub async fn continue_last(
         ContinueTask::new(checkpoint),
     )
     .await;
-    *previous_context = Some(turn_context);
 }
 
 pub async fn override_turn_context(sess: &Session, sub_id: String, updates: SessionSettingsUpdate) {
@@ -258,12 +249,7 @@ pub async fn override_turn_context(sess: &Session, sub_id: String, updates: Sess
     }
 }
 
-pub async fn user_input_or_turn(
-    sess: &Arc<Session>,
-    sub_id: String,
-    op: Op,
-    previous_context: &mut Option<Arc<TurnContext>>,
-) {
+pub async fn user_input_or_turn(sess: &Arc<Session>, sub_id: String, op: Op) {
     let (items, updates) = match op {
         Op::UserTurn {
             cwd,
@@ -325,32 +311,14 @@ pub async fn user_input_or_turn(
     // Attempt to inject input into current task
     if let Err(items) = sess.inject_input(items).await {
         sess.clear_pending_continuation().await;
-        sess.seed_initial_context_if_needed(&current_context).await;
-        let resumed_model = sess.take_pending_resume_previous_model().await;
-        let update_items = sess.build_settings_update_items(
-            previous_context.as_ref(),
-            resumed_model.as_deref(),
-            &current_context,
-        );
-        if !update_items.is_empty() {
-            sess.record_conversation_items(&current_context, &update_items)
-                .await;
-        }
-
         sess.refresh_mcp_servers_if_requested(&current_context)
             .await;
         sess.spawn_task(Arc::clone(&current_context), items, RegularTask)
             .await;
-        *previous_context = Some(current_context);
     }
 }
 
-pub async fn run_user_shell_command(
-    sess: &Arc<Session>,
-    sub_id: String,
-    command: String,
-    previous_context: &mut Option<Arc<TurnContext>>,
-) {
+pub async fn run_user_shell_command(sess: &Arc<Session>, sub_id: String, command: String) {
     if let Some((turn_context, cancellation_token)) =
         sess.active_turn_context_and_cancellation_token().await
     {
@@ -375,7 +343,6 @@ pub async fn run_user_shell_command(
         UserShellCommandTask::new(command),
     )
     .await;
-    *previous_context = Some(turn_context);
 }
 
 pub async fn resolve_elicitation(

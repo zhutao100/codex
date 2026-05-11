@@ -197,6 +197,7 @@ use crate::skills::resolve_skill_dependencies_for_turn;
 use crate::state::ActiveTurn;
 use crate::state::CompletedTurnForReview;
 use crate::state::PendingContinuation;
+use crate::state::PreviousTurnSettings;
 use crate::state::SessionServices;
 use crate::state::SessionState;
 use crate::state_db;
@@ -680,14 +681,8 @@ impl Session {
         let turn_context = self.new_default_turn().await;
         match conversation_history {
             InitialHistory::New => {
-                // Build and record initial items (user instructions + environment context)
-                let items = self.build_initial_context(&turn_context).await;
-                self.record_conversation_items(&turn_context, &items).await;
-                {
-                    let mut state = self.state.lock().await;
-                    state.initial_context_seeded = true;
-                }
-                // Ensure initial items are visible to immediate readers (e.g., tests, forks).
+                // Initial context is recorded with the first real user turn so the
+                // persisted baseline matches a turn boundary.
                 self.flush_rollout().await;
             }
             InitialHistory::Resumed(resumed_history) => {
@@ -844,11 +839,6 @@ impl Session {
         })
     }
 
-    async fn take_pending_resume_previous_model(&self) -> Option<String> {
-        let mut state = self.state.lock().await;
-        state.pending_resume_previous_model.take()
-    }
-
     pub(crate) async fn update_settings(
         &self,
         updates: SessionSettingsUpdate,
@@ -874,39 +864,28 @@ impl Session {
             .original_config_do_not_use
             .clone()
     }
-    pub(crate) async fn current_collaboration_mode(&self) -> CollaborationMode {
-        let state = self.state.lock().await;
-        state.session_configuration.collaboration_mode.clone()
-    }
-
     fn build_environment_update_item(
         &self,
-        previous: Option<&Arc<TurnContext>>,
+        previous: &TurnContextItem,
         next: &TurnContext,
     ) -> Option<ResponseItem> {
-        let prev = previous?;
-
-        let shell = self.user_shell();
-        let prev_context = EnvironmentContext::from_turn_context(prev.as_ref(), shell.as_ref());
-        let next_context = EnvironmentContext::from_turn_context(next, shell.as_ref());
-        if prev_context.equals_except_shell(&next_context) {
+        if previous.cwd == next.cwd {
             return None;
         }
-        Some(ResponseItem::from(EnvironmentContext::diff(
-            prev.as_ref(),
-            next,
-            shell.as_ref(),
+
+        Some(ResponseItem::from(EnvironmentContext::new(
+            Some(next.cwd.clone()),
+            self.user_shell().as_ref().clone(),
         )))
     }
 
     fn build_permissions_update_item(
         &self,
-        previous: Option<&Arc<TurnContext>>,
+        previous: &TurnContextItem,
         next: &TurnContext,
     ) -> Option<ResponseItem> {
-        let prev = previous?;
-        if prev.sandbox_policy == next.sandbox_policy
-            && prev.approval_policy == next.approval_policy
+        if previous.sandbox_policy == next.sandbox_policy
+            && previous.approval_policy == next.approval_policy
         {
             return None;
         }
@@ -923,9 +902,40 @@ impl Session {
         )
     }
 
+    fn build_developer_instructions_update_item(
+        previous: &TurnContextItem,
+        next: &TurnContext,
+    ) -> Option<ResponseItem> {
+        if previous.developer_instructions == next.developer_instructions {
+            return None;
+        }
+
+        next.developer_instructions
+            .as_ref()
+            .map(|instructions| DeveloperInstructions::new(instructions.clone()).into())
+    }
+
+    fn build_user_instructions_update_item(
+        previous: &TurnContextItem,
+        next: &TurnContext,
+    ) -> Option<ResponseItem> {
+        if previous.user_instructions == next.user_instructions {
+            return None;
+        }
+
+        next.user_instructions.as_ref().map(|instructions| {
+            UserInstructions {
+                text: instructions.clone(),
+                directory: next.cwd.to_string_lossy().into_owned(),
+            }
+            .into()
+        })
+    }
+
     fn build_personality_update_item(
         &self,
-        previous: Option<&Arc<TurnContext>>,
+        previous: &TurnContextItem,
+        previous_turn_settings: Option<&PreviousTurnSettings>,
         next: &TurnContext,
     ) -> Option<ResponseItem> {
         if !self.features.enabled(Feature::Personality) {
@@ -934,12 +944,13 @@ impl Session {
         if next.final_instruction_override.is_some() {
             return None;
         }
-        let previous = previous?;
-        if next.model_info.slug != previous.model_info.slug {
+        let previous_model = previous_turn_settings
+            .map(|settings| settings.model.as_str())
+            .unwrap_or(previous.model.as_str());
+        if next.model_info.slug != previous_model {
             return None;
         }
 
-        // if a personality is specified and it's different from the previous one, build a personality update item
         if let Some(personality) = next.personality
             && next.personality != previous.personality
         {
@@ -963,11 +974,11 @@ impl Session {
 
     fn build_collaboration_mode_update_item(
         &self,
-        previous: Option<&Arc<TurnContext>>,
+        previous: &TurnContextItem,
         next: &TurnContext,
     ) -> Option<ResponseItem> {
-        let prev = previous?;
-        if prev.collaboration_mode != next.collaboration_mode {
+        let previous_collaboration_mode = previous.collaboration_mode.as_ref()?;
+        if previous_collaboration_mode != &next.collaboration_mode {
             // If the next mode has empty developer instructions, this returns None and we emit no
             // update, so prior collaboration instructions remain in the prompt history.
             Some(DeveloperInstructions::from_collaboration_mode(&next.collaboration_mode)?.into())
@@ -978,12 +989,13 @@ impl Session {
 
     fn build_model_instructions_update_item(
         &self,
-        previous: Option<&Arc<TurnContext>>,
-        resumed_model: Option<&str>,
+        previous: &TurnContextItem,
+        previous_turn_settings: Option<&PreviousTurnSettings>,
         next: &TurnContext,
     ) -> Option<ResponseItem> {
-        let previous_model =
-            resumed_model.or_else(|| previous.map(|prev| prev.model_info.slug.as_str()))?;
+        let previous_model = previous_turn_settings
+            .map(|settings| settings.model.as_str())
+            .unwrap_or(previous.model.as_str());
         if previous_model == next.model_info.slug {
             return None;
         }
@@ -998,8 +1010,8 @@ impl Session {
 
     fn build_settings_update_items(
         &self,
-        previous_context: Option<&Arc<TurnContext>>,
-        resumed_model: Option<&str>,
+        previous_context: &TurnContextItem,
+        previous_turn_settings: Option<&PreviousTurnSettings>,
         current_context: &TurnContext,
     ) -> Vec<ResponseItem> {
         let mut update_items = Vec::new();
@@ -1008,27 +1020,39 @@ impl Session {
         {
             update_items.push(env_item);
         }
+        if let Some(model_instructions_item) = self.build_model_instructions_update_item(
+            previous_context,
+            previous_turn_settings,
+            current_context,
+        ) {
+            update_items.push(model_instructions_item);
+        }
         if let Some(permissions_item) =
             self.build_permissions_update_item(previous_context, current_context)
         {
             update_items.push(permissions_item);
+        }
+        if let Some(developer_instructions_item) =
+            Self::build_developer_instructions_update_item(previous_context, current_context)
+        {
+            update_items.push(developer_instructions_item);
         }
         if let Some(collaboration_mode_item) =
             self.build_collaboration_mode_update_item(previous_context, current_context)
         {
             update_items.push(collaboration_mode_item);
         }
-        if let Some(model_instructions_item) = self.build_model_instructions_update_item(
+        if let Some(personality_item) = self.build_personality_update_item(
             previous_context,
-            resumed_model,
+            previous_turn_settings,
             current_context,
         ) {
-            update_items.push(model_instructions_item);
-        }
-        if let Some(personality_item) =
-            self.build_personality_update_item(previous_context, current_context)
-        {
             update_items.push(personality_item);
+        }
+        if let Some(user_instructions_item) =
+            Self::build_user_instructions_update_item(previous_context, current_context)
+        {
+            update_items.push(user_instructions_item);
         }
         update_items
     }
@@ -1514,17 +1538,65 @@ impl Session {
         state.replace_history(items);
     }
 
+    pub(crate) async fn reference_context_item(&self) -> Option<TurnContextItem> {
+        let state = self.state.lock().await;
+        state.history.reference_context_item()
+    }
+
+    pub(crate) async fn previous_turn_settings(&self) -> Option<PreviousTurnSettings> {
+        let state = self.state.lock().await;
+        state.previous_turn_settings.clone()
+    }
+
+    pub(crate) async fn record_context_updates_and_set_reference_context_item(
+        &self,
+        turn_context: &TurnContext,
+    ) {
+        let reference_context_item = self.reference_context_item().await;
+        let previous_turn_settings = self.previous_turn_settings().await;
+
+        let update_items = if let Some(reference_context_item) = reference_context_item.as_ref() {
+            if reference_context_item.collaboration_mode.is_some() {
+                self.build_settings_update_items(
+                    reference_context_item,
+                    previous_turn_settings.as_ref(),
+                    turn_context,
+                )
+            } else {
+                self.build_initial_context(turn_context).await
+            }
+        } else {
+            self.build_initial_context(turn_context).await
+        };
+
+        if !update_items.is_empty() {
+            self.record_conversation_items(turn_context, &update_items)
+                .await;
+        }
+
+        let current_context_item = turn_context.to_turn_context_item();
+        self.persist_rollout_items(&[RolloutItem::TurnContext(current_context_item.clone())])
+            .await;
+
+        let mut state = self.state.lock().await;
+        state.initial_context_seeded = true;
+        state
+            .history
+            .set_reference_context_item(Some(current_context_item.clone()));
+        state.previous_turn_settings = Some(PreviousTurnSettings {
+            model: current_context_item.model,
+        });
+    }
+
     pub(crate) async fn seed_initial_context_if_needed(&self, turn_context: &TurnContext) {
         {
-            let mut state = self.state.lock().await;
+            let state = self.state.lock().await;
             if state.initial_context_seeded {
                 return;
             }
-            state.initial_context_seeded = true;
         }
 
-        let initial_context = self.build_initial_context(turn_context).await;
-        self.record_conversation_items(turn_context, &initial_context)
+        self.record_context_updates_and_set_reference_context_item(turn_context)
             .await;
         self.flush_rollout().await;
     }

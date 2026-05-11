@@ -464,6 +464,94 @@ async fn recompute_token_usage_uses_session_base_instructions() {
 }
 
 #[tokio::test]
+async fn record_context_updates_and_set_reference_context_item_injects_full_context_when_baseline_missing()
+ {
+    let (session, turn_context) = make_session_and_context().await;
+
+    session
+        .record_context_updates_and_set_reference_context_item(&turn_context)
+        .await;
+
+    let expected_history = session.build_initial_context(&turn_context).await;
+    let history = session.clone_history().await;
+    assert_eq!(expected_history, history.raw_items());
+    assert_eq!(
+        session.reference_context_item().await,
+        Some(turn_context.to_turn_context_item())
+    );
+    assert_eq!(
+        session.previous_turn_settings().await,
+        Some(PreviousTurnSettings {
+            model: turn_context.model_info.slug.clone()
+        })
+    );
+}
+
+#[tokio::test]
+async fn record_context_updates_and_set_reference_context_item_persists_baseline_without_diff_items()
+ {
+    let (session, turn_context) = make_session_and_context().await;
+    session
+        .record_context_updates_and_set_reference_context_item(&turn_context)
+        .await;
+    let history_after_first = session.clone_history().await;
+
+    session
+        .record_context_updates_and_set_reference_context_item(&turn_context)
+        .await;
+
+    let history_after_second = session.clone_history().await;
+    assert_eq!(
+        history_after_first.raw_items(),
+        history_after_second.raw_items()
+    );
+    assert_eq!(
+        session.reference_context_item().await,
+        Some(turn_context.to_turn_context_item())
+    );
+}
+
+#[tokio::test]
+async fn build_settings_update_items_emits_model_switch_before_other_developer_diffs() {
+    use crate::protocol::AskForApproval;
+
+    let (session, turn_context) = make_session_and_context().await;
+    let mut previous = turn_context.to_turn_context_item();
+    previous.model = "gpt-5.4-mini".to_string();
+    previous.approval_policy = match turn_context.approval_policy {
+        AskForApproval::Never => AskForApproval::OnRequest,
+        AskForApproval::UnlessTrusted | AskForApproval::OnFailure | AskForApproval::OnRequest => {
+            AskForApproval::Never
+        }
+    };
+    let previous_settings = PreviousTurnSettings {
+        model: previous.model.clone(),
+    };
+
+    let update_items =
+        session.build_settings_update_items(&previous, Some(&previous_settings), &turn_context);
+    let developer_texts = update_items
+        .iter()
+        .filter_map(|item| match item {
+            ResponseItem::Message { role, content, .. } if role == "developer" => {
+                let [ContentItem::InputText { text }] = content.as_slice() else {
+                    return None;
+                };
+                Some(text.as_str())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert!(
+        developer_texts.len() >= 2,
+        "expected model-switch and permissions developer updates"
+    );
+    assert!(developer_texts[0].starts_with("<model_switch>"));
+    assert!(developer_texts[1].starts_with("<permissions instructions>"));
+}
+
+#[tokio::test]
 async fn record_initial_history_reconstructs_forked_transcript() {
     let (session, turn_context) = make_session_and_context().await;
     let (rollout_items, mut expected) = sample_rollout(&session, &turn_context).await;

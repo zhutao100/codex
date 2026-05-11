@@ -11,7 +11,6 @@ use crate::features::Feature;
 use crate::preserved_work_notes::PRESERVED_WORK_NOTES_MESSAGE_PREFIX;
 use crate::protocol::CompactedItem;
 use crate::protocol::EventMsg;
-use crate::protocol::TurnContextItem;
 use crate::protocol::TurnStartedEvent;
 use crate::protocol::WarningEvent;
 use crate::session::session::Session;
@@ -109,25 +108,7 @@ async fn run_compact_task_inner(
     // Reuse one client session so turn-scoped state (sticky routing, websocket append tracking)
     // survives retries within this compact turn.
 
-    // TODO: If we need to guarantee the persisted mode always matches the prompt used for this
-    // turn, capture it in TurnContext at creation time. Using SessionConfiguration here avoids
-    // duplicating model settings on TurnContext, but an Op after turn start could update the
-    // session config before this write occurs.
-    let collaboration_mode = sess.current_collaboration_mode().await;
-    let rollout_item = RolloutItem::TurnContext(TurnContextItem {
-        cwd: turn_context.cwd.clone(),
-        approval_policy: turn_context.approval_policy,
-        sandbox_policy: turn_context.sandbox_policy.clone(),
-        model: turn_context.model_info.slug.clone(),
-        personality: turn_context.personality,
-        collaboration_mode: Some(collaboration_mode),
-        effort: turn_context.reasoning_effort,
-        summary: turn_context.reasoning_summary,
-        user_instructions: turn_context.user_instructions.clone(),
-        developer_instructions: turn_context.developer_instructions.clone(),
-        final_output_json_schema: turn_context.final_output_json_schema.clone(),
-        truncation_policy: Some(turn_context.truncation_policy.into()),
-    });
+    let rollout_item = RolloutItem::TurnContext(turn_context.to_turn_context_item());
     sess.persist_rollout_items(&[rollout_item]).await;
 
     loop {

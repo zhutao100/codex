@@ -27,6 +27,11 @@ pub(crate) struct CompletedTurnForReview {
     pub(crate) final_agent_message: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PreviousTurnSettings {
+    pub(crate) model: String,
+}
+
 /// Persistent, session-scoped state previously stored directly on `Session`.
 pub(crate) struct SessionState {
     pub(crate) session_configuration: SessionConfiguration,
@@ -42,6 +47,8 @@ pub(crate) struct SessionState {
     pub(crate) initial_context_seeded: bool,
     /// Previous rollout model for one-shot model-switch handling on first turn after resume.
     pub(crate) pending_resume_previous_model: Option<String>,
+    /// Settings from the latest surviving real user turn.
+    pub(crate) previous_turn_settings: Option<PreviousTurnSettings>,
     /// Most recent paused/interrupted turn that can be continued without a new user input.
     pub(crate) pending_continuation: Option<PendingContinuation>,
     /// Most recent completed regular turn that can be reviewed independently.
@@ -67,6 +74,7 @@ impl SessionState {
             mcp_dependency_prompted: HashSet::new(),
             initial_context_seeded: false,
             pending_resume_previous_model: None,
+            previous_turn_settings: None,
             pending_continuation: None,
             last_completed_regular_turn_for_review: None,
             pending_post_turn_completion_review_continuation: None,

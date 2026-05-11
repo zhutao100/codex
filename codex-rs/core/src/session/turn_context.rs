@@ -38,6 +38,23 @@ pub(crate) struct TurnContext {
     pub(super) turn_metadata_header: OnceCell<Option<String>>,
 }
 impl TurnContext {
+    pub(crate) fn to_turn_context_item(&self) -> TurnContextItem {
+        TurnContextItem {
+            cwd: self.cwd.clone(),
+            approval_policy: self.approval_policy,
+            sandbox_policy: self.sandbox_policy.clone(),
+            model: self.model_info.slug.clone(),
+            personality: self.personality,
+            collaboration_mode: Some(self.collaboration_mode.clone()),
+            effort: self.reasoning_effort,
+            summary: self.reasoning_summary,
+            user_instructions: self.user_instructions.clone(),
+            developer_instructions: self.developer_instructions.clone(),
+            final_output_json_schema: self.final_output_json_schema.clone(),
+            truncation_policy: Some(self.truncation_policy.into()),
+        }
+    }
+
     pub(crate) fn model_context_window(&self) -> Option<i64> {
         let effective_context_window_percent = self.model_info.effective_context_window_percent;
         self.model_info.context_window.map(|context_window| {

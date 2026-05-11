@@ -211,6 +211,9 @@ async fn run_turn_inner(
             }
         }
 
+        sess.record_context_updates_and_set_reference_context_item(turn_context.as_ref())
+            .await;
+
         let skills_outcome = Some(
             sess.services
                 .skills_manager
@@ -1585,22 +1588,6 @@ async fn try_run_sampling_request(
     tool_execution_mode: ToolCallExecutionMode,
     cancellation_token: CancellationToken,
 ) -> CodexResult<SamplingRequestResult> {
-    let collaboration_mode = sess.current_collaboration_mode().await;
-    let rollout_item = RolloutItem::TurnContext(TurnContextItem {
-        cwd: turn_context.cwd.clone(),
-        approval_policy: turn_context.approval_policy,
-        sandbox_policy: turn_context.sandbox_policy.clone(),
-        model: turn_context.model_info.slug.clone(),
-        personality: turn_context.personality,
-        collaboration_mode: Some(collaboration_mode),
-        effort: turn_context.reasoning_effort,
-        summary: turn_context.reasoning_summary,
-        user_instructions: turn_context.user_instructions.clone(),
-        developer_instructions: turn_context.developer_instructions.clone(),
-        final_output_json_schema: turn_context.final_output_json_schema.clone(),
-        truncation_policy: Some(turn_context.truncation_policy.into()),
-    });
-
     feedback_tags!(
         model = turn_context.model_info.slug.clone(),
         approval_policy = turn_context.approval_policy,
@@ -1610,7 +1597,6 @@ async fn try_run_sampling_request(
         features = sess.features.enabled_features(),
     );
 
-    sess.persist_rollout_items(&[rollout_item]).await;
     let mut stream = client_session
         .stream(
             prompt,

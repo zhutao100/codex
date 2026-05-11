@@ -16,6 +16,7 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::InputModality;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TokenUsageInfo;
+use codex_protocol::protocol::TurnContextItem;
 use std::ops::Deref;
 
 /// Transcript of thread history
@@ -26,6 +27,7 @@ pub(crate) struct ContextManager {
     item_token_estimates: Vec<i64>,
     total_item_tokens: i64,
     token_info: Option<TokenUsageInfo>,
+    reference_context_item: Option<TurnContextItem>,
 }
 
 impl ContextManager {
@@ -35,6 +37,7 @@ impl ContextManager {
             item_token_estimates: Vec::new(),
             total_item_tokens: 0,
             token_info: TokenUsageInfo::new_or_append(&None, &None, None),
+            reference_context_item: None,
         }
     }
 
@@ -44,6 +47,14 @@ impl ContextManager {
 
     pub(crate) fn set_token_info(&mut self, info: Option<TokenUsageInfo>) {
         self.token_info = info;
+    }
+
+    pub(crate) fn reference_context_item(&self) -> Option<TurnContextItem> {
+        self.reference_context_item.clone()
+    }
+
+    pub(crate) fn set_reference_context_item(&mut self, item: Option<TurnContextItem>) {
+        self.reference_context_item = item;
     }
 
     pub(crate) fn set_token_usage_full(&mut self, context_window: i64) {

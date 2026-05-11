@@ -1,4 +1,3 @@
-use crate::session::turn_context::TurnContext;
 use crate::shell::Shell;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
@@ -23,6 +22,7 @@ impl EnvironmentContext {
     /// Compares two environment contexts, ignoring the shell. Useful when
     /// comparing turn to turn, since the initial environment_context will
     /// include the shell, and then it is not configurable from turn to turn.
+    #[cfg(test)]
     pub fn equals_except_shell(&self, other: &EnvironmentContext) -> bool {
         let EnvironmentContext {
             cwd,
@@ -32,19 +32,6 @@ impl EnvironmentContext {
         } = other;
 
         self.cwd == *cwd
-    }
-
-    pub fn diff(before: &TurnContext, after: &TurnContext, shell: &Shell) -> Self {
-        let cwd = if before.cwd != after.cwd {
-            Some(after.cwd.clone())
-        } else {
-            None
-        };
-        EnvironmentContext::new(cwd, shell.clone())
-    }
-
-    pub fn from_turn_context(turn_context: &TurnContext, shell: &Shell) -> Self {
-        Self::new(Some(turn_context.cwd.clone()), shell.clone())
     }
 }
 

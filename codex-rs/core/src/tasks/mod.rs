@@ -215,11 +215,13 @@ impl Session {
         task: T,
     ) {
         self.abort_all_tasks(TurnAbortReason::Replaced).await;
-        self.seed_initial_context_if_needed(turn_context.as_ref())
-            .await;
 
         let task: Arc<dyn AnySessionTask> = Arc::new(task);
         let task_kind = task.kind();
+        if task_kind != TaskKind::Regular {
+            self.seed_initial_context_if_needed(turn_context.as_ref())
+                .await;
+        }
         let completed_turn_user_messages = if task_kind == TaskKind::Regular {
             user_text_messages_for_completed_turn_review(&input)
         } else {
