@@ -785,7 +785,6 @@ async fn remote_models_apply_remote_base_instructions() -> Result<()> {
     let TestCodex {
         codex,
         cwd,
-        config,
         thread_manager,
         ..
     } = builder.build(&server).await?;
@@ -827,12 +826,9 @@ async fn remote_models_apply_remote_base_instructions() -> Result<()> {
 
     wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
 
-    let base_model_info = models_manager
-        .get_model_info("gpt-5.2", &config.to_models_manager_config())
-        .await;
     let body = response_mock.single_request().body_json();
     let instructions = body["instructions"].as_str().unwrap();
-    assert_eq!(instructions, base_model_info.base_instructions);
+    assert_eq!(instructions, remote_base);
 
     Ok(())
 }

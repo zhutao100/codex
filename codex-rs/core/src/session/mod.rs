@@ -1008,6 +1008,14 @@ fn push_prompt_fragment(
     }
 }
 
+fn base_instruction_settings_changed(
+    previous: &SessionConfiguration,
+    next: &SessionConfiguration,
+) -> bool {
+    previous.collaboration_mode.model() != next.collaboration_mode.model()
+        || previous.personality != next.personality
+}
+
 impl Session {
     pub(crate) async fn app_server_client_metadata(&self) -> AppServerClientMetadata {
         let state = self.state.lock().await;
@@ -1514,21 +1522,59 @@ impl Session {
         state.set_previous_turn_settings(previous_turn_settings);
     }
 
+    pub(crate) async fn apply_settings_to_configuration(
+        &self,
+        current: &SessionConfiguration,
+        updates: &SessionSettingsUpdate,
+    ) -> ConstraintResult<SessionConfiguration> {
+        let mut updated = current.apply(updates)?;
+        if base_instruction_settings_changed(current, &updated) {
+            updated.base_instructions = self.resolve_current_base_instructions(&updated).await;
+        }
+        Ok(updated)
+    }
+
+    async fn resolve_current_base_instructions(
+        &self,
+        session_configuration: &SessionConfiguration,
+    ) -> String {
+        let config =
+            Self::build_per_turn_config(session_configuration, session_configuration.cwd().clone());
+        let model_info = self
+            .services
+            .models_manager
+            .get_model_info(
+                session_configuration.collaboration_mode.model(),
+                &config.to_models_manager_config(),
+            )
+            .await;
+        config
+            .base_instructions
+            .clone()
+            .unwrap_or_else(|| model_info.get_model_instructions(config.personality))
+    }
+
     pub(crate) async fn update_settings(
         &self,
         updates: SessionSettingsUpdate,
     ) -> ConstraintResult<()> {
         let notify_config_contributors = !self.services.extensions.config_contributors().is_empty();
+        let current = {
+            let state = self.state.lock().await;
+            state.session_configuration.clone()
+        };
+        let updated = match self
+            .apply_settings_to_configuration(&current, &updates)
+            .await
+        {
+            Ok(updated) => updated,
+            Err(err) => {
+                warn!("rejected session settings update: {err}");
+                return Err(err);
+            }
+        };
         let (previous_config, new_config, permission_profile_changed) = {
             let mut state = self.state.lock().await;
-            let updated = match state.session_configuration.apply(&updates) {
-                Ok(updated) => updated,
-                Err(err) => {
-                    warn!("rejected session settings update: {err}");
-                    return Err(err);
-                }
-            };
-
             let previous_config = notify_config_contributors
                 .then(|| Self::build_effective_session_config(&state.session_configuration));
             let new_config =

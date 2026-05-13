@@ -182,6 +182,69 @@ async fn model_change_appends_model_instructions_developer_message() -> Result<(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn model_switch_uses_target_model_base_instructions() -> Result<()> {
+    let server = start_mock_server().await;
+    let resp_mock = mount_sse_once(&server, sse_completed("resp-1")).await;
+
+    let initial_model_slug = "test-initial-model";
+    let target_model_slug = "test-target-model";
+    let initial_base = "INITIAL_MODEL_BASE_INSTRUCTIONS_ONLY";
+    let target_base = "TARGET_MODEL_BASE_INSTRUCTIONS_ONLY";
+    let mut initial_model = test_model_info(
+        initial_model_slug,
+        "Initial Model",
+        "initial model",
+        default_input_modalities(),
+    );
+    initial_model.base_instructions = initial_base.to_string();
+    let mut target_model = test_model_info(
+        target_model_slug,
+        "Target Model",
+        "target model",
+        default_input_modalities(),
+    );
+    target_model.base_instructions = target_base.to_string();
+
+    let mut builder = test_codex().with_config(move |config| {
+        config.model = Some(initial_model_slug.to_string());
+        config.model_catalog = Some(ModelsResponse {
+            models: vec![initial_model, target_model],
+        });
+    });
+    let test = builder.build(&server).await?;
+
+    core_test_support::submit_thread_settings(
+        &test.codex,
+        codex_protocol::protocol::ThreadSettingsOverrides {
+            model: Some(target_model_slug.to_string()),
+            ..Default::default()
+        },
+    )
+    .await?;
+    test.codex
+        .submit(read_only_user_turn(
+            &test,
+            vec![UserInput::Text {
+                text: "target model turn".into(),
+                text_elements: Vec::new(),
+            }],
+            target_model_slug.to_string(),
+        ))
+        .await?;
+    wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let request = resp_mock.single_request();
+    let actual_instructions = request.instructions_text();
+    assert_eq!(actual_instructions, target_base);
+    assert!(
+        !actual_instructions.contains(initial_base),
+        "initial model instructions leaked into switched model request"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn model_and_personality_change_only_appends_model_instructions() -> Result<()> {
     skip_if_no_network!(Ok(()));
 

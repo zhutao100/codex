@@ -585,53 +585,51 @@ impl Session {
         updates: SessionSettingsUpdate,
     ) -> CodexResult<Arc<TurnContext>> {
         let notify_config_contributors = !self.services.extensions.config_contributors().is_empty();
-        let update_result: CodexResult<_> = {
-            let mut state = self.state.lock().await;
-            match state.session_configuration.clone().apply(&updates) {
-                Ok(next) => {
-                    let previous_permission_profile =
-                        state.session_configuration.permission_profile();
-                    let next_permission_profile = next.permission_profile();
-                    let permission_profile_changed =
-                        previous_permission_profile != next_permission_profile;
-                    let previous_config = notify_config_contributors.then(|| {
-                        Self::build_effective_session_config(&state.session_configuration)
-                    });
-                    let new_config = notify_config_contributors
-                        .then(|| Self::build_effective_session_config(&next));
-                    if updates.environments.is_some() {
-                        self.services
-                            .turn_environments
-                            .update_selections(next.environment_selections());
-                    }
-                    state.session_configuration = next.clone();
-                    Ok((
-                        next,
-                        permission_profile_changed,
-                        previous_config,
-                        new_config,
-                    ))
-                }
-                Err(err) => Err(CodexErr::InvalidRequest(err.to_string())),
+        let current = {
+            let state = self.state.lock().await;
+            state.session_configuration.clone()
+        };
+        let next = match self
+            .apply_settings_to_configuration(&current, &updates)
+            .await
+        {
+            Ok(next) => next,
+            Err(err) => {
+                let message = err.to_string();
+                self.send_event_raw(Event {
+                    id: sub_id.clone(),
+                    msg: EventMsg::Error(ErrorEvent {
+                        message: message.clone(),
+                        codex_error_info: Some(CodexErrorInfo::BadRequest),
+                    }),
+                })
+                .await;
+                return Err(CodexErr::InvalidRequest(message));
             }
         };
+        let (session_configuration, permission_profile_changed, previous_config, new_config) = {
+            let mut state = self.state.lock().await;
+            let previous_permission_profile = state.session_configuration.permission_profile();
+            let next_permission_profile = next.permission_profile();
+            let permission_profile_changed = previous_permission_profile != next_permission_profile;
+            let previous_config = notify_config_contributors
+                .then(|| Self::build_effective_session_config(&state.session_configuration));
+            let new_config =
+                notify_config_contributors.then(|| Self::build_effective_session_config(&next));
+            if updates.environments.is_some() {
+                self.services
+                    .turn_environments
+                    .update_selections(next.environment_selections());
+            }
+            state.session_configuration = next.clone();
+            (
+                next,
+                permission_profile_changed,
+                previous_config,
+                new_config,
+            )
+        };
 
-        let (session_configuration, permission_profile_changed, previous_config, new_config) =
-            match update_result {
-                Ok(update) => update,
-                Err(err) => {
-                    let message = err.to_string();
-                    self.send_event_raw(Event {
-                        id: sub_id.clone(),
-                        msg: EventMsg::Error(ErrorEvent {
-                            message: message.clone(),
-                            codex_error_info: Some(CodexErrorInfo::BadRequest),
-                        }),
-                    })
-                    .await;
-                    return Err(CodexErr::InvalidRequest(message));
-                }
-            };
         self.emit_config_changed_contributors(previous_config.as_ref(), new_config.as_ref());
 
         if permission_profile_changed {
