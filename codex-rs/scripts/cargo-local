@@ -169,6 +169,22 @@ has_harness_passthrough_output_arg() {
     return 1
 }
 
+load_network_sandbox_test_skips() {
+    local skips_file="${script_dir}/cargo-local-network-sandbox-skips.txt"
+    local line
+
+    [ -f "${skips_file}" ] || return 0
+
+    while IFS= read -r line || [ -n "${line}" ]; do
+        case "${line}" in
+            ''|\#*)
+                continue
+                ;;
+        esac
+        harness_args+=(--skip "${line}")
+    done <"${skips_file}"
+}
+
 arg_takes_value_before_command() {
     case "${1}" in
         --color|--config|-C|-Z|--manifest-path|--target-dir|--target|--profile|--jobs|-j|--package|-p|--exclude|--bin|--example|--test|--bench|--features|-F)
@@ -300,6 +316,11 @@ rewrite_cargo_test_args() {
         return 0
     fi
 
+    if should_wrap_network_disabled; then
+        load_network_sandbox_test_skips
+        saw_separator=1
+    fi
+
     if [ "${passthrough_harness_output}" -eq 0 ] && [ "${explicit_message_format}" -eq 0 ]; then
         cargo_local_filter_test_output=1
     fi
@@ -341,6 +362,45 @@ filter_cargo_test_output() {
         -v workspace_dir="${workspace_dir}"
 }
 
+network_disabled_policy() {
+    printf '%s\n' \
+        '(version 1)' \
+        '(allow default)' \
+        '(deny network-outbound (remote ip "*:*"))' \
+        '(deny network-bind (local ip "*:*"))' \
+        '(deny network-inbound (local ip "*:*"))' \
+        '(allow network-outbound (remote ip "localhost:*"))' \
+        '(allow network-bind (local ip "localhost:*"))' \
+        '(allow network-inbound (local ip "localhost:*"))'
+}
+
+should_wrap_network_disabled() {
+    [ -n "${CODEX_SANDBOX_NETWORK_DISABLED:-}" ] || return 1
+    [ "$(uname -s)" = "Darwin" ] || return 1
+    [ "${CODEX_SANDBOX:-}" != "seatbelt" ] || return 1
+    [ -x /usr/bin/sandbox-exec ] || return 1
+    return 0
+}
+
+run_cargo_command() {
+    if should_wrap_network_disabled; then
+        /usr/bin/sandbox-exec -p "$(network_disabled_policy)" \
+            /usr/bin/env \
+            -u ALL_PROXY \
+            -u HTTPS_PROXY \
+            -u HTTP_PROXY \
+            -u NO_PROXY \
+            -u all_proxy \
+            -u https_proxy \
+            -u http_proxy \
+            -u no_proxy \
+            CODEX_SANDBOX=seatbelt \
+            "${cargo_bin}" "$@"
+    else
+        "${cargo_bin}" "$@"
+    fi
+}
+
 run_filtered_cargo_test() {
     local output_file
     local filter_status
@@ -350,7 +410,7 @@ run_filtered_cargo_test() {
     trap 'rm -f "${output_file}"' RETURN
 
     set +e
-    "${cargo_bin}" "${argv[@]}" >"${output_file}" 2>&1
+    run_cargo_command "${argv[@]}" >"${output_file}" 2>&1
     status="${?}"
     set -e
 
@@ -396,6 +456,21 @@ if [ "${cargo_local_filter_test_output}" -eq 1 ]; then
         status="${?}"
         exit "${status}"
     fi
+fi
+
+if should_wrap_network_disabled; then
+    exec /usr/bin/sandbox-exec -p "$(network_disabled_policy)" \
+        /usr/bin/env \
+        -u ALL_PROXY \
+        -u HTTPS_PROXY \
+        -u HTTP_PROXY \
+        -u NO_PROXY \
+        -u all_proxy \
+        -u https_proxy \
+        -u http_proxy \
+        -u no_proxy \
+        CODEX_SANDBOX=seatbelt \
+        "${cargo_bin}" "${argv[@]}"
 fi
 
 exec "${cargo_bin}" "${argv[@]}"

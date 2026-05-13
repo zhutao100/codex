@@ -1,6 +1,7 @@
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
+use app_test_support::clear_host_network_env;
 use app_test_support::create_mock_responses_server_sequence_unchecked;
 use codex_app_server_protocol::ClientInfo;
 use codex_app_server_protocol::InitializeParams;
@@ -89,6 +90,7 @@ async fn spawn_websocket_server(codex_home: &Path, bind_addr: SocketAddr) -> Res
         .stderr(Stdio::piped())
         .env("CODEX_HOME", codex_home)
         .env("RUST_LOG", "debug");
+    clear_host_network_env(&mut cmd);
     let mut process = cmd
         .kill_on_drop(true)
         .spawn()

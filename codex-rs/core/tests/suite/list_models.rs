@@ -35,9 +35,7 @@ async fn list_models_filters_api_key_models_to_api_supported() -> Result<()> {
         CodexAuth::from_api_key("sk-test"),
         built_in_model_providers()["openai"].clone(),
     );
-    let models = manager
-        .list_models(&config, RefreshStrategy::OnlineIfUncached)
-        .await;
+    let models = manager.list_models(&config, RefreshStrategy::Offline).await;
 
     assert!(!models.is_empty());
     assert!(models.iter().all(|model| model.supported_in_api));
@@ -56,7 +54,7 @@ async fn list_models_in_chatgpt_mode_includes_api_key_models() -> Result<()> {
         built_in_model_providers()["openai"].clone(),
     );
     let api_key_models = api_key_manager
-        .list_models(&config, RefreshStrategy::OnlineIfUncached)
+        .list_models(&config, RefreshStrategy::Offline)
         .await;
 
     let chatgpt_manager = ThreadManager::with_models_provider(
@@ -64,7 +62,7 @@ async fn list_models_in_chatgpt_mode_includes_api_key_models() -> Result<()> {
         built_in_model_providers()["openai"].clone(),
     );
     let chatgpt_models = chatgpt_manager
-        .list_models(&config, RefreshStrategy::OnlineIfUncached)
+        .list_models(&config, RefreshStrategy::Offline)
         .await;
 
     assert!(!chatgpt_models.is_empty());

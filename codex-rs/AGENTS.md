@@ -14,6 +14,10 @@ Thus, the design of the changes target to minimize the potentials of future reba
   `/Volumes/*/.codex-rs-build-root` marker directory is mounted, and otherwise
   falls back to the workspace `target/`.
 - always use `CODEX_SANDBOX_NETWORK_DISABLED=1` for test runs to avoid tampering the host.
+- With `CODEX_SANDBOX_NETWORK_DISABLED=1` on macOS, `scripts/cargo-local`
+  wraps Cargo in a Seatbelt profile that allows localhost sockets only and
+  filters tests listed in `scripts/cargo-local-network-sandbox-skips.txt`
+  because they exercise nested sandbox/shell behavior.
 - `scripts/cargo-local test` defaults to agent output: it filters passing libtest
   progress into a compact summary while preserving warnings and failures. Use
   `CODEX_RS_CARGO_LOCAL_TEST_OUTPUT=raw` only when exact Cargo/libtest output is
