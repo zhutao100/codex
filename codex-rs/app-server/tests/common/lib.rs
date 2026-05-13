@@ -58,6 +58,7 @@ pub use test_app_server::DEFAULT_APP_SERVER_TEST_ARGS;
 pub use test_app_server::DEFAULT_CLIENT_NAME;
 pub use test_app_server::TestAppServer;
 pub use test_app_server::TestAppServerBuilder;
+pub use test_app_server::clear_host_network_env;
 
 pub fn to_response<T: DeserializeOwned>(response: JSONRPCResponse) -> anyhow::Result<T> {
     let value = serde_json::to_value(response.result)?;

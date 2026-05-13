@@ -2,6 +2,7 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
 use app_test_support::DEFAULT_APP_SERVER_TEST_ARGS;
+use app_test_support::clear_host_network_env;
 use app_test_support::create_mock_responses_server_sequence_unchecked;
 use app_test_support::to_response;
 use base64::Engine;
@@ -590,6 +591,7 @@ pub(super) async fn spawn_websocket_server_with_env(
         .env("CODEX_HOME", codex_home)
         .env("RUST_LOG", "warn")
         .env("OTEL_METRIC_EXPORT_INTERVAL", "200");
+    clear_host_network_env(&mut cmd);
     for (key, value) in env_overrides {
         cmd.env(key, value);
     }

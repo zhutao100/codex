@@ -17,6 +17,8 @@ use tracing::error;
 /// let request_id = "req-123";
 ///
 /// codex_core::feedback_tags!(model = "gpt-5", cached = true);
+/// let provider_id = "openai";
+/// let request_id = "req_123";
 /// codex_core::feedback_tags!(provider = provider_id, request_id = request_id);
 /// ```
 #[macro_export]
