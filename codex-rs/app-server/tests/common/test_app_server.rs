@@ -174,6 +174,30 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(25);
 #[cfg(not(windows))]
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
+pub fn clear_host_network_env(cmd: &mut Command) {
+    for key in [
+        "ALL_PROXY",
+        "AZURE_OPENAI_API_KEY",
+        "CODEX_API_KEY",
+        "CODEX_CONNECTORS_TOKEN",
+        "CODEX_OSS_BASE_URL",
+        "CODEX_OSS_PORT",
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+        "NO_PROXY",
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "OPENAI_ORGANIZATION",
+        "OPENAI_PROJECT",
+        "all_proxy",
+        "https_proxy",
+        "http_proxy",
+        "no_proxy",
+    ] {
+        cmd.env_remove(key);
+    }
+}
+
 impl TestAppServer {
     /// Starts building a server with a temporary CODEX_HOME and the standard
     /// automatic test environment.
@@ -291,6 +315,7 @@ impl TestAppServer {
         );
         cmd.env_remove(CODEX_INTERNAL_ORIGINATOR_OVERRIDE_ENV_VAR);
         cmd.args(args);
+        clear_host_network_env(&mut cmd);
 
         for (k, v) in env_overrides {
             match v {
