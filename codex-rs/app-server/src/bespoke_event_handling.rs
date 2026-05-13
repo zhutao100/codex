@@ -42,6 +42,8 @@ use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::McpToolCallError;
 use codex_app_server_protocol::McpToolCallResult;
 use codex_app_server_protocol::McpToolCallStatus;
+use codex_app_server_protocol::ModelReroutedNotification;
+use codex_app_server_protocol::ModelVerificationNotification;
 use codex_app_server_protocol::PatchApplyStatus;
 use codex_app_server_protocol::PatchChangeKind as V2PatchChangeKind;
 use codex_app_server_protocol::PlanDeltaNotification;
@@ -150,6 +152,28 @@ pub(crate) async fn apply_bespoke_event_handling(
             .await;
         }
         EventMsg::TurnContinued(_ev) => {}
+        EventMsg::ModelReroute(event) => {
+            let notification = ModelReroutedNotification {
+                thread_id: conversation_id.to_string(),
+                turn_id: event_turn_id.clone(),
+                from_model: event.from_model,
+                to_model: event.to_model,
+                reason: event.reason.into(),
+            };
+            outgoing
+                .send_server_notification(ServerNotification::ModelRerouted(notification))
+                .await;
+        }
+        EventMsg::ModelVerification(event) => {
+            let notification = ModelVerificationNotification {
+                thread_id: conversation_id.to_string(),
+                turn_id: event_turn_id.clone(),
+                verifications: event.verifications.into_iter().map(Into::into).collect(),
+            };
+            outgoing
+                .send_server_notification(ServerNotification::ModelVerification(notification))
+                .await;
+        }
         EventMsg::ApplyPatchApprovalRequest(ApplyPatchApprovalRequestEvent {
             call_id,
             turn_id,

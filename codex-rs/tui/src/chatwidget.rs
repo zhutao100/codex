@@ -82,6 +82,7 @@ use codex_core::protocol::McpStartupStatus;
 use codex_core::protocol::McpStartupUpdateEvent;
 use codex_core::protocol::McpToolCallBeginEvent;
 use codex_core::protocol::McpToolCallEndEvent;
+use codex_core::protocol::ModelVerification;
 use codex_core::protocol::Op;
 use codex_core::protocol::PatchApplyBeginEvent;
 use codex_core::protocol::ProgressTraceCategory;
@@ -145,6 +146,7 @@ use tokio::task::JoinHandle;
 use tracing::debug;
 
 const DEFAULT_MODEL_DISPLAY_NAME: &str = "loading";
+const TRUSTED_ACCESS_FOR_CYBER_VERIFICATION_WARNING: &str = "Your conversations have multiple flags for possible cybersecurity risk. Responses may take longer because extra safety checks are on. To get authorized for security work, join the Trusted Access for Cyber program: https://chatgpt.com/cyber";
 const PLAN_IMPLEMENTATION_TITLE: &str = "Implement this plan?";
 const PLAN_IMPLEMENTATION_YES: &str = "Yes, implement this plan";
 const PLAN_IMPLEMENTATION_NO: &str = "No, stay in Plan mode";
@@ -1641,9 +1643,24 @@ impl ChatWidget {
         self.maybe_send_next_queued_input();
     }
 
+    fn on_cyber_policy_error(&mut self) {
+        self.finalize_turn();
+        self.add_to_history(history_cell::new_cyber_policy_error_event());
+        self.request_redraw();
+
+        // After an error ends the turn, try sending the next queued input.
+        self.maybe_send_next_queued_input();
+    }
+
     fn on_warning(&mut self, message: impl Into<String>) {
         self.add_to_history(history_cell::new_warning_event(message.into()));
         self.request_redraw();
+    }
+
+    fn on_model_verification(&mut self, verifications: &[ModelVerification]) {
+        if verifications.contains(&ModelVerification::TrustedAccessForCyber) {
+            self.on_warning(TRUSTED_ACCESS_FOR_CYBER_VERIFICATION_WARNING);
+        }
     }
 
     fn on_mcp_startup_update(&mut self, ev: McpStartupUpdateEvent) {
@@ -4443,12 +4460,18 @@ impl ChatWidget {
                 self.on_rate_limit_snapshot(ev.rate_limits);
             }
             EventMsg::Warning(WarningEvent { message }) => self.on_warning(message),
+            EventMsg::ModelReroute(_) => {}
+            EventMsg::ModelVerification(event) => self.on_model_verification(&event.verifications),
             EventMsg::Error(ErrorEvent {
                 message,
                 codex_error_info,
             }) => {
-                if let Some(info) = codex_error_info
-                    && let Some(kind) = rate_limit_error_kind(&info)
+                if codex_error_info
+                    .as_ref()
+                    .is_some_and(|info| matches!(info, CodexErrorInfo::CyberPolicy))
+                {
+                    self.on_cyber_policy_error();
+                } else if let Some(kind) = codex_error_info.as_ref().and_then(rate_limit_error_kind)
                 {
                     match kind {
                         RateLimitErrorKind::ModelCap {

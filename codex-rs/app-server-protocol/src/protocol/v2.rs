@@ -29,6 +29,8 @@ use codex_protocol::protocol::AgentStatus as CoreAgentStatus;
 use codex_protocol::protocol::AskForApproval as CoreAskForApproval;
 use codex_protocol::protocol::CodexErrorInfo as CoreCodexErrorInfo;
 use codex_protocol::protocol::CreditsSnapshot as CoreCreditsSnapshot;
+use codex_protocol::protocol::ModelRerouteReason as CoreModelRerouteReason;
+use codex_protocol::protocol::ModelVerification as CoreModelVerification;
 use codex_protocol::protocol::NetworkAccess as CoreNetworkAccess;
 use codex_protocol::protocol::ProgressTraceCategory as CoreProgressTraceCategory;
 use codex_protocol::protocol::ProgressTraceState as CoreProgressTraceState;
@@ -90,6 +92,7 @@ macro_rules! v2_enum_from_core {
 pub enum CodexErrorInfo {
     ContextWindowExceeded,
     UsageLimitExceeded,
+    CyberPolicy,
     ModelCap {
         model: String,
         reset_after_seconds: Option<u64>,
@@ -130,6 +133,7 @@ impl From<CoreCodexErrorInfo> for CodexErrorInfo {
         match value {
             CoreCodexErrorInfo::ContextWindowExceeded => CodexErrorInfo::ContextWindowExceeded,
             CoreCodexErrorInfo::UsageLimitExceeded => CodexErrorInfo::UsageLimitExceeded,
+            CoreCodexErrorInfo::CyberPolicy => CodexErrorInfo::CyberPolicy,
             CoreCodexErrorInfo::ModelCap {
                 model,
                 reset_after_seconds,
@@ -234,6 +238,19 @@ v2_enum_from_core!(
         NotLoggedIn,
         BearerToken,
         OAuth
+    }
+);
+
+v2_enum_from_core!(
+    pub enum ModelRerouteReason from CoreModelRerouteReason {
+        ServerSelectedDifferentModel,
+        HighRiskCyberActivity
+    }
+);
+
+v2_enum_from_core!(
+    pub enum ModelVerification from CoreModelVerification {
+        TrustedAccessForCyber
     }
 );
 
@@ -2712,6 +2729,26 @@ pub struct TurnProgressTraceNotification {
     pub category: ProgressTraceCategory,
     pub state: ProgressTraceState,
     pub label: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ModelReroutedNotification {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub from_model: String,
+    pub to_model: String,
+    pub reason: ModelRerouteReason,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ModelVerificationNotification {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub verifications: Vec<ModelVerification>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]

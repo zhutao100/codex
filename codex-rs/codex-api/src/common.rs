@@ -3,6 +3,7 @@ use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::config_types::Verbosity as VerbosityConfig;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
+use codex_protocol::protocol::ModelVerification;
 use codex_protocol::protocol::RateLimitSnapshot;
 use codex_protocol::protocol::TokenUsage;
 use futures::Stream;
@@ -14,11 +15,6 @@ use std::pin::Pin;
 use std::task::Context;
 use std::task::Poll;
 use tokio::sync::mpsc;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ModelVerification {
-    TrustedAccessForCyber,
-}
 
 /// Canonical prompt input for Responses endpoints.
 #[derive(Debug, Clone)]

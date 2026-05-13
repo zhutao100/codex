@@ -281,6 +281,8 @@ async fn record_advisory_and_request_continuation(
         .set_pending_post_turn_completion_review_continuation(Some(PendingContinuation {
             source: TurnContinuationSource::PostTurnCompletionReview,
             continued_from_turn_id: Some(reviewed_turn_id.to_string()),
+            model: Some(ctx.model_info.slug.clone()),
+            pause_reason: None,
         }))
         .await;
 }

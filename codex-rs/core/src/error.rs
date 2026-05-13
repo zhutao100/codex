@@ -106,6 +106,9 @@ pub enum CodexErr {
     #[error("{0}")]
     InvalidRequest(String),
 
+    #[error("{message}")]
+    CyberPolicy { message: String },
+
     /// Invalid image.
     #[error("Image poisoning")]
     InvalidImageRequest(),
@@ -198,6 +201,7 @@ impl CodexErr {
             | CodexErr::QuotaExceeded
             | CodexErr::InvalidImageRequest()
             | CodexErr::InvalidRequest(_)
+            | CodexErr::CyberPolicy { .. }
             | CodexErr::RefreshTokenFailed(_)
             | CodexErr::UnsupportedOperation(_)
             | CodexErr::Sandbox(_)
@@ -609,6 +613,7 @@ impl CodexErr {
             CodexErr::UnsupportedOperation(_)
             | CodexErr::ThreadNotFound(_)
             | CodexErr::AgentLimitReached { .. } => CodexErrorInfo::BadRequest,
+            CodexErr::CyberPolicy { .. } => CodexErrorInfo::CyberPolicy,
             CodexErr::Sandbox(_) => CodexErrorInfo::SandboxError,
             _ => CodexErrorInfo::Other,
         }

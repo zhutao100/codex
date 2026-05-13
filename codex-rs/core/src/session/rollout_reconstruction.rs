@@ -59,6 +59,8 @@ impl Session {
                     pending_continuation = Some(PendingContinuation {
                         source: TurnContinuationSource::Interrupted,
                         continued_from_turn_id: None,
+                        model: context_stack.last().map(|item| item.model.clone()),
+                        pause_reason: None,
                     });
                 }
                 RolloutItem::EventMsg(EventMsg::UserMessage(_)) => {
@@ -80,6 +82,10 @@ impl Session {
             history_needs_continuation(&history).then_some(PendingContinuation {
                 source: TurnContinuationSource::Interrupted,
                 continued_from_turn_id: None,
+                model: reference_context_item
+                    .as_ref()
+                    .map(|item| item.model.clone()),
+                pause_reason: None,
             })
         });
 

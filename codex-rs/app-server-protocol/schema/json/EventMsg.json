@@ -175,6 +175,7 @@
           "enum": [
             "context_window_exceeded",
             "usage_limit_exceeded",
+            "cyber_policy",
             "internal_server_error",
             "unauthorized",
             "bad_request",
@@ -499,6 +500,59 @@
             "type"
           ],
           "title": "WarningEventMsg",
+          "type": "object"
+        },
+        {
+          "description": "Model routing changed from the requested model to a different model.",
+          "properties": {
+            "from_model": {
+              "type": "string"
+            },
+            "reason": {
+              "$ref": "#/definitions/ModelRerouteReason"
+            },
+            "to_model": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "model_reroute"
+              ],
+              "title": "ModelRerouteEventMsgType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "from_model",
+            "reason",
+            "to_model",
+            "type"
+          ],
+          "title": "ModelRerouteEventMsg",
+          "type": "object"
+        },
+        {
+          "description": "Backend recommends additional account/model verification for this turn.",
+          "properties": {
+            "type": {
+              "enum": [
+                "model_verification"
+              ],
+              "title": "ModelVerificationEventMsgType",
+              "type": "string"
+            },
+            "verifications": {
+              "items": {
+                "$ref": "#/definitions/ModelVerification"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "type",
+            "verifications"
+          ],
+          "title": "ModelVerificationEventMsg",
           "type": "object"
         },
         {
@@ -3359,6 +3413,19 @@
       ],
       "type": "string"
     },
+    "ModelRerouteReason": {
+      "enum": [
+        "server_selected_different_model",
+        "high_risk_cyber_activity"
+      ],
+      "type": "string"
+    },
+    "ModelVerification": {
+      "enum": [
+        "trusted_access_for_cyber"
+      ],
+      "type": "string"
+    },
     "NetworkAccess": {
       "description": "Represents whether outbound network access is available to the agent.",
       "enum": [
@@ -5248,7 +5315,8 @@
     },
     "TurnPauseReason": {
       "enum": [
-        "user_requested"
+        "user_requested",
+        "server_selected_different_model"
       ],
       "type": "string"
     },
@@ -5532,6 +5600,59 @@
         "type"
       ],
       "title": "WarningEventMsg",
+      "type": "object"
+    },
+    {
+      "description": "Model routing changed from the requested model to a different model.",
+      "properties": {
+        "from_model": {
+          "type": "string"
+        },
+        "reason": {
+          "$ref": "#/definitions/ModelRerouteReason"
+        },
+        "to_model": {
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "model_reroute"
+          ],
+          "title": "ModelRerouteEventMsgType",
+          "type": "string"
+        }
+      },
+      "required": [
+        "from_model",
+        "reason",
+        "to_model",
+        "type"
+      ],
+      "title": "ModelRerouteEventMsg",
+      "type": "object"
+    },
+    {
+      "description": "Backend recommends additional account/model verification for this turn.",
+      "properties": {
+        "type": {
+          "enum": [
+            "model_verification"
+          ],
+          "title": "ModelVerificationEventMsgType",
+          "type": "string"
+        },
+        "verifications": {
+          "items": {
+            "$ref": "#/definitions/ModelVerification"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "type",
+        "verifications"
+      ],
+      "title": "ModelVerificationEventMsg",
       "type": "object"
     },
     {

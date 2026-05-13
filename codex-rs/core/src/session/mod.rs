@@ -154,6 +154,10 @@ use crate::protocol::Event;
 use crate::protocol::EventMsg;
 use crate::protocol::ExecApprovalRequestEvent;
 use crate::protocol::McpServerRefreshConfig;
+use crate::protocol::ModelRerouteEvent;
+use crate::protocol::ModelRerouteReason;
+use crate::protocol::ModelVerification;
+use crate::protocol::ModelVerificationEvent;
 use crate::protocol::Op;
 use crate::protocol::PlanDeltaEvent;
 use crate::protocol::RateLimitSnapshot;
@@ -177,6 +181,7 @@ use crate::protocol::TokenUsageInfo;
 use crate::protocol::TurnContinuationSource;
 use crate::protocol::TurnContinuedEvent;
 use crate::protocol::TurnDiffEvent;
+use crate::protocol::TurnPauseReason;
 use crate::protocol::WarningEvent;
 use crate::rollout::RolloutRecorder;
 use crate::rollout::RolloutRecorderParams;
@@ -266,6 +271,15 @@ use self::turn::is_user_turn_boundary_response_item;
 use self::turn::remove_trailing_turn_aborted_marker;
 use self::turn::trim_incomplete_continuation_tail;
 use self::turn_context::TurnContext;
+
+const CYBER_VERIFY_URL: &str = "https://chatgpt.com/cyber";
+const CYBER_SAFETY_URL: &str = "https://developers.openai.com/codex/concepts/cyber-safety";
+
+fn server_model_mismatch_warning(requested_model: &str, server_model: &str) -> String {
+    format!(
+        "The server used a different model than requested (requested: {requested_model}; used: {server_model}). This can happen for several reasons, including automated routing for potentially high-risk cybersecurity activity. The turn has been paused; use `/continue` to resume with {requested_model}. For trusted security work, apply for access: {CYBER_VERIFY_URL}. Learn more: {CYBER_SAFETY_URL}"
+    )
+}
 
 /// The high-level interface to the Codex system.
 /// It operates as a queue pair where you send submissions and receive events.
@@ -824,6 +838,8 @@ impl Session {
                     pending_event = Some(PendingContinuation {
                         source: TurnContinuationSource::Interrupted,
                         continued_from_turn_id: None,
+                        model: None,
+                        pause_reason: None,
                     });
                 }
                 RolloutItem::EventMsg(EventMsg::ThreadRolledBack(_))
@@ -843,6 +859,8 @@ impl Session {
             history_needs_continuation(reconstructed_history).then_some(PendingContinuation {
                 source: TurnContinuationSource::Interrupted,
                 continued_from_turn_id: None,
+                model: None,
+                pause_reason: None,
             })
         })
     }
@@ -1505,6 +1523,57 @@ impl Session {
         state.record_items(items.iter(), turn_context.truncation_policy);
     }
 
+    pub(crate) async fn maybe_pause_on_server_model_mismatch(
+        self: &Arc<Self>,
+        turn_context: &Arc<TurnContext>,
+        server_model: String,
+    ) -> bool {
+        let requested_model = turn_context.model_info.slug.clone();
+        if server_model.eq_ignore_ascii_case(&requested_model) {
+            info!("server reported model {server_model} (matches requested model)");
+            return false;
+        }
+
+        warn!("server reported model {server_model} while requested model was {requested_model}");
+
+        self.send_event(
+            turn_context,
+            EventMsg::ModelReroute(ModelRerouteEvent {
+                from_model: requested_model.clone(),
+                to_model: server_model.clone(),
+                reason: ModelRerouteReason::ServerSelectedDifferentModel,
+            }),
+        )
+        .await;
+
+        self.send_event(
+            turn_context,
+            EventMsg::Warning(WarningEvent {
+                message: server_model_mismatch_warning(&requested_model, &server_model),
+            }),
+        )
+        .await;
+        self.pause_current_task_from_self(
+            turn_context,
+            TurnPauseReason::ServerSelectedDifferentModel,
+            Some(requested_model),
+        )
+        .await;
+        true
+    }
+
+    pub(crate) async fn emit_model_verification(
+        self: &Arc<Self>,
+        turn_context: &Arc<TurnContext>,
+        verifications: Vec<ModelVerification>,
+    ) {
+        self.send_event(
+            turn_context,
+            EventMsg::ModelVerification(ModelVerificationEvent { verifications }),
+        )
+        .await;
+    }
+
     pub(crate) async fn record_model_warning(&self, message: impl Into<String>, ctx: &TurnContext) {
         self.services
             .otel_manager
@@ -2042,6 +2111,26 @@ impl Session {
 
     pub(crate) async fn clear_pending_continuation(&self) {
         self.set_pending_continuation(None).await;
+    }
+
+    pub(crate) async fn pending_pause_reason_for_turn(
+        &self,
+        turn_id: &str,
+    ) -> Option<TurnPauseReason> {
+        let state = self.state.lock().await;
+        match state.pending_continuation.as_ref() {
+            Some(PendingContinuation {
+                source: TurnContinuationSource::Paused,
+                continued_from_turn_id: Some(paused_turn_id),
+                pause_reason,
+                ..
+            }) if paused_turn_id == turn_id => Some(
+                pause_reason
+                    .clone()
+                    .unwrap_or(TurnPauseReason::UserRequested),
+            ),
+            Some(_) | None => None,
+        }
     }
 
     pub(crate) async fn submit_internal_op(&self, id: String, op: Op) {

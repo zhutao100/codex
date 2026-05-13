@@ -27,6 +27,7 @@
           "enum": [
             "contextWindowExceeded",
             "usageLimitExceeded",
+            "cyberPolicy",
             "internalServerError",
             "unauthorized",
             "badRequest",

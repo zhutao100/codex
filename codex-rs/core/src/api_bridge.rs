@@ -7,6 +7,7 @@ use codex_api::rate_limits::parse_promo_message;
 use codex_api::rate_limits::parse_rate_limit;
 use http::HeaderMap;
 use serde::Deserialize;
+use serde_json::Value;
 
 use crate::auth::AuthMode;
 use crate::auth::CodexAuth;
@@ -33,7 +34,7 @@ pub(crate) fn map_api_error(err: ApiError) -> CodexErr {
             request_id: None,
         }),
         ApiError::InvalidRequest { message } => CodexErr::InvalidRequest(message),
-        ApiError::CyberPolicy { message } => CodexErr::InvalidRequest(message),
+        ApiError::CyberPolicy { message } => CodexErr::CyberPolicy { message },
         ApiError::ServerOverloaded => CodexErr::InternalServerError,
         ApiError::Transport(transport) => match transport {
             TransportError::Http {
@@ -45,7 +46,9 @@ pub(crate) fn map_api_error(err: ApiError) -> CodexErr {
                 let body_text = body.unwrap_or_default();
 
                 if status == http::StatusCode::BAD_REQUEST {
-                    if body_text
+                    if let Some(message) = cyber_policy_message_from_body(&body_text) {
+                        CodexErr::CyberPolicy { message }
+                    } else if body_text
                         .contains("The image data you provided does not represent a valid image")
                     {
                         CodexErr::InvalidImageRequest()
@@ -123,6 +126,26 @@ const MODEL_CAP_RESET_AFTER_HEADER: &str = "x-codex-model-cap-reset-after-second
 const REQUEST_ID_HEADER: &str = "x-request-id";
 const OAI_REQUEST_ID_HEADER: &str = "x-oai-request-id";
 const CF_RAY_HEADER: &str = "cf-ray";
+const CYBER_POLICY_ERROR_CODE: &str = "cyber_policy";
+const CYBER_POLICY_FALLBACK_MESSAGE: &str =
+    "This request has been flagged for possible cybersecurity risk.";
+
+fn cyber_policy_message_from_body(body_text: &str) -> Option<String> {
+    let parsed = serde_json::from_str::<Value>(body_text).ok()?;
+    let error = parsed.get("error")?;
+    if error.get("code").and_then(Value::as_str) != Some(CYBER_POLICY_ERROR_CODE) {
+        return None;
+    }
+
+    Some(
+        error
+            .get("message")
+            .and_then(Value::as_str)
+            .filter(|message| !message.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| CYBER_POLICY_FALLBACK_MESSAGE.to_string()),
+    )
+}
 
 #[cfg(test)]
 mod tests {
@@ -158,6 +181,71 @@ mod tests {
         };
         assert_eq!(model_cap.model, "boomslang");
         assert_eq!(model_cap.reset_after_seconds, Some(120));
+    }
+
+    #[test]
+    fn map_api_error_maps_cyber_policy() {
+        let err = map_api_error(ApiError::CyberPolicy {
+            message: "This request was flagged.".to_string(),
+        });
+
+        let CodexErr::CyberPolicy { message } = err else {
+            panic!("expected CodexErr::CyberPolicy, got {err:?}");
+        };
+        assert_eq!(message, "This request was flagged.");
+    }
+
+    #[test]
+    fn map_api_error_maps_cyber_policy_from_400_body() {
+        let body = serde_json::json!({
+            "error": {
+                "message": "This request has been flagged for potentially high-risk cyber activity.",
+                "type": "invalid_request",
+                "param": null,
+                "code": "cyber_policy"
+            }
+        })
+        .to_string();
+
+        let err = map_api_error(ApiError::Transport(TransportError::Http {
+            status: StatusCode::BAD_REQUEST,
+            url: Some("http://example.com/v1/responses".to_string()),
+            headers: None,
+            body: Some(body),
+        }));
+
+        let CodexErr::CyberPolicy { message } = err else {
+            panic!("expected CodexErr::CyberPolicy, got {err:?}");
+        };
+        assert_eq!(
+            message,
+            "This request has been flagged for potentially high-risk cyber activity."
+        );
+    }
+
+    #[test]
+    fn map_api_error_uses_cyber_policy_fallback_for_missing_message() {
+        let body = serde_json::json!({
+            "error": {
+                "code": "cyber_policy"
+            }
+        })
+        .to_string();
+
+        let err = map_api_error(ApiError::Transport(TransportError::Http {
+            status: StatusCode::BAD_REQUEST,
+            url: Some("http://example.com/v1/responses".to_string()),
+            headers: None,
+            body: Some(body),
+        }));
+
+        let CodexErr::CyberPolicy { message } = err else {
+            panic!("expected CodexErr::CyberPolicy, got {err:?}");
+        };
+        assert_eq!(
+            message,
+            "This request has been flagged for possible cybersecurity risk."
+        );
     }
 
     #[serial(env_vars)]

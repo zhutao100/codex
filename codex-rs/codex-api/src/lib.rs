@@ -12,6 +12,7 @@ pub use crate::requests::headers::build_conversation_headers;
 pub use codex_client::RequestTelemetry;
 pub use codex_client::ReqwestTransport;
 pub use codex_client::TransportError;
+pub use codex_protocol::protocol::ModelVerification;
 
 pub use crate::auth::AuthProvider;
 pub use crate::common::CompactionInput;
@@ -19,7 +20,6 @@ pub use crate::common::MemoryTrace;
 pub use crate::common::MemoryTraceMetadata;
 pub use crate::common::MemoryTraceSummarizeInput;
 pub use crate::common::MemoryTraceSummaryOutput;
-pub use crate::common::ModelVerification;
 pub use crate::common::Prompt;
 pub use crate::common::ResponseAppendWsRequest;
 pub use crate::common::ResponseCreateWsRequest;

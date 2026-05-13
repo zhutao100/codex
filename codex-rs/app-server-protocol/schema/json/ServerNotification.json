@@ -308,6 +308,7 @@
           "enum": [
             "contextWindowExceeded",
             "usageLimitExceeded",
+            "cyberPolicy",
             "internalServerError",
             "unauthorized",
             "badRequest",
@@ -450,6 +451,7 @@
           "enum": [
             "context_window_exceeded",
             "usage_limit_exceeded",
+            "cyber_policy",
             "internal_server_error",
             "unauthorized",
             "bad_request",
@@ -1077,6 +1079,59 @@
             "type"
           ],
           "title": "WarningEventMsg",
+          "type": "object"
+        },
+        {
+          "description": "Model routing changed from the requested model to a different model.",
+          "properties": {
+            "from_model": {
+              "type": "string"
+            },
+            "reason": {
+              "$ref": "#/definitions/ModelRerouteReason2"
+            },
+            "to_model": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "model_reroute"
+              ],
+              "title": "ModelRerouteEventMsgType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "from_model",
+            "reason",
+            "to_model",
+            "type"
+          ],
+          "title": "ModelRerouteEventMsg",
+          "type": "object"
+        },
+        {
+          "description": "Backend recommends additional account/model verification for this turn.",
+          "properties": {
+            "type": {
+              "enum": [
+                "model_verification"
+              ],
+              "title": "ModelVerificationEventMsgType",
+              "type": "string"
+            },
+            "verifications": {
+              "items": {
+                "$ref": "#/definitions/ModelVerification2"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "type",
+            "verifications"
+          ],
+          "title": "ModelVerificationEventMsg",
           "type": "object"
         },
         {
@@ -4137,6 +4192,81 @@
         "default"
       ],
       "type": "string"
+    },
+    "ModelRerouteReason": {
+      "enum": [
+        "serverSelectedDifferentModel",
+        "highRiskCyberActivity"
+      ],
+      "type": "string"
+    },
+    "ModelRerouteReason2": {
+      "enum": [
+        "server_selected_different_model",
+        "high_risk_cyber_activity"
+      ],
+      "type": "string"
+    },
+    "ModelReroutedNotification": {
+      "properties": {
+        "fromModel": {
+          "type": "string"
+        },
+        "reason": {
+          "$ref": "#/definitions/ModelRerouteReason"
+        },
+        "threadId": {
+          "type": "string"
+        },
+        "toModel": {
+          "type": "string"
+        },
+        "turnId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "fromModel",
+        "reason",
+        "threadId",
+        "toModel",
+        "turnId"
+      ],
+      "type": "object"
+    },
+    "ModelVerification": {
+      "enum": [
+        "trustedAccessForCyber"
+      ],
+      "type": "string"
+    },
+    "ModelVerification2": {
+      "enum": [
+        "trusted_access_for_cyber"
+      ],
+      "type": "string"
+    },
+    "ModelVerificationNotification": {
+      "properties": {
+        "threadId": {
+          "type": "string"
+        },
+        "turnId": {
+          "type": "string"
+        },
+        "verifications": {
+          "items": {
+            "$ref": "#/definitions/ModelVerification"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "threadId",
+        "turnId",
+        "verifications"
+      ],
+      "type": "object"
     },
     "NetworkAccess": {
       "description": "Represents whether outbound network access is available to the agent.",
@@ -7232,7 +7362,8 @@
     },
     "TurnPauseReason": {
       "enum": [
-        "user_requested"
+        "user_requested",
+        "server_selected_different_model"
       ],
       "type": "string"
     },
@@ -7994,6 +8125,46 @@
         "params"
       ],
       "title": "Turn/progressTraceNotification",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "method": {
+          "enum": [
+            "model/rerouted"
+          ],
+          "title": "Model/reroutedNotificationMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/ModelReroutedNotification"
+        }
+      },
+      "required": [
+        "method",
+        "params"
+      ],
+      "title": "Model/reroutedNotification",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "method": {
+          "enum": [
+            "model/verification"
+          ],
+          "title": "Model/verificationNotificationMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/ModelVerificationNotification"
+        }
+      },
+      "required": [
+        "method",
+        "params"
+      ],
+      "title": "Model/verificationNotification",
       "type": "object"
     },
     {

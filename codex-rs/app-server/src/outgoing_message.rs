@@ -250,6 +250,8 @@ fn should_publish_to_codexd(notification: &ServerNotification) -> bool {
             | ServerNotification::TurnDiffUpdated(_)
             | ServerNotification::TurnPlanUpdated(_)
             | ServerNotification::TurnProgressTrace(_)
+            | ServerNotification::ModelRerouted(_)
+            | ServerNotification::ModelVerification(_)
             | ServerNotification::ItemStarted(_)
             | ServerNotification::ItemCompleted(_)
             | ServerNotification::AgentMessageDelta(_)

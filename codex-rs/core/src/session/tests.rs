@@ -291,6 +291,8 @@ async fn rollout_reconstruction_clears_reference_context_item_after_legacy_compa
             pending_continuation: Some(PendingContinuation {
                 source: TurnContinuationSource::Interrupted,
                 continued_from_turn_id: None,
+                model: None,
+                pause_reason: None,
             }),
         }
     );
@@ -319,11 +321,13 @@ async fn rollout_reconstruction_restores_reference_context_item_after_replacemen
             history: replacement_history,
             reference_context_item: Some(context_item.clone()),
             previous_turn_settings: Some(PreviousTurnSettings {
-                model: context_item.model
+                model: context_item.model.clone()
             }),
             pending_continuation: Some(PendingContinuation {
                 source: TurnContinuationSource::Interrupted,
                 continued_from_turn_id: None,
+                model: Some(context_item.model.clone()),
+                pause_reason: None,
             }),
         }
     );
@@ -422,6 +426,8 @@ fn pending_continuation_from_rollout_uses_incomplete_history_without_pause_event
         Some(PendingContinuation {
             source: TurnContinuationSource::Interrupted,
             continued_from_turn_id: None,
+            model: None,
+            pause_reason: None,
         }),
         Session::pending_continuation_from_rollout(&rollout_items, &reconstructed_history)
     );

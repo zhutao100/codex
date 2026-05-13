@@ -4,6 +4,7 @@ use crate::truncate::approx_token_count;
 use crate::truncate::truncate_function_output_items_with_policy;
 use crate::truncate::truncate_text;
 use codex_protocol::models::FunctionCallOutputBody;
+use std::sync::atomic::Ordering;
 
 #[derive(Clone, Copy, Debug, Default)]
 enum PreCompactNotesState {
@@ -2119,10 +2120,29 @@ async fn try_run_sampling_request(
             ResponseEvent::ServerReasoningIncluded(included) => {
                 sess.set_server_reasoning_included(included).await;
             }
-            ResponseEvent::ServerModel(model) => {
-                debug!(server_model = %model, "server reported effective model");
+            ResponseEvent::ServerModel(server_model) => {
+                if !turn_context
+                    .server_model_warning_emitted
+                    .load(Ordering::Relaxed)
+                    && sess
+                        .maybe_pause_on_server_model_mismatch(&turn_context, server_model)
+                        .await
+                {
+                    turn_context
+                        .server_model_warning_emitted
+                        .store(true, Ordering::Relaxed);
+                    break Err(CodexErr::TurnAborted);
+                }
             }
-            ResponseEvent::ModelVerifications(_verifications) => {}
+            ResponseEvent::ModelVerifications(verifications) => {
+                if !turn_context
+                    .model_verification_emitted
+                    .swap(true, Ordering::Relaxed)
+                {
+                    sess.emit_model_verification(&turn_context, verifications)
+                        .await;
+                }
+            }
             ResponseEvent::ToolCallInputDelta { .. } => {}
             ResponseEvent::RateLimits(snapshot) => {
                 // Update internal state with latest rate limits, but defer sending until

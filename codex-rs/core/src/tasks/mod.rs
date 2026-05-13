@@ -230,6 +230,7 @@ impl Session {
 
         let cancellation_token = CancellationToken::new();
         let done = Arc::new(Notify::new());
+        let (registered_tx, registered_rx) = tokio::sync::oneshot::channel::<()>();
 
         let done_clone = Arc::clone(&done);
         let handle = {
@@ -240,6 +241,7 @@ impl Session {
             let session_span = Span::current();
             tokio::spawn(
                 async move {
+                    let _ = registered_rx.await;
                     let ctx_for_finish = Arc::clone(&ctx);
                     let last_agent_message = task_for_run
                         .run(
@@ -278,6 +280,7 @@ impl Session {
             _timer: timer,
         };
         self.register_new_active_task(running_task).await;
+        let _ = registered_tx.send(());
     }
 
     pub async fn abort_all_tasks(self: &Arc<Self>, reason: TurnAbortReason) {
@@ -286,6 +289,33 @@ impl Session {
 
     pub async fn pause_all_tasks(self: &Arc<Self>, reason: TurnPauseReason) {
         self.stop_all_tasks(TaskStopReason::Pause(reason)).await;
+    }
+
+    pub(crate) async fn pause_current_task_from_self(
+        self: &Arc<Self>,
+        turn_context: &Arc<TurnContext>,
+        reason: TurnPauseReason,
+        model: Option<String>,
+    ) {
+        let sub_id = turn_context.sub_id.clone();
+        let turn_state = {
+            let active = self.active_turn.lock().await;
+            let Some(active_turn) = active.as_ref() else {
+                return;
+            };
+            if !active_turn.tasks.contains_key(&sub_id) {
+                return;
+            }
+            Arc::clone(&active_turn.turn_state)
+        };
+        turn_state.lock().await.clear_pending();
+        self.set_pending_continuation(Some(PendingContinuation {
+            source: TurnContinuationSource::Paused,
+            continued_from_turn_id: Some(sub_id.clone()),
+            model,
+            pause_reason: Some(reason),
+        }))
+        .await;
     }
 
     async fn stop_all_tasks(self: &Arc<Self>, reason: TaskStopReason) {
@@ -319,7 +349,10 @@ impl Session {
             *active = None;
         }
         drop(active);
-        if !pending_input.is_empty() {
+        let paused_current_turn_reason = self
+            .pending_pause_reason_for_turn(turn_context.sub_id.as_str())
+            .await;
+        if !pending_input.is_empty() && paused_current_turn_reason.is_none() {
             let pending_response_items = pending_input
                 .into_iter()
                 .map(ResponseItem::from)
@@ -329,6 +362,18 @@ impl Session {
         }
         if should_close_processes {
             self.close_unified_exec_processes().await;
+        }
+        if let Some(reason) = paused_current_turn_reason {
+            let sub_id = turn_context.sub_id.clone();
+            self.send_event_raw(Event {
+                id: sub_id.clone(),
+                msg: EventMsg::TurnPaused(TurnPausedEvent {
+                    turn_id: sub_id,
+                    reason,
+                }),
+            })
+            .await;
+            return;
         }
         self.clear_pending_continuation().await;
         if task_kind == TaskKind::Regular {
@@ -564,6 +609,8 @@ impl Session {
                 self.set_pending_continuation(Some(PendingContinuation {
                     source: TurnContinuationSource::Interrupted,
                     continued_from_turn_id: Some(sub_id.clone()),
+                    model: Some(task.turn_context.model_info.slug.clone()),
+                    pause_reason: None,
                 }))
                 .await;
 
@@ -600,6 +647,8 @@ impl Session {
                 self.set_pending_continuation(Some(PendingContinuation {
                     source: TurnContinuationSource::Paused,
                     continued_from_turn_id: Some(sub_id.clone()),
+                    model: Some(task.turn_context.model_info.slug.clone()),
+                    pause_reason: Some(reason.clone()),
                 }))
                 .await;
                 self.send_event_raw_flushed(Event {

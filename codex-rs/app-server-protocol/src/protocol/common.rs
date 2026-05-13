@@ -704,6 +704,8 @@ server_notification_definitions! {
     TurnDiffUpdated => "turn/diff/updated" (v2::TurnDiffUpdatedNotification),
     TurnPlanUpdated => "turn/plan/updated" (v2::TurnPlanUpdatedNotification),
     TurnProgressTrace => "turn/progressTrace" (v2::TurnProgressTraceNotification),
+    ModelRerouted => "model/rerouted" (v2::ModelReroutedNotification),
+    ModelVerification => "model/verification" (v2::ModelVerificationNotification),
     ItemStarted => "item/started" (v2::ItemStartedNotification),
     ItemCompleted => "item/completed" (v2::ItemCompletedNotification),
     /// This event is internal-only. Used by Codex Cloud.

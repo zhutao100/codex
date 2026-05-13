@@ -10,6 +10,7 @@ use crate::protocol::RateLimitSnapshot;
 use crate::protocol::TokenUsage;
 use crate::protocol::TokenUsageInfo;
 use crate::protocol::TurnContinuationSource;
+use crate::protocol::TurnPauseReason;
 use crate::session::session::SessionConfiguration;
 use crate::truncate::TruncationPolicy;
 
@@ -17,6 +18,8 @@ use crate::truncate::TruncationPolicy;
 pub(crate) struct PendingContinuation {
     pub(crate) source: TurnContinuationSource,
     pub(crate) continued_from_turn_id: Option<String>,
+    pub(crate) model: Option<String>,
+    pub(crate) pause_reason: Option<TurnPauseReason>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

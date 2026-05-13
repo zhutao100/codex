@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::atomic::AtomicBool;
 
 /// Spawn a review thread using the given prompt.
 pub(super) async fn spawn_review_thread(
@@ -100,6 +101,8 @@ pub(super) async fn spawn_review_thread(
         dynamic_tools: parent_turn_context.dynamic_tools.clone(),
         truncation_policy: model_info.truncation_policy.into(),
         turn_metadata_header: parent_turn_context.turn_metadata_header.clone(),
+        server_model_warning_emitted: AtomicBool::new(false),
+        model_verification_emitted: AtomicBool::new(false),
     };
 
     // Seed the child task with the review prompt as the initial user message.

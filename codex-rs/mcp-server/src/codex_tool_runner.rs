@@ -336,6 +336,8 @@ async fn run_codex_tool_session_inner(
                     | EventMsg::RuntimeContextDeactivated(_)
                     | EventMsg::AgentReasoning(_)
                     | EventMsg::AgentReasoningSectionBreak(_)
+                    | EventMsg::ModelReroute(_)
+                    | EventMsg::ModelVerification(_)
                     | EventMsg::McpToolCallBegin(_)
                     | EventMsg::McpToolCallEnd(_)
                     | EventMsg::McpListToolsResponse(_)

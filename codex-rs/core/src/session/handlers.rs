@@ -227,7 +227,31 @@ pub async fn continue_last(sess: &Arc<Session>, sub_id: String) {
         return;
     };
 
-    let turn_context = sess.new_default_turn_with_sub_id(sub_id).await;
+    let continuation_model = checkpoint.model.clone();
+    let turn_context = if let Some(model) = continuation_model {
+        let collaboration_mode = {
+            let state = sess.state.lock().await;
+            state
+                .session_configuration
+                .collaboration_mode
+                .with_updates(Some(model), None, None)
+        };
+        let Ok(turn_context) = sess
+            .new_turn_with_sub_id(
+                sub_id,
+                SessionSettingsUpdate {
+                    collaboration_mode: Some(collaboration_mode),
+                    ..Default::default()
+                },
+            )
+            .await
+        else {
+            return;
+        };
+        turn_context
+    } else {
+        sess.new_default_turn_with_sub_id(sub_id).await
+    };
     sess.spawn_task(
         Arc::clone(&turn_context),
         Vec::new(),
