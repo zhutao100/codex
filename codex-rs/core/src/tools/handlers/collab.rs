@@ -592,6 +592,7 @@ fn build_agent_spawn_config(
     let mut config = (*base_config).clone();
     config.base_instructions = Some(base_instructions.text.clone());
     config.model = Some(turn.model_info.slug.clone());
+    config.model_provider_id = turn.model_provider_id.clone();
     config.model_provider = turn.provider.clone();
     config.model_reasoning_effort = turn.reasoning_effort;
     config.model_reasoning_summary = turn.reasoning_summary;
@@ -1186,6 +1187,7 @@ mod tests {
         let mut expected = (*turn.config).clone();
         expected.base_instructions = Some(base_instructions.text);
         expected.model = Some(turn.model_info.slug.clone());
+        expected.model_provider_id = turn.model_provider_id.clone();
         expected.model_provider = turn.provider.clone();
         expected.model_reasoning_effort = turn.reasoning_effort;
         expected.model_reasoning_summary = turn.reasoning_summary;

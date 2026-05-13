@@ -125,7 +125,8 @@ async fn run_remote_compact_task_inner_impl(
     let mut new_history = sess
         .services
         .model_client
-        .compact_conversation_history(
+        .compact_conversation_history_with_provider(
+            &turn_context.provider,
             &prompt,
             &turn_context.model_info,
             &turn_context.otel_manager,

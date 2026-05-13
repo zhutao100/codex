@@ -898,6 +898,7 @@ mod tests {
         config.model_overlay = Some(ModelOverlay {
             models: vec![ModelOverlayEntry {
                 slug: "private-model".to_string(),
+                model_provider: None,
                 patch: ModelInfoPatch {
                     context_window: Some(Some(1_048_576)),
                     auto_compact_token_limit: Some(Some(950_000)),
@@ -923,6 +924,7 @@ mod tests {
         config.model_overlay = Some(ModelOverlay {
             models: vec![ModelOverlayEntry {
                 slug: "gpt-5.4".to_string(),
+                model_provider: None,
                 patch: ModelInfoPatch {
                     context_window: Some(Some(1_000_000)),
                     model_messages: Some(ModelMessagesPatch {
@@ -978,6 +980,7 @@ mod tests {
             },
             models: vec![ModelOverlayEntry {
                 slug: "gpt-5.4".to_string(),
+                model_provider: None,
                 patch: ModelInfoPatch {
                     context_window: Some(Some(512_000)),
                     ..Default::default()
@@ -1004,6 +1007,7 @@ mod tests {
         config.model_overlay = Some(ModelOverlay {
             models: vec![ModelOverlayEntry {
                 slug: "gpt-5.4".to_string(),
+                model_provider: None,
                 patch: ModelInfoPatch::default(),
                 final_instruction_override: Some("patched gpt-5.4".to_string()),
             }],
@@ -1049,6 +1053,7 @@ mod tests {
         config.model_overlay = Some(ModelOverlay {
             models: vec![ModelOverlayEntry {
                 slug: "private-model".to_string(),
+                model_provider: None,
                 patch: ModelInfoPatch {
                     display_name: Some("Private Model".to_string()),
                     visibility: Some(codex_protocol::openai_models::ModelVisibility::List),
@@ -1092,6 +1097,7 @@ mod tests {
         config.model_overlay = Some(ModelOverlay {
             models: vec![ModelOverlayEntry {
                 slug: "private-model".to_string(),
+                model_provider: None,
                 patch: ModelInfoPatch {
                     visibility: Some(codex_protocol::openai_models::ModelVisibility::List),
                     ..Default::default()

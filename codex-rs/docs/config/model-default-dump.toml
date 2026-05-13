@@ -257,9 +257,11 @@
 # Default: no entries. Each entry requires `slug`; every patch field accepted
 # under `[model_overlay]` is also accepted under each `[[model_overlay.models]]`
 # entry, including `model_messages` and `final_instruction_override`.
+# `model_provider` optionally binds this slug to a configured provider id.
 #
 # [[model_overlay.models]]
 # slug = "custom-model"
+# model_provider = "openai"
 # display_name = "Custom Model"
 # visibility = "list"
 # context_window = 163840

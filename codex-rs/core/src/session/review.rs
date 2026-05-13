@@ -52,6 +52,7 @@ pub(super) async fn spawn_review_thread(
     });
 
     let review_prompt = resolved.prompt.clone();
+    let model_provider_id = per_turn_config.model_provider_id.clone();
     let provider = per_turn_config.model_provider.clone();
     let auth_manager = parent_turn_context.auth_manager.clone();
     let model_info = review_model_info.clone();
@@ -76,6 +77,7 @@ pub(super) async fn spawn_review_thread(
         auth_manager: auth_manager_for_context,
         model_info: model_info.clone(),
         otel_manager: otel_manager_for_context,
+        model_provider_id,
         provider: provider_for_context,
         reasoning_effort,
         reasoning_summary,

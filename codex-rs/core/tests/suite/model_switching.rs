@@ -1,4 +1,6 @@
 use anyhow::Result;
+use codex_core::ModelProviderInfo;
+use codex_core::WireApi;
 use codex_core::compact::SUMMARIZATION_PROMPT;
 use codex_core::config::types::Personality;
 use codex_core::features::Feature;
@@ -14,6 +16,7 @@ use codex_protocol::user_input::UserInput;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed_with_tokens;
 use core_test_support::responses::mount_compact_json_once;
+use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::sse_completed;
@@ -22,6 +25,25 @@ use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
+
+fn responses_provider(name: &str, base_url: String) -> ModelProviderInfo {
+    ModelProviderInfo {
+        name: name.to_string(),
+        base_url: Some(base_url),
+        env_key: None,
+        env_key_instructions: None,
+        experimental_bearer_token: None,
+        wire_api: WireApi::Responses,
+        query_params: None,
+        http_headers: None,
+        env_http_headers: None,
+        request_max_retries: Some(0),
+        stream_max_retries: Some(0),
+        stream_idle_timeout_ms: Some(5_000),
+        requires_openai_auth: false,
+        supports_websockets: false,
+    }
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn model_change_appends_model_instructions_developer_message() -> Result<()> {
@@ -111,6 +133,215 @@ async fn model_change_appends_model_instructions_developer_message() -> Result<(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn overlay_model_provider_routes_initial_model_to_provider() -> Result<()> {
+    let primary_server = start_mock_server().await;
+    let secondary_server = start_mock_server().await;
+    let secondary_mock =
+        mount_sse_once(&secondary_server, sse_completed("secondary-initial")).await;
+
+    let custom_model = "deepseek-v4-pro";
+    let secondary_base_url = format!("{}/v1", secondary_server.uri());
+    let mut builder = test_codex()
+        .with_model(custom_model)
+        .with_config(move |config| {
+            config.model_providers.insert(
+                "deepseek".to_string(),
+                responses_provider("DeepSeek", secondary_base_url),
+            );
+            config.model_overlay = Some(ModelOverlay {
+                models: vec![ModelOverlayEntry {
+                    slug: custom_model.to_string(),
+                    model_provider: Some("deepseek".to_string()),
+                    patch: ModelInfoPatch {
+                        display_name: Some("DeepSeek V4 Pro".to_string()),
+                        visibility: Some(codex_protocol::openai_models::ModelVisibility::List),
+                        ..Default::default()
+                    },
+                    final_instruction_override: None,
+                }],
+                ..Default::default()
+            });
+        });
+    let test = builder.build(&primary_server).await?;
+    assert_eq!(test.session_configured.model, custom_model);
+    assert_eq!(test.session_configured.model_provider_id, "deepseek");
+
+    test.codex
+        .submit(Op::UserTurn {
+            items: vec![UserInput::Text {
+                text: "custom initial turn".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            cwd: test.cwd_path().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            model: custom_model.to_string(),
+            effort: test.config.model_reasoning_effort,
+            summary: ReasoningSummary::Auto,
+            collaboration_mode: None,
+            personality: None,
+            service_tier: None,
+        })
+        .await?;
+    wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let secondary_request = secondary_mock.single_request();
+    assert_eq!(
+        secondary_request.body_json()["model"].as_str(),
+        Some(custom_model)
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn overlay_model_provider_routes_model_switch_between_providers() -> Result<()> {
+    let primary_server = start_mock_server().await;
+    let secondary_server = start_mock_server().await;
+    let primary_mock = mount_sse_sequence(
+        &primary_server,
+        vec![sse_completed("primary-1"), sse_completed("primary-2")],
+    )
+    .await;
+    let secondary_mock = mount_sse_once(&secondary_server, sse_completed("secondary-1")).await;
+
+    let custom_model = "deepseek-v4-pro";
+    let secondary_base_url = format!("{}/v1", secondary_server.uri());
+    let mut builder = test_codex()
+        .with_model("gpt-4.1")
+        .with_config(move |config| {
+            config.model_providers.insert(
+                "deepseek".to_string(),
+                responses_provider("DeepSeek", secondary_base_url),
+            );
+            config.model_overlay = Some(ModelOverlay {
+                models: vec![ModelOverlayEntry {
+                    slug: custom_model.to_string(),
+                    model_provider: Some("deepseek".to_string()),
+                    patch: ModelInfoPatch {
+                        display_name: Some("DeepSeek V4 Pro".to_string()),
+                        visibility: Some(codex_protocol::openai_models::ModelVisibility::List),
+                        ..Default::default()
+                    },
+                    final_instruction_override: None,
+                }],
+                ..Default::default()
+            });
+        });
+    let test = builder.build(&primary_server).await?;
+    assert_eq!(test.session_configured.model, "gpt-4.1");
+    assert_eq!(test.session_configured.model_provider_id, "openai");
+
+    test.codex
+        .submit(Op::UserTurn {
+            items: vec![UserInput::Text {
+                text: "first primary turn".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            cwd: test.cwd_path().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            model: "gpt-4.1".to_string(),
+            effort: test.config.model_reasoning_effort,
+            summary: ReasoningSummary::Auto,
+            collaboration_mode: None,
+            personality: None,
+            service_tier: None,
+        })
+        .await?;
+    wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    test.codex
+        .submit(Op::OverrideTurnContext {
+            cwd: None,
+            approval_policy: None,
+            sandbox_policy: None,
+            windows_sandbox_level: None,
+            model: Some(custom_model.to_string()),
+            effort: None,
+            summary: None,
+            collaboration_mode: None,
+            personality: None,
+            service_tier: None,
+        })
+        .await?;
+    test.codex
+        .submit(Op::UserTurn {
+            items: vec![UserInput::Text {
+                text: "custom provider turn".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            cwd: test.cwd_path().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            model: custom_model.to_string(),
+            effort: test.config.model_reasoning_effort,
+            summary: ReasoningSummary::Auto,
+            collaboration_mode: None,
+            personality: None,
+            service_tier: None,
+        })
+        .await?;
+    wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    test.codex
+        .submit(Op::OverrideTurnContext {
+            cwd: None,
+            approval_policy: None,
+            sandbox_policy: None,
+            windows_sandbox_level: None,
+            model: Some("gpt-4.1".to_string()),
+            effort: None,
+            summary: None,
+            collaboration_mode: None,
+            personality: None,
+            service_tier: None,
+        })
+        .await?;
+    test.codex
+        .submit(Op::UserTurn {
+            items: vec![UserInput::Text {
+                text: "second primary turn".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            cwd: test.cwd_path().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            model: "gpt-4.1".to_string(),
+            effort: test.config.model_reasoning_effort,
+            summary: ReasoningSummary::Auto,
+            collaboration_mode: None,
+            personality: None,
+            service_tier: None,
+        })
+        .await?;
+    wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let primary_requests = primary_mock.requests();
+    assert_eq!(primary_requests.len(), 2);
+    assert_eq!(
+        primary_requests[0].body_json()["model"].as_str(),
+        Some("gpt-4.1")
+    );
+    assert_eq!(
+        primary_requests[1].body_json()["model"].as_str(),
+        Some("gpt-4.1")
+    );
+
+    let secondary_request = secondary_mock.single_request();
+    assert_eq!(
+        secondary_request.body_json()["model"].as_str(),
+        Some(custom_model)
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn model_downshift_uses_previous_model_for_pre_sampling_compaction() -> Result<()> {
     let server = start_mock_server().await;
     let resp_mock = mount_sse_sequence(
@@ -151,6 +382,7 @@ async fn model_downshift_uses_previous_model_for_pre_sampling_compaction() -> Re
                 models: vec![
                     ModelOverlayEntry {
                         slug: large_model.to_string(),
+                        model_provider: None,
                         patch: ModelInfoPatch {
                             context_window: Some(Some(20_000)),
                             auto_compact_token_limit: Some(Some(18_000)),
@@ -160,6 +392,7 @@ async fn model_downshift_uses_previous_model_for_pre_sampling_compaction() -> Re
                     },
                     ModelOverlayEntry {
                         slug: small_model.to_string(),
+                        model_provider: None,
                         patch: ModelInfoPatch {
                             context_window: Some(Some(12_000)),
                             auto_compact_token_limit: Some(Some(9_000)),

@@ -6,6 +6,9 @@ use codex_core::REVIEW_PROMPT;
 use codex_core::ResponseItem;
 use codex_core::WireApi;
 use codex_core::config::Config;
+use codex_core::models_manager::overlay::ModelInfoPatch;
+use codex_core::models_manager::overlay::ModelOverlay;
+use codex_core::models_manager::overlay::ModelOverlayEntry;
 use codex_core::protocol::ENVIRONMENT_CONTEXT_OPEN_TAG;
 use codex_core::protocol::EventMsg;
 use codex_core::protocol::ExitedReviewModeEvent;
@@ -938,6 +941,126 @@ async fn review_model_provider_routes_delegate_only_to_secondary_provider() {
     assert_ne!(
         secondary_request.header("authorization").as_deref(),
         Some("Bearer Access Token")
+    );
+
+    let _codex_home_guard = codex_home;
+    primary_server.verify().await;
+    secondary_server.verify().await;
+}
+
+#[serial(env_vars)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_model_uses_overlay_model_provider_when_review_provider_unset() {
+    let sse_raw = r#"[
+        {"type":"response.completed", "response": {"id": "__ID__"}}
+    ]"#;
+    let (primary_server, primary_log) = start_responses_server_with_sse(sse_raw, 1).await;
+    let (secondary_server, secondary_log) = start_responses_server_with_sse(sse_raw, 1).await;
+    let _env_guard = EnvGuard::set(REVIEW_PROVIDER_API_KEY_ENV, "secondary-key");
+    let secondary_base_url = format!("{}/v1", secondary_server.uri());
+
+    let codex_home = Arc::new(TempDir::new().unwrap());
+    let mut builder = test_codex()
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_home(codex_home.clone())
+        .with_config(move |cfg| {
+            cfg.model = Some("gpt-4.1".to_string());
+            cfg.review_model = Some("external-reviewer".to_string());
+            cfg.review_model_provider = None;
+            cfg.model_providers.insert(
+                "external-review".to_string(),
+                ModelProviderInfo {
+                    name: "External Review".to_string(),
+                    base_url: Some(secondary_base_url),
+                    env_key: Some(REVIEW_PROVIDER_API_KEY_ENV.to_string()),
+                    env_key_instructions: None,
+                    experimental_bearer_token: None,
+                    wire_api: WireApi::Responses,
+                    query_params: None,
+                    http_headers: None,
+                    env_http_headers: None,
+                    request_max_retries: Some(0),
+                    stream_max_retries: Some(0),
+                    stream_idle_timeout_ms: Some(5_000),
+                    requires_openai_auth: false,
+                    supports_websockets: false,
+                },
+            );
+            cfg.model_overlay = Some(ModelOverlay {
+                models: vec![ModelOverlayEntry {
+                    slug: "external-reviewer".to_string(),
+                    model_provider: Some("external-review".to_string()),
+                    patch: ModelInfoPatch {
+                        context_window: Some(Some(1_048_576)),
+                        auto_compact_token_limit: Some(Some(960_000)),
+                        ..Default::default()
+                    },
+                    final_instruction_override: None,
+                }],
+                ..Default::default()
+            });
+        });
+    let test = builder
+        .build(&primary_server)
+        .await
+        .expect("create conversation");
+    assert_eq!(test.config.review_model_provider, None);
+    assert_eq!(test.session_configured.model_provider_id, "openai");
+    let codex = test.codex;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "parent turn".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await
+        .unwrap();
+    let _parent_complete =
+        wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    codex
+        .submit(Op::Review {
+            review_request: ReviewRequest {
+                target: ReviewTarget::Custom {
+                    instructions: "provider-specific review".to_string(),
+                },
+                user_facing_hint: None,
+            },
+        })
+        .await
+        .unwrap();
+
+    let _entered = wait_for_event(&codex, |ev| matches!(ev, EventMsg::EnteredReviewMode(_))).await;
+    let _closed = wait_for_event(&codex, |ev| {
+        matches!(
+            ev,
+            EventMsg::ExitedReviewMode(ExitedReviewModeEvent {
+                review_output: None,
+                ..
+            })
+        )
+    })
+    .await;
+    let _review_complete =
+        wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let primary_request = primary_log.single_request();
+    assert_eq!(
+        primary_request.body_json()["model"].as_str(),
+        Some("gpt-4.1")
+    );
+
+    let secondary_request = secondary_log.single_request();
+    assert_eq!(
+        secondary_request.body_json()["model"].as_str(),
+        Some("external-reviewer")
+    );
+    assert_eq!(
+        secondary_request.header("authorization").as_deref(),
+        Some("Bearer secondary-key")
     );
 
     let _codex_home_guard = codex_home;

@@ -360,6 +360,9 @@ impl Codex {
             )
             .await;
 
+        let (model_provider_id, model_provider) =
+            config.resolve_model_provider_for_model(model.as_str())?;
+
         let model_info = models_manager.get_model_info(model.as_str(), &config).await;
         let final_instruction_override = models_manager
             .get_final_instruction_override(model.as_str(), &config)
@@ -415,7 +418,8 @@ impl Codex {
             },
         };
         let session_configuration = SessionConfiguration {
-            provider: config.model_provider.clone(),
+            provider_id: model_provider_id,
+            provider: model_provider,
             collaboration_mode,
             model_reasoning_summary: config.model_reasoning_summary,
             service_tier: config.service_tier.clone(),

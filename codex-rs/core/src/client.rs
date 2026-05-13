@@ -149,6 +149,7 @@ pub struct ModelClient {
 /// contract and can cause routing bugs.
 pub struct ModelClientSession {
     client: ModelClient,
+    provider: ModelProviderInfo,
     connection: Option<ApiWebSocketConnection>,
     websocket_last_request: Option<ResponseCreateWsRequest>,
     websocket_last_response_rx: Option<oneshot::Receiver<LastResponse>>,
@@ -217,8 +218,13 @@ impl ModelClient {
     /// This does not open any network connections; the WebSocket connection is established lazily
     /// when the first WebSocket stream request is issued.
     pub fn new_session(&self) -> ModelClientSession {
+        self.new_session_with_provider(self.state.provider.clone())
+    }
+
+    pub fn new_session_with_provider(&self, provider: ModelProviderInfo) -> ModelClientSession {
         ModelClientSession {
             client: self.clone(),
+            provider,
             connection: None,
             websocket_last_request: None,
             websocket_last_response_rx: None,
@@ -239,6 +245,22 @@ impl ModelClient {
         model_info: &ModelInfo,
         otel_manager: &OtelManager,
     ) -> Result<Vec<ResponseItem>> {
+        self.compact_conversation_history_with_provider(
+            &self.state.provider,
+            prompt,
+            model_info,
+            otel_manager,
+        )
+        .await
+    }
+
+    pub async fn compact_conversation_history_with_provider(
+        &self,
+        provider: &ModelProviderInfo,
+        prompt: &Prompt,
+        model_info: &ModelInfo,
+        otel_manager: &OtelManager,
+    ) -> Result<Vec<ResponseItem>> {
         if prompt.input.is_empty() {
             return Ok(Vec::new());
         }
@@ -247,11 +269,8 @@ impl ModelClient {
             Some(manager) => manager.auth().await,
             None => None,
         };
-        let request_auth = resolve_request_auth(auth, &self.state.provider)?;
-        let api_provider = self
-            .state
-            .provider
-            .to_api_provider(request_auth.auth_mode)?;
+        let request_auth = resolve_request_auth(auth, provider)?;
+        let api_provider = provider.to_api_provider(request_auth.auth_mode)?;
         let api_auth = request_auth.provider;
         let transport = ReqwestTransport::new(build_reqwest_client());
         let request_telemetry = Self::build_request_telemetry(otel_manager);
@@ -402,7 +421,7 @@ impl ModelClientSession {
     }
 
     fn responses_websocket_enabled(&self) -> bool {
-        self.client.state.provider.supports_websockets
+        self.provider.supports_websockets
             && self.client.state.enable_responses_websockets
             && (*CODEX_RS_SSE_FIXTURE).is_none()
     }
@@ -468,7 +487,7 @@ impl ModelClientSession {
         ApiResponsesOptions {
             reasoning,
             include,
-            service_tier: service_tier_for_wire(&self.client.state.provider, service_tier),
+            service_tier: service_tier_for_wire(&self.provider, service_tier),
             prompt_cache_key: Some(conversation_id.clone()),
             text,
             store_override: None,
@@ -639,7 +658,7 @@ impl ModelClientSession {
     fn responses_request_compression(&self, auth_mode: Option<AuthMode>) -> Compression {
         if self.client.state.enable_request_compression
             && auth_mode == Some(AuthMode::Chatgpt)
-            && self.client.state.provider.is_openai()
+            && self.provider.is_openai()
         {
             Compression::Zstd
         } else {
@@ -664,11 +683,8 @@ impl ModelClientSession {
     ) -> Result<ResponseStream> {
         if let Some(path) = &*CODEX_RS_SSE_FIXTURE {
             warn!(path, "Streaming from fixture");
-            let stream = codex_api::stream_from_fixture(
-                path,
-                self.client.state.provider.stream_idle_timeout(),
-            )
-            .map_err(map_api_error)?;
+            let stream = codex_api::stream_from_fixture(path, self.provider.stream_idle_timeout())
+                .map_err(map_api_error)?;
             let (stream, _last_response_rx) = map_response_stream(stream, otel_manager.clone());
             return Ok(stream);
         }
@@ -682,17 +698,13 @@ impl ModelClientSession {
                 Some(manager) => manager.auth().await,
                 None => None,
             };
-            let request_auth = resolve_request_auth(auth, &self.client.state.provider)?;
+            let request_auth = resolve_request_auth(auth, &self.provider)?;
             if request_auth.enable_unauthorized_recovery && auth_recovery.is_none() {
                 auth_recovery = auth_manager
                     .as_ref()
                     .map(super::auth::AuthManager::unauthorized_recovery);
             }
-            let api_provider = self
-                .client
-                .state
-                .provider
-                .to_api_provider(request_auth.auth_mode)?;
+            let api_provider = self.provider.to_api_provider(request_auth.auth_mode)?;
             let api_auth = request_auth.provider;
             let transport = ReqwestTransport::new(build_reqwest_client());
             let (request_telemetry, sse_telemetry) = Self::build_streaming_telemetry(otel_manager);
@@ -753,17 +765,13 @@ impl ModelClientSession {
                 Some(manager) => manager.auth().await,
                 None => None,
             };
-            let request_auth = resolve_request_auth(auth, &self.client.state.provider)?;
+            let request_auth = resolve_request_auth(auth, &self.provider)?;
             if request_auth.enable_unauthorized_recovery && auth_recovery.is_none() {
                 auth_recovery = auth_manager
                     .as_ref()
                     .map(super::auth::AuthManager::unauthorized_recovery);
             }
-            let api_provider = self
-                .client
-                .state
-                .provider
-                .to_api_provider(request_auth.auth_mode)?;
+            let api_provider = self.provider.to_api_provider(request_auth.auth_mode)?;
             let api_auth = request_auth.provider;
             let compression = self.responses_request_compression(request_auth.auth_mode);
 
@@ -854,7 +862,7 @@ impl ModelClientSession {
         service_tier: Option<String>,
         turn_metadata_header: Option<&str>,
     ) -> Result<ResponseStream> {
-        let wire_api = self.client.state.provider.wire_api;
+        let wire_api = self.provider.wire_api;
         match wire_api {
             WireApi::Responses => {
                 let websocket_enabled =

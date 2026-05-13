@@ -21,6 +21,7 @@ pub(crate) struct Session {
 #[derive(Clone)]
 pub(crate) struct SessionConfiguration {
     /// Provider identifier ("openai", "openrouter", ...).
+    pub(super) provider_id: String,
     pub(super) provider: ModelProviderInfo,
 
     pub(super) collaboration_mode: CollaborationMode,
@@ -76,7 +77,7 @@ impl SessionConfiguration {
     pub(super) fn thread_config_snapshot(&self) -> ThreadConfigSnapshot {
         ThreadConfigSnapshot {
             model: self.collaboration_mode.model().to_string(),
-            model_provider_id: self.original_config_do_not_use.model_provider_id.clone(),
+            model_provider_id: self.provider_id.clone(),
             approval_policy: self.approval_policy.value(),
             sandbox_policy: self.sandbox_policy.get().clone(),
             cwd: self.cwd.clone(),
@@ -91,6 +92,13 @@ impl SessionConfiguration {
         let mut next_configuration = self.clone();
         if let Some(collaboration_mode) = updates.collaboration_mode.clone() {
             next_configuration.collaboration_mode = collaboration_mode;
+        }
+        if let Ok((provider_id, provider)) = next_configuration
+            .original_config_do_not_use
+            .resolve_model_provider_for_model(next_configuration.collaboration_mode.model())
+        {
+            next_configuration.provider_id = provider_id;
+            next_configuration.provider = provider;
         }
         if let Some(summary) = updates.reasoning_summary {
             next_configuration.model_reasoning_summary = summary;
@@ -149,8 +157,9 @@ impl Session {
         agent_control: AgentControl,
     ) -> anyhow::Result<Arc<Self>> {
         debug!(
-            "Configuring session: model={}; provider={:?}",
+            "Configuring session: model={}; provider_id={}; provider={:?}",
             session_configuration.collaboration_mode.model(),
+            session_configuration.provider_id,
             session_configuration.provider
         );
         if !session_configuration.cwd.is_absolute() {
@@ -171,6 +180,7 @@ impl Session {
                         conversation_id,
                         forked_from_id,
                         session_source,
+                        session_configuration.provider_id.clone(),
                         BaseInstructions {
                             text: session_configuration.base_instructions.clone(),
                         },
@@ -306,7 +316,7 @@ impl Session {
         );
 
         otel_manager.conversation_starts(
-            config.model_provider.name.as_str(),
+            session_configuration.provider.name.as_str(),
             session_configuration.collaboration_mode.reasoning_effort(),
             config.model_reasoning_summary,
             config.model_context_window,
@@ -439,7 +449,7 @@ impl Session {
                 forked_from_id,
                 thread_name: session_configuration.thread_name.clone(),
                 model: session_configuration.collaboration_mode.model().to_string(),
-                model_provider_id: config.model_provider_id.clone(),
+                model_provider_id: session_configuration.provider_id.clone(),
                 approval_policy: session_configuration.approval_policy.value(),
                 sandbox_policy: session_configuration.sandbox_policy.get().clone(),
                 cwd: session_configuration.cwd.clone(),

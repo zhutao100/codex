@@ -346,7 +346,10 @@ async fn run_turn_inner(
                 let skill_name_counts_lower: HashMap<String, usize> = HashMap::new();
                 let turn_diff_tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
                 let turn_metadata_header = turn_context.resolve_turn_metadata_header().await;
-                let mut client_session = sess.services.model_client.new_session();
+                let mut client_session = sess
+                    .services
+                    .model_client
+                    .new_session_with_provider(turn_context.provider.clone());
 
                 loop {
                     let sampling_request_input: Vec<ResponseItem> =
@@ -541,7 +544,10 @@ async fn run_turn_inner(
     let turn_metadata_header = turn_context.resolve_turn_metadata_header().await;
     // `ModelClientSession` is turn-scoped and caches WebSocket + sticky routing state, so we reuse
     // one instance across retries within this turn.
-    let mut client_session = sess.services.model_client.new_session();
+    let mut client_session = sess
+        .services
+        .model_client
+        .new_session_with_provider(turn_context.provider.clone());
 
     let mut pre_compact_notes_state = PreCompactNotesState::Idle;
     let mut pre_compact_notes_attempts: u8 = 0;

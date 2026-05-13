@@ -2,7 +2,7 @@
 
 ## Status
 
-Implemented for the global `model_overlay` path. Profile-scoped overlays, generalized null/clear markers, and broader clear semantics remain deferred; `clear_model_messages = true` is the only first-class clear operation.
+Implemented for the global `model_overlay` path. Per-model entries can bind a slug to a configured `model_provider`. Profile-scoped overlays, generalized null/clear markers, and broader clear semantics remain deferred; `clear_model_messages = true` is the only first-class clear operation.
 
 ## Target Base
 
@@ -33,7 +33,7 @@ No overlay config means no behavior change.
 - Do not mutate or persist overlay-expanded models into `models_cache.json`.
 - Do not add a new provider abstraction.
 - Do not change the `/models` response shape.
-- Do not make custom model availability guarantees. The overlay describes client metadata; the selected provider still must accept the model slug.
+- Do not make custom model availability guarantees. The overlay can select a provider id for a model slug, but the selected provider still must accept the model slug.
 - Do not solve hot-reload. The first implementation can resolve overlay config at process/session startup like other config fields.
 
 ## Proposed Config Shape
@@ -62,6 +62,7 @@ Important picker note: `model_info_from_slug(...)` currently uses `visibility = 
 ```toml
 [[model_overlay.models]]
 slug = "new-model"
+model_provider = "private-provider"
 display_name = "New Model"
 description = "Private high-context provider model."
 visibility = "list"
@@ -726,4 +727,6 @@ Consider after Phase 1/2 are stable:
 - Users should prefer `instructions_template_file` or per-personality file overrides when they want to preserve personality support while patching the instruction body.
 - Users should not edit `models_cache.json`; it is still only a cache.
 - Users should set `visibility = "list"` for custom models they want to appear in picker UI.
-- Provider compatibility is external to this overlay. A locally configured slug can still fail at request time if the selected model provider rejects it.
+- Users should set `model_provider` on custom models that are served by a non-default provider.
+- Runtime provider resolution is overlay-aware by default: `model_provider` is the fallback provider, and per-model overlay bindings can route matching slugs elsewhere. Delegate/task-specific provider overrides pin the provider and intentionally ignore overlay provider bindings.
+- Provider compatibility is still enforced by the provider. A locally configured slug can still fail at request time if the selected model provider rejects it.

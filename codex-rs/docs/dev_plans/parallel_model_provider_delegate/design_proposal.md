@@ -2,7 +2,7 @@
 
 ## Status
 
-Implemented for `/review`. Validation added app-server v2 typed config/schema exposure, request-auth centralization, clearer unknown-provider errors, consistent inline/detached review provider application, and targeted validation for misplaced `review_model` keys.
+Implemented for `/review`. Validation added app-server v2 typed config/schema exposure, request-auth centralization, clearer unknown-provider errors, consistent inline/detached review provider application, targeted validation for misplaced `review_model` keys, and `model_overlay.models[].model_provider` fallback for review models without an explicit `review_model_provider`.
 
 ## Objective
 
@@ -20,7 +20,7 @@ The design should reuse the existing delegate runner and avoid turning model-pro
 
 ## Recommended User-Facing Shape
 
-For the existing `/review` task, add a provider sibling to the existing `review_model` setting:
+For the existing `/review` task, add a provider sibling to the existing `review_model` setting when an explicit task override is needed. In common cases, prefer binding the provider on the overlay model entry:
 
 ```toml
 # Primary session remains unchanged.
@@ -29,9 +29,6 @@ model = "gpt-5.4"
 
 # Existing review model setting.
 review_model = "external-reviewer"
-
-# New review-specific provider setting.
-review_model_provider = "external-review"
 
 [model_providers.external-review]
 name = "External Review Provider"
@@ -43,11 +40,14 @@ supports_websockets = false
 
 [[model_overlay.models]]
 slug = "external-reviewer"
+model_provider = "external-review"
 display_name = "External Reviewer"
 visibility = "list"
 context_window = 200000
 auto_compact_token_limit = 160000
 ```
+
+`review_model_provider = "external-review"` remains supported as an explicit override and wins over the overlay entry.
 
 For a new sibling task rather than `/review`, use the same pattern with task-specific names, for example:
 
@@ -89,19 +89,11 @@ pub(crate) fn apply_delegate_model_provider(
     config: &mut Config,
     provider_id: &str,
 ) -> Result<(), CodexErr> {
-    let provider = config
-        .model_providers
-        .get(provider_id)
-        .cloned()
-        .ok_or_else(|| CodexErr::Fatal(format!("Model provider `{provider_id}` not found")))?;
-
-    config.model_provider_id = provider_id.to_string();
-    config.model_provider = provider;
-    Ok(())
+    config.apply_model_provider_id(provider_id)
 }
 ```
 
-The helper should not modify the parent session config. It operates only on the cloned sub-agent config.
+The helper should not modify the parent session config. It operates only on the cloned sub-agent config. `apply_model_provider_id(...)` pins provider resolution for that derived config, so an explicit task provider wins over any `model_overlay.models[].model_provider` binding for the selected model.
 
 ### 3. Apply provider/model override before `run_codex_thread_one_shot(...)`
 
@@ -291,6 +283,7 @@ For `/review`, `ReviewTask` currently sets `sub_agent_config.base_instructions =
 ### Config tests
 
 - `review_model_provider` selects the configured provider id from `model_providers`.
+- `model_overlay.models[].model_provider` selects the provider when `review_model_provider` is unset.
 - Unknown `review_model_provider` produces a clear config/task error.
 - A primary config with `model_provider = "openai"` and `review_model_provider = "external-review"` keeps the primary `Config.model_provider_id == "openai"`.
 
@@ -308,6 +301,7 @@ Assert:
 - the delegate request body uses `review_model` / task-specific model;
 - the delegate request includes `Authorization: Bearer <secondary key>` from the secondary provider `env_key`;
 - no secondary provider request uses the ChatGPT access token.
+- when `review_model_provider` is unset, the same routing works through the overlay entry's `model_provider`.
 
 ### Auth-mode tests
 

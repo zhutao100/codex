@@ -158,6 +158,10 @@ pub struct Config {
     /// Info needed to make an API request to the model.
     pub model_provider: ModelProviderInfo,
 
+    /// Controls whether per-model overlay provider bindings can supersede the
+    /// configured provider.
+    pub model_provider_resolution: ModelProviderResolutionMode,
+
     /// Optionally specify the personality of the model
     pub personality: Option<Personality>,
 
@@ -440,6 +444,24 @@ pub struct Config {
     pub otel: crate::config::types::OtelConfig,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ModelProviderResolutionMode {
+    /// `model_provider_id` is the fallback provider; model overlay entries can
+    /// route specific model slugs to their bound providers.
+    #[default]
+    OverlayAware,
+
+    /// `model_provider_id` was explicitly selected for this derived config and
+    /// must remain active even if the selected model has an overlay provider.
+    Pinned,
+}
+
+impl ModelProviderResolutionMode {
+    fn allows_overlay_provider(self) -> bool {
+        matches!(self, Self::OverlayAware)
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ConfigBuilder {
     codex_home: Option<PathBuf>,
@@ -548,7 +570,35 @@ impl Config {
 
         self.model_provider_id = provider_id.to_string();
         self.model_provider = provider;
+        self.model_provider_resolution = ModelProviderResolutionMode::Pinned;
         Ok(())
+    }
+
+    pub(crate) fn overlay_model_provider_id_for_model(&self, model: &str) -> Option<&str> {
+        if !self.model_provider_resolution.allows_overlay_provider() {
+            return None;
+        }
+        self.model_overlay
+            .as_ref()
+            .and_then(|overlay| overlay.model_provider_for_slug(model))
+    }
+
+    pub(crate) fn resolve_model_provider_for_model(
+        &self,
+        model: &str,
+    ) -> Result<(String, ModelProviderInfo), CodexErr> {
+        if let Some(provider_id) = self.overlay_model_provider_id_for_model(model) {
+            let provider = self
+                .model_providers
+                .get(provider_id)
+                .cloned()
+                .ok_or_else(|| {
+                    CodexErr::Fatal(format!("Model provider `{provider_id}` not found"))
+                })?;
+            return Ok((provider_id.to_string(), provider));
+        }
+
+        Ok((self.model_provider_id.clone(), self.model_provider.clone()))
     }
 
     pub fn apply_review_model_overrides(&mut self) -> Result<(), CodexErr> {
@@ -883,6 +933,32 @@ pub fn set_default_oss_provider(codex_home: &Path, provider: &str) -> std::io::R
         .with_edits(edits)
         .apply_blocking()
         .map_err(|err| std::io::Error::other(format!("failed to persist config.toml: {err}")))
+}
+
+fn validate_model_overlay_providers(
+    model_overlay: Option<&ModelOverlay>,
+    model_providers: &HashMap<String, ModelProviderInfo>,
+) -> std::io::Result<()> {
+    let Some(model_overlay) = model_overlay else {
+        return Ok(());
+    };
+
+    for entry in &model_overlay.models {
+        let Some(provider_id) = entry.model_provider.as_deref() else {
+            continue;
+        };
+        if !model_providers.contains_key(provider_id) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "Model provider `{provider_id}` not found for model_overlay.models[slug={}]",
+                    entry.slug
+                ),
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 /// Base config deserialized from ~/.codex/config.toml.
@@ -1585,6 +1661,7 @@ impl Config {
         for (key, provider) in cfg.model_providers.into_iter() {
             model_providers.entry(key).or_insert(provider);
         }
+        validate_model_overlay_providers(model_overlay.as_ref(), &model_providers)?;
 
         let model_provider_id = model_provider
             .or(config_profile.model_provider)
@@ -1770,6 +1847,7 @@ impl Config {
             service_tier,
             model_provider_id,
             model_provider,
+            model_provider_resolution: ModelProviderResolutionMode::OverlayAware,
             cwd: resolved_cwd,
             approval_policy: constrained_approval_policy.value,
             sandbox_policy: constrained_sandbox_policy.value,
@@ -4264,6 +4342,106 @@ wire_api = "responses"
     }
 
     #[test]
+    fn model_overlay_model_provider_resolves_for_matching_model() -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+        let cfg: ConfigToml = toml::from_str(
+            r#"
+model = "deepseek-v4-pro"
+
+[model_providers.deepseek]
+name = "DeepSeek"
+base_url = "https://deepseek.example.com/v1"
+wire_api = "responses"
+
+[[model_overlay.models]]
+slug = "deepseek-v4-pro"
+model_provider = "deepseek"
+display_name = "DeepSeek V4 Pro"
+visibility = "list"
+"#,
+        )
+        .expect("TOML deserialization should succeed");
+
+        let config = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )?;
+
+        let (provider_id, provider) = config
+            .resolve_model_provider_for_model("deepseek-v4-pro")
+            .expect("overlay provider should resolve");
+        assert_eq!(provider_id, "deepseek");
+        assert_eq!(provider.name, "DeepSeek");
+        assert_eq!(config.model_provider_id, "openai");
+        assert_eq!(config.review_model_provider, None);
+        Ok(())
+    }
+
+    #[test]
+    fn model_overlay_provider_is_ignored_when_provider_is_pinned() -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+        let cfg: ConfigToml = toml::from_str(
+            r#"
+[model_providers.deepseek]
+name = "DeepSeek"
+base_url = "https://deepseek.example.com/v1"
+wire_api = "responses"
+
+[[model_overlay.models]]
+slug = "deepseek-v4-pro"
+model_provider = "deepseek"
+"#,
+        )
+        .expect("TOML deserialization should succeed");
+
+        let mut config = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )?;
+        config
+            .apply_model_provider_id("openai")
+            .expect("built-in provider should resolve");
+
+        let (provider_id, provider) = config
+            .resolve_model_provider_for_model("deepseek-v4-pro")
+            .expect("pinned provider should resolve");
+        assert_eq!(provider_id, "openai");
+        assert_eq!(provider.name, "OpenAI");
+        assert_eq!(
+            config.model_provider_resolution,
+            ModelProviderResolutionMode::Pinned
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn model_overlay_rejects_unknown_model_provider() -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+        let cfg: ConfigToml = toml::from_str(
+            r#"
+[[model_overlay.models]]
+slug = "deepseek-v4-pro"
+model_provider = "missing-provider"
+"#,
+        )
+        .expect("TOML deserialization should succeed");
+
+        let err = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )
+        .expect_err("unknown overlay provider should be rejected");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(err.to_string().contains("missing-provider"));
+        assert!(err.to_string().contains("deepseek-v4-pro"));
+        Ok(())
+    }
+
+    #[test]
     fn review_prompt_files_are_loaded_and_trimmed() -> std::io::Result<()> {
         let codex_home = TempDir::new()?;
         let review_prompt_path = codex_home.path().join("review-prompt.md");
@@ -4579,6 +4757,7 @@ model_verbosity = "high"
                 service_tier: None,
                 model_provider_id: "openai".to_string(),
                 model_provider: fixture.openai_provider.clone(),
+                model_provider_resolution: ModelProviderResolutionMode::OverlayAware,
                 approval_policy: Constrained::allow_any(AskForApproval::Never),
                 sandbox_policy: Constrained::allow_any(SandboxPolicy::new_read_only_policy()),
                 sandbox_read_only: SandboxReadOnlyConfig::default(),
@@ -4683,6 +4862,7 @@ model_verbosity = "high"
             service_tier: None,
             model_provider_id: "openai-custom".to_string(),
             model_provider: fixture.openai_custom_provider.clone(),
+            model_provider_resolution: ModelProviderResolutionMode::OverlayAware,
             approval_policy: Constrained::allow_any(AskForApproval::UnlessTrusted),
             sandbox_policy: Constrained::allow_any(SandboxPolicy::new_read_only_policy()),
             sandbox_read_only: SandboxReadOnlyConfig::default(),
@@ -4802,6 +4982,7 @@ model_verbosity = "high"
             service_tier: None,
             model_provider_id: "openai".to_string(),
             model_provider: fixture.openai_provider.clone(),
+            model_provider_resolution: ModelProviderResolutionMode::OverlayAware,
             approval_policy: Constrained::allow_any(AskForApproval::OnFailure),
             sandbox_policy: Constrained::allow_any(SandboxPolicy::new_read_only_policy()),
             sandbox_read_only: SandboxReadOnlyConfig::default(),
@@ -4907,6 +5088,7 @@ model_verbosity = "high"
             service_tier: None,
             model_provider_id: "openai".to_string(),
             model_provider: fixture.openai_provider.clone(),
+            model_provider_resolution: ModelProviderResolutionMode::OverlayAware,
             approval_policy: Constrained::allow_any(AskForApproval::OnFailure),
             sandbox_policy: Constrained::allow_any(SandboxPolicy::new_read_only_policy()),
             sandbox_read_only: SandboxReadOnlyConfig::default(),

@@ -4776,8 +4776,6 @@ impl CodexMessageProcessor {
                 message: format!("failed to apply review model settings: {err}"),
                 data: None,
             })?;
-        let fallback_provider = config.model_provider_id.clone();
-
         let NewThread {
             thread_id,
             thread: review_thread,
@@ -4793,6 +4791,7 @@ impl CodexMessageProcessor {
                 data: None,
             })?;
         let review_model = session_configured.model.clone();
+        let fallback_provider = session_configured.model_provider_id.clone();
 
         if let Err(err) = self
             .attach_conversation_listener(thread_id, false, ApiVersion::V2)
@@ -4812,6 +4811,7 @@ impl CodexMessageProcessor {
                 Ok(summary) => {
                     let mut thread = summary_to_thread(summary);
                     thread.model = Some(review_model.clone());
+                    thread.model_provider = fallback_provider.clone();
                     let notif = ThreadStartedNotification { thread };
                     self.outgoing
                         .send_server_notification(ServerNotification::ThreadStarted(notif))

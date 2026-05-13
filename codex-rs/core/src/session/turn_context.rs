@@ -9,6 +9,7 @@ pub(crate) struct TurnContext {
     pub(crate) auth_manager: Option<Arc<AuthManager>>,
     pub(crate) model_info: ModelInfo,
     pub(crate) otel_manager: OtelManager,
+    pub(crate) model_provider_id: String,
     pub(crate) provider: ModelProviderInfo,
     pub(crate) reasoning_effort: Option<ReasoningEffortConfig>,
     pub(crate) reasoning_summary: ReasoningSummaryConfig,
@@ -124,6 +125,8 @@ impl Session {
         // todo(aibrahim): store this state somewhere else so we don't need to mut config
         let config = session_configuration.original_config_do_not_use.clone();
         let mut per_turn_config = (*config).clone();
+        per_turn_config.model_provider_id = session_configuration.provider_id.clone();
+        per_turn_config.model_provider = session_configuration.provider.clone();
         per_turn_config.approval_policy = session_configuration.approval_policy.clone();
         per_turn_config.sandbox_policy = session_configuration.sandbox_policy.clone();
         per_turn_config.model_reasoning_effort =
@@ -176,6 +179,7 @@ impl Session {
             auth_manager: auth_manager_for_context,
             model_info: model_info.clone(),
             otel_manager: otel_manager_for_context,
+            model_provider_id: session_configuration.provider_id.clone(),
             provider: provider_for_context,
             reasoning_effort,
             reasoning_summary,

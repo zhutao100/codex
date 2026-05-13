@@ -84,11 +84,19 @@ impl ModelOverlay {
             .and_then(|entry| entry.final_instruction_override.clone())
             .or_else(|| self.final_instruction_override.clone())
     }
+
+    pub(crate) fn model_provider_for_slug(&self, slug: &str) -> Option<&str> {
+        self.models
+            .iter()
+            .find(|entry| entry.slug == slug)
+            .and_then(|entry| entry.model_provider.as_deref())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelOverlayEntry {
     pub slug: String,
+    pub model_provider: Option<String>,
     pub patch: ModelInfoPatch,
     pub final_instruction_override: Option<String>,
 }
@@ -329,6 +337,7 @@ impl ModelOverlayToml {
 #[schemars(deny_unknown_fields)]
 pub struct ModelOverlayEntryToml {
     pub slug: String,
+    pub model_provider: Option<String>,
     #[serde(flatten)]
     pub patch: ModelInfoPatchToml,
     pub final_instruction_override: Option<String>,
@@ -349,6 +358,16 @@ impl ModelOverlayEntryToml {
                 "model_overlay.models[].slug must not be empty",
             ));
         }
+        if self
+            .model_provider
+            .as_ref()
+            .is_some_and(|provider| provider.trim().is_empty())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "model_overlay.models[].model_provider must not be empty",
+            ));
+        }
 
         let context = format!("model_overlay.models[slug={}]", self.slug);
         reject_misplaced_review_fields(
@@ -356,6 +375,10 @@ impl ModelOverlayEntryToml {
             self.review_model.as_ref(),
             self.review_model_provider.as_ref(),
         )?;
+        let model_provider = self
+            .model_provider
+            .as_ref()
+            .map(|provider| provider.trim().to_string());
         let final_instruction_override = resolve_text_field(
             self.final_instruction_override,
             self.final_instruction_override_file,
@@ -365,6 +388,7 @@ impl ModelOverlayEntryToml {
 
         Ok(ModelOverlayEntry {
             slug: self.slug,
+            model_provider,
             patch,
             final_instruction_override,
         })
@@ -637,6 +661,7 @@ mod tests {
         let overlay = ModelOverlay {
             models: vec![ModelOverlayEntry {
                 slug: "private-model".to_string(),
+                model_provider: None,
                 patch: ModelInfoPatch {
                     context_window: Some(Some(1_000_000)),
                     auto_compact_token_limit: Some(Some(900_000)),

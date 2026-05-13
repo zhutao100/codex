@@ -78,6 +78,7 @@ pub enum RolloutRecorderParams {
         conversation_id: ThreadId,
         forked_from_id: Option<ThreadId>,
         source: SessionSource,
+        model_provider_id: String,
         base_instructions: BaseInstructions,
         dynamic_tools: Vec<DynamicToolSpec>,
     },
@@ -102,6 +103,7 @@ impl RolloutRecorderParams {
         conversation_id: ThreadId,
         forked_from_id: Option<ThreadId>,
         source: SessionSource,
+        model_provider_id: String,
         base_instructions: BaseInstructions,
         dynamic_tools: Vec<DynamicToolSpec>,
     ) -> Self {
@@ -109,6 +111,7 @@ impl RolloutRecorderParams {
             conversation_id,
             forked_from_id,
             source,
+            model_provider_id,
             base_instructions,
             dynamic_tools,
         }
@@ -295,11 +298,12 @@ impl RolloutRecorder {
         state_db_ctx: Option<StateDbHandle>,
         state_builder: Option<ThreadMetadataBuilder>,
     ) -> std::io::Result<Self> {
-        let (file, rollout_path, meta) = match params {
+        let (file, rollout_path, meta, default_provider_id) = match params {
             RolloutRecorderParams::Create {
                 conversation_id,
                 forked_from_id,
                 source,
+                model_provider_id,
                 base_instructions,
                 dynamic_tools,
             } => {
@@ -329,7 +333,7 @@ impl RolloutRecorder {
                         originator: originator().value,
                         cli_version: crate::CODEX_VERSION.to_string(),
                         source,
-                        model_provider: Some(config.model_provider_id.clone()),
+                        model_provider: Some(model_provider_id.clone()),
                         base_instructions: Some(base_instructions),
                         dynamic_tools: if dynamic_tools.is_empty() {
                             None
@@ -337,6 +341,7 @@ impl RolloutRecorder {
                             Some(dynamic_tools)
                         },
                     }),
+                    model_provider_id,
                 )
             }
             RolloutRecorderParams::Resume { path } => (
@@ -346,6 +351,7 @@ impl RolloutRecorder {
                     .await?,
                 path,
                 None,
+                config.model_provider_id.clone(),
             ),
         };
 
@@ -368,7 +374,7 @@ impl RolloutRecorder {
             rollout_path.clone(),
             state_db_ctx.clone(),
             state_builder,
-            config.model_provider_id.clone(),
+            default_provider_id,
         ));
 
         Ok(Self {

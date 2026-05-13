@@ -1018,6 +1018,7 @@ async fn set_rate_limits_retains_previous_credits() {
         },
     };
     let session_configuration = SessionConfiguration {
+        provider_id: config.model_provider_id.clone(),
         provider: config.model_provider.clone(),
         collaboration_mode,
         model_reasoning_summary: config.model_reasoning_summary,
@@ -1102,6 +1103,7 @@ async fn set_rate_limits_updates_plan_type_when_present() {
         },
     };
     let session_configuration = SessionConfiguration {
+        provider_id: config.model_provider_id.clone(),
         provider: config.model_provider.clone(),
         collaboration_mode,
         model_reasoning_summary: config.model_reasoning_summary,
@@ -1378,6 +1380,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         },
     };
     let session_configuration = SessionConfiguration {
+        provider_id: config.model_provider_id.clone(),
         provider: config.model_provider.clone(),
         collaboration_mode,
         model_reasoning_summary: config.model_reasoning_summary,
@@ -1516,6 +1519,7 @@ pub(crate) async fn make_session_and_context_with_rx() -> (
         },
     };
     let session_configuration = SessionConfiguration {
+        provider_id: config.model_provider_id.clone(),
         provider: config.model_provider.clone(),
         collaboration_mode,
         model_reasoning_summary: config.model_reasoning_summary,

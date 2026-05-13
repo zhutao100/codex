@@ -106,8 +106,18 @@ pub(crate) fn configure_review_delegate_config(
         .clone()
         .unwrap_or_else(|| parent_model_slug.to_string());
     sub_agent_config.model = Some(model);
-    if let Some(provider_id) = parent_config.review_model_provider.as_deref() {
-        apply_delegate_model_provider(&mut sub_agent_config, provider_id)?;
+    let provider_id = parent_config
+        .review_model_provider
+        .as_deref()
+        .or_else(|| {
+            sub_agent_config
+                .model
+                .as_deref()
+                .and_then(|model| parent_config.overlay_model_provider_id_for_model(model))
+        })
+        .map(str::to_string);
+    if let Some(provider_id) = provider_id {
+        apply_delegate_model_provider(&mut sub_agent_config, &provider_id)?;
         sub_agent_config.features.disable(Feature::RemoteModels);
     }
 

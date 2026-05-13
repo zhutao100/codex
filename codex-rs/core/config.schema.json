@@ -577,6 +577,9 @@
         "model_messages": {
           "$ref": "#/definitions/ModelMessagesPatchToml"
         },
+        "model_provider": {
+          "type": "string"
+        },
         "priority": {
           "format": "int32",
           "type": "integer"
