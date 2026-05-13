@@ -19,6 +19,16 @@ blocks into one compact summary while preserving warnings, errors, failure
 details, and sanitized local paths. Set
 `CODEX_RS_CARGO_LOCAL_TEST_OUTPUT=raw` when exact Cargo/libtest output is needed.
 
+When `CODEX_SANDBOX_NETWORK_DISABLED=1` wraps Cargo on macOS, the wrapper reuses
+already-downloaded native artifacts for WebRTC and V8 from sibling local target
+dirs by setting `LK_CUSTOM_WEBRTC` and `RUSTY_V8_ARCHIVE` when those variables
+are not already set. This keeps broad test runs network-closed while avoiding
+build-script downloads for artifacts that are already present locally.
+
+Network-disabled test runs also default `RUST_MIN_STACK` to 8 MiB when the
+caller has not set it, matching the stack needs of the app-server protocol tests
+on macOS debug builds.
+
 Target-dir selection:
 
 1. Existing `CARGO_TARGET_DIR`.

@@ -1,0 +1,13 @@
+# Test filters added by scripts/cargo-local on macOS when
+# CODEX_SANDBOX_NETWORK_DISABLED=1 wraps Cargo in a localhost-only Seatbelt
+# network sandbox. These tests exercise Codex's own process sandboxing and
+# shell execution paths, which cannot run under an already-sandboxed parent.
+suite::abort_tasks::
+suite::v2::command_exec::
+suite::v2::executor_mcp::selected_executor_plugin_exposes_its_stdio_mcp_only_to_that_thread
+suite::v2::imagegen_extension::standalone_image_edit_uses_attached_model_visible_image
+suite::v2::turn_interrupt::turn_interrupt_aborts_running_turn
+file_system_
+suite::seatbelt::
+suite::user_shell_cmd::
+suite::unified_exec::

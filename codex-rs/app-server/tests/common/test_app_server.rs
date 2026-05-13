@@ -156,6 +156,30 @@ pub const DISABLE_PLUGIN_STARTUP_TASKS_ARG: &str = "--disable-plugin-startup-tas
 const DISABLE_MANAGED_CONFIG_ENV_VAR: &str = "CODEX_APP_SERVER_DISABLE_MANAGED_CONFIG";
 const CODE_MODE_HOST_PATH_ENV_VAR: &str = "CODEX_CODE_MODE_HOST_PATH";
 
+pub fn clear_host_network_env(cmd: &mut Command) {
+    for key in [
+        "ALL_PROXY",
+        "AZURE_OPENAI_API_KEY",
+        "CODEX_API_KEY",
+        "CODEX_CONNECTORS_TOKEN",
+        "CODEX_OSS_BASE_URL",
+        "CODEX_OSS_PORT",
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+        "NO_PROXY",
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "OPENAI_ORGANIZATION",
+        "OPENAI_PROJECT",
+        "all_proxy",
+        "https_proxy",
+        "http_proxy",
+        "no_proxy",
+    ] {
+        cmd.env_remove(key);
+    }
+}
+
 impl TestAppServer {
     /// Starts building a server with a temporary CODEX_HOME and the standard
     /// automatic test environment.
@@ -243,6 +267,7 @@ impl TestAppServer {
         );
         cmd.env_remove(CODEX_INTERNAL_ORIGINATOR_OVERRIDE_ENV_VAR);
         cmd.args(args);
+        clear_host_network_env(&mut cmd);
 
         for (k, v) in env_overrides {
             match v {
