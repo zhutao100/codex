@@ -11,6 +11,7 @@ mod imp {
     use codex_codexd::producer::CodexdProducerClient;
     use codex_codexd::producer::RuntimeMetadata;
     use codex_codexd::protocol::HubNotification;
+    use codex_core::protocol::FileChange;
     use codex_core::protocol::NetworkAccess;
     use codex_core::protocol::RuntimeContextScope;
     use codex_core::protocol::RuntimeContextSnapshot;
@@ -18,6 +19,8 @@ mod imp {
     use codex_core::protocol::SessionSource;
     use codex_core::protocol::SubAgentSource;
     use codex_core::protocol::TokenUsageInfo;
+    use codex_protocol::plan_tool::StepStatus;
+    use codex_protocol::plan_tool::UpdatePlanArgs;
     use serde_json::json;
     use std::collections::HashMap;
     use std::collections::HashSet;
@@ -29,11 +32,39 @@ mod imp {
         turn_id: String,
     }
 
+    #[derive(Debug, Clone, Copy)]
+    enum FileChangeLifecycle {
+        Started,
+        Completed { success: bool },
+    }
+
+    impl FileChangeLifecycle {
+        fn method(self) -> &'static str {
+            match self {
+                Self::Started => "item/started",
+                Self::Completed { .. } => "item/completed",
+            }
+        }
+
+        fn status(self) -> &'static str {
+            match self {
+                Self::Started => "inProgress",
+                Self::Completed { success: true } => "completed",
+                Self::Completed { success: false } => "failed",
+            }
+        }
+
+        fn is_start(self) -> bool {
+            matches!(self, Self::Started)
+        }
+    }
+
     pub struct MenuBarBridge {
         producer: CodexdProducerClient,
         active_turns: HashMap<String, ActiveTurnState>,
         turn_start_order: Vec<String>,
         known_turn_keys: HashSet<String>,
+        file_change_started: HashSet<String>,
         active_runtime_context: Option<RuntimeContextSnapshot>,
         current_model: Option<String>,
         current_model_provider: Option<String>,
@@ -67,6 +98,7 @@ mod imp {
                 active_turns: HashMap::new(),
                 turn_start_order: Vec::new(),
                 known_turn_keys: HashSet::new(),
+                file_change_started: HashSet::new(),
                 active_runtime_context: None,
                 current_model: None,
                 current_model_provider: None,
@@ -170,6 +202,13 @@ mod imp {
                         None,
                     ));
                 }
+                EventMsg::PlanUpdate(update) => {
+                    notifications.extend(self.plan_update_notifications(
+                        update,
+                        event_turn_id,
+                        active_thread_id.as_deref(),
+                    ));
+                }
                 EventMsg::ReasoningContentDelta(event) => {
                     notifications.extend(self.ensure_turn_started(
                         event.thread_id.clone(),
@@ -209,6 +248,29 @@ mod imp {
                             info, thread_id, turn_id, turn_key,
                         ));
                     }
+                }
+                EventMsg::PatchApplyBegin(event) => {
+                    notifications.extend(
+                        self.file_change_started_notifications(
+                            event.call_id.as_str(),
+                            normalize_turn_id(event.turn_id.as_str())
+                                .or_else(|| normalize_turn_id(event_turn_id)),
+                            active_thread_id.as_deref(),
+                            &event.changes,
+                        ),
+                    );
+                }
+                EventMsg::PatchApplyEnd(event) => {
+                    notifications.extend(
+                        self.file_change_completed_notifications(
+                            event.call_id.as_str(),
+                            normalize_turn_id(event.turn_id.as_str())
+                                .or_else(|| normalize_turn_id(event_turn_id)),
+                            active_thread_id.as_deref(),
+                            &event.changes,
+                            event.success,
+                        ),
+                    );
                 }
                 EventMsg::RuntimeContextActivated(event) => {
                     self.active_runtime_context = Some(event.snapshot.clone());
@@ -291,6 +353,118 @@ mod imp {
             }]
         }
 
+        fn plan_update_notifications(
+            &mut self,
+            update: &UpdatePlanArgs,
+            event_turn_id: &str,
+            active_thread_id: Option<&str>,
+        ) -> Vec<HubNotification> {
+            let Some(turn_id) = normalize_turn_id(event_turn_id) else {
+                return Vec::new();
+            };
+            let Some(thread_id) = self.resolve_thread_id(&turn_id, active_thread_id) else {
+                return Vec::new();
+            };
+
+            let mut notifications =
+                self.ensure_turn_started(thread_id.clone(), turn_id.clone(), None);
+            let plan = update
+                .plan
+                .iter()
+                .map(|step| {
+                    json!({
+                        "step": step.step.clone(),
+                        "status": plan_step_status_label(&step.status),
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            notifications.push(HubNotification {
+                method: "turn/plan/updated".to_string(),
+                params: Some(json!({
+                    "threadId": thread_id,
+                    "turnId": turn_id,
+                    "explanation": update.explanation.clone(),
+                    "plan": plan,
+                })),
+            });
+            notifications
+        }
+
+        fn file_change_started_notifications(
+            &mut self,
+            item_id: &str,
+            turn_id: Option<String>,
+            active_thread_id: Option<&str>,
+            changes: &HashMap<PathBuf, FileChange>,
+        ) -> Vec<HubNotification> {
+            self.file_change_notifications(
+                FileChangeLifecycle::Started,
+                item_id,
+                turn_id,
+                active_thread_id,
+                changes,
+            )
+        }
+
+        fn file_change_completed_notifications(
+            &mut self,
+            item_id: &str,
+            turn_id: Option<String>,
+            active_thread_id: Option<&str>,
+            changes: &HashMap<PathBuf, FileChange>,
+            success: bool,
+        ) -> Vec<HubNotification> {
+            self.file_change_notifications(
+                FileChangeLifecycle::Completed { success },
+                item_id,
+                turn_id,
+                active_thread_id,
+                changes,
+            )
+        }
+
+        fn file_change_notifications(
+            &mut self,
+            lifecycle: FileChangeLifecycle,
+            item_id: &str,
+            turn_id: Option<String>,
+            active_thread_id: Option<&str>,
+            changes: &HashMap<PathBuf, FileChange>,
+        ) -> Vec<HubNotification> {
+            let Some(turn_id) = turn_id else {
+                return Vec::new();
+            };
+            let Some(thread_id) = self.resolve_thread_id(&turn_id, active_thread_id) else {
+                return Vec::new();
+            };
+
+            let change_key = file_change_key(&thread_id, &turn_id, item_id);
+            if lifecycle.is_start() && !self.file_change_started.insert(change_key.clone()) {
+                return Vec::new();
+            }
+            if !lifecycle.is_start() {
+                self.file_change_started.remove(&change_key);
+            }
+
+            let mut notifications =
+                self.ensure_turn_started(thread_id.clone(), turn_id.clone(), None);
+            notifications.push(HubNotification {
+                method: lifecycle.method().to_string(),
+                params: Some(json!({
+                    "threadId": thread_id,
+                    "turnId": turn_id,
+                    "item": {
+                        "type": "fileChange",
+                        "id": item_id,
+                        "changes": file_update_changes(changes),
+                        "status": lifecycle.status(),
+                    },
+                })),
+            });
+            notifications
+        }
+
         fn resolve_turn_key_for_turn(&self, turn_id: &str) -> Option<String> {
             self.turn_start_order.iter().rev().find_map(|key| {
                 self.active_turns
@@ -298,6 +472,22 @@ mod imp {
                     .filter(|turn| turn.turn_id == turn_id)
                     .map(|_| key.clone())
             })
+        }
+
+        fn resolve_thread_id(
+            &self,
+            turn_id: &str,
+            active_thread_id: Option<&str>,
+        ) -> Option<String> {
+            self.active_runtime_context
+                .as_ref()
+                .map(|snapshot| snapshot.session_id.to_string())
+                .or_else(|| active_thread_id.map(ToString::to_string))
+                .or_else(|| {
+                    self.resolve_turn_key_for_turn(turn_id)
+                        .and_then(|key| self.active_turns.get(&key))
+                        .map(|turn| turn.thread_id.clone())
+                })
         }
 
         fn latest_turn_for_thread(&self, thread_id: &str) -> Option<(String, String)> {
@@ -443,6 +633,7 @@ mod imp {
                 && let Some(turn) = self.active_turns.remove(&key)
             {
                 self.turn_start_order.retain(|existing| existing != &key);
+                self.prune_file_changes_for_turn(&key);
                 return vec![Self::turn_completed_notification(key, turn)];
             }
 
@@ -450,6 +641,7 @@ mod imp {
                 let Some(turn) = self.active_turns.remove(&key) else {
                     continue;
                 };
+                self.prune_file_changes_for_turn(&key);
                 return vec![Self::turn_completed_notification(key, turn)];
             }
 
@@ -477,11 +669,18 @@ mod imp {
 
             keys.into_iter()
                 .filter_map(|key| {
+                    self.prune_file_changes_for_turn(&key);
                     self.active_turns
                         .remove(&key)
                         .map(|turn| Self::turn_completed_notification(key, turn))
                 })
                 .collect()
+        }
+
+        fn prune_file_changes_for_turn(&mut self, turn_key: &str) {
+            let prefix = format!("{turn_key}:");
+            self.file_change_started
+                .retain(|existing| !existing.starts_with(&prefix));
         }
 
         fn turn_completed_notification(key: String, turn: ActiveTurnState) -> HubNotification {
@@ -593,6 +792,60 @@ mod imp {
         format!("{thread_id}:{turn_id}")
     }
 
+    fn file_change_key(thread_id: &str, turn_id: &str, item_id: &str) -> String {
+        format!("{}:{item_id}", turn_key(thread_id, turn_id))
+    }
+
+    fn plan_step_status_label(status: &StepStatus) -> &'static str {
+        match status {
+            StepStatus::Pending => "pending",
+            StepStatus::InProgress => "inProgress",
+            StepStatus::Completed => "completed",
+        }
+    }
+
+    fn file_update_changes(changes: &HashMap<PathBuf, FileChange>) -> Vec<serde_json::Value> {
+        let mut entries = changes.iter().collect::<Vec<_>>();
+        entries.sort_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
+        entries
+            .into_iter()
+            .map(|(path, change)| {
+                json!({
+                    "path": path.to_string_lossy(),
+                    "kind": patch_change_kind_value(change),
+                    "diff": file_change_diff(change),
+                })
+            })
+            .collect()
+    }
+
+    fn patch_change_kind_value(change: &FileChange) -> serde_json::Value {
+        match change {
+            FileChange::Add { .. } => json!({ "type": "add" }),
+            FileChange::Delete { .. } => json!({ "type": "delete" }),
+            FileChange::Update { move_path, .. } => json!({
+                "type": "update",
+                "movePath": move_path,
+            }),
+        }
+    }
+
+    fn file_change_diff(change: &FileChange) -> String {
+        match change {
+            FileChange::Add { content } | FileChange::Delete { content } => content.clone(),
+            FileChange::Update {
+                unified_diff,
+                move_path,
+            } => {
+                if let Some(path) = move_path {
+                    format!("{unified_diff}\n\nMoved to: {}", path.display())
+                } else {
+                    unified_diff.clone()
+                }
+            }
+        }
+    }
+
     fn scope_label(scope: &RuntimeContextScope) -> &'static str {
         match scope {
             RuntimeContextScope::Primary => "primary",
@@ -659,6 +912,7 @@ mod imp {
                 active_turns: HashMap::new(),
                 turn_start_order: Vec::new(),
                 known_turn_keys: HashSet::new(),
+                file_change_started: HashSet::new(),
                 active_runtime_context: None,
                 current_model: Some("parent-model".to_string()),
                 current_model_provider: Some("parent-provider".to_string()),
@@ -808,6 +1062,95 @@ mod imp {
                     .complete_turn(Some("post-turn-review-0".to_string()))
                     .is_empty()
             );
+
+            bridge.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn plan_update_emits_turn_plan_notification() {
+            let mut bridge = test_bridge();
+            let update = UpdatePlanArgs {
+                explanation: Some("adjust plan".to_string()),
+                plan: vec![
+                    codex_protocol::plan_tool::PlanItemArg {
+                        step: "inspect bridge".to_string(),
+                        status: StepStatus::Completed,
+                    },
+                    codex_protocol::plan_tool::PlanItemArg {
+                        step: "wire event".to_string(),
+                        status: StepStatus::InProgress,
+                    },
+                ],
+            };
+
+            let notifications =
+                bridge.plan_update_notifications(&update, "turn-1", Some("thread-1"));
+
+            assert_eq!(notifications.len(), 2);
+            assert_eq!(notifications[0].method, "turn/started");
+            assert_eq!(notifications[1].method, "turn/plan/updated");
+            let params = notifications[1].params.as_ref().expect("plan params");
+            assert_eq!(params["threadId"], json!("thread-1"));
+            assert_eq!(params["turnId"], json!("turn-1"));
+            assert_eq!(params["explanation"], json!("adjust plan"));
+            assert_eq!(
+                params["plan"],
+                json!([
+                    { "step": "inspect bridge", "status": "completed" },
+                    { "step": "wire event", "status": "inProgress" },
+                ])
+            );
+
+            bridge.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn patch_apply_events_emit_file_change_items() {
+            let mut bridge = test_bridge();
+            let changes = HashMap::from([(
+                PathBuf::from("src/main.rs"),
+                FileChange::Update {
+                    unified_diff: "@@ -1 +1 @@".to_string(),
+                    move_path: None,
+                },
+            )]);
+
+            let started = bridge.file_change_started_notifications(
+                "call-1",
+                Some("turn-1".to_string()),
+                Some("thread-1"),
+                &changes,
+            );
+            assert_eq!(started.len(), 2);
+            assert_eq!(started[0].method, "turn/started");
+            assert_eq!(started[1].method, "item/started");
+            let started_item = &started[1].params.as_ref().expect("started params")["item"];
+            assert_eq!(started_item["type"], json!("fileChange"));
+            assert_eq!(started_item["status"], json!("inProgress"));
+            assert_eq!(started_item["changes"][0]["path"], json!("src/main.rs"));
+            assert_eq!(started_item["changes"][0]["kind"]["type"], json!("update"));
+
+            let duplicate_started = bridge.file_change_started_notifications(
+                "call-1",
+                Some("turn-1".to_string()),
+                Some("thread-1"),
+                &changes,
+            );
+            assert!(duplicate_started.is_empty());
+
+            let completed = bridge.file_change_completed_notifications(
+                "call-1",
+                Some("turn-1".to_string()),
+                Some("thread-1"),
+                &changes,
+                true,
+            );
+            assert_eq!(completed.len(), 1);
+            assert_eq!(completed[0].method, "item/completed");
+            let completed_item = &completed[0].params.as_ref().expect("completed params")["item"];
+            assert_eq!(completed_item["type"], json!("fileChange"));
+            assert_eq!(completed_item["status"], json!("completed"));
+            assert!(bridge.file_change_started.is_empty());
 
             bridge.shutdown().await;
         }
