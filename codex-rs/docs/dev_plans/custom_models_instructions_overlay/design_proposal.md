@@ -4,6 +4,8 @@
 
 Implemented for the global `model_overlay` path. Per-model entries can bind a slug to a configured `model_provider`. Profile-scoped overlays, generalized null/clear markers, and broader clear semantics remain deferred; `clear_model_messages = true` is the only first-class clear operation.
 
+Session model changes now recompute the session request `instructions` from the target model's effective metadata and per-model final override. A resumed thread with no explicit model change still preserves the rollout `base_instructions`; an explicit `/model` or turn-level model change refreshes the request instructions for the new model.
+
 ## Target Base
 
 This proposal targets this project's customized branch shape.

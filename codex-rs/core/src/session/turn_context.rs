@@ -215,17 +215,11 @@ impl Session {
         sub_id: String,
         updates: SessionSettingsUpdate,
     ) -> ConstraintResult<Arc<TurnContext>> {
-        let (session_configuration, sandbox_policy_changed) = {
-            let mut state = self.state.lock().await;
-            match state.session_configuration.clone().apply(&updates) {
-                Ok(next) => {
-                    let sandbox_policy_changed =
-                        state.session_configuration.sandbox_policy != next.sandbox_policy;
-                    state.session_configuration = next.clone();
-                    (next, sandbox_policy_changed)
-                }
+        let final_output_json_schema = updates.final_output_json_schema.clone();
+        let (session_configuration, sandbox_policy_changed) =
+            match self.apply_settings_update(updates).await {
+                Ok(result) => result,
                 Err(err) => {
-                    drop(state);
                     self.send_event_raw(Event {
                         id: sub_id.clone(),
                         msg: EventMsg::Error(ErrorEvent {
@@ -236,14 +230,13 @@ impl Session {
                     .await;
                     return Err(err);
                 }
-            }
-        };
+            };
 
         Ok(self
             .new_turn_from_configuration(
                 sub_id,
                 session_configuration,
-                updates.final_output_json_schema,
+                final_output_json_schema,
                 sandbox_policy_changed,
             )
             .await)

@@ -4,6 +4,7 @@ use codex_core::WireApi;
 use codex_core::compact::SUMMARIZATION_PROMPT;
 use codex_core::config::types::Personality;
 use codex_core::features::Feature;
+use codex_core::models_manager::manager::ModelsManager;
 use codex_core::models_manager::overlay::ModelInfoPatch;
 use codex_core::models_manager::overlay::ModelOverlay;
 use codex_core::models_manager::overlay::ModelOverlayEntry;
@@ -336,6 +337,95 @@ async fn overlay_model_provider_routes_model_switch_between_providers() -> Resul
     assert_eq!(
         secondary_request.body_json()["model"].as_str(),
         Some(custom_model)
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn model_switch_uses_target_model_overlay_instructions() -> Result<()> {
+    let primary_server = start_mock_server().await;
+    let secondary_server = start_mock_server().await;
+    let secondary_mock = mount_sse_once(&secondary_server, sse_completed("secondary-1")).await;
+
+    let initial_model = "gpt-5.5";
+    let custom_model = "deepseek-v4-pro";
+    let initial_final_override = "GPT_5_5_FINAL_INSTRUCTIONS_ONLY";
+    let secondary_base_url = format!("{}/v1", secondary_server.uri());
+    let mut builder = test_codex()
+        .with_model(initial_model)
+        .with_config(move |config| {
+            config.model_providers.insert(
+                "deepseek".to_string(),
+                responses_provider("DeepSeek", secondary_base_url),
+            );
+            config.model_overlay = Some(ModelOverlay {
+                models: vec![
+                    ModelOverlayEntry {
+                        slug: initial_model.to_string(),
+                        model_provider: None,
+                        patch: ModelInfoPatch::default(),
+                        final_instruction_override: Some(initial_final_override.to_string()),
+                    },
+                    ModelOverlayEntry {
+                        slug: custom_model.to_string(),
+                        model_provider: Some("deepseek".to_string()),
+                        patch: ModelInfoPatch {
+                            context_window: Some(Some(1_048_576)),
+                            ..Default::default()
+                        },
+                        final_instruction_override: None,
+                    },
+                ],
+                ..Default::default()
+            });
+        });
+    let test = builder.build(&primary_server).await?;
+
+    test.codex
+        .submit(Op::OverrideTurnContext {
+            cwd: None,
+            approval_policy: None,
+            sandbox_policy: None,
+            windows_sandbox_level: None,
+            model: Some(custom_model.to_string()),
+            effort: None,
+            summary: None,
+            collaboration_mode: None,
+            personality: None,
+            service_tier: None,
+        })
+        .await?;
+    test.codex
+        .submit(Op::UserTurn {
+            items: vec![UserInput::Text {
+                text: "custom provider turn".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            cwd: test.cwd_path().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            model: custom_model.to_string(),
+            effort: test.config.model_reasoning_effort,
+            summary: ReasoningSummary::Auto,
+            collaboration_mode: None,
+            personality: None,
+            service_tier: None,
+        })
+        .await?;
+    wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let request = secondary_mock.single_request();
+    assert_eq!(request.body_json()["model"].as_str(), Some(custom_model));
+    let expected_model_info =
+        ModelsManager::construct_model_info_offline(custom_model, &test.config);
+    let expected_instructions = expected_model_info.get_model_instructions(test.config.personality);
+    let actual_instructions = request.instructions_text();
+    assert_eq!(actual_instructions, expected_instructions);
+    assert!(
+        !actual_instructions.contains(initial_final_override),
+        "initial model final instructions leaked into switched model request"
     );
 
     Ok(())

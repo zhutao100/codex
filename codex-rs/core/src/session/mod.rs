@@ -561,6 +561,28 @@ fn resolve_session_base_instructions(
         })
 }
 
+fn resolve_current_base_instructions(
+    config: &Config,
+    model_info: &ModelInfo,
+    final_instruction_override: Option<&str>,
+) -> String {
+    config.base_instructions.clone().unwrap_or_else(|| {
+        ModelsManager::effective_model_instructions(
+            model_info,
+            config.personality,
+            final_instruction_override,
+        )
+    })
+}
+
+fn base_instruction_settings_changed(
+    previous: &SessionConfiguration,
+    next: &SessionConfiguration,
+) -> bool {
+    previous.collaboration_mode.model() != next.collaboration_mode.model()
+        || previous.personality != next.personality
+}
+
 impl Session {
     /// Builds the `x-codex-beta-features` header value for this session.
     ///
@@ -873,18 +895,51 @@ impl Session {
         &self,
         updates: SessionSettingsUpdate,
     ) -> ConstraintResult<()> {
-        let mut state = self.state.lock().await;
+        self.apply_settings_update(updates).await.map(|_| ())
+    }
 
-        match state.session_configuration.apply(&updates) {
-            Ok(updated) => {
-                state.session_configuration = updated;
-                Ok(())
-            }
-            Err(err) => {
-                warn!("rejected session settings update: {err}");
-                Err(err)
-            }
+    pub(crate) async fn apply_settings_update(
+        &self,
+        updates: SessionSettingsUpdate,
+    ) -> ConstraintResult<(SessionConfiguration, bool)> {
+        let (mut updated, sandbox_policy_changed, refresh_base_instructions) = {
+            let state = self.state.lock().await;
+            let current = state.session_configuration.clone();
+            let updated = match current.apply(&updates) {
+                Ok(updated) => updated,
+                Err(err) => {
+                    warn!("rejected session settings update: {err}");
+                    return Err(err);
+                }
+            };
+            let sandbox_policy_changed = current.sandbox_policy != updated.sandbox_policy;
+            let refresh_base_instructions = base_instruction_settings_changed(&current, &updated);
+            (updated, sandbox_policy_changed, refresh_base_instructions)
+        };
+
+        if refresh_base_instructions {
+            let per_turn_config = Self::build_per_turn_config(&updated);
+            let model = updated.collaboration_mode.model().to_string();
+            let model_info = self
+                .services
+                .models_manager
+                .get_model_info(model.as_str(), &per_turn_config)
+                .await;
+            let final_instruction_override = self
+                .services
+                .models_manager
+                .get_final_instruction_override(model.as_str(), &per_turn_config)
+                .await;
+            updated.base_instructions = resolve_current_base_instructions(
+                &per_turn_config,
+                &model_info,
+                final_instruction_override.as_deref(),
+            );
         }
+
+        let mut state = self.state.lock().await;
+        state.session_configuration = updated.clone();
+        Ok((updated, sandbox_policy_changed))
     }
 
     async fn get_config(&self) -> std::sync::Arc<Config> {
