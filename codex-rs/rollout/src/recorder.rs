@@ -21,6 +21,7 @@ use time::format_description::FormatItem;
 use time::format_description::well_known::Rfc3339;
 use time::macros::format_description;
 use tokio::io::AsyncWriteExt;
+use tokio::io::BufWriter;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::oneshot;
@@ -1566,7 +1567,7 @@ impl RolloutWriterState {
         rollout_path: PathBuf,
     ) -> Self {
         Self {
-            writer: file.map(|file| JsonlWriter { file }),
+            writer: file.map(JsonlWriter::new),
             deferred_log_file_info,
             pending_items: Vec::new(),
             meta,
@@ -1578,15 +1579,6 @@ impl RolloutWriterState {
 
     fn add_items(&mut self, items: Vec<RolloutItem>) {
         self.pending_items.extend(items);
-    }
-
-    async fn flush_if_materialized(&mut self) {
-        if self.is_deferred() {
-            return;
-        }
-        if let Err(err) = self.flush().await {
-            self.enter_recovery_mode(&err);
-        }
     }
 
     async fn persist(&mut self) -> std::io::Result<()> {
@@ -1664,31 +1656,32 @@ impl RolloutWriterState {
             .map(|info| info.path.as_path())
             .unwrap_or(self.rollout_path.as_path());
         let file = open_log_file(path)?;
-        self.writer = Some(JsonlWriter {
-            file: tokio::fs::File::from_std(file),
-        });
+        self.writer = Some(JsonlWriter::new(tokio::fs::File::from_std(file)));
         self.deferred_log_file_info = None;
         Ok(())
     }
 
-    async fn write_session_meta_if_needed(&mut self) -> std::io::Result<()> {
+    async fn write_session_meta_if_needed(&mut self) -> std::io::Result<bool> {
         let Some(session_meta) = self.meta.as_ref().cloned() else {
-            return Ok(());
+            return Ok(false);
         };
         write_session_meta(self.writer.as_mut(), session_meta, &self.cwd).await?;
-        self.meta = None;
-        Ok(())
+        Ok(true)
     }
 
     async fn write_pending_once(&mut self) -> std::io::Result<()> {
         self.ensure_writer_open().await?;
-        self.write_session_meta_if_needed().await?;
+        let wrote_session_meta = self.write_session_meta_if_needed().await?;
 
         self.write_pending_items_once().await?;
 
         if let Some(writer) = self.writer.as_mut() {
             writer.file.flush().await?;
         }
+        if wrote_session_meta {
+            self.meta = None;
+        }
+        self.pending_items.clear();
         Ok(())
     }
 
@@ -1697,21 +1690,10 @@ impl RolloutWriterState {
             return Err(IoError::other("rollout writer is not open"));
         };
 
-        let mut written_count = 0usize;
-        let mut write_result = Ok(());
         for item in &self.pending_items {
-            if let Err(err) = writer.write_rollout_item(item).await {
-                write_result = Err(err);
-                break;
-            }
-            written_count += 1;
+            writer.write_rollout_item(item).await?;
         }
-
-        if written_count > 0 {
-            self.pending_items.drain(..written_count);
-        }
-
-        write_result
+        Ok(())
     }
 }
 
@@ -1730,7 +1712,6 @@ async fn rollout_writer(
         match cmd {
             RolloutCmd::AddItems(items) => {
                 state.add_items(items);
-                state.flush_if_materialized().await;
             }
             RolloutCmd::Persist { ack } => {
                 let _ = ack.send(state.persist().await);
@@ -1793,12 +1774,13 @@ pub async fn append_rollout_item_to_path(
         .append(true)
         .open(rollout_path)
         .await?;
-    let mut writer = JsonlWriter { file };
-    writer.write_rollout_item(item).await
+    let mut writer = JsonlWriter::new(file);
+    writer.write_rollout_item(item).await?;
+    writer.file.flush().await
 }
 
 struct JsonlWriter {
-    file: tokio::fs::File,
+    file: BufWriter<tokio::fs::File>,
 }
 
 #[derive(serde::Serialize)]
@@ -1809,6 +1791,12 @@ struct RolloutLineRef<'a> {
 }
 
 impl JsonlWriter {
+    fn new(file: tokio::fs::File) -> Self {
+        Self {
+            file: BufWriter::new(file),
+        }
+    }
+
     async fn write_rollout_item(&mut self, rollout_item: &RolloutItem) -> std::io::Result<()> {
         let timestamp_format: &[FormatItem] = format_description!(
             "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
@@ -1827,7 +1815,6 @@ impl JsonlWriter {
         let mut json = serde_json::to_string(item)?;
         json.push('\n');
         self.file.write_all(json.as_bytes()).await?;
-        self.file.flush().await?;
         Ok(())
     }
 }

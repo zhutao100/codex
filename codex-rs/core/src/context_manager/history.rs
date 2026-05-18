@@ -38,6 +38,8 @@ use std::sync::LazyLock;
 pub(crate) struct ContextManager {
     /// The oldest items are at the beginning of the vector.
     items: Vec<ResponseItem>,
+    item_token_estimates: Vec<i64>,
+    total_item_tokens: i64,
     /// Bumped whenever history is rewritten, such as compaction or rollback.
     history_version: u64,
     token_info: Option<TokenUsageInfo>,
@@ -60,6 +62,8 @@ impl ContextManager {
     pub(crate) fn new() -> Self {
         Self {
             items: Vec::new(),
+            item_token_estimates: Vec::new(),
+            total_item_tokens: 0,
             history_version: 0,
             token_info: TokenUsageInfo::new_or_append(
                 &None, &None, /*model_context_window*/ None,
@@ -130,7 +134,7 @@ impl ContextManager {
             }
 
             let processed = self.process_item(item_ref, policy);
-            self.items.push(processed);
+            self.push_item(processed);
         }
     }
 
@@ -138,9 +142,17 @@ impl ContextManager {
     /// normalization and drops un-suited items. When `input_modalities` does not
     /// include `InputModality::Image`, images are stripped from messages and tool
     /// outputs.
-    pub(crate) fn for_prompt(mut self, input_modalities: &[InputModality]) -> Vec<ResponseItem> {
-        self.normalize_history(input_modalities);
-        self.items
+    pub(crate) fn for_prompt(self, input_modalities: &[InputModality]) -> Vec<ResponseItem> {
+        Self::prepare_items_for_prompt(self.items, input_modalities)
+    }
+
+    pub(crate) fn prepare_items_for_prompt(
+        mut items: Vec<ResponseItem>,
+        input_modalities: &[InputModality],
+    ) -> Vec<ResponseItem> {
+        normalize::normalize_history(&mut items);
+        normalize::strip_images_when_unsupported(input_modalities, &mut items);
+        items
     }
 
     /// Returns raw items in the history.
@@ -175,31 +187,24 @@ impl ContextManager {
         let base_tokens =
             i64::try_from(approx_token_count(&base_instructions.text)).unwrap_or(i64::MAX);
 
-        let items_tokens = self
-            .items
-            .iter()
-            .map(estimate_item_token_count)
-            .fold(0i64, i64::saturating_add);
-
-        Some(base_tokens.saturating_add(items_tokens))
+        Some(base_tokens.saturating_add(self.total_item_tokens))
     }
 
     pub(crate) fn remove_first_item(&mut self) {
         if !self.items.is_empty() {
             // Remove the oldest item (front of the list). Items are ordered from
             // oldest → newest, so index 0 is the first entry recorded.
-            let removed = self.items.remove(0);
+            let removed = self.remove_item_at(0);
             // If the removed item participates in a call/output pair, also remove
             // its corresponding counterpart to keep the invariants intact without
             // running a full normalization pass.
-            normalize::remove_corresponding_for(&mut self.items, &removed);
+            self.remove_corresponding_for(&removed);
             self.world_state_baseline = None;
         }
     }
 
     pub(crate) fn replace(&mut self, items: Vec<ResponseItem>) {
-        self.items = items;
-        self.history_version = self.history_version.saturating_add(1);
+        self.replace_items(items);
         self.world_state_baseline = None;
     }
 
@@ -228,6 +233,7 @@ impl ContextManager {
                     }
                 }
                 if replaced {
+                    self.update_item_token_estimate(index);
                     self.history_version = self.history_version.saturating_add(1);
                 }
                 replaced
@@ -258,10 +264,8 @@ impl ContextManager {
             return;
         }
 
-        let snapshot = self.items.clone();
-        let user_positions = user_message_positions(&snapshot);
+        let user_positions = user_message_positions(&self.items);
         let Some(&first_instruction_turn_idx) = user_positions.first() else {
-            self.replace(snapshot);
             return;
         };
 
@@ -272,10 +276,9 @@ impl ContextManager {
             user_positions[user_positions.len() - n_from_end]
         };
 
-        cut_idx =
-            self.trim_pre_turn_context_updates(&snapshot, first_instruction_turn_idx, cut_idx);
+        cut_idx = self.trim_pre_turn_context_updates(first_instruction_turn_idx, cut_idx);
 
-        self.replace(snapshot[..cut_idx].to_vec());
+        self.truncate_items(cut_idx);
     }
 
     pub(crate) fn update_token_info(
@@ -298,28 +301,33 @@ impl ContextManager {
 
         self.items
             .iter()
+            .zip(&self.item_token_estimates)
             .take(last_user_index)
             .filter(|item| {
                 matches!(
-                    item,
+                    item.0,
                     ResponseItem::Reasoning {
                         encrypted_content: Some(_),
                         ..
                     }
                 )
             })
-            .map(estimate_item_token_count)
+            .map(|(_, estimate)| *estimate)
             .fold(0i64, i64::saturating_add)
     }
 
     // These are local items added after the most recent model-emitted item.
     // They are not reflected in `last_token_usage.total_tokens`.
-    fn items_after_last_model_generated_item(&self) -> &[ResponseItem] {
-        let start = self
-            .items
+    fn index_after_last_model_generated_item(&self) -> usize {
+        self.items
             .iter()
             .rposition(is_model_generated_item)
-            .map_or(self.items.len(), |index| index.saturating_add(1));
+            .map_or(self.items.len(), |index| index.saturating_add(1))
+    }
+
+    #[cfg(test)]
+    fn items_after_last_model_generated_item(&self) -> &[ResponseItem] {
+        let start = self.index_after_last_model_generated_item();
         &self.items[start..]
     }
 
@@ -331,10 +339,13 @@ impl ContextManager {
             .as_ref()
             .map(|info| info.last_token_usage.total_tokens)
             .unwrap_or(0);
+        let after_last_model_generated_index = self.index_after_last_model_generated_item();
         let items_after_last_model_generated_tokens = self
-            .items_after_last_model_generated_item()
+            .item_token_estimates
+            .get(after_last_model_generated_index..)
+            .unwrap_or_default()
             .iter()
-            .map(estimate_item_token_count)
+            .copied()
             .fold(0i64, i64::saturating_add);
         if server_reasoning_included {
             last_tokens.saturating_add(items_after_last_model_generated_tokens)
@@ -346,9 +357,12 @@ impl ContextManager {
     }
 
     pub(crate) fn estimated_tokens_after_last_model_generated_item(&self) -> i64 {
-        self.items_after_last_model_generated_item()
+        let after_last_model_generated_index = self.index_after_last_model_generated_item();
+        self.item_token_estimates
+            .get(after_last_model_generated_index..)
+            .unwrap_or_default()
             .iter()
-            .map(estimate_item_token_count)
+            .copied()
             .fold(0i64, i64::saturating_add)
     }
 
@@ -356,15 +370,69 @@ impl ContextManager {
     /// 1. every call (function/custom) has a corresponding output entry
     /// 2. every output has a corresponding call entry
     /// 3. when images are unsupported, image content is stripped from messages and tool outputs
+    #[cfg(test)]
     fn normalize_history(&mut self, input_modalities: &[InputModality]) {
-        // all function/tool calls must have a corresponding output
-        normalize::ensure_call_outputs_present(&mut self.items);
-
-        // all outputs must have a corresponding function/tool call
-        normalize::remove_orphan_outputs(&mut self.items);
-
-        // strip images when model does not support them
+        normalize::normalize_history(&mut self.items);
         normalize::strip_images_when_unsupported(input_modalities, &mut self.items);
+        self.rebuild_token_estimates();
+    }
+
+    fn push_item(&mut self, item: ResponseItem) {
+        let token_estimate = estimate_item_token_count(&item);
+        self.total_item_tokens = self.total_item_tokens.saturating_add(token_estimate);
+        self.item_token_estimates.push(token_estimate);
+        self.items.push(item);
+    }
+
+    fn remove_item_at(&mut self, index: usize) -> ResponseItem {
+        let token_estimate = self.item_token_estimates.remove(index);
+        let item = self.items.remove(index);
+        self.total_item_tokens = self.total_item_tokens.saturating_sub(token_estimate);
+        item
+    }
+
+    fn remove_corresponding_for(&mut self, item: &ResponseItem) {
+        if let Some(pos) = normalize::corresponding_position_for(&self.items, item) {
+            self.remove_item_at(pos);
+        }
+    }
+
+    fn replace_items(&mut self, items: Vec<ResponseItem>) {
+        self.items = items;
+        self.rebuild_token_estimates();
+        self.history_version = self.history_version.saturating_add(1);
+    }
+
+    fn truncate_items(&mut self, len: usize) {
+        if len >= self.items.len() {
+            return;
+        }
+
+        self.items.truncate(len);
+        let removed_tokens = self
+            .item_token_estimates
+            .drain(len..)
+            .fold(0i64, i64::saturating_add);
+        self.total_item_tokens = self.total_item_tokens.saturating_sub(removed_tokens);
+        self.history_version = self.history_version.saturating_add(1);
+    }
+
+    fn update_item_token_estimate(&mut self, index: usize) {
+        let previous = self.item_token_estimates[index];
+        let updated = estimate_item_token_count(&self.items[index]);
+        self.item_token_estimates[index] = updated;
+        self.total_item_tokens = self
+            .total_item_tokens
+            .saturating_sub(previous)
+            .saturating_add(updated);
+    }
+
+    fn rebuild_token_estimates(&mut self) {
+        self.item_token_estimates = self.items.iter().map(estimate_item_token_count).collect();
+        self.total_item_tokens = self
+            .item_token_estimates
+            .iter()
+            .fold(0i64, |acc, estimate| acc.saturating_add(*estimate));
     }
 
     fn process_item(&self, item: &ResponseItem, policy: TruncationPolicy) -> ResponseItem {
@@ -417,9 +485,9 @@ impl ContextManager {
     /// Returns the adjusted cut index after removing contextual developer/user items immediately
     /// above the rolled-back turn boundary.
     ///
-    /// `first_instruction_turn_idx` is the earliest rollback-eligible instruction-turn boundary
-    /// in `snapshot`; the trim walk never crosses it so any session-prefix items that predate the
-    /// first real turn survive rollback.
+    /// `first_instruction_turn_idx` is the earliest rollback-eligible instruction-turn boundary.
+    /// The trim walk never crosses it so any session-prefix items that predate the first real turn
+    /// survive rollback.
     ///
     /// `cut_idx` is the tentative slice boundary after dropping the requested number of
     /// instruction turns, before stripping contextual pre-turn items that sit immediately above
@@ -431,12 +499,12 @@ impl ContextManager {
     /// reinjection.
     fn trim_pre_turn_context_updates(
         &mut self,
-        snapshot: &[ResponseItem],
         first_instruction_turn_idx: usize,
         mut cut_idx: usize,
     ) -> usize {
+        let mut clear_reference_context_item = false;
         while cut_idx > first_instruction_turn_idx {
-            match &snapshot[cut_idx - 1] {
+            match &self.items[cut_idx - 1] {
                 ResponseItem::Message { role, content, .. }
                     if role == "developer" && is_contextual_dev_message_content(content) =>
                 {
@@ -444,7 +512,7 @@ impl ContextManager {
                         // Mixed `build_initial_context` bundles are not reconstructible from
                         // steady-state diffs once trimmed, so the next real turn must fully
                         // reinject context instead of diffing against a stale baseline.
-                        self.reference_context_item = None;
+                        clear_reference_context_item = true;
                     }
                     cut_idx -= 1;
                 }
@@ -455,6 +523,9 @@ impl ContextManager {
                 }
                 _ => break,
             }
+        }
+        if clear_reference_context_item {
+            self.reference_context_item = None;
         }
         cut_idx
     }

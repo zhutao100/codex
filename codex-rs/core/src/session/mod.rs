@@ -103,9 +103,11 @@ use codex_protocol::items::UserMessageItem;
 use codex_protocol::models::ActivePermissionProfile;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::models::BaseInstructions;
+use codex_protocol::models::MessagePhase;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::SandboxEnforcement;
 use codex_protocol::models::format_allow_prefixes;
+use codex_protocol::openai_models::InputModality;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
@@ -1811,8 +1813,9 @@ impl Session {
 
     /// Persist the event to rollout and send it to clients.
     pub(crate) async fn send_event(&self, turn_context: &TurnContext, msg: EventMsg) {
-        let legacy_source = msg.clone();
-        if let EventMsg::Error(error) = &legacy_source
+        let show_raw_agent_reasoning = self.show_raw_agent_reasoning();
+        let legacy_events = msg.as_legacy_events(show_raw_agent_reasoning);
+        if let EventMsg::Error(error) = &msg
             && error
                 .codex_error_info
                 .as_ref()
@@ -1826,24 +1829,34 @@ impl Session {
         }
         self.services
             .rollout_thread_trace
-            .record_codex_turn_event(&turn_context.sub_id, &legacy_source);
+            .record_codex_turn_event(&turn_context.sub_id, &msg);
         self.services
             .rollout_thread_trace
-            .record_tool_call_event(turn_context.sub_id.clone(), &legacy_source);
+            .record_tool_call_event(turn_context.sub_id.clone(), &msg);
+        let parent_completion = self
+            .parent_completion_for_terminal_turn(turn_context, &msg)
+            .await;
+        let realtime_text = realtime_text_for_event(&msg);
+        let clear_realtime_handoff = matches!(msg, EventMsg::TurnComplete(_));
         let event = Event {
             id: turn_context.sub_id.clone(),
             msg,
         };
         self.send_event_raw(event).await;
-        self.maybe_notify_parent_of_terminal_turn(turn_context, &legacy_source)
+        if let Some((parent_thread_id, child_agent_path, status)) = parent_completion {
+            self.forward_child_completion_to_parent(
+                turn_context,
+                parent_thread_id,
+                &child_agent_path,
+                status,
+            )
             .await;
-        self.maybe_mirror_event_text_to_realtime(&legacy_source)
-            .await;
-        self.maybe_clear_realtime_handoff_for_event(&legacy_source)
+        }
+        self.maybe_mirror_text_to_realtime(realtime_text).await;
+        self.maybe_clear_realtime_handoff(clear_realtime_handoff)
             .await;
 
-        let show_raw_agent_reasoning = self.show_raw_agent_reasoning();
-        for legacy in legacy_source.as_legacy_events(show_raw_agent_reasoning) {
+        for legacy in legacy_events {
             self.services
                 .rollout_thread_trace
                 .record_tool_call_event(turn_context.sub_id.clone(), &legacy);
@@ -1860,15 +1873,15 @@ impl Session {
     /// Use this for events whose canonical persistence belongs to another
     /// session, such as forwarded delegate events.
     pub(crate) async fn send_event_transient(&self, turn_context: &TurnContext, msg: EventMsg) {
-        let legacy_source = msg.clone();
+        let show_raw_agent_reasoning = self.show_raw_agent_reasoning();
+        let legacy_events = msg.as_legacy_events(show_raw_agent_reasoning);
         let event = Event {
             id: turn_context.sub_id.clone(),
             msg,
         };
         self.deliver_event_raw(event).await;
 
-        let show_raw_agent_reasoning = self.show_raw_agent_reasoning();
-        for legacy in legacy_source.as_legacy_events(show_raw_agent_reasoning) {
+        for legacy in legacy_events {
             let legacy_event = Event {
                 id: turn_context.sub_id.clone(),
                 msg: legacy,
@@ -1877,18 +1890,17 @@ impl Session {
         }
     }
 
-    /// Forwards terminal turn events from spawned MultiAgentV2 children to their direct parent.
-    async fn maybe_notify_parent_of_terminal_turn(
+    async fn parent_completion_for_terminal_turn(
         &self,
         turn_context: &TurnContext,
         msg: &EventMsg,
-    ) {
+    ) -> Option<(ThreadId, codex_protocol::AgentPath, AgentStatus)> {
         if turn_context.multi_agent_version != MultiAgentVersion::V2 {
-            return;
+            return None;
         }
 
         if !matches!(msg, EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_)) {
-            return;
+            return None;
         }
 
         let SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
@@ -1897,7 +1909,7 @@ impl Session {
             ..
         }) = &turn_context.session_source
         else {
-            return;
+            return None;
         };
 
         let status = match turn_context.terminal_error.lock().await.take() {
@@ -1906,24 +1918,13 @@ impl Session {
                 self.agent_status.send_replace(status.clone());
                 status
             }
-            None => {
-                let Some(status) = agent_status_from_event(msg) else {
-                    return;
-                };
-                status
-            }
+            None => agent_status_from_event(msg)?,
         };
         if !is_final(&status) {
-            return;
+            return None;
         }
 
-        self.forward_child_completion_to_parent(
-            turn_context,
-            *parent_thread_id,
-            child_agent_path,
-            status,
-        )
-        .await;
+        Some((*parent_thread_id, child_agent_path.clone(), status))
     }
 
     /// Sends the standard completion envelope from a spawned MultiAgentV2 child to its parent.
@@ -1989,8 +1990,8 @@ impl Session {
         }
     }
 
-    async fn maybe_mirror_event_text_to_realtime(&self, msg: &EventMsg) {
-        let Some((text, phase)) = realtime_text_for_event(msg) else {
+    async fn maybe_mirror_text_to_realtime(&self, text: Option<(String, Option<MessagePhase>)>) {
+        let Some((text, phase)) = text else {
             return;
         };
         if self.conversation.running_state().await.is_none() {
@@ -2001,8 +2002,8 @@ impl Session {
         }
     }
 
-    async fn maybe_clear_realtime_handoff_for_event(&self, msg: &EventMsg) {
-        if !matches!(msg, EventMsg::TurnComplete(_)) {
+    async fn maybe_clear_realtime_handoff(&self, clear: bool) {
+        if !clear {
             return;
         }
         if let Err(err) = self.conversation.handoff_complete().await {
@@ -3636,6 +3637,17 @@ impl Session {
         window_number
     }
 
+    pub(crate) async fn prompt_history(
+        &self,
+        input_modalities: &[InputModality],
+    ) -> Vec<ResponseItem> {
+        let items = {
+            let state = self.state.lock().await;
+            state.history.raw_items().to_vec()
+        };
+        ContextManager::prepare_items_for_prompt(items, input_modalities)
+    }
+
     pub(crate) async fn reference_context_item(&self) -> Option<TurnContextItem> {
         let state = self.state.lock().await;
         state.reference_context_item()
@@ -3790,11 +3802,14 @@ impl Session {
     }
 
     pub(crate) async fn recompute_token_usage(&self, turn_context: &TurnContext) {
-        let history = self.clone_history().await;
         let base_instructions = self.get_base_instructions().await;
-        let Some(estimated_total_tokens) =
-            history.estimate_token_count_with_base_instructions(&base_instructions)
-        else {
+        let estimated_total_tokens = {
+            let state = self.state.lock().await;
+            state
+                .history
+                .estimate_token_count_with_base_instructions(&base_instructions)
+        };
+        let Some(estimated_total_tokens) = estimated_total_tokens else {
             return;
         };
         {

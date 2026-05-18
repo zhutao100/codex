@@ -593,6 +593,40 @@ async fn writer_state_retries_write_error_before_reporting_flush_success() -> st
 }
 
 #[tokio::test]
+async fn writer_state_buffers_materialized_items_until_flush() -> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let rollout_path = home.path().join("rollout.jsonl");
+    let file = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&rollout_path)?;
+    let mut state = RolloutWriterState::new(
+        Some(tokio::fs::File::from_std(file)),
+        /*deferred_log_file_info*/ None,
+        /*meta*/ None,
+        home.path().to_path_buf(),
+        rollout_path.clone(),
+    );
+
+    state.add_items(vec![RolloutItem::EventMsg(EventMsg::AgentMessage(
+        AgentMessageEvent {
+            message: "buffered-until-flush".to_string(),
+            phase: None,
+            memory_citation: None,
+        },
+    ))]);
+
+    assert_eq!(std::fs::read_to_string(&rollout_path)?, "");
+    state.flush().await?;
+    let text = std::fs::read_to_string(&rollout_path)?;
+    assert!(
+        text.contains("buffered-until-flush"),
+        "flush should write materialized buffered items"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn list_threads_db_disabled_does_not_skip_paginated_items() -> std::io::Result<()> {
     let home = TempDir::new().expect("temp dir");
     let config = test_config(home.path());
