@@ -36,15 +36,16 @@ fn history_sums_measured_and_unknown_file_audio() {
         history.estimate_token_count_with_base_instructions(&base),
         Some(24_000)
     );
-    history.file_audio_durations = Arc::new(FileAudioDurations(BTreeMap::from([(
-        "short".into(),
-        Duration::from_secs(30),
-    )])));
+    let snapshot = history.clone();
+    history.update_file_audio_durations(|durations| {
+        durations.0.insert("short".into(), Duration::from_secs(30));
+    });
     assert_eq!(
         history.estimate_token_count_with_base_instructions(&base),
         Some(12_300)
     );
     assert_eq!(history.estimated_tokens_since_last_usage(), 12_300);
+    assert_eq!(snapshot.estimated_tokens_since_last_usage(), 24_000);
 }
 
 #[test]

@@ -110,6 +110,8 @@ pub(crate) struct ContextManager {
     /// The oldest items are at the beginning of the vector. Snapshots share the vector until a
     /// caller needs to mutate it, avoiding deep copies for read-only history consumers.
     items: Arc<Vec<ResponseItemEnvelope>>,
+    item_token_estimates: Arc<Vec<i64>>,
+    total_item_tokens: i64,
     /// Compatibility history for legacy review and missing root instructions.
     review_history: Option<TranscriptHistory>,
     /// Captured before recording; replay and legacy backups keep the same storage policy.
@@ -327,6 +329,8 @@ impl ContextManager {
             sampling: Default::default(),
             restored_through_sequence: 0,
             items: Arc::new(Vec::new()),
+            item_token_estimates: Arc::new(Vec::new()),
+            total_item_tokens: 0,
             review_history: None,
             review_budgeting: ContextBudgeting::Fixed,
             retained_context: Arc::default(),
@@ -758,6 +762,10 @@ impl ContextManager {
         if is_model_generated_item(&processed.item) {
             self.last_model_output_item_count = Some(self.items.len() + 1);
         }
+        let token_estimate =
+            estimate_item_token_count_with_audio(&processed.item, &self.file_audio_durations);
+        self.total_item_tokens = self.total_item_tokens.saturating_add(token_estimate);
+        Arc::make_mut(&mut self.item_token_estimates).push(token_estimate);
         Arc::make_mut(&mut self.items).push(processed);
         source
     }
@@ -780,32 +788,42 @@ impl ContextManager {
 
     /// Returns normalized history envelopes for internal consumers that must retain metadata.
     pub(crate) async fn for_prompt_annotated(
-        mut self,
+        self,
         input_modalities: &[InputModality],
         image_store: &dyn AttachmentStore,
     ) -> Vec<ResponseItemEnvelope> {
-        self.normalize_history(input_modalities);
+        let mut items = Arc::unwrap_or_clone(self.items);
+        normalize::normalize_for_prompt(
+            &mut items,
+            input_modalities,
+            self.restored_through_sequence,
+        );
         replace_unresolvable_media_files(
-            Arc::make_mut(&mut self.items)
-                .iter_mut()
-                .map(|envelope| &mut envelope.item),
+            items.iter_mut().map(|envelope| &mut envelope.item),
             image_store,
         )
         .await;
-        self.project_file_audio_for_prompt();
-        Arc::unwrap_or_clone(self.items)
+        if !self.rejected_audio_file_ids.is_empty() {
+            rejected_audio::project_file_audio(&mut items, &self.rejected_audio_file_ids);
+        }
+        items
     }
 
-    /// Applies the file-audio request projection to a normalized snapshot whose
-    /// remaining preparation is performed by another request path.
-    pub(crate) fn project_file_audio_for_prompt(&mut self) {
-        if self.rejected_audio_file_ids.is_empty() {
-            return;
-        }
-        rejected_audio::project_file_audio(
-            Arc::make_mut(&mut self.items),
-            &self.rejected_audio_file_ids,
+    /// Prepares a background compaction snapshot; its request path resolves media separately.
+    pub(crate) fn into_compaction_prompt_items(
+        self,
+        input_modalities: &[InputModality],
+    ) -> Vec<ResponseItemEnvelope> {
+        let mut items = Arc::unwrap_or_clone(self.items);
+        normalize::normalize_for_prompt(
+            &mut items,
+            input_modalities,
+            self.restored_through_sequence,
         );
+        if !self.rejected_audio_file_ids.is_empty() {
+            rejected_audio::project_file_audio(&mut items, &self.rejected_audio_file_ids);
+        }
+        items
     }
 
     /// Iterates over raw response items without exposing their history envelopes.
@@ -904,15 +922,7 @@ impl ContextManager {
             i64::try_from(approx_token_count(&base_instructions.text)).unwrap_or(i64::MAX)
         };
 
-        let items_tokens = self
-            .items
-            .iter()
-            .map(|envelope| {
-                estimate_item_token_count_with_audio(&envelope.item, &self.file_audio_durations)
-            })
-            .fold(0i64, i64::saturating_add);
-
-        Some(base_tokens.saturating_add(items_tokens))
+        Some(base_tokens.saturating_add(self.total_item_tokens))
     }
 
     pub(crate) fn remove_first_item(&mut self) {
@@ -920,11 +930,19 @@ impl ContextManager {
             // Remove the oldest item (front of the list). Items are ordered from
             // oldest → newest, so index 0 is the first entry recorded.
             let items = Arc::make_mut(&mut self.items);
-            let removed = items.remove(0);
+            let removed = items.remove(/*index*/ 0);
+            let estimates = Arc::make_mut(&mut self.item_token_estimates);
+            self.total_item_tokens = self
+                .total_item_tokens
+                .saturating_sub(estimates.remove(/*index*/ 0));
             // If the removed item participates in a call/output pair, also remove
             // its corresponding counterpart to keep the invariants intact without
             // running a full normalization pass.
-            normalize::remove_corresponding_for(items, &removed.item);
+            if let Some(index) = normalize::remove_corresponding_for(items, &removed.item) {
+                self.total_item_tokens = self
+                    .total_item_tokens
+                    .saturating_sub(estimates.remove(index));
+            }
             self.reset_last_usage_boundary();
             self.world_state_baseline = None;
         }
@@ -951,6 +969,7 @@ impl ContextManager {
         }
         self.items = Arc::new(items);
         self.reset_last_usage_boundary();
+        self.rebuild_token_estimates();
         self.history_version = self.history_version.saturating_add(1);
         self.reset_version = self.history_version;
         self.world_state_baseline = None;
@@ -993,6 +1012,7 @@ impl ContextManager {
         }
         self.items = Arc::new(items);
         self.reset_last_usage_boundary();
+        self.rebuild_token_estimates();
         self.history_version = self.history_version.saturating_add(1);
         if promoted {
             self.reset_version = self.history_version;
@@ -1175,9 +1195,10 @@ impl ContextManager {
 
         self.items
             .iter()
+            .zip(self.item_token_estimates.iter())
             // Reasoning after the usage boundary is already included in the tail estimate.
             .take(last_user_index.min(self.last_server_reported_usage_item_count))
-            .filter(|envelope| {
+            .filter(|(envelope, _)| {
                 matches!(
                     &envelope.item,
                     ResponseItem::Reasoning {
@@ -1186,13 +1207,12 @@ impl ContextManager {
                     }
                 )
             })
-            .map(|envelope| {
-                estimate_item_token_count_with_audio(&envelope.item, &self.file_audio_durations)
-            })
+            .map(|(_, estimate)| *estimate)
             .fold(0i64, i64::saturating_add)
     }
 
     // Keep failed or usage-less output in the estimate until a usable count covers it.
+    #[cfg(test)]
     fn items_since_last_usage(
         &self,
     ) -> impl Clone + ExactSizeIterator<Item = &ResponseItem> + DoubleEndedIterator {
@@ -1222,8 +1242,9 @@ impl ContextManager {
     }
 
     pub(crate) fn estimated_tokens_since_last_usage(&self) -> i64 {
-        self.items_since_last_usage()
-            .map(|item| estimate_item_token_count_with_audio(item, &self.file_audio_durations))
+        self.item_token_estimates[self.last_server_reported_usage_item_count..]
+            .iter()
+            .copied()
             .fold(0i64, i64::saturating_add)
     }
 
@@ -1231,25 +1252,40 @@ impl ContextManager {
     /// 1. every call (function/custom) has a corresponding output entry
     /// 2. every output has a corresponding call entry or names an external tool event
     /// 3. unsupported image and audio content is stripped from messages and tool outputs
-    pub(crate) fn normalize_history(&mut self, input_modalities: &[InputModality]) {
+    #[cfg(test)]
+    fn normalize_history(&mut self, input_modalities: &[InputModality]) {
         let items = Arc::make_mut(&mut self.items);
-
-        // all function/tool calls must have a corresponding output
-        normalize::ensure_call_outputs_present(items, self.restored_through_sequence);
-
-        // Paired outputs must have a corresponding call; named external outputs stand alone.
-        normalize::remove_orphan_outputs(items);
-
-        // strip images when model does not support them
-        normalize::strip_images_when_unsupported(input_modalities, items);
-
-        // strip audio when model does not support it
-        normalize::strip_audio_when_unsupported(input_modalities, items);
-
+        normalize::normalize_for_prompt(items, input_modalities, self.restored_through_sequence);
         self.last_model_output_item_count = items
             .iter()
             .rposition(|envelope| is_model_generated_item(&envelope.item))
             .map(|index| index + 1);
+        self.rebuild_token_estimates();
+    }
+
+    /// Replace provisional estimates once attachment metadata supplies measured durations.
+    pub(crate) fn update_file_audio_durations(
+        &mut self,
+        update: impl FnOnce(&mut FileAudioDurations),
+    ) {
+        update(Arc::make_mut(&mut self.file_audio_durations));
+        self.rebuild_token_estimates();
+    }
+
+    fn rebuild_token_estimates(&mut self) {
+        self.item_token_estimates = Arc::new(
+            self.items
+                .iter()
+                .map(|envelope| {
+                    estimate_item_token_count_with_audio(&envelope.item, &self.file_audio_durations)
+                })
+                .collect(),
+        );
+        self.total_item_tokens = self
+            .item_token_estimates
+            .iter()
+            .copied()
+            .fold(/*init*/ 0i64, i64::saturating_add);
     }
 
     /// Walk backward from a rollback cut and trim contiguous pre-turn context-update items.

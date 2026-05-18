@@ -312,10 +312,8 @@ pub(crate) async fn capture_background_input(
         step_context.settings.model_info.usable_context_window(),
         &base_instructions,
     );
-    snapshot.normalize_history(&step_context.settings.model_info.input_modalities);
-    snapshot.project_file_audio_for_prompt();
     let (mut input, metadata): (Vec<_>, Vec<_>) = snapshot
-        .into_annotated_items()
+        .into_compaction_prompt_items(&step_context.settings.model_info.input_modalities)
         .into_iter()
         .map(|envelope| (envelope.item, envelope.metadata))
         .unzip();

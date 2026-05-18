@@ -1124,6 +1124,55 @@ async fn writer_state_retries_write_error_before_reporting_flush_success() -> st
 }
 
 #[tokio::test]
+async fn writer_state_does_not_retry_durable_prefix_after_later_error() -> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let rollout_path = home.path().join("rollout.jsonl");
+    let file = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&rollout_path)?;
+    let mut state = RolloutWriterState {
+        writer: Some(JsonlWriter {
+            file: tokio::fs::File::from_std(file),
+        }),
+        deferred_creation: false,
+        pending_items: Vec::new(),
+        realtime_sync_pending: false,
+        #[cfg(unix)]
+        directories_to_sync: Vec::new(),
+        meta: None,
+        cwd: home.path().to_path_buf(),
+        rollout_path: rollout_path.clone(),
+        ordinal_state: RolloutOrdinalState::Paginated {
+            next: Some(u64::MAX),
+        },
+        last_logged_error: None,
+    };
+    let durable_item = agent_message_item("x".repeat(16 * 1024).as_str());
+    state.add_items(vec![
+        durable_item.clone(),
+        agent_message_item("ordinal overflow"),
+    ]);
+
+    let err = state
+        .flush()
+        .await
+        .expect_err("the second item should overflow the rollout ordinal");
+
+    assert!(err.to_string().contains("overflow"));
+    let durable_lines = read_rollout_lines(&rollout_path)?;
+    assert_eq!(durable_lines.len(), 1);
+    assert_eq!(
+        durable_lines
+            .into_iter()
+            .map(|line| serde_json::to_value((line.ordinal, line.item)))
+            .collect::<Result<Vec<_>, _>>()?,
+        vec![serde_json::to_value((Some(u64::MAX), durable_item))?]
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn resumed_paginated_rollout_continues_after_ordinal_gap() -> std::io::Result<()> {
     let home = TempDir::new().expect("temp dir");
     let config = test_config(home.path());

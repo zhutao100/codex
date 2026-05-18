@@ -281,9 +281,9 @@ pub(super) async fn resolve(session: &Session, mut file_ids: BTreeSet<String>) {
     .await;
     if !resolved.is_empty() {
         let mut state = session.state.lock().await;
-        Arc::make_mut(&mut state.history.file_audio_durations)
-            .0
-            .extend(resolved);
+        state
+            .history
+            .update_file_audio_durations(|durations| durations.0.extend(resolved));
     }
 }
 
