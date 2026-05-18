@@ -1013,7 +1013,7 @@ impl RolloutRecorder {
                 let (path, file, ordinal_state) =
                     open_rollout_for_append(path.as_path(), writer_lock.clone()).await?;
                 RolloutWriterState {
-                    writer: Some(JsonlWriter { file }),
+                    writer: Some(JsonlWriter::new(file)),
                     deferred_creation: false,
                     pending_items: Vec::new(),
                     meta: None,
@@ -1845,15 +1845,6 @@ impl RolloutWriterState {
         self.pending_items.extend(items);
     }
 
-    async fn flush_if_materialized(&mut self) {
-        if self.is_deferred() {
-            return;
-        }
-        if let Err(err) = self.flush().await {
-            self.enter_recovery_mode(&err);
-        }
-    }
-
     async fn persist(&mut self) -> std::io::Result<()> {
         self.write_pending_with_recovery("persist").await
     }
@@ -1924,9 +1915,7 @@ impl RolloutWriterState {
         }
 
         let file = open_log_file(self.rollout_path.as_path())?;
-        self.writer = Some(JsonlWriter {
-            file: tokio::fs::File::from_std(file),
-        });
+        self.writer = Some(JsonlWriter::new(tokio::fs::File::from_std(file)));
         self.deferred_creation = false;
         Ok(())
     }
@@ -2007,7 +1996,6 @@ async fn rollout_writer(
             }
             RolloutCmd::AddItems(items) => {
                 state.add_items(items);
-                state.flush_if_materialized().await;
             }
             RolloutCmd::Persist { ack } => {
                 let _ = ack.send(state.persist().await);
@@ -2075,8 +2063,9 @@ pub async fn append_rollout_item_to_path(
     let (_rollout_path, file, ordinal_state) =
         open_rollout_for_append(rollout_path, /*writer_lock*/ None).await?;
     let ordinal = ordinal_state.current()?;
-    let mut writer = JsonlWriter { file };
-    writer.write_rollout_item(item, ordinal).await
+    let mut writer = JsonlWriter::new(file);
+    writer.write_rollout_item(item, ordinal).await?;
+    writer.file.flush().await
 }
 
 async fn open_rollout_for_append(
@@ -2134,6 +2123,10 @@ struct RolloutLineRef<'a> {
 }
 
 impl JsonlWriter {
+    fn new(file: tokio::fs::File) -> Self {
+        Self { file }
+    }
+
     async fn write_rollout_item(
         &mut self,
         rollout_item: &RolloutItem,

@@ -3591,6 +3591,10 @@ async fn recompute_token_usage_uses_session_base_instructions() {
         .last_token_usage
         .total_tokens;
     assert_eq!(actual_tokens, expected_tokens.max(0));
+    assert_eq!(
+        session.get_total_token_usage().await,
+        expected_tokens.max(0)
+    );
 }
 
 #[tokio::test]

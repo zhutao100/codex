@@ -2551,8 +2551,16 @@ impl Session {
                 .record_item_started(item_id.to_owned(), started_at_ms)
                 .await;
         }
-        let legacy_source = msg.clone();
-        if let EventMsg::Error(error) = &legacy_source
+        let legacy_events = msg.as_legacy_events(self.show_raw_agent_reasoning());
+        // Only terminal and realtime callbacks need the original event after delivery.
+        let post_send_event = if matches!(&msg, EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_))
+            || self.conversation.running_state().await.is_some()
+        {
+            Some(msg.clone())
+        } else {
+            None
+        };
+        if let EventMsg::Error(error) = &msg
             && error
                 .codex_error_info
                 .as_ref()
@@ -2566,10 +2574,10 @@ impl Session {
         }
         self.services
             .rollout_thread_trace
-            .record_codex_turn_event(&turn_context.sub_id, &legacy_source);
+            .record_codex_turn_event(&turn_context.sub_id, &msg);
         self.services
             .rollout_thread_trace
-            .record_tool_call_event(turn_context.sub_id.clone(), &legacy_source);
+            .record_tool_call_event(turn_context.sub_id.clone(), &msg);
         let event = Event {
             id: turn_context.sub_id.clone(),
             msg,
@@ -2593,15 +2601,14 @@ impl Session {
                 .track_guardian_session_event(self.thread_id, &event);
         }
         self.send_event_raw(event).await;
-        self.maybe_notify_parent_of_terminal_turn(turn_context, &legacy_source)
-            .await;
-        self.maybe_mirror_event_text_to_realtime(&legacy_source)
-            .await;
-        self.maybe_clear_realtime_handoff_for_event(&legacy_source)
-            .await;
+        if let Some(msg) = post_send_event {
+            self.maybe_notify_parent_of_terminal_turn(turn_context, &msg)
+                .await;
+            self.maybe_mirror_event_text_to_realtime(&msg).await;
+            self.maybe_clear_realtime_handoff_for_event(&msg).await;
+        }
 
-        let show_raw_agent_reasoning = self.show_raw_agent_reasoning();
-        for legacy in legacy_source.as_legacy_events(show_raw_agent_reasoning) {
+        for legacy in legacy_events {
             self.services
                 .rollout_thread_trace
                 .record_tool_call_event(turn_context.sub_id.clone(), &legacy);
@@ -2618,15 +2625,14 @@ impl Session {
     /// Use this for events whose canonical persistence belongs to another
     /// session, such as forwarded delegate events.
     pub(crate) async fn send_event_transient(&self, turn_context: &TurnContext, msg: EventMsg) {
-        let legacy_source = msg.clone();
+        let legacy_events = msg.as_legacy_events(self.show_raw_agent_reasoning());
         let event = Event {
             id: turn_context.sub_id.clone(),
             msg,
         };
         self.deliver_event_raw(event).await;
 
-        let show_raw_agent_reasoning = self.show_raw_agent_reasoning();
-        for legacy in legacy_source.as_legacy_events(show_raw_agent_reasoning) {
+        for legacy in legacy_events {
             let legacy_event = Event {
                 id: turn_context.sub_id.clone(),
                 msg: legacy,
@@ -5483,11 +5489,17 @@ impl Session {
     }
 
     pub(crate) async fn recompute_token_usage(&self, turn_context: &TurnContext) {
-        let history = self.clone_history().await;
         let base_instructions = self.get_base_instructions().await;
-        let Some(estimated_total_tokens) =
-            history.estimate_token_count_with_base_instructions(&base_instructions)
-        else {
+        let (estimated_total_tokens, input_item_count) = {
+            let state = self.state.lock().await;
+            (
+                state
+                    .history
+                    .estimate_token_count_with_base_instructions(&base_instructions),
+                state.history.raw_items().len(),
+            )
+        };
+        let Some(estimated_total_tokens) = estimated_total_tokens else {
             return;
         };
         {
@@ -5517,7 +5529,7 @@ impl Session {
             info.last_usage_includes_reasoning = Some(true);
             state
                 .history
-                .set_token_info_with_boundary(Some(info), history.raw_items().len());
+                .set_token_info_with_boundary(Some(info), input_item_count);
         }
         self.set_auto_compact_window_estimated_prefill_for_scope(
             turn_context,

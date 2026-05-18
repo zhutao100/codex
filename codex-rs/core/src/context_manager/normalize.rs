@@ -18,6 +18,16 @@ use tracing::info;
 // Changing this value would change model-visible IDs and invalidate prompt caches.
 const SYNTHETIC_OUTPUT_ID_NAMESPACE: Uuid = Uuid::from_u128(0x90d38d3e_6a5b_4d52_bfe2_2f1e634bfac4);
 
+pub(crate) fn normalize_for_prompt(
+    items: &mut Vec<ResponseItemEnvelope>,
+    input_modalities: &[InputModality],
+) {
+    ensure_call_outputs_present(items);
+    remove_orphan_outputs(items);
+    strip_images_when_unsupported(input_modalities, items);
+    strip_audio_when_unsupported(input_modalities, items);
+}
+
 pub(crate) fn ensure_call_outputs_present(items: &mut Vec<ResponseItemEnvelope>) {
     let mut function_output_ids = HashSet::new();
     let mut tool_search_output_ids = HashSet::new();
@@ -43,9 +53,7 @@ pub(crate) fn ensure_call_outputs_present(items: &mut Vec<ResponseItemEnvelope>)
         }
     }
 
-    // Collect synthetic outputs to insert immediately after their calls.
-    // Store the insertion position (index of call) alongside the item so
-    // we can insert in reverse order and avoid index shifting.
+    // Collect synthetic outputs with their call positions so we can rebuild the vector once.
     let mut missing_outputs_to_insert: Vec<(usize, ResponseItemEnvelope)> = Vec::new();
 
     for (idx, envelope) in items.iter().enumerate() {
@@ -147,9 +155,20 @@ pub(crate) fn ensure_call_outputs_present(items: &mut Vec<ResponseItemEnvelope>)
         custom_tool_output_ids,
     ));
 
-    // Insert synthetic outputs in reverse index order to avoid re-indexing.
-    for (idx, output_item) in missing_outputs_to_insert.into_iter().rev() {
-        items.insert(idx + 1, output_item);
+    if !missing_outputs_to_insert.is_empty() {
+        let mut normalized = Vec::with_capacity(items.len() + missing_outputs_to_insert.len());
+        let mut missing_outputs = missing_outputs_to_insert.into_iter().peekable();
+        for (index, item) in std::mem::take(items).into_iter().enumerate() {
+            normalized.push(item);
+            if missing_outputs
+                .peek()
+                .is_some_and(|(position, _)| *position == index)
+                && let Some((_, output)) = missing_outputs.next()
+            {
+                normalized.push(output);
+            }
+        }
+        *items = normalized;
     }
 }
 
@@ -240,7 +259,10 @@ pub(crate) fn remove_orphan_outputs(items: &mut Vec<ResponseItemEnvelope>) {
     }
 }
 
-pub(crate) fn remove_corresponding_for(items: &mut Vec<ResponseItemEnvelope>, item: &ResponseItem) {
+pub(crate) fn remove_corresponding_for(
+    items: &mut Vec<ResponseItemEnvelope>,
+    item: &ResponseItem,
+) -> Option<usize> {
     match item {
         ResponseItem::FunctionCall { call_id, .. } => {
             remove_first_matching(items, |i| {
@@ -251,7 +273,7 @@ pub(crate) fn remove_corresponding_for(items: &mut Vec<ResponseItemEnvelope>, it
                         ..
                     } if existing == call_id
                 )
-            });
+            })
         }
         ResponseItem::FunctionCallOutput {
             call_id: Some(call_id),
@@ -261,10 +283,14 @@ pub(crate) fn remove_corresponding_for(items: &mut Vec<ResponseItemEnvelope>, it
                 matches!(&envelope.item, ResponseItem::FunctionCall { call_id: existing, .. } if existing == call_id)
             }) {
                 items.remove(pos);
+                Some(pos)
             } else if let Some(pos) = items.iter().position(|envelope| {
                 matches!(&envelope.item, ResponseItem::LocalShellCall { call_id: Some(existing), .. } if existing == call_id)
             }) {
                 items.remove(pos);
+                Some(pos)
+            } else {
+                None
             }
         }
         ResponseItem::ToolSearchCall {
@@ -279,7 +305,7 @@ pub(crate) fn remove_corresponding_for(items: &mut Vec<ResponseItemEnvelope>, it
                         ..
                     } if existing == call_id
                 )
-            });
+            })
         }
         ResponseItem::ToolSearchOutput {
             call_id: Some(call_id),
@@ -296,7 +322,7 @@ pub(crate) fn remove_corresponding_for(items: &mut Vec<ResponseItemEnvelope>, it
                         } if existing == call_id
                     )
                 },
-            );
+            )
         }
         ResponseItem::CustomToolCall { call_id, .. } => {
             remove_first_matching(items, |i| {
@@ -306,13 +332,13 @@ pub(crate) fn remove_corresponding_for(items: &mut Vec<ResponseItemEnvelope>, it
                         call_id: existing, ..
                     } if existing == call_id
                 )
-            });
+            })
         }
         ResponseItem::CustomToolCallOutput { call_id, .. } => {
             remove_first_matching(
                 items,
                 |i| matches!(i, ResponseItem::CustomToolCall { call_id: existing, .. } if existing == call_id),
-            );
+            )
         }
         ResponseItem::LocalShellCall {
             call_id: Some(call_id),
@@ -326,19 +352,21 @@ pub(crate) fn remove_corresponding_for(items: &mut Vec<ResponseItemEnvelope>, it
                         ..
                     } if existing == call_id
                 )
-            });
+            })
         }
-        _ => {}
+        _ => None,
     }
 }
 
-fn remove_first_matching<F>(items: &mut Vec<ResponseItemEnvelope>, predicate: F)
+fn remove_first_matching<F>(items: &mut Vec<ResponseItemEnvelope>, predicate: F) -> Option<usize>
 where
     F: Fn(&ResponseItem) -> bool,
 {
-    if let Some(pos) = items.iter().position(|envelope| predicate(&envelope.item)) {
-        items.remove(pos);
-    }
+    let pos = items
+        .iter()
+        .position(|envelope| predicate(&envelope.item))?;
+    items.remove(pos);
+    Some(pos)
 }
 
 /// Strip image content from messages and tool outputs when the model does not support images.
