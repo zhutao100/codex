@@ -1191,6 +1191,7 @@ mod tests {
     use crate::model_provider_info::OLLAMA_OSS_PROVIDER_ID;
     use crate::model_provider_info::built_in_model_providers;
     use codex_protocol::models::ContentItem;
+    use codex_protocol::models::FunctionCallOutputPayload;
     use pretty_assertions::assert_eq;
     use tokio::sync::oneshot;
 
@@ -1288,6 +1289,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn incremental_items_preserve_prefix_when_steer_appends_after_committed_response() {
+        let initial_user = user_message_item("initial prompt");
+        let assistant = assistant_message_item("msg-1", "working on it");
+        let tool_output = function_call_output_item("call-1", "tool complete");
+        let steer = user_message_item("steer: prefer focused tests");
+
+        let previous_request = ws_request(vec![initial_user.clone()]);
+        let last_response = LastResponse {
+            response_id: "resp-1".to_string(),
+            items_added: vec![assistant.clone()],
+        };
+        let session = test_client_session(previous_request);
+
+        let post_steer_request = ws_request(vec![
+            initial_user.clone(),
+            assistant.clone(),
+            tool_output.clone(),
+            steer.clone(),
+        ]);
+
+        assert_eq!(
+            session.get_incremental_items(&post_steer_request, Some(&last_response), false),
+            Some(vec![tool_output.clone(), steer.clone()])
+        );
+
+        let reordered_request = ws_request(vec![initial_user, steer, assistant, tool_output]);
+
+        assert_eq!(
+            session.get_incremental_items(&reordered_request, Some(&last_response), false),
+            None
+        );
+    }
+
     fn assistant_message_item(id: &str, text: &str) -> ResponseItem {
         ResponseItem::Message {
             id: Some(id.to_string()),
@@ -1298,6 +1333,68 @@ mod tests {
             end_turn: None,
             phase: None,
         }
+    }
+
+    fn user_message_item(text: &str) -> ResponseItem {
+        ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: text.to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        }
+    }
+
+    fn function_call_output_item(call_id: &str, output: &str) -> ResponseItem {
+        ResponseItem::FunctionCallOutput {
+            call_id: call_id.to_string(),
+            output: FunctionCallOutputPayload::from_text(output.to_string()),
+        }
+    }
+
+    fn ws_request(input: Vec<ResponseItem>) -> ResponseCreateWsRequest {
+        ResponseCreateWsRequest {
+            model: "test-model".to_string(),
+            instructions: "test instructions".to_string(),
+            previous_response_id: None,
+            input,
+            tools: Vec::new(),
+            tool_choice: "auto".to_string(),
+            parallel_tool_calls: false,
+            reasoning: None,
+            store: false,
+            stream: true,
+            include: Vec::new(),
+            service_tier: None,
+            prompt_cache_key: Some("test-thread".to_string()),
+            text: None,
+            generate: None,
+            client_metadata: None,
+        }
+    }
+
+    fn test_client_session(previous_request: ResponseCreateWsRequest) -> ModelClientSession {
+        let provider = built_in_model_providers()
+            .get("openai")
+            .expect("openai provider")
+            .clone();
+        let client = ModelClient::new(
+            None,
+            ThreadId::new(),
+            provider,
+            SessionSource::Exec,
+            None,
+            true,
+            false,
+            false,
+            false,
+            None,
+        );
+        let mut session = client.new_session();
+        session.websocket_last_request = Some(previous_request);
+        session
     }
 
     fn test_otel_manager() -> OtelManager {

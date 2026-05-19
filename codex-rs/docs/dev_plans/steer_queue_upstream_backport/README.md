@@ -32,6 +32,7 @@ Implemented required phases:
 - Rejected steers are retained separately and drained before normal queued messages.
 - Queue auto-drain is gated while a submitted or continued turn is waiting for `TurnStarted`.
 - Pending steers are recoverable across pause/interruption cleanup paths.
+- The incremental request path has regression coverage for the cache-relevant invariant: a post-steer request may append a new suffix, but it must still start with the previous request input plus committed response items.
 
 Optional phases not implemented here:
 

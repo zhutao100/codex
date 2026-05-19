@@ -199,5 +199,5 @@ Do this only if external clients need same-turn steer parity.
 |Review/compact active|Steer is rejected, moved to rejected queue, and retried before normal queued input.|
 |Pause after pending steer|The uncommitted steer remains recoverable and is not silently discarded.|
 |Continue|Resumes without adding a user prompt and without prematurely draining queued messages.|
-|Prefix-cache semantics|No premature local transcript/history mutation before core commit; post-commit model-visible context changes are accepted as intended.|
+|Prefix-cache semantics|No premature local transcript/history mutation before core commit; post-commit model-visible context changes are accepted as intended; unchanged committed request prefix remains prefix-preserving for incremental request construction.|
 |Existing queue editing|Move, edit, delete, and send-next behavior for normal queued messages still works.|

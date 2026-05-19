@@ -69,6 +69,7 @@ The correctness requirement is narrower:
 - pending input ordering must be deterministic;
 - queued input must not be merged into the first sample of a fresh explicit prompt;
 - uncommitted steer input must be recoverable if the active task is stopped.
+- request construction must preserve the committed prefix. A post-steer request can append tool output and the new steer, but it should still begin with the previous request input plus committed response items unless compaction or request settings intentionally changed.
 
 ## Backport goals
 
