@@ -2011,6 +2011,28 @@
           ],
           "title": "ResponseTooManyFailedAttemptsCodexErrorInfo",
           "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Returned when a user turn is submitted while the current active turn cannot accept same-turn steering, for example review, compact, or standalone user-shell turns.",
+          "properties": {
+            "active_turn_not_steerable": {
+              "properties": {
+                "turn_kind": {
+                  "$ref": "#/definitions/NonSteerableTurnKind"
+                }
+              },
+              "required": [
+                "turn_kind"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "active_turn_not_steerable"
+          ],
+          "title": "ActiveTurnNotSteerableCodexErrorInfo",
+          "type": "object"
         }
       ]
     },
@@ -6446,6 +6468,15 @@
       "title": "NewConversationResponse",
       "type": "object"
     },
+    "NonSteerableTurnKind": {
+      "description": "Turn kinds that reject same-turn steering.",
+      "enum": [
+        "review",
+        "compact",
+        "user_shell"
+      ],
+      "type": "string"
+    },
     "ParsedCommand": {
       "oneOf": [
         {
@@ -10652,6 +10683,28 @@
             ],
             "title": "ResponseTooManyFailedAttemptsCodexErrorInfo",
             "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "The active turn cannot accept same-turn steering.",
+            "properties": {
+              "activeTurnNotSteerable": {
+                "properties": {
+                  "turnKind": {
+                    "$ref": "#/definitions/v2/NonSteerableTurnKind"
+                  }
+                },
+                "required": [
+                  "turnKind"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "activeTurnNotSteerable"
+            ],
+            "title": "ActiveTurnNotSteerableCodexErrorInfo",
+            "type": "object"
           }
         ]
       },
@@ -12801,6 +12854,14 @@
         "enum": [
           "restricted",
           "enabled"
+        ],
+        "type": "string"
+      },
+      "NonSteerableTurnKind": {
+        "enum": [
+          "review",
+          "compact",
+          "userShell"
         ],
         "type": "string"
       },

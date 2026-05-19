@@ -441,6 +441,28 @@
           ],
           "title": "ResponseTooManyFailedAttemptsCodexErrorInfo",
           "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The active turn cannot accept same-turn steering.",
+          "properties": {
+            "activeTurnNotSteerable": {
+              "properties": {
+                "turnKind": {
+                  "$ref": "#/definitions/NonSteerableTurnKind"
+                }
+              },
+              "required": [
+                "turnKind"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "activeTurnNotSteerable"
+          ],
+          "title": "ActiveTurnNotSteerableCodexErrorInfo",
+          "type": "object"
         }
       ]
     },
@@ -583,6 +605,28 @@
             "response_too_many_failed_attempts"
           ],
           "title": "ResponseTooManyFailedAttemptsCodexErrorInfo2",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Returned when a user turn is submitted while the current active turn cannot accept same-turn steering, for example review, compact, or standalone user-shell turns.",
+          "properties": {
+            "active_turn_not_steerable": {
+              "properties": {
+                "turn_kind": {
+                  "$ref": "#/definitions/NonSteerableTurnKind2"
+                }
+              },
+              "required": [
+                "turn_kind"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "active_turn_not_steerable"
+          ],
+          "title": "ActiveTurnNotSteerableCodexErrorInfo2",
           "type": "object"
         }
       ]
@@ -4273,6 +4317,23 @@
       "enum": [
         "restricted",
         "enabled"
+      ],
+      "type": "string"
+    },
+    "NonSteerableTurnKind": {
+      "enum": [
+        "review",
+        "compact",
+        "userShell"
+      ],
+      "type": "string"
+    },
+    "NonSteerableTurnKind2": {
+      "description": "Turn kinds that reject same-turn steering.",
+      "enum": [
+        "review",
+        "compact",
+        "user_shell"
       ],
       "type": "string"
     },

@@ -127,6 +127,7 @@ export type { ModelVerificationEvent } from "./ModelVerificationEvent";
 export type { NetworkAccess } from "./NetworkAccess";
 export type { NewConversationParams } from "./NewConversationParams";
 export type { NewConversationResponse } from "./NewConversationResponse";
+export type { NonSteerableTurnKind } from "./NonSteerableTurnKind";
 export type { ParsedCommand } from "./ParsedCommand";
 export type { PatchApplyBeginEvent } from "./PatchApplyBeginEvent";
 export type { PatchApplyEndEvent } from "./PatchApplyEndEvent";

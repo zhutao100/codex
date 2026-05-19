@@ -243,6 +243,7 @@ use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::InitialHistory;
+use codex_protocol::protocol::NonSteerableTurnKind;
 use codex_protocol::user_input::UserInput;
 use codex_utils_readiness::Readiness;
 use codex_utils_readiness::ReadinessFlag;
@@ -271,6 +272,41 @@ use self::turn::is_user_turn_boundary_response_item;
 use self::turn::remove_trailing_turn_aborted_marker;
 use self::turn::trim_incomplete_continuation_tail;
 use self::turn_context::TurnContext;
+
+#[derive(Debug, PartialEq)]
+pub enum SteerInputError {
+    NoActiveTurn(Vec<UserInput>),
+    ActiveTurnNotSteerable { turn_kind: NonSteerableTurnKind },
+    EmptyInput,
+}
+
+impl SteerInputError {
+    fn to_error_event(&self) -> ErrorEvent {
+        match self {
+            Self::NoActiveTurn(_) => ErrorEvent {
+                message: "no active turn to steer".to_string(),
+                codex_error_info: Some(CodexErrorInfo::BadRequest),
+            },
+            Self::ActiveTurnNotSteerable { turn_kind } => {
+                let turn_kind_label = match turn_kind {
+                    NonSteerableTurnKind::Review => "review",
+                    NonSteerableTurnKind::Compact => "compact",
+                    NonSteerableTurnKind::UserShell => "user-shell",
+                };
+                ErrorEvent {
+                    message: format!("cannot steer a {turn_kind_label} turn"),
+                    codex_error_info: Some(CodexErrorInfo::ActiveTurnNotSteerable {
+                        turn_kind: *turn_kind,
+                    }),
+                }
+            }
+            Self::EmptyInput => ErrorEvent {
+                message: "input must not be empty".to_string(),
+                codex_error_info: Some(CodexErrorInfo::BadRequest),
+            },
+        }
+    }
+}
 
 const CYBER_VERIFY_URL: &str = "https://chatgpt.com/cyber";
 const CYBER_SAFETY_URL: &str = "https://developers.openai.com/codex/concepts/cyber-safety";
@@ -2081,17 +2117,47 @@ impl Session {
             .await;
     }
 
-    /// Returns the input if there was no task running to inject into
-    pub async fn inject_input(&self, input: Vec<UserInput>) -> Result<(), Vec<UserInput>> {
-        let mut active = self.active_turn.lock().await;
-        match active.as_mut() {
-            Some(at) => {
-                let mut ts = at.turn_state.lock().await;
-                ts.push_pending_input(input.into());
-                Ok(())
-            }
-            None => Err(input),
+    /// Inject additional user input into the currently active regular turn.
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "active turn checks and turn state updates must remain atomic"
+    )]
+    pub async fn steer_input(&self, input: Vec<UserInput>) -> Result<(), SteerInputError> {
+        if input.is_empty() {
+            return Err(SteerInputError::EmptyInput);
         }
+
+        let mut active = self.active_turn.lock().await;
+        let Some(active_turn) = active.as_mut() else {
+            return Err(SteerInputError::NoActiveTurn(input));
+        };
+
+        let Some((_, active_task)) = active_turn.tasks.first() else {
+            return Err(SteerInputError::NoActiveTurn(input));
+        };
+
+        match active_task.kind {
+            crate::state::TaskKind::Regular => {}
+            crate::state::TaskKind::Review | crate::state::TaskKind::PostTurnCompletionReview => {
+                return Err(SteerInputError::ActiveTurnNotSteerable {
+                    turn_kind: NonSteerableTurnKind::Review,
+                });
+            }
+            crate::state::TaskKind::Compact => {
+                return Err(SteerInputError::ActiveTurnNotSteerable {
+                    turn_kind: NonSteerableTurnKind::Compact,
+                });
+            }
+            crate::state::TaskKind::UserShell => {
+                return Err(SteerInputError::ActiveTurnNotSteerable {
+                    turn_kind: NonSteerableTurnKind::UserShell,
+                });
+            }
+        }
+
+        let mut ts = active_turn.turn_state.lock().await;
+        ts.push_pending_input(input.into());
+        Ok(())
     }
 
     /// Returns the input if there was no task running to inject into

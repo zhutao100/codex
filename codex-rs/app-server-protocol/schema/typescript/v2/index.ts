@@ -93,6 +93,7 @@ export type { ModelReroutedNotification } from "./ModelReroutedNotification";
 export type { ModelVerification } from "./ModelVerification";
 export type { ModelVerificationNotification } from "./ModelVerificationNotification";
 export type { NetworkAccess } from "./NetworkAccess";
+export type { NonSteerableTurnKind } from "./NonSteerableTurnKind";
 export type { OverriddenMetadata } from "./OverriddenMetadata";
 export type { PatchApplyStatus } from "./PatchApplyStatus";
 export type { PatchChangeKind } from "./PatchChangeKind";

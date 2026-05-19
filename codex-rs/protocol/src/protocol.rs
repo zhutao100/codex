@@ -1014,6 +1014,16 @@ pub enum AgentStatus {
     NotFound,
 }
 
+/// Turn kinds that reject same-turn steering.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+pub enum NonSteerableTurnKind {
+    Review,
+    Compact,
+    UserShell,
+}
+
 /// Codex errors that we expose to clients.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "snake_case")]
@@ -1044,6 +1054,11 @@ pub enum CodexErrorInfo {
     /// Reached the retry limit for responses.
     ResponseTooManyFailedAttempts {
         http_status_code: Option<u16>,
+    },
+    /// Returned when a user turn is submitted while the current active turn cannot accept
+    /// same-turn steering, for example review, compact, or standalone user-shell turns.
+    ActiveTurnNotSteerable {
+        turn_kind: NonSteerableTurnKind,
     },
     ThreadRollbackFailed,
     Other,

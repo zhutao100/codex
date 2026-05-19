@@ -141,8 +141,38 @@
           ],
           "title": "ResponseTooManyFailedAttemptsCodexErrorInfo",
           "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The active turn cannot accept same-turn steering.",
+          "properties": {
+            "activeTurnNotSteerable": {
+              "properties": {
+                "turnKind": {
+                  "$ref": "#/definitions/NonSteerableTurnKind"
+                }
+              },
+              "required": [
+                "turnKind"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "activeTurnNotSteerable"
+          ],
+          "title": "ActiveTurnNotSteerableCodexErrorInfo",
+          "type": "object"
         }
       ]
+    },
+    "NonSteerableTurnKind": {
+      "enum": [
+        "review",
+        "compact",
+        "userShell"
+      ],
+      "type": "string"
     },
     "TurnError": {
       "properties": {

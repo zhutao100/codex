@@ -32,6 +32,7 @@ use codex_protocol::protocol::CreditsSnapshot as CoreCreditsSnapshot;
 use codex_protocol::protocol::ModelRerouteReason as CoreModelRerouteReason;
 use codex_protocol::protocol::ModelVerification as CoreModelVerification;
 use codex_protocol::protocol::NetworkAccess as CoreNetworkAccess;
+use codex_protocol::protocol::NonSteerableTurnKind as CoreNonSteerableTurnKind;
 use codex_protocol::protocol::ProgressTraceCategory as CoreProgressTraceCategory;
 use codex_protocol::protocol::ProgressTraceState as CoreProgressTraceState;
 use codex_protocol::protocol::RateLimitSnapshot as CoreRateLimitSnapshot;
@@ -82,6 +83,14 @@ macro_rules! v2_enum_from_core {
     };
 }
 
+v2_enum_from_core! {
+    pub enum NonSteerableTurnKind from CoreNonSteerableTurnKind {
+        Review,
+        Compact,
+        UserShell,
+    }
+}
+
 /// This translation layer make sure that we expose codex error code in camel case.
 ///
 /// When an upstream HTTP status is available (for example, from the Responses API or a provider),
@@ -125,6 +134,12 @@ pub enum CodexErrorInfo {
         #[ts(rename = "httpStatusCode")]
         http_status_code: Option<u16>,
     },
+    /// The active turn cannot accept same-turn steering.
+    ActiveTurnNotSteerable {
+        #[serde(rename = "turnKind")]
+        #[ts(rename = "turnKind")]
+        turn_kind: NonSteerableTurnKind,
+    },
     Other,
 }
 
@@ -157,6 +172,11 @@ impl From<CoreCodexErrorInfo> for CodexErrorInfo {
             }
             CoreCodexErrorInfo::ResponseTooManyFailedAttempts { http_status_code } => {
                 CodexErrorInfo::ResponseTooManyFailedAttempts { http_status_code }
+            }
+            CoreCodexErrorInfo::ActiveTurnNotSteerable { turn_kind } => {
+                CodexErrorInfo::ActiveTurnNotSteerable {
+                    turn_kind: turn_kind.into(),
+                }
             }
             CoreCodexErrorInfo::Other => CodexErrorInfo::Other,
         }

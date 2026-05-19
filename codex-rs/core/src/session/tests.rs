@@ -14,6 +14,7 @@ use codex_protocol::models::FunctionCallOutputPayload;
 use crate::protocol::CompactedItem;
 use crate::protocol::CreditsSnapshot;
 use crate::protocol::InitialHistory;
+use crate::protocol::NonSteerableTurnKind;
 use crate::protocol::RateLimitSnapshot;
 use crate::protocol::RateLimitWindow;
 use crate::protocol::ResumedHistory;
@@ -1721,6 +1722,83 @@ impl SessionTask for NeverEndingTask {
         loop {
             sleep(Duration::from_secs(60)).await;
         }
+    }
+}
+
+fn steer_text_input(text: &str) -> Vec<UserInput> {
+    vec![UserInput::Text {
+        text: text.to_string(),
+        text_elements: Vec::new(),
+    }]
+}
+
+async fn spawn_never_ending_task(sess: &Arc<Session>, tc: &Arc<TurnContext>, kind: TaskKind) {
+    sess.spawn_task(
+        Arc::clone(tc),
+        steer_text_input("active task"),
+        NeverEndingTask {
+            kind,
+            listen_to_cancellation_token: true,
+        },
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn steer_input_returns_no_active_turn_when_idle() {
+    let (sess, _tc, _rx) = make_session_and_context_with_rx().await;
+    let input = steer_text_input("steer");
+
+    assert_eq!(
+        sess.steer_input(input.clone()).await,
+        Err(SteerInputError::NoActiveTurn(input))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn steer_input_rejects_empty_input() {
+    let (sess, _tc, _rx) = make_session_and_context_with_rx().await;
+
+    assert_eq!(
+        sess.steer_input(Vec::new()).await,
+        Err(SteerInputError::EmptyInput)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn steer_input_accepts_regular_active_turn() {
+    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
+    spawn_never_ending_task(&sess, &tc, TaskKind::Regular).await;
+
+    let input = steer_text_input("steer");
+    sess.steer_input(input.clone())
+        .await
+        .expect("regular turn should accept steer input");
+
+    assert_eq!(
+        sess.get_pending_input().await,
+        vec![ResponseInputItem::from(input)]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn steer_input_rejects_non_steerable_active_turns() {
+    for (task_kind, turn_kind) in [
+        (TaskKind::Review, NonSteerableTurnKind::Review),
+        (
+            TaskKind::PostTurnCompletionReview,
+            NonSteerableTurnKind::Review,
+        ),
+        (TaskKind::Compact, NonSteerableTurnKind::Compact),
+        (TaskKind::UserShell, NonSteerableTurnKind::UserShell),
+    ] {
+        let (sess, tc, _rx) = make_session_and_context_with_rx().await;
+        spawn_never_ending_task(&sess, &tc, task_kind).await;
+
+        assert_eq!(
+            sess.steer_input(steer_text_input("steer")).await,
+            Err(SteerInputError::ActiveTurnNotSteerable { turn_kind })
+        );
     }
 }
 

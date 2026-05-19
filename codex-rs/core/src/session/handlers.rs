@@ -148,6 +148,7 @@ pub(super) async fn submission_loop(
 
 use crate::config::Config;
 
+use super::SteerInputError;
 use crate::mcp::auth::compute_auth_statuses;
 use crate::mcp::collect_mcp_snapshot_from_manager;
 use crate::mcp::effective_mcp_servers;
@@ -326,19 +327,29 @@ pub async fn user_input_or_turn(sess: &Arc<Session>, sub_id: String, op: Op) {
         _ => unreachable!(),
     };
 
-    let Ok(current_context) = sess.new_turn_with_sub_id(sub_id, updates).await else {
+    let Ok(current_context) = sess.new_turn_with_sub_id(sub_id.clone(), updates).await else {
         // new_turn_with_sub_id already emits the error event.
         return;
     };
-    current_context.otel_manager.user_prompt(&items);
-
-    // Attempt to inject input into current task
-    if let Err(items) = sess.inject_input(items).await {
-        sess.clear_pending_continuation().await;
-        sess.refresh_mcp_servers_if_requested(&current_context)
+    match sess.steer_input(items.clone()).await {
+        Ok(()) => {
+            current_context.otel_manager.user_prompt(&items);
+        }
+        Err(SteerInputError::NoActiveTurn(items)) => {
+            current_context.otel_manager.user_prompt(&items);
+            sess.clear_pending_continuation().await;
+            sess.refresh_mcp_servers_if_requested(&current_context)
+                .await;
+            sess.spawn_task(Arc::clone(&current_context), items, RegularTask)
+                .await;
+        }
+        Err(err) => {
+            sess.send_event_raw(Event {
+                id: sub_id,
+                msg: EventMsg::Error(err.to_error_event()),
+            })
             .await;
-        sess.spawn_task(Arc::clone(&current_context), items, RegularTask)
-            .await;
+        }
     }
 }
 
