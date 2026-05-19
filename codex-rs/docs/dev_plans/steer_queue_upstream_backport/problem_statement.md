@@ -77,7 +77,7 @@ The correctness requirement is narrower:
 |Commit steer display from core events|Enter steer while a task is running appears as pending preview first, then as one visible user prompt after `EventMsg::UserMessage` or equivalent committed user item.|
 |Separate steer from queue|Enter remains same-turn steer; Tab remains next-turn queue.|
 |Reject non-steerable active tasks|Review and compact tasks do not accept pending steer input; the TUI moves those payloads to rejected-steer queue.|
-|Preserve pending steer payloads|Pause, interrupt, thread switch, and recoverable error paths do not lose uncommitted user input.|
+|Preserve pending steer payloads|Pause, interrupt, review/compact rejection, and recoverable error paths in this branch's in-place TUI lifecycle do not lose uncommitted user input.|
 |Close queue-drain race|Queued follow-ups do not drain until no user turn is pending or running.|
 |Preserve `/pause` and `/continue`|Upstream interrupt-specific behavior is adapted, not copied over the branch's pause lifecycle.|
 

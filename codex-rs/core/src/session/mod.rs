@@ -2118,10 +2118,6 @@ impl Session {
     }
 
     /// Inject additional user input into the currently active regular turn.
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "active turn checks and turn state updates must remain atomic"
-    )]
     pub async fn steer_input(&self, input: Vec<UserInput>) -> Result<(), SteerInputError> {
         if input.is_empty() {
             return Err(SteerInputError::EmptyInput);

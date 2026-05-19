@@ -67,4 +67,4 @@ The later model-visible history mutation is intended. A same-turn steer is addit
 
 1. Do not render or otherwise commit the steer in local visible conversation history before core emits the committed user-message item.
 2. Preserve deterministic ordering: fresh explicit user prompt first, then pending steer follow-up after a successful sample, then queued next-turn input only after the current turn is no longer pending or running.
-3. Preserve uncommitted steer text across pause, interrupt, review rejection, compact rejection, thread switch, and recoverable error paths.
+3. Preserve uncommitted steer text across pause, interrupt, review rejection, compact rejection, and recoverable error paths. In-place thread-switch restoration is only required if that upstream app-server workflow is backported later.
