@@ -19,7 +19,8 @@ Thus, the design of the changes target to minimize the potentials of future reba
   filters tests listed in `scripts/cargo-local-network-sandbox-skips.txt`
   because they exercise nested sandbox/shell behavior.
 - `scripts/cargo-local test` defaults to agent output: it filters passing libtest
-  progress into a compact summary while preserving warnings and failures. Use
+  progress, passing-test subprocess chatter, and legacy snapshot notices into a
+  compact summary while preserving warnings and failures. Use
   `CODEX_RS_CARGO_LOCAL_TEST_OUTPUT=raw` only when exact Cargo/libtest output is
   needed.
 - The `cargo build` commands can produce giant console output, even with

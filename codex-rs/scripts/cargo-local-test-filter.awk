@@ -21,10 +21,35 @@ function sanitize(value) {
 
     value = replace_all(value, target_dir "/", "<target-dir>/")
     value = replace_all(value, target_dir, "<target-dir>")
+    value = replace_all(value, tmp_dir_real "/", "<tmp-dir>/")
+    value = replace_all(value, tmp_dir_real, "<tmp-dir>")
+    value = replace_all(value, tmp_dir "/", "<tmp-dir>/")
+    value = replace_all(value, tmp_dir, "<tmp-dir>")
     value = replace_all(value, workspace_dir "/", "./")
     value = replace_all(value, workspace_dir, ".")
     value = replace_all(value, home_dir "/", "~/")
     value = replace_all(value, home_dir, "~")
+
+    return value
+}
+
+function strip_libtest_progress_prefix(value,    comparable) {
+    comparable = comparable_line(value)
+
+    if (comparable ~ /^[.iF]+( [0-9]+\/[0-9]+)?$/) {
+        return ""
+    }
+
+    if (value ~ /^[.iF]+/) {
+        comparable = value
+        sub(/^[.iF]+[[:space:]]*/, "", comparable)
+        if (comparable ~ /^(Snapshot test passes but|all doctests ran|test result:|failures:|running [0-9]+ tests?$|warning:|error(:|\[)|Initialized empty Git repository in |Switched to |branch .* set up to track |fatal: path )/) {
+            return comparable
+        }
+        if (comparable ~ /^(\[[^]]+\] |To <tmp-dir>\/|\* \[new branch\]|[0-9]+ files? changed,|create mode [0-9]+ |delete mode [0-9]+ |rm ')/) {
+            return comparable
+        }
+    }
 
     return value
 }
@@ -103,17 +128,110 @@ function emit_ok_summary(    summary) {
     emit(summary)
 }
 
+function emit_suppressed_summary(    summary) {
+    if (suppressed_legacy_snapshot_notices > 0) {
+        summary = "cargo-local: suppressed " suppressed_legacy_snapshot_notices " passing legacy snapshot notice"
+        if (suppressed_legacy_snapshot_notices != 1) {
+            summary = summary "s"
+        }
+        emit(summary)
+    }
+
+    if (suppressed_passing_output_lines > 0) {
+        summary = "cargo-local: suppressed " suppressed_passing_output_lines " passing-test stdout/stderr line"
+        if (suppressed_passing_output_lines != 1) {
+            summary = summary "s"
+        }
+        emit(summary)
+    }
+}
+
+function is_legacy_snapshot_notice(value) {
+    return value ~ /^Snapshot test passes but the existing value is in a legacy format\./
+}
+
+# Legacy snapshot notices include full snapshot bodies even when tests pass.
+function is_legacy_snapshot_boundary(value) {
+    if (value == "") {
+        return 0
+    }
+    if (is_legacy_snapshot_notice(value)) {
+        return 1
+    }
+    if (value ~ /^(failures:|test result:|running [0-9]+ tests?$|Finished `.*` profile |Running (unittests|tests|doctests|benchmarks) |Doc-tests |all doctests ran|warning:|error(:|\[)|Initialized empty Git repository in )/) {
+        return 1
+    }
+    if (value ~ /^(\[[^]]+\] |Switched to |branch .* set up to track |To <tmp-dir>\/|\* \[new branch\]|fatal: path )/) {
+        return 1
+    }
+    return 0
+}
+
+# Keep subprocess chatter for failed runs; on success it is usually fixture setup.
+function is_passing_subprocess_noise(value) {
+    if (cargo_status != 0) {
+        return 0
+    }
+    if (value ~ /^Initialized empty Git repository in <tmp-dir>\//) {
+        return 1
+    }
+    if (value ~ /^\[[^]]+\] /) {
+        return 1
+    }
+    if (value ~ /^[0-9]+ files? changed,/) {
+        return 1
+    }
+    if (value ~ /^(create|delete) mode [0-9]+ /) {
+        return 1
+    }
+    if (value ~ /^Switched to (a new branch|branch) /) {
+        return 1
+    }
+    if (value ~ /^branch '[^']+' set up to track /) {
+        return 1
+    }
+    if (value ~ /^To <tmp-dir>\//) {
+        return 1
+    }
+    if (value ~ /^\* \[new branch\] /) {
+        return 1
+    }
+    if (value ~ /^rm '[^']+'$/) {
+        return 1
+    }
+    if (value ~ /^fatal: path '[^']+' exists on disk, but not in '[0-9a-f]+'$/) {
+        return 1
+    }
+    return 0
+}
+
 BEGIN {
     esc = sprintf("%c", 27)
     cr = sprintf("%c", 13)
 }
 
 {
-    line = sanitize($0)
+    line = strip_libtest_progress_prefix(sanitize($0))
     comparable = comparable_line(line)
+
+    if (skipping_legacy_snapshot_notice) {
+        if (is_legacy_snapshot_notice(comparable)) {
+            suppressed_legacy_snapshot_notices += 1
+            next
+        }
+        if (!is_legacy_snapshot_boundary(comparable)) {
+            next
+        }
+        skipping_legacy_snapshot_notice = 0
+    }
 
     if (comparable == "") {
         emit("")
+        next
+    }
+    if (is_legacy_snapshot_notice(comparable)) {
+        suppressed_legacy_snapshot_notices += 1
+        skipping_legacy_snapshot_notice = 1
         next
     }
     if (comparable == "failures:") {
@@ -150,7 +268,14 @@ BEGIN {
     if (comparable ~ /^Doc-tests /) {
         next
     }
+    if (comparable ~ /^all doctests ran in .*; merged doctests compilation took /) {
+        next
+    }
     if (comparable ~ /^warning: `.*` .* generated [0-9]+ warnings?$/) {
+        next
+    }
+    if (is_passing_subprocess_noise(comparable)) {
+        suppressed_passing_output_lines += 1
         next
     }
     if (comparable ~ /^error(:|\[)/) {
@@ -161,6 +286,9 @@ BEGIN {
 }
 
 END {
+    if (!saw_failed && !saw_error) {
+        emit_suppressed_summary()
+    }
     if (ok_suites > 0 && cargo_status == 0 && !saw_failed && !saw_error) {
         emit_ok_summary()
     }

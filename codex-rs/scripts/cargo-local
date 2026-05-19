@@ -358,6 +358,8 @@ filter_cargo_test_output() {
         -f "${script_dir}/cargo-local-test-filter.awk" \
         -v cargo_status="${cargo_status}" \
         -v home_dir="${HOME:-}" \
+        -v tmp_dir="${tmp_dir}" \
+        -v tmp_dir_real="${tmp_dir_real}" \
         -v target_dir="${target_dir}" \
         -v workspace_dir="${workspace_dir}"
 }
@@ -429,6 +431,10 @@ run_filtered_cargo_test() {
 cargo_local_filter_test_output=0
 
 target_dir="$(select_target_dir)"
+tmp_dir="${TMPDIR:-/tmp}"
+tmp_dir="${tmp_dir%/}"
+[ -n "${tmp_dir}" ] || tmp_dir="/"
+tmp_dir_real="$(cd -- "${tmp_dir}" && pwd -P)"
 
 if [ "${1:-}" = "--print-target-dir" ]; then
     printf '%s\n' "${target_dir}"
