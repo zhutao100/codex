@@ -45,6 +45,7 @@ use codex_core::protocol::ItemCompletedEvent;
 use codex_core::protocol::McpStartupCompleteEvent;
 use codex_core::protocol::McpStartupStatus;
 use codex_core::protocol::McpStartupUpdateEvent;
+use codex_core::protocol::NonSteerableTurnKind;
 use codex_core::protocol::Op;
 use codex_core::protocol::PatchApplyBeginEvent;
 use codex_core::protocol::PatchApplyEndEvent;
@@ -879,6 +880,11 @@ async fn make_chatwidget_manual(
         frame_requester: FrameRequester::test_dummy(),
         show_welcome_banner: true,
         queued_user_messages: VecDeque::new(),
+        pending_steers: VecDeque::new(),
+        rejected_steers_queue: VecDeque::new(),
+        rejected_steer_history_records: VecDeque::new(),
+        user_turn_pending_start: false,
+        last_rendered_user_message_display: None,
         next_queued_user_message_id: 1,
         queued_edit_state: None,
         suppress_session_configured_redraw: false,
@@ -4286,6 +4292,231 @@ async fn submitting_during_active_turn_keeps_running_model_and_effort() {
         chat.running_turn_reasoning_effort,
         Some(ReasoningEffortConfig::High)
     );
+}
+
+#[tokio::test]
+async fn steer_enter_while_active_waits_for_committed_user_message() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.agent_turn_running = true;
+
+    chat.submit_user_message("follow-up while running".into());
+
+    let op = next_submit_op(&mut op_rx);
+    assert!(matches!(op, Op::UserTurn { .. }));
+    assert_eq!(chat.pending_steers.len(), 1);
+    assert!(
+        drain_insert_history(&mut rx).is_empty(),
+        "pending steers must not render before core commits them"
+    );
+}
+
+#[tokio::test]
+async fn committed_user_message_renders_pending_steer_once() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.agent_turn_running = true;
+
+    chat.submit_user_message("follow-up while running".into());
+    drain_insert_history(&mut rx);
+
+    chat.handle_codex_event(Event {
+        id: "user-message".into(),
+        msg: EventMsg::UserMessage(UserMessageEvent {
+            message: "follow-up while running".to_string(),
+            images: None,
+            text_elements: Vec::new(),
+            local_images: Vec::new(),
+        }),
+    });
+
+    assert!(chat.pending_steers.is_empty());
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(cells.len(), 1);
+    assert!(lines_to_single_string(&cells[0]).contains("follow-up while running"));
+
+    chat.handle_codex_event(Event {
+        id: "duplicate-user-message".into(),
+        msg: EventMsg::UserMessage(UserMessageEvent {
+            message: "follow-up while running".to_string(),
+            images: None,
+            text_elements: Vec::new(),
+            local_images: Vec::new(),
+        }),
+    });
+    assert!(
+        drain_insert_history(&mut rx).is_empty(),
+        "duplicate live user-message events should not render twice"
+    );
+}
+
+#[tokio::test]
+async fn committed_user_message_uses_pending_steer_rich_payload() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    let placeholder = "[Image #1]";
+    let message = format!("{placeholder} inspect this");
+    let pending_image = PathBuf::from("/tmp/pending-steer.png");
+    let core_image = PathBuf::from("/tmp/core-event.png");
+    let text_elements = vec![TextElement::new(
+        (0..placeholder.len()).into(),
+        Some(placeholder.to_string()),
+    )];
+    chat.pending_steers.push_back(PendingSteer {
+        user_message: UserMessage {
+            text: message.clone(),
+            local_images: vec![LocalImageAttachment {
+                placeholder: placeholder.to_string(),
+                path: pending_image.clone(),
+            }],
+            text_elements: text_elements.clone(),
+            mention_paths: HashMap::new(),
+        },
+        history_record: UserMessageHistoryRecord::UserMessageText,
+        compare_key: PendingSteerCompareKey {
+            message: message.clone(),
+            image_count: 1,
+        },
+    });
+
+    chat.handle_codex_event(Event {
+        id: "user-message".into(),
+        msg: EventMsg::UserMessage(UserMessageEvent {
+            message: message.clone(),
+            images: None,
+            text_elements: Vec::new(),
+            local_images: vec![core_image],
+        }),
+    });
+
+    let mut user_cell = None;
+    while let Ok(ev) = rx.try_recv() {
+        if let AppEvent::InsertHistoryCell(cell) = ev
+            && let Some(cell) = cell.as_any().downcast_ref::<UserHistoryCell>()
+        {
+            user_cell = Some((
+                cell.message.clone(),
+                cell.text_elements.clone(),
+                cell.local_image_paths.clone(),
+            ));
+            break;
+        }
+    }
+
+    assert_eq!(
+        user_cell,
+        Some((message, text_elements, vec![pending_image]))
+    );
+}
+
+#[tokio::test]
+async fn active_turn_not_steerable_moves_pending_steer_to_rejected_queue() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.agent_turn_running = true;
+
+    chat.submit_user_message("review follow-up".into());
+    drain_insert_history(&mut rx);
+    assert_eq!(chat.pending_steers.len(), 1);
+
+    chat.handle_codex_event(Event {
+        id: "steer-error".into(),
+        msg: EventMsg::Error(ErrorEvent {
+            message: "cannot steer a review turn".to_string(),
+            codex_error_info: Some(CodexErrorInfo::ActiveTurnNotSteerable {
+                turn_kind: NonSteerableTurnKind::Review,
+            }),
+        }),
+    });
+
+    assert!(chat.pending_steers.is_empty());
+    assert_eq!(chat.rejected_steers_queue.len(), 1);
+    assert_eq!(
+        chat.rejected_steers_queue.front().unwrap().text,
+        "review follow-up"
+    );
+    assert!(
+        drain_insert_history(&mut rx).is_empty(),
+        "rejected steers should not surface as generic errors"
+    );
+}
+
+#[tokio::test]
+async fn rejected_steer_drains_before_normal_queue() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.rejected_steers_queue
+        .push_back(UserMessage::from("rejected steer"));
+    chat.rejected_steer_history_records
+        .push_back(UserMessageHistoryRecord::UserMessageText);
+    chat.queued_user_messages
+        .push_back(queued_message(1, "normal queued"));
+
+    chat.maybe_send_next_queued_input();
+
+    let op = next_submit_op(&mut op_rx);
+    match op {
+        Op::UserTurn { items, .. } => assert_eq!(
+            items,
+            vec![UserInput::Text {
+                text: "rejected steer".to_string(),
+                text_elements: Vec::new(),
+            }]
+        ),
+        other => panic!("expected Op::UserTurn, got {other:?}"),
+    }
+    assert!(chat.rejected_steers_queue.is_empty());
+    assert_eq!(chat.queued_user_messages.len(), 1);
+}
+
+#[tokio::test]
+async fn queue_does_not_drain_while_user_turn_is_pending_start() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.user_turn_pending_start = true;
+    chat.queued_user_messages
+        .push_back(queued_message(1, "normal queued"));
+
+    chat.maybe_send_next_queued_input();
+
+    assert_eq!(chat.queued_user_messages.len(), 1);
+    assert!(
+        op_rx.try_recv().is_err(),
+        "queue should not drain until the pending turn starts or stops"
+    );
+}
+
+#[tokio::test]
+async fn pause_after_pending_steer_restores_steer_to_composer() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.agent_turn_running = true;
+
+    chat.submit_user_message("pause-safe steer".into());
+    drain_insert_history(&mut rx);
+    assert_eq!(chat.pending_steers.len(), 1);
+
+    chat.handle_codex_event(Event {
+        id: "turn-paused".into(),
+        msg: EventMsg::TurnPaused(codex_core::protocol::TurnPausedEvent {
+            turn_id: "turn-1".to_string(),
+            reason: codex_core::protocol::TurnPauseReason::UserRequested,
+        }),
+    });
+
+    assert!(chat.pending_steers.is_empty());
+    assert_eq!(chat.bottom_pane.composer_text(), "pause-safe steer");
+}
+
+#[tokio::test]
+async fn continue_sets_pending_start_without_rendering_user_prompt() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(None).await;
+    chat.thread_id = Some(ThreadId::new());
+
+    chat.dispatch_command(SlashCommand::Continue);
+
+    assert!(chat.user_turn_pending_start);
+    assert!(drain_insert_history(&mut rx).is_empty());
+    assert!(matches!(op_rx.try_recv(), Ok(Op::Continue)));
 }
 
 #[tokio::test]

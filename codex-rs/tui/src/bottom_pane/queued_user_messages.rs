@@ -13,6 +13,8 @@ use crate::wrapping::word_wrap_lines;
 /// Widget that displays a list of user messages queued while a turn is in progress.
 pub(crate) struct QueuedUserMessages {
     pub messages: Vec<String>,
+    pub pending_steers: Vec<String>,
+    pub rejected_steers: Vec<String>,
     pub show_send_next_hint: bool,
 }
 
@@ -20,22 +22,98 @@ impl QueuedUserMessages {
     pub(crate) fn new() -> Self {
         Self {
             messages: Vec::new(),
+            pending_steers: Vec::new(),
+            rejected_steers: Vec::new(),
             show_send_next_hint: false,
         }
     }
 
     fn as_renderable(&self, width: u16) -> Box<dyn Renderable> {
-        if self.messages.is_empty() || width < 4 {
+        if (self.messages.is_empty()
+            && self.pending_steers.is_empty()
+            && self.rejected_steers.is_empty())
+            || width < 4
+        {
             return Box::new(());
         }
 
         let mut lines = vec![];
 
-        for message in &self.messages {
+        self.push_section(
+            &mut lines,
+            "Messages to be submitted after next tool call",
+            &self.pending_steers,
+            "  ↪ ",
+            width,
+        );
+        self.push_section(
+            &mut lines,
+            "Messages to be submitted at end of turn",
+            &self.rejected_steers,
+            "  ↳ ",
+            width,
+        );
+        let show_queued_label = !self.pending_steers.is_empty() || !self.rejected_steers.is_empty();
+        self.push_section(
+            &mut lines,
+            if show_queued_label {
+                "Queued messages"
+            } else {
+                ""
+            },
+            &self.messages,
+            "  ↳ ",
+            width,
+        );
+
+        if !self.messages.is_empty() {
+            let mut hint = vec![
+                "    ".into(),
+                key_hint::alt(KeyCode::Up).into(),
+                " edit".into(),
+            ];
+
+            if self.show_send_next_hint {
+                hint.push(" · ".into());
+                hint.push(key_hint::ctrl(KeyCode::Char('y')).into());
+                hint.push(" send next".into());
+            }
+
+            hint.push(" · ".into());
+            hint.push(key_hint::ctrl(KeyCode::Char('o')).into());
+            hint.push(" queue".into());
+
+            hint.push(" · /queue".into());
+            lines.push(Line::from(hint).dim());
+        }
+
+        Paragraph::new(lines).into()
+    }
+
+    fn push_section(
+        &self,
+        lines: &mut Vec<Line<'static>>,
+        label: &str,
+        messages: &[String],
+        prefix: &str,
+        width: u16,
+    ) {
+        if messages.is_empty() {
+            return;
+        }
+
+        if !lines.is_empty() {
+            lines.push("".into());
+        }
+        if !label.is_empty() {
+            lines.push(label.to_string().dim().into());
+        }
+
+        for message in messages {
             let wrapped = word_wrap_lines(
                 message.lines().map(|line| line.dim().italic()),
                 RtOptions::new(width as usize)
-                    .initial_indent(Line::from("  ↳ ".dim()))
+                    .initial_indent(Line::from(prefix.to_string().dim()))
                     .subsequent_indent(Line::from("    ")),
             );
             let len = wrapped.len();
@@ -46,27 +124,6 @@ impl QueuedUserMessages {
                 lines.push(Line::from("    …".dim().italic()));
             }
         }
-
-        let mut hint = vec![
-            "    ".into(),
-            key_hint::alt(KeyCode::Up).into(),
-            " edit".into(),
-        ];
-
-        if self.show_send_next_hint {
-            hint.push(" · ".into());
-            hint.push(key_hint::ctrl(KeyCode::Char('y')).into());
-            hint.push(" send next".into());
-        }
-
-        hint.push(" · ".into());
-        hint.push(key_hint::ctrl(KeyCode::Char('o')).into());
-        hint.push(" queue".into());
-
-        hint.push(" · /queue".into());
-        lines.push(Line::from(hint).dim());
-
-        Paragraph::new(lines).into()
     }
 }
 

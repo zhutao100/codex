@@ -592,6 +592,11 @@ pub(crate) struct ChatWidget {
     suppress_session_configured_redraw: bool,
     // User messages queued while a turn is in progress
     queued_user_messages: VecDeque<QueuedUserMessage>,
+    pending_steers: VecDeque<PendingSteer>,
+    rejected_steers_queue: VecDeque<UserMessage>,
+    rejected_steer_history_records: VecDeque<UserMessageHistoryRecord>,
+    user_turn_pending_start: bool,
+    last_rendered_user_message_display: Option<UserMessageDisplay>,
     next_queued_user_message_id: u64,
     queued_edit_state: Option<QueuedEditState>,
     // Pending notification to show when unfocused on next Draw
@@ -686,11 +691,123 @@ pub(crate) struct ActiveCellTranscriptKey {
     pub(crate) animation_tick: Option<u64>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct UserMessage {
     text: String,
     local_images: Vec<LocalImageAttachment>,
     text_elements: Vec<TextElement>,
     mention_paths: HashMap<String, String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum UserMessageHistoryRecord {
+    UserMessageText,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingSteerCompareKey {
+    message: String,
+    image_count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct PendingSteer {
+    user_message: UserMessage,
+    history_record: UserMessageHistoryRecord,
+    compare_key: PendingSteerCompareKey,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct UserMessageDisplay {
+    message: String,
+    text_elements: Vec<TextElement>,
+    local_images: Vec<PathBuf>,
+}
+
+impl UserMessageDisplay {
+    fn from_user_message(message: UserMessage) -> Self {
+        Self {
+            message: message.text,
+            text_elements: message.text_elements,
+            local_images: message
+                .local_images
+                .into_iter()
+                .map(|image| image.path)
+                .collect(),
+        }
+    }
+
+    fn from_event(event: UserMessageEvent) -> Self {
+        Self {
+            message: event.message,
+            text_elements: event.text_elements,
+            local_images: event.local_images,
+        }
+    }
+
+    fn has_visible_content(&self) -> bool {
+        !self.message.trim().is_empty()
+            || !self.text_elements.is_empty()
+            || !self.local_images.is_empty()
+    }
+}
+
+fn user_message_for_history(
+    message: UserMessage,
+    history_record: &UserMessageHistoryRecord,
+) -> UserMessage {
+    match history_record {
+        UserMessageHistoryRecord::UserMessageText => message,
+    }
+}
+
+fn user_message_preview_text(
+    message: &UserMessage,
+    history_record: Option<&UserMessageHistoryRecord>,
+) -> String {
+    match history_record {
+        Some(UserMessageHistoryRecord::UserMessageText) | None => message.text.clone(),
+    }
+}
+
+fn append_text_with_rebased_elements(
+    target_text: &mut String,
+    target_text_elements: &mut Vec<TextElement>,
+    text: &str,
+    text_elements: impl IntoIterator<Item = TextElement>,
+) {
+    let offset = target_text.len();
+    target_text.push_str(text);
+    target_text_elements.extend(text_elements.into_iter().map(|mut element| {
+        element.byte_range.start += offset;
+        element.byte_range.end += offset;
+        element
+    }));
+}
+
+fn merge_user_messages(messages: impl IntoIterator<Item = UserMessage>) -> UserMessage {
+    let mut combined = UserMessage {
+        text: String::new(),
+        local_images: Vec::new(),
+        text_elements: Vec::new(),
+        mention_paths: HashMap::new(),
+    };
+
+    for (idx, message) in messages.into_iter().enumerate() {
+        if idx > 0 {
+            combined.text.push('\n');
+        }
+        append_text_with_rebased_elements(
+            &mut combined.text,
+            &mut combined.text_elements,
+            &message.text,
+            message.text_elements,
+        );
+        combined.local_images.extend(message.local_images);
+        combined.mention_paths.extend(message.mention_paths);
+    }
+
+    combined
 }
 
 #[derive(Clone, Debug)]
@@ -1299,6 +1416,7 @@ impl ChatWidget {
     // Raw reasoning uses the same flow as summarized reasoning
 
     fn on_task_started(&mut self) {
+        self.user_turn_pending_start = false;
         if self.running_turn_model.is_none() {
             if let Some(snapshot) = self
                 .active_runtime_context
@@ -1378,6 +1496,7 @@ impl ChatWidget {
             self.request_status_line_branch_refresh();
         }
         // Mark task stopped and request redraw now that all content is in history.
+        self.user_turn_pending_start = false;
         self.agent_turn_running = false;
         self.running_turn_model = None;
         self.running_turn_reasoning_effort = None;
@@ -1392,8 +1511,11 @@ impl ChatWidget {
         self.clear_unified_exec_processes();
         self.refresh_status_line();
         self.request_redraw();
+        if !from_replay {
+            self.move_pending_steers_to_rejected_queue();
+        }
 
-        if !from_replay && self.queued_user_messages.is_empty() {
+        if !from_replay && !self.has_queued_follow_up_messages() {
             self.maybe_prompt_plan_implementation();
         }
         // Keep this flag for replayed completion events so a subsequent live TurnComplete can
@@ -1415,7 +1537,7 @@ impl ChatWidget {
         if !self.collaboration_modes_enabled() {
             return;
         }
-        if !self.queued_user_messages.is_empty() {
+        if self.has_queued_follow_up_messages() {
             return;
         }
         if self.active_mode_kind() != ModeKind::Plan {
@@ -1598,6 +1720,7 @@ impl ChatWidget {
         // Ensure any spinner is replaced by a red ✗ and flushed into history.
         self.finalize_active_cell_as_failed();
         // Reset running state and clear streaming buffers.
+        self.user_turn_pending_start = false;
         self.agent_turn_running = false;
         self.running_turn_model = None;
         self.running_turn_reasoning_effort = None;
@@ -1634,8 +1757,84 @@ impl ChatWidget {
         self.maybe_send_next_queued_input();
     }
 
+    fn handle_steer_rejected_error(&mut self, info: &CodexErrorInfo) -> bool {
+        matches!(info, CodexErrorInfo::ActiveTurnNotSteerable { .. })
+            && self.enqueue_rejected_steer()
+    }
+
+    fn enqueue_rejected_steer(&mut self) -> bool {
+        let Some(pending_steer) = self.pending_steers.pop_front() else {
+            tracing::warn!(
+                "received active-turn-not-steerable error without a matching pending steer"
+            );
+            return false;
+        };
+        self.rejected_steers_queue
+            .push_back(pending_steer.user_message);
+        self.rejected_steer_history_records
+            .push_back(pending_steer.history_record);
+        self.refresh_pending_input_preview();
+        true
+    }
+
+    fn restore_pending_steers_to_composer_or_reject(&mut self) {
+        if self.pending_steers.is_empty() {
+            return;
+        }
+
+        let pending_steers = self
+            .pending_steers
+            .drain(..)
+            .map(|pending| (pending.user_message, pending.history_record))
+            .collect::<Vec<_>>();
+
+        if self.bottom_pane.composer_is_empty() {
+            let restored =
+                merge_user_messages(pending_steers.into_iter().map(|(message, history_record)| {
+                    user_message_for_history(message, &history_record)
+                }));
+            self.restore_user_message_to_composer(restored);
+        } else {
+            for (message, history_record) in pending_steers {
+                self.rejected_steers_queue.push_back(message);
+                self.rejected_steer_history_records
+                    .push_back(history_record);
+            }
+        }
+
+        self.refresh_pending_input_preview();
+    }
+
+    fn move_pending_steers_to_rejected_queue(&mut self) {
+        if self.pending_steers.is_empty() {
+            return;
+        }
+
+        for pending in self.pending_steers.drain(..) {
+            self.rejected_steers_queue.push_back(pending.user_message);
+            self.rejected_steer_history_records
+                .push_back(pending.history_record);
+        }
+        self.refresh_pending_input_preview();
+    }
+
+    fn restore_user_message_to_composer(&mut self, user_message: UserMessage) {
+        let local_image_paths = user_message
+            .local_images
+            .into_iter()
+            .map(|image| image.path)
+            .collect();
+        self.bottom_pane.set_composer_text_with_mention_paths(
+            user_message.text,
+            user_message.text_elements,
+            local_image_paths,
+            user_message.mention_paths,
+        );
+    }
+
     fn on_error(&mut self, message: String) {
         self.finalize_turn();
+        self.move_pending_steers_to_rejected_queue();
         self.add_to_history(history_cell::new_error_event(message));
         self.request_redraw();
 
@@ -1736,6 +1935,7 @@ impl ChatWidget {
     fn on_interrupted_turn(&mut self, reason: TurnAbortReason) {
         // Finalize, log a gentle prompt, and clear running state.
         self.finalize_turn();
+        self.restore_pending_steers_to_composer_or_reject();
 
         if reason != TurnAbortReason::ReviewEnded {
             self.add_to_history(history_cell::new_error_event(
@@ -1748,6 +1948,7 @@ impl ChatWidget {
 
     fn on_paused_turn(&mut self) {
         self.finalize_turn();
+        self.restore_pending_steers_to_composer_or_reject();
         self.add_info_message(
             "Conversation paused.".to_string(),
             Some("Use `/continue` to resume this turn.".to_string()),
@@ -2128,6 +2329,7 @@ impl ChatWidget {
     }
 
     fn on_stream_error(&mut self, message: String, additional_details: Option<String>) {
+        self.user_turn_pending_start = false;
         if self.retry_status_header.is_none() {
             self.retry_status_header = Some(self.current_status_header.clone());
         }
@@ -2642,6 +2844,11 @@ impl ChatWidget {
             copy_message_ui_state: None,
             forked_from: None,
             queued_user_messages: VecDeque::new(),
+            pending_steers: VecDeque::new(),
+            rejected_steers_queue: VecDeque::new(),
+            rejected_steer_history_records: VecDeque::new(),
+            user_turn_pending_start: false,
+            last_rendered_user_message_display: None,
             next_queued_user_message_id: 1,
             queued_edit_state: None,
             show_welcome_banner: is_first_run,
@@ -2838,6 +3045,11 @@ impl ChatWidget {
             plan_delta_buffer: String::new(),
             plan_item_active: false,
             queued_user_messages: VecDeque::new(),
+            pending_steers: VecDeque::new(),
+            rejected_steers_queue: VecDeque::new(),
+            rejected_steer_history_records: VecDeque::new(),
+            user_turn_pending_start: false,
+            last_rendered_user_message_display: None,
             next_queued_user_message_id: 1,
             queued_edit_state: None,
             show_welcome_banner: is_first_run,
@@ -3014,6 +3226,11 @@ impl ChatWidget {
             copy_message_ui_state: None,
             forked_from: None,
             queued_user_messages: VecDeque::new(),
+            pending_steers: VecDeque::new(),
+            rejected_steers_queue: VecDeque::new(),
+            rejected_steer_history_records: VecDeque::new(),
+            user_turn_pending_start: false,
+            last_rendered_user_message_display: None,
             next_queued_user_message_id: 1,
             queued_edit_state: None,
             show_welcome_banner: false,
@@ -3194,7 +3411,7 @@ impl ChatWidget {
                 kind: KeyEventKind::Press,
                 ..
             } if self.bottom_pane.no_modal_or_popup_active()
-                && !self.bottom_pane.is_task_running()
+                && !self.is_user_turn_pending_or_running()
                 && !self.queued_user_messages.is_empty()
                 && self.queued_edit_state.is_none() =>
             {
@@ -3436,6 +3653,7 @@ impl ChatWidget {
                         Some("Pause or interrupt it before continuing another turn.".to_string()),
                     );
                 } else {
+                    self.user_turn_pending_start = true;
                     self.submit_op(Op::Continue);
                 }
             }
@@ -4126,9 +4344,94 @@ impl ChatWidget {
         self.app_event_tx.send(AppEvent::InsertHistoryCell(cell));
     }
 
+    fn has_queued_follow_up_messages(&self) -> bool {
+        !self.rejected_steers_queue.is_empty() || !self.queued_user_messages.is_empty()
+    }
+
+    fn is_user_turn_pending_or_running(&self) -> bool {
+        self.user_turn_pending_start || self.bottom_pane.is_task_running()
+    }
+
+    fn pending_steer_compare_key_from_inputs(items: &[UserInput]) -> PendingSteerCompareKey {
+        let mut message = String::new();
+        let mut image_count = 0;
+
+        for item in items {
+            match item {
+                UserInput::Text { text, .. } => message.push_str(text),
+                UserInput::Image { .. } | UserInput::LocalImage { .. } => image_count += 1,
+                UserInput::Skill { .. } | UserInput::Mention { .. } => {}
+                _ => {}
+            }
+        }
+
+        PendingSteerCompareKey {
+            message,
+            image_count,
+        }
+    }
+
+    fn pending_steer_compare_key_from_event(event: &UserMessageEvent) -> PendingSteerCompareKey {
+        PendingSteerCompareKey {
+            message: event.message.clone(),
+            image_count: event.images.as_ref().map_or(0, Vec::len) + event.local_images.len(),
+        }
+    }
+
+    fn refresh_pending_input_preview(&mut self) {
+        let session_model = self.current_model();
+        let session_effort = self.effective_reasoning_effort();
+        let editing_id = self
+            .queued_edit_state
+            .as_ref()
+            .map(|state| state.selected_id);
+        let queued: Vec<String> = self
+            .queued_user_messages
+            .iter()
+            .map(|message| {
+                let effective_model = message.model_override.as_deref().unwrap_or(session_model);
+                let effective_effort = message.effort_override.unwrap_or(session_effort);
+                let mut tag = String::new();
+                if message.model_override.is_some() || message.effort_override.is_some() {
+                    tag = format!(
+                        "[{effective_model} · reasoning {}] ",
+                        Self::status_line_reasoning_effort_label(effective_effort)
+                    );
+                }
+
+                if Some(message.id) == editing_id {
+                    format!("✎ {tag}{}", message.text)
+                } else {
+                    format!("{tag}{}", message.text)
+                }
+            })
+            .collect();
+        let pending_steers = self
+            .pending_steers
+            .iter()
+            .map(|steer| {
+                user_message_preview_text(&steer.user_message, Some(&steer.history_record))
+            })
+            .collect();
+        let rejected_steers = self
+            .rejected_steers_queue
+            .iter()
+            .enumerate()
+            .map(|(idx, message)| {
+                user_message_preview_text(message, self.rejected_steer_history_records.get(idx))
+            })
+            .collect();
+        self.bottom_pane
+            .set_pending_input_preview(queued, pending_steers, rejected_steers);
+    }
+
+    fn refresh_queued_user_messages(&mut self) {
+        self.refresh_pending_input_preview();
+    }
+
     fn queue_user_message(&mut self, user_message: UserMessage) {
         if !self.is_session_configured()
-            || self.bottom_pane.is_task_running()
+            || self.is_user_turn_pending_or_running()
             || self.is_review_mode
         {
             let id = self.next_queued_user_message_id;
@@ -4143,7 +4446,7 @@ impl ChatWidget {
                 effort_override: None,
             };
             self.queued_user_messages.push_back(queued);
-            self.refresh_queued_user_messages();
+            self.refresh_pending_input_preview();
         } else {
             self.submit_user_message(user_message);
         }
@@ -4293,6 +4596,19 @@ impl ChatWidget {
             .personality
             .filter(|_| self.config.features.enabled(Feature::Personality))
             .filter(|_| self.current_model_supports_personality());
+        let render_in_history = !self.agent_turn_running;
+        let history_record = UserMessageHistoryRecord::UserMessageText;
+        let submitted_user_message = UserMessage {
+            text: text.clone(),
+            local_images,
+            text_elements,
+            mention_paths,
+        };
+        let pending_steer = (!render_in_history).then(|| PendingSteer {
+            user_message: submitted_user_message.clone(),
+            history_record: history_record.clone(),
+            compare_key: Self::pending_steer_compare_key_from_inputs(&items),
+        });
         let op = Op::UserTurn {
             items,
             cwd: self.config.cwd.clone(),
@@ -4307,33 +4623,35 @@ impl ChatWidget {
             service_tier: self.config.service_tier.clone(),
         };
 
-        if !self.agent_turn_running {
-            self.running_turn_model = Some(running_model);
-            self.running_turn_reasoning_effort = running_effort;
+        if let Err(e) = self.codex_op_tx.send(op) {
+            tracing::error!("failed to send message: {e}");
+            return;
         }
 
-        self.codex_op_tx.send(op).unwrap_or_else(|e| {
-            tracing::error!("failed to send message: {e}");
-        });
+        if render_in_history {
+            self.running_turn_model = Some(running_model);
+            self.running_turn_reasoning_effort = running_effort;
+            self.user_turn_pending_start = true;
+        }
 
         // Persist the text to cross-session message history.
         if !text.is_empty() {
             self.codex_op_tx
-                .send(Op::AddToHistory { text: text.clone() })
+                .send(Op::AddToHistory { text })
                 .unwrap_or_else(|e| {
                     tracing::error!("failed to send AddHistory op: {e}");
                 });
         }
 
-        // Only show the text portion in conversation history.
-        if !text.is_empty() {
-            let local_image_paths = local_images.into_iter().map(|img| img.path).collect();
-            self.add_to_history(history_cell::new_user_prompt(
-                text.clone(),
-                text_elements,
-                local_image_paths,
+        if let Some(pending_steer) = pending_steer {
+            self.pending_steers.push_back(pending_steer);
+            self.refresh_pending_input_preview();
+        } else {
+            let display = UserMessageDisplay::from_user_message(user_message_for_history(
+                submitted_user_message,
+                &history_record,
             ));
-            self.push_copyable_message(CopyableRole::User, &text);
+            self.on_user_message_display(display);
         }
 
         self.needs_final_message_separator = false;
@@ -4468,6 +4786,10 @@ impl ChatWidget {
             }) => {
                 if codex_error_info
                     .as_ref()
+                    .is_some_and(|info| self.handle_steer_rejected_error(info))
+                {
+                } else if codex_error_info
+                    .as_ref()
                     .is_some_and(|info| matches!(info, CodexErrorInfo::CyberPolicy))
                 {
                     self.on_cyber_policy_error();
@@ -4552,9 +4874,7 @@ impl ChatWidget {
                 ..
             }) => self.on_stream_error(message, additional_details),
             EventMsg::UserMessage(ev) => {
-                if from_replay {
-                    self.on_user_message_event(ev);
-                }
+                self.on_committed_user_message(ev, from_replay);
             }
             EventMsg::EnteredReviewMode(review_request) => {
                 self.on_entered_review_mode(review_request, from_replay)
@@ -4669,13 +4989,48 @@ impl ChatWidget {
         self.request_redraw();
     }
 
-    fn on_user_message_event(&mut self, event: UserMessageEvent) {
-        if !event.message.trim().is_empty() {
-            self.push_copyable_message(CopyableRole::User, &event.message);
+    fn on_committed_user_message(&mut self, event: UserMessageEvent, from_replay: bool) {
+        let compare_key = Self::pending_steer_compare_key_from_event(&event);
+        let display = UserMessageDisplay::from_event(event);
+
+        if from_replay {
+            self.on_user_message_display(display);
+            return;
+        }
+
+        if self
+            .pending_steers
+            .front()
+            .is_some_and(|pending| pending.compare_key == compare_key)
+        {
+            if let Some(pending) = self.pending_steers.pop_front() {
+                self.refresh_pending_input_preview();
+                let display = UserMessageDisplay::from_user_message(user_message_for_history(
+                    pending.user_message,
+                    &pending.history_record,
+                ));
+                self.on_user_message_display(display);
+            } else if self.last_rendered_user_message_display.as_ref() != Some(&display) {
+                tracing::warn!(
+                    "pending steer matched compare key but queue was empty when rendering committed user message"
+                );
+                self.on_user_message_display(display);
+            }
+        } else if !self.is_review_mode
+            && self.last_rendered_user_message_display.as_ref() != Some(&display)
+        {
+            self.on_user_message_display(display);
+        }
+    }
+
+    fn on_user_message_display(&mut self, display: UserMessageDisplay) {
+        self.last_rendered_user_message_display = Some(display.clone());
+        if display.has_visible_content() {
+            self.push_copyable_message(CopyableRole::User, &display.message);
             self.add_to_history(history_cell::new_user_prompt(
-                event.message,
-                event.text_elements,
-                event.local_images,
+                display.message,
+                display.text_elements,
+                display.local_images,
             ));
         }
 
@@ -4739,17 +5094,20 @@ impl ChatWidget {
 
     // If idle and there are queued inputs, submit exactly one to start the next turn.
     fn maybe_send_next_queued_input(&mut self) {
-        if self.bottom_pane.is_task_running()
+        if self.is_user_turn_pending_or_running()
             || self.queued_edit_state.is_some()
             || !self.bottom_pane.no_modal_or_popup_active()
         {
             return;
         }
-        if let Some(queued) = self.queued_user_messages.pop_front() {
+        if let Some(rejected) = self.rejected_steers_queue.pop_front() {
+            self.rejected_steer_history_records.pop_front();
+            self.submit_user_message(rejected);
+        } else if let Some(queued) = self.queued_user_messages.pop_front() {
             self.submit_queued_user_message(queued);
         }
         // Update the list to reflect the remaining queued messages (if any).
-        self.refresh_queued_user_messages();
+        self.refresh_pending_input_preview();
     }
 
     fn paste_from_clipboard(&mut self) {
@@ -5458,16 +5816,19 @@ impl ChatWidget {
     }
 
     fn send_next_queued_user_message(&mut self) {
-        if self.bottom_pane.is_task_running()
+        if self.is_user_turn_pending_or_running()
             || self.queued_edit_state.is_some()
             || !self.bottom_pane.no_modal_or_popup_active()
         {
             return;
         }
-        if let Some(queued) = self.queued_user_messages.pop_front() {
+        if let Some(rejected) = self.rejected_steers_queue.pop_front() {
+            self.rejected_steer_history_records.pop_front();
+            self.submit_user_message(rejected);
+        } else if let Some(queued) = self.queued_user_messages.pop_front() {
             self.submit_queued_user_message(queued);
         }
-        self.refresh_queued_user_messages();
+        self.refresh_pending_input_preview();
     }
 
     fn handle_queue_edit_key_event(&mut self, key_event: KeyEvent) -> bool {
@@ -6156,38 +6517,6 @@ impl ChatWidget {
             ("Alt+M".to_string(), "model".to_string()),
             ("Alt+T".to_string(), "thinking".to_string()),
         ]));
-    }
-
-    /// Rebuild and update the queued user messages from the current queue.
-    fn refresh_queued_user_messages(&mut self) {
-        let session_model = self.current_model();
-        let session_effort = self.effective_reasoning_effort();
-        let editing_id = self
-            .queued_edit_state
-            .as_ref()
-            .map(|state| state.selected_id);
-        let messages: Vec<String> = self
-            .queued_user_messages
-            .iter()
-            .map(|message| {
-                let effective_model = message.model_override.as_deref().unwrap_or(session_model);
-                let effective_effort = message.effort_override.unwrap_or(session_effort);
-                let mut tag = String::new();
-                if message.model_override.is_some() || message.effort_override.is_some() {
-                    tag = format!(
-                        "[{effective_model} · reasoning {}] ",
-                        Self::status_line_reasoning_effort_label(effective_effort)
-                    );
-                }
-
-                if Some(message.id) == editing_id {
-                    format!("✎ {tag}{}", message.text)
-                } else {
-                    format!("{tag}{}", message.text)
-                }
-            })
-            .collect();
-        self.bottom_pane.set_queued_user_messages(messages);
     }
 
     pub(crate) fn add_diff_in_progress(&mut self) {

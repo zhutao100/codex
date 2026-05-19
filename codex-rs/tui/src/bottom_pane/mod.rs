@@ -775,9 +775,15 @@ impl BottomPane {
         self.push_view(Box::new(view));
     }
 
-    /// Update the queued messages preview shown above the composer.
-    pub(crate) fn set_queued_user_messages(&mut self, queued: Vec<String>) {
+    pub(crate) fn set_pending_input_preview(
+        &mut self,
+        queued: Vec<String>,
+        pending_steers: Vec<String>,
+        rejected_steers: Vec<String>,
+    ) {
         self.queued_user_messages.messages = queued;
+        self.queued_user_messages.pending_steers = pending_steers;
+        self.queued_user_messages.rejected_steers = rejected_steers;
         self.refresh_queued_user_message_hints();
         self.request_redraw();
     }
@@ -985,7 +991,9 @@ impl BottomPane {
             if !self.unified_exec_footer.is_empty() {
                 flex.push(0, RenderableItem::Borrowed(&self.unified_exec_footer));
             }
-            let has_queued_messages = !self.queued_user_messages.messages.is_empty();
+            let has_queued_messages = !self.queued_user_messages.messages.is_empty()
+                || !self.queued_user_messages.pending_steers.is_empty()
+                || !self.queued_user_messages.rejected_steers.is_empty();
             let has_status_or_footer =
                 self.status.is_some() || !self.unified_exec_footer.is_empty();
             if has_queued_messages && has_status_or_footer {
@@ -1307,7 +1315,11 @@ mod tests {
             "Working".to_string(),
             Some("First detail line\nSecond detail line".to_string()),
         );
-        pane.set_queued_user_messages(vec!["Queued follow-up question".to_string()]);
+        pane.set_pending_input_preview(
+            vec!["Queued follow-up question".to_string()],
+            Vec::new(),
+            Vec::new(),
+        );
 
         let width = 48;
         let height = pane.desired_height(width);
@@ -1336,7 +1348,11 @@ mod tests {
         });
 
         pane.set_task_running(true);
-        pane.set_queued_user_messages(vec!["Queued follow-up question".to_string()]);
+        pane.set_pending_input_preview(
+            vec!["Queued follow-up question".to_string()],
+            Vec::new(),
+            Vec::new(),
+        );
         pane.hide_status_indicator();
 
         let width = 48;
@@ -1366,7 +1382,11 @@ mod tests {
         });
 
         pane.set_task_running(true);
-        pane.set_queued_user_messages(vec!["Queued follow-up question".to_string()]);
+        pane.set_pending_input_preview(
+            vec!["Queued follow-up question".to_string()],
+            Vec::new(),
+            Vec::new(),
+        );
 
         let width = 48;
         let height = pane.desired_height(width);
