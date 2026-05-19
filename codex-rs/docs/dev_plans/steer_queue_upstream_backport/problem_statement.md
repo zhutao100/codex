@@ -35,6 +35,8 @@ After the eager render is removed for active-turn steering, the live user-messag
 
 The upstream branch rejects same-turn steering for review and compact tasks and reports `CodexErrorInfo::ActiveTurnNotSteerable`. This branch should do the same so a steer typed during review or compaction is not injected into a task that cannot semantically process same-turn instructions.
 
+This branch also has `PostTurnCompletionReview` and standalone `UserShell` task kinds. The backport must handle those explicitly: post-turn completion review should be treated as a review task, and standalone user-shell turns should be rejected as a non-steerable user-shell task. Auxiliary user-shell commands already run under the active regular turn and do not need separate handling.
+
 ### 4. Pending steers can be lost when work is stopped
 
 This branch's task stop paths clear active-turn pending state. For example, `core/src/tasks/mod.rs::take_all_running_tasks(...)` clears pending state before draining tasks, and pause paths intentionally keep continuation state rather than pending user input.

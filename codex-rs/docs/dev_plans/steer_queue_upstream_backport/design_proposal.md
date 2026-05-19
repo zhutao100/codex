@@ -130,6 +130,7 @@ Add protocol-level error information in `protocol/src/protocol.rs`:
 enum NonSteerableTurnKind {
     Review,
     Compact,
+    UserShell,
 }
 
 enum CodexErrorInfo {
@@ -145,8 +146,9 @@ Implement `Session::steer_input(...)` with these rules:
 3. Inspect the first active task kind.
 4. Accept only `TaskKind::Regular`.
 5. Reject `TaskKind::Review` and `TaskKind::Compact` as non-steerable.
-6. Treat `TaskKind::PostTurnCompletionReview` and `TaskKind::UserShell` as non-steerable or no-active-turn depending on desired UX; default recommendation is non-steerable with a branch-local error message.
-7. If accepted, push input into active-turn pending input.
+6. Treat this branch's `TaskKind::PostTurnCompletionReview` as `NonSteerableTurnKind::Review`.
+7. Treat this branch's standalone `TaskKind::UserShell` as `NonSteerableTurnKind::UserShell`. Auxiliary user-shell commands run inside an existing regular turn and do not change the active task kind.
+8. If accepted, push input into active-turn pending input.
 
 Then change `core/src/session/handlers.rs::user_input_or_turn(...)`:
 

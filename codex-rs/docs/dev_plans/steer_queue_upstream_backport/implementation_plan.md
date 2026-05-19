@@ -85,6 +85,9 @@ Recommended test areas:
 3. Implement `Session::steer_input(...)` using this branch's existing `active_turn` and `TaskKind` types.
 4. Replace the user-turn `inject_input(...)` call in `core/src/session/handlers.rs` with `steer_input(...)` plus `NoActiveTurn` fallback.
 5. Keep `inject_response_items(...)` for non-user-turn internals unless they need the same validation.
+6. Keep the `TaskKind` match exhaustive. This branch has `PostTurnCompletionReview` and `UserShell` in addition to upstream's regular/review/compact task kinds:
+   - map `PostTurnCompletionReview` to `NonSteerableTurnKind::Review`;
+   - map standalone `UserShell` to `NonSteerableTurnKind::UserShell`.
 
 ### Tests
 
@@ -93,6 +96,8 @@ Recommended test areas:
 - Regular active turn accepts steer input into pending input.
 - Review active turn emits `ActiveTurnNotSteerable { Review }`.
 - Compact active turn emits `ActiveTurnNotSteerable { Compact }`.
+- Post-turn completion review emits `ActiveTurnNotSteerable { Review }`.
+- Standalone user-shell active turn emits `ActiveTurnNotSteerable { UserShell }`.
 
 ## Phase 5 - Recover rejected steers in the TUI
 
