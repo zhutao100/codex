@@ -5829,8 +5829,9 @@ async fn runtime_context_status_output_uses_delegate_until_deactivated() {
     chat.config.model_context_window = Some(200_000);
     chat.set_token_info(Some(make_token_info(50_000, 200_000)));
 
-    let snapshot =
+    let mut snapshot =
         make_delegate_runtime_context("delegate-status", Some(make_token_info(90_000, 100_000)));
+    snapshot.task_kind = Some("post_turn_completion_review".to_string());
     let delegate_session_id = snapshot.session_id;
     chat.handle_codex_event(Event {
         id: "runtime-active".into(),
@@ -5848,7 +5849,10 @@ async fn runtime_context_status_output_uses_delegate_until_deactivated() {
     assert!(rendered.contains("Task"), "{rendered}");
     assert!(rendered.contains("review"), "{rendered}");
     assert!(rendered.contains("Parent session"), "{rendered}");
-    assert!(rendered.contains("Parent turn"), "{rendered}");
+    assert!(rendered.contains("Review target"), "{rendered}");
+    assert!(rendered.contains("previous completed turn"), "{rendered}");
+    assert!(!rendered.contains("Parent turn ID"), "{rendered}");
+    assert!(!rendered.contains("parent-turn"), "{rendered}");
 
     chat.handle_codex_event(Event {
         id: "runtime-done".into(),

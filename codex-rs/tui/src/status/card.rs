@@ -324,6 +324,17 @@ impl StatusHistoryCell {
         ])
     }
 
+    fn parent_turn_display(&self) -> Option<(&'static str, &'static str)> {
+        self.parent_turn_id.as_ref()?;
+        Some(
+            if self.task_kind.as_deref() == Some("post_turn_completion_review") {
+                ("Review target", "previous completed turn")
+            } else {
+                ("Parent turn", "same-session parent")
+            },
+        )
+    }
+
     fn rate_limit_lines(
         &self,
         available_inner_width: usize,
@@ -491,8 +502,9 @@ impl HistoryCell for StatusHistoryCell {
         if self.parent_session_id.is_some() {
             push_label(&mut labels, &mut seen, "Parent session");
         }
-        if self.parent_turn_id.is_some() {
-            push_label(&mut labels, &mut seen, "Parent turn");
+        let parent_turn_display = self.parent_turn_display();
+        if let Some((parent_turn_label, _)) = parent_turn_display {
+            push_label(&mut labels, &mut seen, parent_turn_label);
         }
         if self.collaboration_mode.is_some() {
             push_label(&mut labels, &mut seen, "Collaboration mode");
@@ -570,8 +582,11 @@ impl HistoryCell for StatusHistoryCell {
                 vec![Span::from(parent_session_id.clone())],
             ));
         }
-        if let Some(parent_turn_id) = self.parent_turn_id.as_ref() {
-            lines.push(formatter.line("Parent turn", vec![Span::from(parent_turn_id.clone())]));
+        if let Some((parent_turn_label, parent_turn_value)) = parent_turn_display {
+            lines.push(formatter.line(
+                parent_turn_label,
+                vec![Span::from(parent_turn_value.to_string())],
+            ));
         }
 
         lines.push(Line::from(Vec::<Span<'static>>::new()));

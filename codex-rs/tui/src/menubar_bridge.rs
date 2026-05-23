@@ -628,10 +628,13 @@ mod imp {
         }
 
         fn complete_turn(&mut self, turn_id: Option<String>) -> Vec<HubNotification> {
-            if let Some(turn_id) = turn_id
-                && let Some(key) = self.resolve_turn_key_for_turn(&turn_id)
-                && let Some(turn) = self.active_turns.remove(&key)
-            {
+            if let Some(turn_id) = turn_id {
+                let Some(key) = self.resolve_turn_key_for_turn(&turn_id) else {
+                    return Vec::new();
+                };
+                let Some(turn) = self.active_turns.remove(&key) else {
+                    return Vec::new();
+                };
                 self.turn_start_order.retain(|existing| existing != &key);
                 self.prune_file_changes_for_turn(&key);
                 return vec![Self::turn_completed_notification(key, turn)];
@@ -1061,6 +1064,49 @@ mod imp {
                 bridge
                     .complete_turn(Some("post-turn-review-0".to_string()))
                     .is_empty()
+            );
+
+            bridge.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn duplicate_delegate_completion_does_not_complete_latest_primary_turn() {
+            let mut bridge = test_bridge();
+            let primary = bridge.ensure_turn_started(
+                "primary-thread".to_string(),
+                "primary-turn".to_string(),
+                None,
+            );
+            assert_eq!(primary.len(), 1);
+
+            let snapshot = runtime_context();
+            let delegate_thread_id = snapshot.session_id.to_string();
+            bridge.active_runtime_context = Some(snapshot);
+            let delegate = bridge.ensure_turn_started(
+                delegate_thread_id.clone(),
+                "post-turn-review-0".to_string(),
+                None,
+            );
+            assert_eq!(delegate.len(), 1);
+            assert_eq!(bridge.active_turns.len(), 2);
+
+            let completed = bridge.complete_turns_for_thread(&delegate_thread_id);
+            assert_eq!(completed.len(), 1);
+            assert_eq!(
+                completed[0].params.as_ref().unwrap()["turn"]["id"],
+                json!("post-turn-review-0")
+            );
+
+            assert!(
+                bridge
+                    .complete_turn(Some("post-turn-review-0".to_string()))
+                    .is_empty()
+            );
+            assert_eq!(bridge.active_turns.len(), 1);
+            assert!(
+                bridge
+                    .active_turns
+                    .contains_key("primary-thread:primary-turn")
             );
 
             bridge.shutdown().await;
