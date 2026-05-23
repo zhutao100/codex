@@ -582,19 +582,27 @@ mod imp {
         }
 
         fn runtime_context_update_notifications(
-            &self,
+            &mut self,
             snapshot: &RuntimeContextSnapshot,
             event_turn_id: Option<String>,
         ) -> Vec<HubNotification> {
             let thread_id = snapshot.session_id.to_string();
             let resolved_turn = event_turn_id
+                .as_ref()
                 .and_then(|turn_id| {
                     self.active_turns
-                        .contains_key(&turn_key(&thread_id, &turn_id))
-                        .then(|| (turn_key(&thread_id, &turn_id), turn_id))
+                        .contains_key(&turn_key(&thread_id, turn_id))
+                        .then(|| (turn_key(&thread_id, turn_id), turn_id.clone()))
                 })
                 .or_else(|| self.latest_turn_for_thread(&thread_id));
             let Some((turn_key, turn_id)) = resolved_turn else {
+                if let Some(turn_id) = event_turn_id {
+                    let started =
+                        self.ensure_turn_started(thread_id, turn_id, snapshot.model_context_window);
+                    if !started.is_empty() {
+                        return started;
+                    }
+                }
                 return Vec::new();
             };
 
@@ -1029,6 +1037,112 @@ mod imp {
             assert_eq!(updates[0].params.as_ref().unwrap()["turnKey"], turn["key"]);
             assert_eq!(updates[1].method, "thread/tokenUsage/updated");
             assert_eq!(updates[1].params.as_ref().unwrap()["turnKey"], turn["key"]);
+
+            bridge.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn runtime_context_activation_starts_delegate_turn_before_turn_started_event() {
+            let mut bridge = test_bridge();
+            let snapshot = runtime_context();
+            let thread_id = snapshot.session_id.to_string();
+            bridge.active_runtime_context = Some(snapshot.clone());
+
+            let notifications = bridge.runtime_context_update_notifications(
+                &snapshot,
+                Some("post-turn-review-0".to_string()),
+            );
+
+            assert_eq!(notifications.len(), 1);
+            assert_eq!(notifications[0].method, "turn/started");
+            let params = notifications[0]
+                .params
+                .as_ref()
+                .expect("turn started params");
+            assert_eq!(params["threadId"], json!(thread_id));
+            assert_eq!(params["turn"]["id"], json!("post-turn-review-0"));
+            assert_eq!(
+                params["turn"]["key"],
+                json!(format!("{thread_id}:post-turn-review-0"))
+            );
+            assert_eq!(params["turn"]["taskKind"], json!("review"));
+            assert!(params["turn"]["tokenUsage"].is_object());
+
+            let duplicate_started =
+                bridge.ensure_turn_started(thread_id, "post-turn-review-0".to_string(), None);
+            assert!(duplicate_started.is_empty());
+
+            bridge.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn runtime_context_publish_event_prestarts_delegate_turn_before_turn_started_event() {
+            let mut bridge = test_bridge();
+            let snapshot = runtime_context();
+            let thread_id = snapshot.session_id.to_string();
+            let expected_key = format!("{thread_id}:post-turn-review-0");
+
+            bridge.publish_event(
+                &EventMsg::RuntimeContextActivated(
+                    codex_protocol::protocol::RuntimeContextActivatedEvent {
+                        snapshot: snapshot.clone(),
+                    },
+                ),
+                "post-turn-review-0",
+                None,
+            );
+
+            assert_eq!(bridge.active_turns.len(), 1);
+            assert!(bridge.active_turns.contains_key(&expected_key));
+            assert_eq!(bridge.turn_start_order, vec![expected_key.clone()]);
+
+            let mut updated_snapshot = snapshot;
+            updated_snapshot.token_info = Some(token_info(12_000, 100_000));
+            bridge.publish_event(
+                &EventMsg::RuntimeContextUpdated(
+                    codex_protocol::protocol::RuntimeContextUpdatedEvent {
+                        snapshot: updated_snapshot,
+                    },
+                ),
+                "post-turn-review-0",
+                None,
+            );
+
+            assert_eq!(bridge.active_turns.len(), 1);
+            assert_eq!(bridge.turn_start_order, vec![expected_key]);
+
+            bridge.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn runtime_context_token_update_refreshes_prestarted_delegate_turn() {
+            let mut bridge = test_bridge();
+            let mut snapshot = runtime_context();
+            let thread_id = snapshot.session_id.to_string();
+            bridge.active_runtime_context = Some(snapshot.clone());
+            let started = bridge.runtime_context_update_notifications(
+                &snapshot,
+                Some("post-turn-review-0".to_string()),
+            );
+            assert_eq!(started.len(), 1);
+
+            snapshot.token_info = Some(token_info(12_000, 100_000));
+            bridge.active_runtime_context = Some(snapshot.clone());
+            let updates = bridge.runtime_context_update_notifications(
+                &snapshot,
+                Some("post-turn-review-0".to_string()),
+            );
+
+            assert_eq!(updates.len(), 2);
+            assert_eq!(updates[0].method, "turn/contextUpdated");
+            assert_eq!(updates[1].method, "thread/tokenUsage/updated");
+            let expected_key = json!(format!("{thread_id}:post-turn-review-0"));
+            assert_eq!(updates[0].params.as_ref().unwrap()["turnKey"], expected_key);
+            assert_eq!(updates[1].params.as_ref().unwrap()["turnKey"], expected_key);
+            assert_eq!(
+                updates[1].params.as_ref().unwrap()["tokenUsage"]["last"]["totalTokens"],
+                json!(12_000)
+            );
 
             bridge.shutdown().await;
         }
