@@ -1952,6 +1952,13 @@ async fn regular_task_completion_stores_completed_turn_for_review() {
         Some(CompletedTurnForReview {
             turn_id: tc.sub_id.clone(),
             cwd: tc.cwd.clone(),
+            interaction_history: vec![CompletedTurnReviewRound {
+                user_messages: vec![
+                    "first user message".to_string(),
+                    "second user message".to_string()
+                ],
+                final_agent_message: "final assistant message".to_string(),
+            }],
             user_messages: vec![
                 "first user message".to_string(),
                 "second user message".to_string()
@@ -1985,6 +1992,10 @@ fn completed_turn_reconstruction_uses_user_and_final_assistant_text() {
         Some(CompletedTurnForReview {
             turn_id: "reconstructed-1-4".to_string(),
             cwd,
+            interaction_history: vec![CompletedTurnReviewRound {
+                user_messages: vec!["implement the feature".to_string()],
+                final_agent_message: "done".to_string(),
+            }],
             user_messages: vec!["implement the feature".to_string()],
             final_agent_message: "done".to_string(),
         })
@@ -2008,8 +2019,54 @@ fn completed_turn_reconstruction_skips_review_synthetic_turn() {
         Some(CompletedTurnForReview {
             turn_id: "reconstructed-0-1".to_string(),
             cwd,
+            interaction_history: vec![CompletedTurnReviewRound {
+                user_messages: vec!["real request".to_string()],
+                final_agent_message: "real response".to_string(),
+            }],
             user_messages: vec!["real request".to_string()],
             final_agent_message: "real response".to_string(),
+        })
+    );
+}
+
+#[test]
+fn completed_turn_reconstruction_keeps_multi_round_interaction_history() {
+    let cwd = PathBuf::from("/tmp/project");
+    let history = vec![
+        user_message("round one request"),
+        ResponseItem::FunctionCall {
+            id: None,
+            name: "shell".to_string(),
+            arguments: "{}".to_string(),
+            call_id: "call-1".to_string(),
+        },
+        ResponseItem::FunctionCallOutput {
+            call_id: "call-1".to_string(),
+            output: FunctionCallOutputPayload::from_text("tool output".to_string()),
+        },
+        assistant_message("round one final"),
+        user_message("round two request"),
+        assistant_message("round two interim"),
+        assistant_message("round two final"),
+    ];
+
+    assert_eq!(
+        completed_turn_for_review_from_history(&history, cwd.clone()),
+        Some(CompletedTurnForReview {
+            turn_id: "reconstructed-4-6".to_string(),
+            cwd,
+            interaction_history: vec![
+                CompletedTurnReviewRound {
+                    user_messages: vec!["round one request".to_string()],
+                    final_agent_message: "round one final".to_string(),
+                },
+                CompletedTurnReviewRound {
+                    user_messages: vec!["round two request".to_string()],
+                    final_agent_message: "round two final".to_string(),
+                },
+            ],
+            user_messages: vec!["round two request".to_string()],
+            final_agent_message: "round two final".to_string(),
         })
     );
 }

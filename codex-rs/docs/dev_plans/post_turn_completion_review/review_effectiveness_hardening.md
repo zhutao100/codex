@@ -6,7 +6,7 @@ Implemented. The baseline post-turn completion review workflow exists in this pr
 
 ## Problem
 
-The reviewer was intended to catch blind spots from context-efficient coding turns: missed files, partial reads, duplicated logic, missing paired updates, and final-answer overclaims. Test runs showed that the reviewer often used the same strategy as the main session: infer intent, run keyword searches, read narrow line ranges, and decide from those slices. When the reviewer repeats that strategy, it can miss the same files and context the main session missed.
+The reviewer was intended to catch blind spots from context-efficient coding turns: missed files, partial reads, duplicated logic, missing paired updates, incomplete requested scope, and final-answer overclaims. Test runs showed that the reviewer often used the same strategy as the main session: infer intent, run keyword searches, read narrow line ranges, and decide from those slices. When the reviewer repeats that strategy, it can miss the same files and context the main session missed.
 
 The current prompt describes what to catch, but it does not define a distinct review methodology. The delegate also receives the normal instruction stream assembled from host-level `AGENTS.md`, project-level `AGENTS.md`, skills, and environment context. Project-level docs are useful to the reviewer, but host-level instructions can mix machine resource notes with main-session editing and efficient-search guidance.
 
@@ -19,7 +19,7 @@ The current prompt describes what to catch, but it does not define a distinct re
 |Project context retained|Project-level `AGENTS.md` and repository-specific technical notes stay available.|
 |Host instruction hygiene|Machine resource notes can remain available, but main-session-only editing and efficient-search instructions can be excluded from review delegates.|
 |Runtime customization|Users can override review prompts and review-specific host instruction filenames from `~/.codex/config.toml` without rebuilding.|
-|Stable protocol|Keep `PostTurnCompletionReviewOutputEvent { evaluation, fix_actions_advised }` unchanged.|
+|Stable protocol|Keep `PostTurnCompletionReviewOutputEvent { evaluation, fix_actions_advised }` unchanged while treating the boolean as a concrete follow-up signal for bug fixes and incomplete-scope delivery.|
 
 ## Proposal
 
@@ -37,11 +37,12 @@ When a prompt file is configured, read it during config loading or delegate setu
 Also add explicit post-turn methodology requirements to `core/post_turn_completion_review_prompt.md`:
 
 1. Do not perform a generic code review and do not merely replay keyword search plus narrow range reads.
-2. Derive a coverage checklist from the user request, final assistant answer, changed or untracked files when available, repository manifests, adjacent modules, tests, schemas, protocol definitions, generated bindings, and registration points.
-3. Prefer whole-file inspection for small and medium changed files. For large files, inspect whole symbol or module contexts plus imports, exports, registration tables, nearby tests, and paired helper functions.
-4. Search for duplicate or existing functionality with multiple signals: new symbol names, semantic concepts, config keys, protocol variants, UI labels, test names, file families, and neighboring directories.
-5. Require concrete evidence for each finding in `evaluation`: file path, missing paired surface, conflicting existing helper, unsupported final-answer claim, or test gap.
-6. Keep `fix_actions_advised = true` only for concrete follow-up work the main session should verify and potentially perform.
+2. Build a request-fulfillment checklist from every user message in the supplied interaction history.
+3. Derive a coverage checklist from the request-fulfillment checklist, final assistant answer, changed or untracked files when available, repository manifests, adjacent modules, tests, schemas, protocol definitions, generated bindings, and registration points.
+4. Prefer whole-file inspection for small and medium changed files. For large files, inspect whole symbol or module contexts plus imports, exports, registration tables, nearby tests, and paired helper functions.
+5. Search for duplicate or existing functionality with multiple signals: new symbol names, semantic concepts, config keys, protocol variants, UI labels, test names, file families, and neighboring directories.
+6. Require concrete evidence for each finding in `evaluation`: file path, missing paired surface, conflicting existing helper, unsupported final-answer claim, unfulfilled user requirement, or test gap.
+7. Keep `fix_actions_advised = true` for concrete follow-up work the main session should verify and potentially perform, including incomplete requested scope.
 
 The prompt should also state that when inherited instructions conflict with this review methodology, the post-turn review prompt wins.
 
@@ -88,7 +89,7 @@ Project-level `AGENTS.md` usually contains repository-specific build, test, arch
 Do not change the protocol payload yet. Instead, require the `evaluation` Markdown to include a compact coverage statement, for example:
 
 ```markdown
-Inspection coverage: checked changed files, sibling modules, protocol registrations, and tests around ...
+Inspection coverage: checked request-fulfillment checklist, changed files, sibling modules, protocol registrations, and tests around ...
 
 Findings:
 - ...
@@ -121,6 +122,7 @@ This gives the main session and the user visibility into whether the reviewer ac
 - Integration test: project-level `AGENTS.md` remains present in the post-turn delegate initial context while host main-session-only guidance is absent.
 - Behavior test: a delegate response with coverage text and `fix_actions_advised = false` does not continue the main session.
 - Behavior test: a delegate response with concrete findings and `fix_actions_advised = true` records one advisory developer message and triggers `TurnContinuationSource::PostTurnCompletionReview`.
+- Behavior test: a multi-round session passes every real round's user messages and final assistant message to the post-turn delegate, while omitting tool transcript and review synthetic turns.
 
 ## Rollout
 

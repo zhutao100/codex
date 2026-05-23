@@ -995,43 +995,112 @@ pub(super) fn completed_turn_for_review_from_history(
     items: &[ResponseItem],
     cwd: PathBuf,
 ) -> Option<CompletedTurnForReview> {
-    let mut search_end = items.len();
-    while let Some(assistant_index) = items[..search_end]
-        .iter()
-        .rposition(|item| assistant_message_text(item).is_some_and(|text| !text.trim().is_empty()))
-    {
-        let final_agent_message = assistant_message_text(&items[assistant_index])?
-            .trim()
-            .to_string();
-        let Some((user_index, user_messages)) = items[..assistant_index]
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(index, item)| {
-                user_message_texts_for_review(item).map(|texts| (index, texts))
-            })
-        else {
-            search_end = assistant_index;
-            continue;
-        };
+    let (interaction_history, latest_user_index, latest_assistant_index) =
+        completed_turn_interaction_history_from_history(items)?;
+    let latest_round = interaction_history.last()?.clone();
 
-        let has_review_synthetic_between = items[user_index + 1..assistant_index]
-            .iter()
-            .any(is_review_rollout_user_message);
-        if has_review_synthetic_between {
-            search_end = assistant_index;
+    Some(CompletedTurnForReview {
+        turn_id: format!("reconstructed-{latest_user_index}-{latest_assistant_index}"),
+        cwd,
+        user_messages: latest_round.user_messages.clone(),
+        final_agent_message: latest_round.final_agent_message,
+        interaction_history,
+    })
+}
+
+pub(super) fn completed_turn_interaction_history_from_history(
+    items: &[ResponseItem],
+) -> Option<(Vec<CompletedTurnReviewRound>, usize, usize)> {
+    let mut rounds = Vec::new();
+    let mut current_user_index: Option<usize> = None;
+    let mut current_user_messages: Vec<String> = Vec::new();
+    let mut current_final_agent_message: Option<String> = None;
+    let mut current_assistant_index: Option<usize> = None;
+    let mut latest_indices: Option<(usize, usize)> = None;
+    let mut ignoring_synthetic_review_turn = false;
+
+    for (index, item) in items.iter().enumerate() {
+        if is_review_rollout_user_message(item) {
+            push_completed_turn_review_round(
+                &mut rounds,
+                &mut latest_indices,
+                current_user_index,
+                current_user_messages.as_slice(),
+                current_final_agent_message.as_deref(),
+                current_assistant_index,
+            );
+            current_user_index = None;
+            current_user_messages.clear();
+            current_final_agent_message = None;
+            current_assistant_index = None;
+            ignoring_synthetic_review_turn = true;
             continue;
         }
 
-        return Some(CompletedTurnForReview {
-            turn_id: format!("reconstructed-{user_index}-{assistant_index}"),
-            cwd,
-            user_messages,
-            final_agent_message,
-        });
+        if let Some(user_messages) = user_message_texts_for_review(item) {
+            ignoring_synthetic_review_turn = false;
+            push_completed_turn_review_round(
+                &mut rounds,
+                &mut latest_indices,
+                current_user_index,
+                current_user_messages.as_slice(),
+                current_final_agent_message.as_deref(),
+                current_assistant_index,
+            );
+            current_user_index = Some(index);
+            current_user_messages = user_messages;
+            current_final_agent_message = None;
+            current_assistant_index = None;
+            continue;
+        }
+
+        if ignoring_synthetic_review_turn {
+            continue;
+        }
+
+        if let Some(text) = assistant_message_text(item)
+            && !text.trim().is_empty()
+            && current_user_index.is_some()
+        {
+            current_final_agent_message = Some(text.trim().to_string());
+            current_assistant_index = Some(index);
+        }
     }
 
-    None
+    push_completed_turn_review_round(
+        &mut rounds,
+        &mut latest_indices,
+        current_user_index,
+        current_user_messages.as_slice(),
+        current_final_agent_message.as_deref(),
+        current_assistant_index,
+    );
+
+    let (latest_user_index, latest_assistant_index) = latest_indices?;
+    Some((rounds, latest_user_index, latest_assistant_index))
+}
+
+fn push_completed_turn_review_round(
+    rounds: &mut Vec<CompletedTurnReviewRound>,
+    latest_indices: &mut Option<(usize, usize)>,
+    user_index: Option<usize>,
+    user_messages: &[String],
+    final_agent_message: Option<&str>,
+    assistant_index: Option<usize>,
+) {
+    let (Some(user_index), Some(final_agent_message), Some(assistant_index)) =
+        (user_index, final_agent_message, assistant_index)
+    else {
+        return;
+    };
+    if user_messages.is_empty() || final_agent_message.trim().is_empty() {
+        return;
+    }
+    rounds.push(CompletedTurnReviewRound {
+        user_messages: user_messages.to_vec(),
+        final_agent_message: final_agent_message.to_string(),
+    });
+    *latest_indices = Some((user_index, assistant_index));
 }
 
 fn assistant_message_text(item: &ResponseItem) -> Option<String> {

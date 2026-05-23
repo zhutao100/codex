@@ -366,6 +366,102 @@ async fn review_completed_turn_positive_output_records_developer_advisory_and_co
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_completed_turn_passes_multi_round_interaction_history() {
+    skip_if_no_network!();
+
+    let review_json = serde_json::json!({
+        "evaluation": "Inspection coverage: checked request-fulfillment checklist.\n\nFindings:\n- None.\n\nFix actions advised: no",
+        "fix_actions_advised": false
+    })
+    .to_string();
+    let review_json_escaped = serde_json::to_string(&review_json).unwrap();
+    let sse_round_one = r#"[
+        {"type":"response.output_item.done", "item":{
+            "type":"message", "role":"assistant",
+            "content":[{"type":"output_text","text":"round one final"}]
+        }},
+        {"type":"response.completed", "response": {"id": "__ID__"}}
+    ]"#;
+    let sse_round_two = r#"[
+        {"type":"response.output_item.done", "item":{
+            "type":"message", "role":"assistant",
+            "content":[{"type":"output_text","text":"round two final"}]
+        }},
+        {"type":"response.completed", "response": {"id": "__ID__"}}
+    ]"#;
+    let sse_review = format!(
+        r#"[
+            {{"type":"response.output_item.done", "item":{{
+                "type":"message", "role":"assistant",
+                "content":[{{"type":"output_text","text":{review_json_escaped}}}]
+            }}}},
+            {{"type":"response.completed", "response": {{"id": "__ID__"}}}}
+        ]"#
+    );
+    let server = MockServer::start().await;
+    let request_log = mount_sse_sequence(
+        &server,
+        vec![
+            load_sse_fixture_with_id_from_str(sse_round_one, &Uuid::new_v4().to_string()),
+            load_sse_fixture_with_id_from_str(sse_round_two, &Uuid::new_v4().to_string()),
+            load_sse_fixture_with_id_from_str(&sse_review, &Uuid::new_v4().to_string()),
+        ],
+    )
+    .await;
+    let codex_home = Arc::new(TempDir::new().unwrap());
+    let codex = new_conversation_for_server(&server, codex_home.clone(), |_| {}).await;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "round one request".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await
+        .unwrap();
+    let _round_one_complete =
+        wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "round two request".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await
+        .unwrap();
+    let _round_two_complete =
+        wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    codex.submit(Op::ReviewCompletedTurn).await.unwrap();
+    let _entered = wait_for_event(&codex, |ev| matches!(ev, EventMsg::EnteredReviewMode(_))).await;
+    let _exited = wait_for_event(&codex, |ev| matches!(ev, EventMsg::ExitedReviewMode(_))).await;
+    let _review_complete =
+        wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let requests = request_log.requests();
+    assert_eq!(requests.len(), 3);
+    let delegate_input = serde_json::to_string(&requests[2].input()).expect("serialize input");
+    assert!(
+        delegate_input.contains("<session_interaction_history"),
+        "delegate input should contain session interaction history: {delegate_input}"
+    );
+    assert!(delegate_input.contains("<round index=\\\"1\\\">"));
+    assert!(delegate_input.contains("round one request"));
+    assert!(delegate_input.contains("round one final"));
+    assert!(delegate_input.contains("<round index=\\\"2\\\">"));
+    assert!(delegate_input.contains("round two request"));
+    assert!(delegate_input.contains("round two final"));
+
+    let _codex_home_guard = codex_home;
+    server.verify().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn review_completed_turn_false_output_does_not_continue() {
     skip_if_no_network!();
 

@@ -296,21 +296,40 @@ fn render_completed_turn_context(completed_turn: &CompletedTurnForReview) -> Str
         "  <cwd><![CDATA[{}]]></cwd>",
         cdata_escape(&completed_turn.cwd.display().to_string())
     );
-    let _ = writeln!(out, "  <user_messages>");
-    for (index, message) in completed_turn.user_messages.iter().enumerate() {
-        let _ = writeln!(
-            out,
-            "    <message index=\"{}\"><![CDATA[{}]]></message>",
-            index + 1,
-            cdata_escape(message)
-        );
-    }
-    let _ = writeln!(out, "  </user_messages>");
     let _ = writeln!(
         out,
-        "  <final_agent_message><![CDATA[{}]]></final_agent_message>",
-        cdata_escape(&completed_turn.final_agent_message)
+        "  <session_interaction_history note=\"The highest-indexed round is the completed turn being reviewed.\">"
     );
+    let fallback_round;
+    let rounds = if completed_turn.interaction_history.is_empty() {
+        fallback_round = vec![crate::state::CompletedTurnReviewRound {
+            user_messages: completed_turn.user_messages.clone(),
+            final_agent_message: completed_turn.final_agent_message.clone(),
+        }];
+        fallback_round.as_slice()
+    } else {
+        completed_turn.interaction_history.as_slice()
+    };
+    for (round_index, round) in rounds.iter().enumerate() {
+        let _ = writeln!(out, "    <round index=\"{}\">", round_index + 1);
+        let _ = writeln!(out, "      <user_messages>");
+        for (message_index, message) in round.user_messages.iter().enumerate() {
+            let _ = writeln!(
+                out,
+                "        <message index=\"{}\"><![CDATA[{}]]></message>",
+                message_index + 1,
+                cdata_escape(message)
+            );
+        }
+        let _ = writeln!(out, "      </user_messages>");
+        let _ = writeln!(
+            out,
+            "      <final_agent_message><![CDATA[{}]]></final_agent_message>",
+            cdata_escape(&round.final_agent_message)
+        );
+        let _ = writeln!(out, "    </round>");
+    }
+    let _ = writeln!(out, "  </session_interaction_history>");
     let _ = writeln!(out, "</completed_turn_review_context>");
     out
 }
@@ -329,7 +348,11 @@ fn cdata_escape(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::parse_post_turn_completion_review_output_event;
+    use super::render_completed_turn_context;
+    use crate::state::CompletedTurnForReview;
+    use crate::state::CompletedTurnReviewRound;
     use pretty_assertions::assert_eq;
+    use std::path::PathBuf;
 
     #[test]
     fn parses_json_object_inside_text() {
@@ -356,6 +379,37 @@ mod tests {
         assert!(prompt.contains("Do not perform a generic code review"));
         assert!(prompt.contains("keyword-search plus narrow range reads"));
         assert!(prompt.contains("coverage-driven"));
+        assert!(prompt.contains("request-fulfillment checklist"));
+        assert!(prompt.contains("incomplete fulfillment"));
         assert!(prompt.contains("Inspection coverage:"));
+    }
+
+    #[test]
+    fn renders_complete_session_interaction_history() {
+        let completed_turn = CompletedTurnForReview {
+            turn_id: "turn-2".to_string(),
+            cwd: PathBuf::from("/tmp/project"),
+            interaction_history: vec![
+                CompletedTurnReviewRound {
+                    user_messages: vec!["first request".to_string()],
+                    final_agent_message: "first final".to_string(),
+                },
+                CompletedTurnReviewRound {
+                    user_messages: vec!["second request".to_string()],
+                    final_agent_message: "second final".to_string(),
+                },
+            ],
+            user_messages: vec!["second request".to_string()],
+            final_agent_message: "second final".to_string(),
+        };
+
+        let rendered = render_completed_turn_context(&completed_turn);
+
+        assert!(rendered.contains("<round index=\"1\">"));
+        assert!(rendered.contains("<![CDATA[first request]]>"));
+        assert!(rendered.contains("<![CDATA[first final]]>"));
+        assert!(rendered.contains("<round index=\"2\">"));
+        assert!(rendered.contains("<![CDATA[second request]]>"));
+        assert!(rendered.contains("<![CDATA[second final]]>"));
     }
 }

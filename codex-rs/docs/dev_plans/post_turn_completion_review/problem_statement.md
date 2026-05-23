@@ -8,17 +8,20 @@ Initial workflow implemented in this project; follow-up review-effectiveness har
 
 A normal Codex coding turn is intentionally optimized for context-window efficiency: the agent infers the task, uses keyword search to find likely relevant files, reads targeted ranges, and applies small diff-style edits. This usually produces fast and useful changes, but it can miss project-level context that was not reachable from the initial keywords or the ranges that were read.
 
-The proposed workflow adds an independent read-only review after a turn has completed. It reviews the completed turn's end-state and final deliverables, not the in-flight reasoning or tool transcript, and it can feed actionable concerns back into the same main session without requiring a new user message.
+The proposed workflow adds an independent read-only review after a turn has completed. It reviews the completed turn's end-state and final deliverables against the compact multi-round user/final-assistant interaction history, not the in-flight reasoning or tool transcript, and it can feed actionable concerns back into the same main session without requiring a new user message.
 
 ## Test-Run Findings
 
 Test runs showed that post-turn review delegates often inspected the repository the same way as the main coding session: infer intent, run keyword searches, read narrow ranges, and judge from those slices. This weakens the workflow because the reviewer can repeat the same discovery path and miss the same adjacent files, paired updates, existing helpers, and repository-level consistency checks.
 
-Two likely causes are now in scope:
+Additional multi-round test runs showed that completed-turn reconstruction could collapse the session into a false pair: an early user request plus the latest assistant final message. That deprived the reviewer of intervening user-agent rounds and made it harder to evaluate whether the full requested scope was faithfully delivered.
+
+Likely causes now in scope:
 
 - `core/post_turn_completion_review_prompt.md` states the high-level review purpose but does not require a different inspection methodology.
 - Review delegates inherit the same host-level and project-level `AGENTS.md` instruction stream through the normal instruction-loading path. Project-level instructions are still valuable, but host-level instructions can contain main-session editing and efficient-search guidance that is counterproductive for an independent review.
 - The review prompts are currently built in through `include_str!`, so changing `core/review_prompt.md` or `core/post_turn_completion_review_prompt.md` requires a rebuild rather than a host-level config change.
+- Completed-turn context originally modeled a single `(user messages, final assistant message)` pair instead of a per-round compact interaction history.
 
 ## Risks To Address
 
@@ -28,6 +31,7 @@ Two likely causes are now in scope:
 |Partial context from range reads|The main agent read only selected line ranges and missed invariants, nearby helpers, module-level contracts, or paired methods.|Re-read whole relevant files or broader symbol/module context when needed, then assess whether the final change is internally consistent.|
 |Reinvented duplicate logic|The main agent did not search broadly enough for existing helpers or patterns before adding new code.|Identify duplicate or conflicting logic and advise reusing the existing project component when the evidence is strong.|
 |Final answer overclaims|The final agent message may claim tests, guarantees, or implementation scope that the repository state does not support.|Compare the final user-facing deliverable against repository state and report mismatches.|
+|Incomplete requested scope|A turn can be self-consistent but silently narrow the user's request, omit requested deliverables, or fail to honor constraints from earlier rounds.|Build a request-fulfillment checklist from the full supplied interaction history and advise follow-up when repository evidence shows incomplete delivery.|
 |Unsafe follow-up assumptions|A successful-looking turn may leave a subtle required follow-up that the main session did not know to perform.|Produce an advisory result with an explicit binary `fix_actions_advised` signal so the main session can decide whether to continue.|
 |Reviewer repeats the main search path|The review prompt and inherited host instructions encourage context-efficient keyword/range inspection, which is the same strategy that caused the missed context.|Require the reviewer to build an independent coverage plan, inspect changed files and paired surfaces broadly, and search for duplicate or related implementations using multiple orthogonal signals.|
 |Main-session host instructions leak into review|Host-level `AGENTS.md` may mix machine resource notes with editing and efficiency instructions intended for normal work sessions.|Introduce review-scoped host instruction loading so `/review` prefers `AGENTS.review.md` and post-turn review prefers `AGENTS.post-turn-review.md`, with explicit fallback to shared host instructions.|
@@ -68,8 +72,8 @@ The existing `ContinueTask` path is designed for paused or interrupted turns. It
 |Always disable web search|Force `WebSearchMode::Disabled` and disable `Feature::WebSearchRequest` / `Feature::WebSearchCached` in the delegate config.|
 |Always run read-only|Force the delegate `sandbox_policy` to `SandboxPolicy::ReadOnly` regardless of the main session policy, and keep approval policy at `AskForApproval::Never` to prevent escalation into writes.|
 |Use a dedicated prompt file|Add a prompt file separate from `core/review_prompt.md`, for example `core/post_turn_completion_review_prompt.md`.|
-|Pass only user messages and final agent messages as context|Capture or reconstruct a compact completed-turn context and pass no reasoning, tool calls, tool outputs, approval events, or intermediate assistant messages.|
-|Produce a loose evaluation plus a binary fix signal|Add a small output type such as `PostTurnCompletionReviewOutputEvent { evaluation: String, fix_actions_advised: bool }`.|
+|Pass only user messages and final agent messages as context|Capture or reconstruct a compact per-round interaction history and pass no reasoning, tool calls, tool outputs, approval events, or intermediate assistant messages.|
+|Produce a loose evaluation plus a binary follow-up signal|Add a small output type such as `PostTurnCompletionReviewOutputEvent { evaluation: String, fix_actions_advised: bool }`; keep the historical field name but define it as true for concrete bug fixes or incomplete-scope follow-up.|
 |Feed fix advice back as a developer message|When `fix_actions_advised` is true, wrap the evaluation in a developer message that labels it as independent advisory input and instructs the main model to verify before acting.|
 |Continue the main session instead of starting a new user turn|Reuse the no-new-user-input continuation machinery where possible, but add a post-completion continuation source to avoid pretending this was an interrupt or pause.|
 |Sanity-check misuse|Fresh sessions, active turns, sessions with no completed regular turn, or completed turns without a final assistant message should emit user-friendly errors and not spawn a delegate.|

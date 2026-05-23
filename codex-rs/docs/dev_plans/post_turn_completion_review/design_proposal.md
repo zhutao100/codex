@@ -2,7 +2,7 @@
 
 ## Implementation Status
 
-The initial workflow is present in this project: `Op::ReviewCompletedTurn`, `PostTurnCompletionReviewTask`, `core/post_turn_completion_review_prompt.md`, read-only review delegate configuration, post-turn output parsing, and continuation handoff are wired. Test runs revealed a follow-up design issue: the delegate can still follow the same keyword-search and range-read strategy as the main session, especially when inherited host-level `AGENTS.md` instructions encourage efficient main-session inspection. The rest of this document treats the existing implementation as the baseline and adds hardening requirements for the prompts, review-specific host instruction loading, and runtime configuration.
+The workflow is present in this project: `Op::ReviewCompletedTurn`, `PostTurnCompletionReviewTask`, `core/post_turn_completion_review_prompt.md`, read-only review delegate configuration, post-turn output parsing, and continuation handoff are wired. Later hardening addressed two observed gaps: review delegates now receive the full compact user/final-assistant interaction history for the session instead of only a single reconstructed pair, and the prompt treats `fix_actions_advised` as a concrete follow-up signal for both bugs and incomplete user-request fulfillment.
 
 ## Target Base
 
@@ -10,11 +10,11 @@ This proposal targets this project's current customized code shape with the cust
 
 ## Design Summary
 
-Add a sibling workflow named `post_turn_completion_review` that can be invoked manually through `/review-completed-turn` or automatically after a regular `TurnComplete` when `[features].auto_post_turn_completion_review = true` is enabled. The workflow spawns a read-only review delegate using the existing review model/provider selection, evaluates the last completed turn using only the user messages and final agent message, and, when it advises fixes, injects an advisory developer message into the main session and continues without a new user turn.
+Add a sibling workflow named `post_turn_completion_review` that can be invoked manually through `/review-completed-turn` or automatically after a regular `TurnComplete` when `[features].auto_post_turn_completion_review = true` is enabled. The workflow spawns a read-only review delegate using the existing review model/provider selection, evaluates the last completed turn using a compact history of every regular round's user messages and final assistant message, and, when it advises concrete follow-up actions, injects an advisory developer message into the main session and continues without a new user turn.
 
 The hardening layer also updates generic `/review` and post-turn review delegate setup so each review task can use review-scoped host `AGENTS.*.md` instructions and optional prompt files from `~/.codex/config.toml`, while retaining the built-in prompts and project-level `AGENTS.md` docs as fallbacks.
 
-The design intentionally keeps the delegate independent from the main agent's hidden reasoning and tool transcript. This makes the review useful for the specific blind points of context-efficient coding turns: missed files, partial reads, duplicated logic, and final deliverable overclaims.
+The design intentionally keeps the delegate independent from the main agent's hidden reasoning and tool transcript. This makes the review useful for the specific blind points of context-efficient coding turns: missed files, partial reads, duplicated logic, final deliverable overclaims, and silent narrowing of the requested scope across a multi-round session.
 
 ## User-Facing Shape
 
@@ -190,13 +190,20 @@ This makes the event stream explicit when the main model resumes because an inde
 
 ## Completed-Turn Context Capture
 
-Add a small session-state record for the latest completed regular turn:
+Add a small session-state record for the latest completed regular turn plus the compact session interaction history that led to it:
 
 ```rust
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CompletedTurnReviewRound {
+    pub(crate) user_messages: Vec<String>,
+    pub(crate) final_agent_message: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CompletedTurnForReview {
     pub(crate) turn_id: String,
     pub(crate) cwd: PathBuf,
+    pub(crate) interaction_history: Vec<CompletedTurnReviewRound>,
     pub(crate) user_messages: Vec<String>,
     pub(crate) final_agent_message: String,
 }
@@ -210,8 +217,9 @@ pub(crate) last_completed_regular_turn_for_review: Option<CompletedTurnForReview
 
 Capture it when a `RegularTask` finishes and before the automatic review trigger runs. The capture path should preserve only:
 
-- text from the user input items for the completed turn;
-- the final assistant message returned by `run_turn(...)`.
+- text from real user-turn boundary messages for each completed round;
+- the final assistant message for each completed round;
+- the latest completed turn's `turn_id` and `cwd`.
 
 Do not include:
 
@@ -219,12 +227,12 @@ Do not include:
 - shell/function/tool calls;
 - tool outputs;
 - approval events;
-- intermediate assistant deltas or messages;
+- intermediate assistant deltas or non-final assistant messages within a round;
 - review-mode synthetic user/assistant messages.
 
-Prefer explicit capture over scanning the full history. `Session::spawn_task(...)` currently receives `input: Vec<UserInput>` and moves it into the task; clone or summarize that input into `RunningTask` for regular tasks before moving it. `Session::on_task_finished(...)` already receives `last_agent_message` and `task_kind`, so it can update `last_completed_regular_turn_for_review` when `task_kind == TaskKind::Regular` and the final message is non-empty.
+Build `interaction_history` from the session history by pairing each real user-turn boundary with the last non-empty assistant message before the next real user turn. This pairing fixes the multi-round failure mode where the reviewer could receive the first user message and the latest assistant message as a single false pair. `Session::spawn_task(...)` still summarizes the current input into `RunningTask` for regular tasks before moving it; `Session::on_task_finished(...)` uses that explicit input as a fallback when history cannot reconstruct the current turn precisely.
 
-If resume support for manual `/review-completed-turn` is required, add a fallback reconstruction helper that scans history for the most recent user-turn boundary followed by a final assistant message. This fallback should ignore Codex-generated developer messages and review synthetic messages; it should remain a fallback because history reconstruction is less precise than explicit per-turn capture.
+If resume support for manual `/review-completed-turn` is required, use the same reconstruction helper over the resumed history. The helper should ignore Codex-generated developer messages and review synthetic messages.
 
 ## Delegate Prompt And Input
 
@@ -261,14 +269,18 @@ Pass the completed-turn context as the delegate's only user input:
 <completed_turn_review_context>
   <turn_id>...</turn_id>
   <cwd>...</cwd>
-  <user_messages>
-    <message index="1"><![CDATA[...]]></message>
-  </user_messages>
-  <final_agent_message><![CDATA[...]]></final_agent_message>
+  <session_interaction_history note="The highest-indexed round is the completed turn being reviewed.">
+    <round index="1">
+      <user_messages>
+        <message index="1"><![CDATA[...]]></message>
+      </user_messages>
+      <final_agent_message><![CDATA[...]]></final_agent_message>
+    </round>
+  </session_interaction_history>
 </completed_turn_review_context>
 ```
 
-Do not pass the normal session history as `InitialHistory`; use `InitialHistory::New`. The delegate can inspect the repository read-only through tools, but the only conversation context it receives should be the user message(s) and final agent message from the completed turn.
+Do not pass the normal session history as `InitialHistory`; use `InitialHistory::New`. The delegate can inspect the repository read-only through tools, but the only conversation context it receives should be the compact per-round user/final-assistant history. Do not pass hidden reasoning, tool calls, or tool outputs.
 
 
 ## Review Effectiveness Hardening
@@ -278,11 +290,12 @@ The post-turn reviewer must be optimized for complementarity, not for repeating 
 Minimum prompt requirements:
 
 1. Treat the completed turn as an end-state artifact to verify, not as a request to perform a generic review.
-2. Start by deriving a coverage checklist from the user request, the final assistant message, changed or untracked files when available, repository manifests, neighboring modules, tests, schemas, protocol definitions, generated bindings, and registration points.
-3. Prefer whole-file reads for small and medium changed files. For large files, inspect the whole relevant symbol or module context plus imports, exports, registration tables, nearby tests, and paired helper functions. Do not rely only on `rg` hits followed by narrow `sed` ranges.
-4. Use multiple orthogonal searches for duplicate or related logic: new symbol names, semantic concepts, config keys, protocol variants, UI labels, test names, file families, and neighboring directory structure.
-5. For each suspected issue, cite concrete repository evidence in the `evaluation` text: file path, missing paired surface, conflicting existing helper, unsupported final-answer claim, or test gap.
-6. Set `fix_actions_advised = true` only for concrete actionable follow-up. Use `false` for speculative concerns, stylistic preferences, missing evidence, or findings that do not require the main session to continue.
+2. Build a request-fulfillment checklist from every user message in the supplied interaction history, including explicit requirements, constraints, verification asks, and promised follow-ups.
+3. Start by deriving a coverage checklist from the request-fulfillment checklist, the final assistant message, changed or untracked files when available, repository manifests, neighboring modules, tests, schemas, protocol definitions, generated bindings, and registration points.
+4. Prefer whole-file reads for small and medium changed files. For large files, inspect the whole relevant symbol or module context plus imports, exports, registration tables, nearby tests, and paired helper functions. Do not rely only on `rg` hits followed by narrow `sed` ranges.
+5. Use multiple orthogonal searches for duplicate or related logic: new symbol names, semantic concepts, config keys, protocol variants, UI labels, test names, file families, and neighboring directory structure.
+6. For each suspected issue, cite concrete repository evidence in the `evaluation` text: file path, missing paired surface, conflicting existing helper, unsupported final-answer claim, unfulfilled user requirement, or test gap.
+7. Treat `fix_actions_advised` as the concrete follow-up signal despite its historical bug-fix name. Set it to true for actionable bugs, incomplete requested scope, missed deliverables, or required verification follow-up. Use false for speculative concerns, stylistic preferences, missing evidence, or findings that do not require the main session to continue.
 
 A useful `evaluation` format is Markdown inside the JSON string with short sections such as `Inspection coverage`, `Findings`, and `Fix actions advised`. The schema should stay unchanged so existing clients only need the `evaluation` text and the boolean signal.
 

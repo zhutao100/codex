@@ -203,6 +203,7 @@ use crate::skills::injection::tool_kind_for_path;
 use crate::skills::resolve_skill_dependencies_for_turn;
 use crate::state::ActiveTurn;
 use crate::state::CompletedTurnForReview;
+use crate::state::CompletedTurnReviewRound;
 use crate::state::PendingContinuation;
 use crate::state::PreviousTurnSettings;
 use crate::state::SessionServices;
@@ -265,6 +266,7 @@ use self::session::Session;
 use self::session::SessionConfiguration;
 pub(crate) use self::session::SessionSettingsUpdate;
 use self::turn::completed_turn_for_review_from_history;
+use self::turn::completed_turn_interaction_history_from_history;
 #[cfg(test)]
 use self::turn::filter_connectors_for_input;
 use self::turn::history_needs_continuation;
@@ -2310,14 +2312,35 @@ impl Session {
             return;
         }
 
-        if user_messages.is_empty()
-            && let Some(reconstructed) = self.reconstruct_completed_turn_for_review().await
+        let mut state = self.state.lock().await;
+        let mut interaction_history =
+            completed_turn_interaction_history_from_history(state.history.raw_items())
+                .map(|(rounds, _, _)| rounds)
+                .unwrap_or_default();
+
+        if !user_messages.is_empty()
+            && interaction_history
+                .last()
+                .is_none_or(|round| round.final_agent_message != final_agent_message)
         {
-            user_messages = reconstructed.user_messages;
+            if let Some(round) = interaction_history
+                .last_mut()
+                .filter(|round| round.user_messages == user_messages)
+            {
+                round.final_agent_message = final_agent_message.to_string();
+            } else {
+                interaction_history.push(CompletedTurnReviewRound {
+                    user_messages: user_messages.clone(),
+                    final_agent_message: final_agent_message.to_string(),
+                });
+            }
         }
 
-        if user_messages.is_empty() {
+        let Some(latest_round) = interaction_history.last().cloned() else {
             return;
+        };
+        if user_messages.is_empty() {
+            user_messages = latest_round.user_messages;
         }
 
         let completed_turn = CompletedTurnForReview {
@@ -2325,17 +2348,9 @@ impl Session {
             cwd: turn_context.cwd.clone(),
             user_messages,
             final_agent_message: final_agent_message.to_string(),
+            interaction_history,
         };
-        let mut state = self.state.lock().await;
         state.last_completed_regular_turn_for_review = Some(completed_turn);
-    }
-
-    async fn reconstruct_completed_turn_for_review(&self) -> Option<CompletedTurnForReview> {
-        let state = self.state.lock().await;
-        completed_turn_for_review_from_history(
-            state.history.raw_items(),
-            state.session_configuration.cwd.clone(),
-        )
     }
 
     async fn prepare_history_for_continuation(&self, remove_interrupted_abort: bool) {

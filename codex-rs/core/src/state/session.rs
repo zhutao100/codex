@@ -23,9 +23,16 @@ pub(crate) struct PendingContinuation {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CompletedTurnReviewRound {
+    pub(crate) user_messages: Vec<String>,
+    pub(crate) final_agent_message: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CompletedTurnForReview {
     pub(crate) turn_id: String,
     pub(crate) cwd: PathBuf,
+    pub(crate) interaction_history: Vec<CompletedTurnReviewRound>,
     pub(crate) user_messages: Vec<String>,
     pub(crate) final_agent_message: String,
 }
