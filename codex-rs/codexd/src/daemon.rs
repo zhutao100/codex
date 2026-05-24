@@ -786,6 +786,7 @@ fn parse_thread_token_usage_update(notification: &HubNotification) -> Option<Tur
 }
 
 fn remove_completed_turn(runtime: &mut RuntimeState, completion: TurnCompletion) -> bool {
+    let had_turn_key = completion.turn_key.is_some();
     if let Some(turn_key) = completion.turn_key
         && runtime.active_turns.remove(&turn_key).is_some()
     {
@@ -797,6 +798,10 @@ fn remove_completed_turn(runtime: &mut RuntimeState, completion: TurnCompletion)
         if runtime.active_turns.remove(&key).is_some() {
             return true;
         }
+    }
+
+    if had_turn_key {
+        return false;
     }
 
     let key = runtime
@@ -1171,6 +1176,52 @@ mod tests {
                 turn_id: "turn-1".to_string(),
                 status: Some("inProgress".to_string()),
                 model: Some("model-thread-a".to_string()),
+                ..Default::default()
+            }]
+        );
+    }
+
+    #[test]
+    fn stale_completion_key_does_not_remove_reused_child_turn_id() {
+        let mut state = DaemonState::default();
+        state.apply_runtime_notification(RuntimeEventParams {
+            runtime_id: "rt-1".to_string(),
+            notification: HubNotification {
+                method: "turn/started".to_string(),
+                params: Some(serde_json::json!({
+                    "threadId": "thread-new",
+                    "turn": {
+                        "id": "0",
+                        "key": "thread-new:0",
+                        "status": "inProgress",
+                        "taskKind": "post_turn_completion_review",
+                    },
+                })),
+            },
+        });
+
+        state.apply_runtime_notification(RuntimeEventParams {
+            runtime_id: "rt-1".to_string(),
+            notification: HubNotification {
+                method: "turn/completed".to_string(),
+                params: Some(serde_json::json!({
+                    "turn": {
+                        "id": "0",
+                        "key": "stale-thread:0",
+                        "status": "completed",
+                    },
+                })),
+            },
+        });
+
+        assert_eq!(
+            state.snapshot().runtimes[0].active_turns,
+            vec![ActiveTurnSnapshot {
+                turn_key: Some("thread-new:0".to_string()),
+                thread_id: "thread-new".to_string(),
+                turn_id: "0".to_string(),
+                status: Some("inProgress".to_string()),
+                task_kind: Some("post_turn_completion_review".to_string()),
                 ..Default::default()
             }]
         );

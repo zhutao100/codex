@@ -261,10 +261,10 @@ async fn process_review_events(
                 // Cancellation or abort: consumer will finalize with None.
                 return None;
             }
-            other => {
+            _ => {
                 session
                     .clone_session()
-                    .send_event_transient(ctx.as_ref(), other)
+                    .send_event_transient_raw(event)
                     .await;
             }
         }

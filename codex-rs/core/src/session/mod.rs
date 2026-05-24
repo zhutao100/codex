@@ -1238,6 +1238,10 @@ impl Session {
         }
     }
 
+    pub(crate) async fn send_event_transient_raw(&self, event: Event) {
+        self.send_event_raw_transient(event).await;
+    }
+
     pub(crate) async fn send_event_raw(&self, event: Event) {
         // Persist the event into rollout (recorder filters as needed)
         let rollout_items = vec![RolloutItem::EventMsg(event.msg.clone())];

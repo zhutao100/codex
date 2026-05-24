@@ -198,10 +198,10 @@ async fn process_post_turn_completion_review_events(
             EventMsg::TurnAborted(_) | EventMsg::TurnPaused(_) => {
                 return None;
             }
-            other => {
+            _ => {
                 session
                     .clone_session()
-                    .send_event_transient(ctx.as_ref(), other)
+                    .send_event_transient_raw(event)
                     .await;
             }
         }
@@ -347,12 +347,27 @@ fn cdata_escape(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::SessionTaskContext;
     use super::parse_post_turn_completion_review_output_event;
+    use super::process_post_turn_completion_review_events;
     use super::render_completed_turn_context;
     use crate::state::CompletedTurnForReview;
     use crate::state::CompletedTurnReviewRound;
+    use codex_protocol::ThreadId;
+    use codex_protocol::protocol::AskForApproval;
+    use codex_protocol::protocol::Event;
+    use codex_protocol::protocol::EventMsg;
+    use codex_protocol::protocol::RuntimeContextScope;
+    use codex_protocol::protocol::RuntimeContextSnapshot;
+    use codex_protocol::protocol::RuntimeContextUpdatedEvent;
+    use codex_protocol::protocol::SessionSource;
+    use codex_protocol::protocol::SubAgentSource;
+    use codex_protocol::protocol::TurnCompleteEvent;
     use pretty_assertions::assert_eq;
     use std::path::PathBuf;
+    use std::sync::Arc;
+    use tokio::time::Duration;
+    use tokio::time::timeout;
 
     #[test]
     fn parses_json_object_inside_text() {
@@ -411,5 +426,73 @@ mod tests {
         assert!(rendered.contains("<round index=\"2\">"));
         assert!(rendered.contains("<![CDATA[second request]]>"));
         assert!(rendered.contains("<![CDATA[second final]]>"));
+    }
+
+    fn runtime_context_snapshot() -> RuntimeContextSnapshot {
+        RuntimeContextSnapshot {
+            scope_id: "delegate-scope".to_string(),
+            scope: RuntimeContextScope::Delegate,
+            task_kind: Some("post_turn_completion_review".to_string()),
+            session_source: SessionSource::SubAgent(SubAgentSource::Review),
+            session_id: ThreadId::new(),
+            parent_session_id: Some(ThreadId::new()),
+            parent_turn_id: Some("regular-turn".to_string()),
+            thread_name: Some("Post-turn review".to_string()),
+            rollout_path: None,
+            cwd: PathBuf::from("/tmp/review"),
+            model: "gpt-5-review".to_string(),
+            model_provider_id: "openai".to_string(),
+            approval_policy: AskForApproval::Never,
+            sandbox_policy: super::SandboxPolicy::new_read_only_policy(),
+            reasoning_effort: None,
+            service_tier: None,
+            model_context_window: Some(128_000),
+            agents_summary: None,
+            token_info: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn process_events_preserves_delegate_runtime_context_event_ids() {
+        let (session, ctx, rx_events) =
+            crate::session::tests::make_session_and_context_with_rx().await;
+        let session_ctx = Arc::new(SessionTaskContext::new(session));
+        let (tx_delegate, rx_delegate) = async_channel::bounded(4);
+
+        let process = tokio::spawn(process_post_turn_completion_review_events(
+            session_ctx,
+            ctx,
+            rx_delegate,
+        ));
+
+        tx_delegate
+            .send(Event {
+                id: "0".to_string(),
+                msg: EventMsg::RuntimeContextUpdated(RuntimeContextUpdatedEvent {
+                    snapshot: runtime_context_snapshot(),
+                }),
+            })
+            .await
+            .expect("send runtime context update");
+
+        let forwarded = rx_events.recv().await.expect("forwarded runtime context");
+        assert_eq!(forwarded.id, "0");
+        assert!(matches!(forwarded.msg, EventMsg::RuntimeContextUpdated(_)));
+
+        tx_delegate
+            .send(Event {
+                id: "0".to_string(),
+                msg: EventMsg::TurnComplete(TurnCompleteEvent {
+                    last_agent_message: None,
+                }),
+            })
+            .await
+            .expect("send turn complete");
+        drop(tx_delegate);
+
+        timeout(Duration::from_secs(1), process)
+            .await
+            .expect("process_post_turn_completion_review_events hung")
+            .expect("process join failed");
     }
 }
