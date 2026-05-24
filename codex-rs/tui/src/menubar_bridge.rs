@@ -118,12 +118,8 @@ mod imp {
             let mut notifications = Vec::new();
             match event {
                 EventMsg::TurnStarted(event) => {
-                    if let Some(turn_id) = normalize_turn_id(event_turn_id)
-                        && let Some(thread_id) = self
-                            .active_runtime_context
-                            .as_ref()
-                            .map(|snapshot| snapshot.session_id.to_string())
-                            .or(active_thread_id)
+                    if let Some((thread_id, turn_id)) =
+                        self.resolve_event_turn(event_turn_id, active_thread_id.as_deref())
                     {
                         notifications.extend(self.ensure_turn_started(
                             thread_id,
@@ -225,11 +221,16 @@ mod imp {
                 }
                 EventMsg::TokenCount(event) => {
                     if let Some(info) = &event.info {
-                        let turn_id = normalize_turn_id(event_turn_id);
+                        let resolved_turn =
+                            self.resolve_event_turn(event_turn_id, active_thread_id.as_deref());
+                        let turn_id = resolved_turn
+                            .as_ref()
+                            .map(|(_, turn_id)| turn_id.clone())
+                            .or_else(|| normalize_turn_id(event_turn_id));
                         let turn_key = turn_id
                             .as_deref()
                             .and_then(|id| {
-                                active_thread_id.as_deref().and_then(|thread_id| {
+                                resolved_turn.as_ref().and_then(|(thread_id, _)| {
                                     let key = turn_key(thread_id, id);
                                     self.active_turns.contains_key(&key).then_some(key)
                                 })
@@ -243,6 +244,7 @@ mod imp {
                             .as_deref()
                             .and_then(|key| self.active_turns.get(key))
                             .map(|turn| turn.thread_id.clone())
+                            .or_else(|| resolved_turn.map(|(thread_id, _)| thread_id))
                             .or(active_thread_id);
                         notifications.push(Self::token_usage_notification(
                             info, thread_id, turn_id, turn_key,
@@ -359,10 +361,9 @@ mod imp {
             event_turn_id: &str,
             active_thread_id: Option<&str>,
         ) -> Vec<HubNotification> {
-            let Some(turn_id) = normalize_turn_id(event_turn_id) else {
-                return Vec::new();
-            };
-            let Some(thread_id) = self.resolve_thread_id(&turn_id, active_thread_id) else {
+            let Some((thread_id, turn_id)) =
+                self.resolve_event_turn(event_turn_id, active_thread_id)
+            else {
                 return Vec::new();
             };
 
@@ -499,6 +500,24 @@ mod imp {
             })
         }
 
+        fn resolve_event_turn(
+            &self,
+            event_turn_id: &str,
+            active_thread_id: Option<&str>,
+        ) -> Option<(String, String)> {
+            if let Some(snapshot) = self.active_runtime_context.as_ref() {
+                let thread_id = snapshot.session_id.to_string();
+                if let Some((_, turn_id)) = self.latest_turn_for_thread(&thread_id) {
+                    return Some((thread_id, turn_id));
+                }
+                return normalize_turn_id(event_turn_id).map(|turn_id| (thread_id, turn_id));
+            }
+
+            let turn_id = normalize_turn_id(event_turn_id)?;
+            let thread_id = self.resolve_thread_id(&turn_id, active_thread_id)?;
+            Some((thread_id, turn_id))
+        }
+
         fn turn_started_payload(
             &self,
             key: &str,
@@ -587,6 +606,7 @@ mod imp {
             event_turn_id: Option<String>,
         ) -> Vec<HubNotification> {
             let thread_id = snapshot.session_id.to_string();
+            let mut notifications = Vec::new();
             let resolved_turn = event_turn_id
                 .as_ref()
                 .and_then(|turn_id| {
@@ -595,15 +615,21 @@ mod imp {
                         .then(|| (turn_key(&thread_id, turn_id), turn_id.clone()))
                 })
                 .or_else(|| self.latest_turn_for_thread(&thread_id));
-            let Some((turn_key, turn_id)) = resolved_turn else {
-                if let Some(turn_id) = event_turn_id {
-                    let started =
-                        self.ensure_turn_started(thread_id, turn_id, snapshot.model_context_window);
-                    if !started.is_empty() {
-                        return started;
-                    }
+            let (turn_key, turn_id) = if let Some(resolved_turn) = resolved_turn {
+                resolved_turn
+            } else if let Some(turn_id) = event_turn_id {
+                let key = turn_key(&thread_id, &turn_id);
+                notifications.extend(self.ensure_turn_started(
+                    thread_id.clone(),
+                    turn_id.clone(),
+                    snapshot.model_context_window,
+                ));
+                if !self.active_turns.contains_key(&key) {
+                    return notifications;
                 }
-                return Vec::new();
+                (key, turn_id)
+            } else {
+                return notifications;
             };
 
             let mut params = runtime_context_params(snapshot);
@@ -620,10 +646,10 @@ mod imp {
                 }
             }
 
-            let mut notifications = vec![HubNotification {
+            notifications.push(HubNotification {
                 method: "turn/contextUpdated".to_string(),
                 params: Some(serde_json::Value::Object(params)),
-            }];
+            });
             if let Some(info) = snapshot.token_info.as_ref() {
                 notifications.push(Self::token_usage_notification(
                     info,
@@ -1053,8 +1079,10 @@ mod imp {
                 Some("post-turn-review-0".to_string()),
             );
 
-            assert_eq!(notifications.len(), 1);
+            assert_eq!(notifications.len(), 3);
             assert_eq!(notifications[0].method, "turn/started");
+            assert_eq!(notifications[1].method, "turn/contextUpdated");
+            assert_eq!(notifications[2].method, "thread/tokenUsage/updated");
             let params = notifications[0]
                 .params
                 .as_ref()
@@ -1115,6 +1143,72 @@ mod imp {
         }
 
         #[tokio::test]
+        async fn forwarded_parent_delegate_events_reuse_runtime_context_turn() {
+            let mut bridge = test_bridge();
+            let mut snapshot = runtime_context();
+            snapshot.task_kind = Some("post_turn_completion_review".to_string());
+            snapshot.token_info = None;
+            let thread_id = snapshot.session_id.to_string();
+            let runtime_turn_key = format!("{thread_id}:0");
+            bridge.active_runtime_context = Some(snapshot.clone());
+
+            let started =
+                bridge.runtime_context_update_notifications(&snapshot, Some("0".to_string()));
+            assert_eq!(started.len(), 2);
+            assert_eq!(started[0].method, "turn/started");
+            assert_eq!(
+                started[0].params.as_ref().unwrap()["turn"]["key"],
+                json!(runtime_turn_key)
+            );
+
+            bridge.publish_event(
+                &EventMsg::TurnStarted(codex_core::protocol::TurnStartedEvent {
+                    model_context_window: Some(100_000),
+                    collaboration_mode_kind: Default::default(),
+                }),
+                "post-turn-review-0",
+                None,
+            );
+            assert_eq!(bridge.active_turns.len(), 1);
+            assert!(bridge.active_turns.contains_key(&runtime_turn_key));
+
+            bridge.publish_event(
+                &EventMsg::PlanUpdate(UpdatePlanArgs {
+                    explanation: Some("review checklist".to_string()),
+                    plan: vec![codex_protocol::plan_tool::PlanItemArg {
+                        step: "Inspect completed turn".to_string(),
+                        status: StepStatus::InProgress,
+                    }],
+                }),
+                "post-turn-review-0",
+                None,
+            );
+            assert_eq!(bridge.active_turns.len(), 1);
+            assert!(bridge.active_turns.contains_key(&runtime_turn_key));
+
+            snapshot.token_info = Some(token_info(12_000, 100_000));
+            bridge.active_runtime_context = Some(snapshot.clone());
+            let updates =
+                bridge.runtime_context_update_notifications(&snapshot, Some("0".to_string()));
+            assert_eq!(updates.len(), 2);
+            assert_eq!(updates[0].method, "turn/contextUpdated");
+            assert_eq!(updates[1].method, "thread/tokenUsage/updated");
+            assert_eq!(
+                updates[1].params.as_ref().unwrap()["turnKey"],
+                json!(runtime_turn_key)
+            );
+
+            let completed = bridge.complete_turns_for_thread(&thread_id);
+            assert_eq!(completed.len(), 1);
+            assert_eq!(
+                completed[0].params.as_ref().unwrap()["turn"]["key"],
+                json!(runtime_turn_key)
+            );
+
+            bridge.shutdown().await;
+        }
+
+        #[tokio::test]
         async fn runtime_context_token_update_refreshes_prestarted_delegate_turn() {
             let mut bridge = test_bridge();
             let mut snapshot = runtime_context();
@@ -1124,7 +1218,7 @@ mod imp {
                 &snapshot,
                 Some("post-turn-review-0".to_string()),
             );
-            assert_eq!(started.len(), 1);
+            assert_eq!(started.len(), 3);
 
             snapshot.token_info = Some(token_info(12_000, 100_000));
             bridge.active_runtime_context = Some(snapshot.clone());
