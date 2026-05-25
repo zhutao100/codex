@@ -270,6 +270,24 @@ has_harness_passthrough_output_arg() {
     return 1
 }
 
+has_nextest_reporter_arg() {
+    local arg prev=""
+    for arg in "$@"; do
+        case "${prev}" in
+            --failure-output|--success-output|--status-level|--final-status-level|--show-progress)
+                return 0
+                ;;
+        esac
+        case "${arg}" in
+            --failure-output|--failure-output=*|--success-output|--success-output=*|--status-level|--status-level=*|--final-status-level|--final-status-level=*|--show-progress|--show-progress=*|--no-capture|--nocapture|-v|--verbose)
+                return 0
+                ;;
+        esac
+        prev="${arg}"
+    done
+    return 1
+}
+
 load_network_sandbox_test_skips() {
     local skips_file="${script_dir}/cargo-local-network-sandbox-skips.txt"
     local line
@@ -327,6 +345,30 @@ find_subcommand_index() {
             *)
                 printf '%s\n' "${i}"
                 return 0
+                ;;
+        esac
+    done
+
+    return 1
+}
+
+find_nextest_run_index() {
+    local i="${1}"
+    local arg
+
+    i=$((i + 1))
+    while [ "${i}" -lt "${#argv[@]}" ]; do
+        arg="${argv[${i}]}"
+        case "${arg}" in
+            run)
+                printf '%s\n' "${i}"
+                return 0
+                ;;
+            -h|--help|-V|--version)
+                return 1
+                ;;
+            *)
+                return 1
                 ;;
         esac
     done
@@ -452,6 +494,79 @@ rewrite_cargo_test_args() {
     argv=("${rewritten[@]}")
 }
 
+rewrite_nextest_run_args() {
+    local run_index="${1}"
+    local output_mode="${CODEX_RS_CARGO_LOCAL_TEST_OUTPUT:-agent}"
+
+    case "${output_mode}" in
+        agent|quiet|token-efficient|minimal|raw|passthrough|off|0|false)
+            ;;
+        *)
+            printf 'cargo-local: unsupported CODEX_RS_CARGO_LOCAL_TEST_OUTPUT=%s; expected agent or raw\n' "${output_mode}" >&2
+            return 2
+            ;;
+    esac
+
+    local prefix=()
+    local nextest_args=()
+    local harness_args=()
+    local rewritten=()
+    local saw_separator=0
+    local i arg
+
+    i=0
+    while [ "${i}" -le "${run_index}" ]; do
+        prefix+=("${argv[${i}]}")
+        i=$((i + 1))
+    done
+
+    while [ "${i}" -lt "${#argv[@]}" ]; do
+        arg="${argv[${i}]}"
+        if [ "${saw_separator}" -eq 0 ] && [ "${arg}" = "--" ]; then
+            saw_separator=1
+        elif [ "${saw_separator}" -eq 0 ]; then
+            nextest_args+=("${arg}")
+        else
+            harness_args+=("${arg}")
+        fi
+        i=$((i + 1))
+    done
+
+    if has_help_arg "${nextest_args[@]}" "${harness_args[@]}"; then
+        return 0
+    fi
+
+    rewritten=("${prefix[@]}")
+
+    case "${output_mode}" in
+        raw|passthrough|off|0|false)
+            ;;
+        *)
+            if ! has_nextest_reporter_arg "${nextest_args[@]}" "${harness_args[@]}"; then
+                nextest_args+=(
+                    --failure-output=immediate-final
+                    --success-output=never
+                    --status-level=fail
+                    --final-status-level=fail
+                    --show-progress=none
+                )
+            fi
+            ;;
+    esac
+
+    if should_wrap_network_disabled; then
+        load_network_sandbox_test_skips
+        saw_separator=1
+    fi
+
+    rewritten+=("${nextest_args[@]}")
+    if [ "${saw_separator}" -eq 1 ]; then
+        rewritten+=(-- "${harness_args[@]}")
+    fi
+
+    argv=("${rewritten[@]}")
+}
+
 filter_cargo_test_output() {
     local cargo_status="${1}"
 
@@ -556,6 +671,9 @@ argv=("$@")
 if subcommand_index="$(find_subcommand_index)" && [ "${argv[${subcommand_index}]}" = "test" ]; then
     configure_network_disabled_test_environment
     rewrite_cargo_test_args "${subcommand_index}"
+elif [ -n "${subcommand_index:-}" ] && [ "${argv[${subcommand_index}]}" = "nextest" ] && run_index="$(find_nextest_run_index "${subcommand_index}")"; then
+    configure_network_disabled_test_environment
+    rewrite_nextest_run_args "${run_index}"
 fi
 
 if [ "${CODEX_RS_CARGO_LOCAL_VERBOSE:-}" = "1" ]; then
