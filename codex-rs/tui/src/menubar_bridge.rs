@@ -19,8 +19,10 @@ mod imp {
     use codex_core::protocol::SessionSource;
     use codex_core::protocol::SubAgentSource;
     use codex_core::protocol::TokenUsageInfo;
+    use codex_protocol::items::TurnItem;
     use codex_protocol::plan_tool::StepStatus;
     use codex_protocol::plan_tool::UpdatePlanArgs;
+    use codex_protocol::protocol::UserMessageEvent;
     use serde_json::json;
     use std::collections::HashMap;
     use std::collections::HashSet;
@@ -30,6 +32,7 @@ mod imp {
     struct ActiveTurnState {
         thread_id: String,
         turn_id: String,
+        prompt_preview: Option<String>,
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -138,34 +141,47 @@ mod imp {
                     self.current_sandbox = Some(sandbox_status_label(&event.sandbox_policy));
                 }
                 EventMsg::ItemStarted(item) => {
+                    let thread_id = item.thread_id.to_string();
+                    let turn_id = item.turn_id.clone();
                     notifications.extend(self.ensure_turn_started(
-                        item.thread_id.to_string(),
-                        item.turn_id.clone(),
+                        thread_id.clone(),
+                        turn_id.clone(),
                         None,
                     ));
+                    self.record_prompt_preview(&thread_id, &turn_id, &item.item);
                     notifications.push(HubNotification {
                         method: "item/started".to_string(),
                         params: Some(json!({
-                            "threadId": item.thread_id,
-                            "turnId": item.turn_id,
-                            "item": item.item,
+                            "threadId": thread_id,
+                            "turnId": turn_id,
+                            "item": item.item.clone(),
                         })),
                     });
                 }
                 EventMsg::ItemCompleted(item) => {
+                    let thread_id = item.thread_id.to_string();
+                    let turn_id = item.turn_id.clone();
                     notifications.extend(self.ensure_turn_started(
-                        item.thread_id.to_string(),
-                        item.turn_id.clone(),
+                        thread_id.clone(),
+                        turn_id.clone(),
                         None,
                     ));
+                    self.record_prompt_preview(&thread_id, &turn_id, &item.item);
                     notifications.push(HubNotification {
                         method: "item/completed".to_string(),
                         params: Some(json!({
-                            "threadId": item.thread_id,
-                            "turnId": item.turn_id,
-                            "item": item.item,
+                            "threadId": thread_id,
+                            "turnId": turn_id,
+                            "item": item.item.clone(),
                         })),
                     });
+                }
+                EventMsg::UserMessage(event) => {
+                    notifications.extend(self.user_message_notifications(
+                        event,
+                        event_turn_id,
+                        active_thread_id.as_deref(),
+                    ));
                 }
                 EventMsg::ProgressTrace(trace) => {
                     notifications.extend(self.ensure_turn_started(
@@ -340,6 +356,7 @@ mod imp {
                 ActiveTurnState {
                     thread_id: thread_id.clone(),
                     turn_id: turn_id.clone(),
+                    prompt_preview: None,
                 },
             );
             self.turn_start_order.push(key.clone());
@@ -353,6 +370,54 @@ mod imp {
                     "turn": turn,
                 })),
             }]
+        }
+
+        fn record_prompt_preview(
+            &mut self,
+            thread_id: &str,
+            turn_id: &str,
+            item: &TurnItem,
+        ) -> Option<String> {
+            let prompt_preview = prompt_preview_from_turn_item(item)?;
+            let key = turn_key(thread_id, turn_id);
+            if let Some(turn) = self.active_turns.get_mut(&key) {
+                turn.prompt_preview = Some(prompt_preview.clone());
+            }
+            Some(prompt_preview)
+        }
+
+        fn user_message_notifications(
+            &mut self,
+            event: &UserMessageEvent,
+            event_turn_id: &str,
+            active_thread_id: Option<&str>,
+        ) -> Vec<HubNotification> {
+            let Some((thread_id, turn_id)) =
+                self.resolve_event_turn(event_turn_id, active_thread_id)
+            else {
+                return Vec::new();
+            };
+            let prompt_preview = prompt_preview_from_user_message(&event.message);
+            let mut notifications =
+                self.ensure_turn_started(thread_id.clone(), turn_id.clone(), None);
+            let key = turn_key(&thread_id, &turn_id);
+            let Some(prompt_preview) = prompt_preview else {
+                return notifications;
+            };
+
+            if let Some(turn) = self.active_turns.get_mut(&key) {
+                turn.prompt_preview = Some(prompt_preview.clone());
+            }
+            notifications.push(HubNotification {
+                method: "turn/contextUpdated".to_string(),
+                params: Some(json!({
+                    "threadId": thread_id,
+                    "turnId": turn_id,
+                    "turnKey": key,
+                    "promptPreview": prompt_preview,
+                })),
+            });
+            notifications
         }
 
         fn plan_update_notifications(
@@ -721,15 +786,19 @@ mod imp {
         }
 
         fn turn_completed_notification(key: String, turn: ActiveTurnState) -> HubNotification {
+            let mut turn_payload = serde_json::Map::new();
+            turn_payload.insert("id".to_string(), json!(turn.turn_id));
+            turn_payload.insert("key".to_string(), json!(key));
+            turn_payload.insert("status".to_string(), json!("completed"));
+            if let Some(prompt_preview) = turn.prompt_preview {
+                turn_payload.insert("promptPreview".to_string(), json!(prompt_preview));
+            }
+
             HubNotification {
                 method: "turn/completed".to_string(),
                 params: Some(json!({
                     "threadId": turn.thread_id,
-                    "turn": {
-                        "id": turn.turn_id,
-                        "key": key,
-                        "status": "completed",
-                    }
+                    "turn": serde_json::Value::Object(turn_payload),
                 })),
             }
         }
@@ -823,6 +892,27 @@ mod imp {
             info.last_token_usage
                 .percent_of_context_window_remaining(window)
         })
+    }
+
+    fn prompt_preview_from_turn_item(item: &TurnItem) -> Option<String> {
+        match item {
+            TurnItem::UserMessage(user_message) => {
+                prompt_preview_from_user_message(&user_message.message())
+            }
+            TurnItem::AgentMessage(_)
+            | TurnItem::Plan(_)
+            | TurnItem::Reasoning(_)
+            | TurnItem::WebSearch(_)
+            | TurnItem::ContextCompaction(_) => None,
+        }
+    }
+
+    fn prompt_preview_from_user_message(message: &str) -> Option<String> {
+        let prompt_preview = message.trim();
+        if prompt_preview.is_empty() {
+            return None;
+        }
+        Some(prompt_preview.to_string())
     }
 
     fn turn_key(thread_id: &str, turn_id: &str) -> String {
@@ -930,6 +1020,8 @@ mod imp {
         use codex_core::protocol::RuntimeContextScope;
         use codex_core::protocol::TokenUsage;
         use codex_protocol::ThreadId;
+        use codex_protocol::items::UserMessageItem;
+        use codex_protocol::user_input::UserInput;
         use pretty_assertions::assert_eq;
 
         fn test_bridge() -> MenuBarBridge {
@@ -1032,6 +1124,88 @@ mod imp {
             assert_eq!(
                 completed[0].params.as_ref().unwrap()["threadId"],
                 "thread-a"
+            );
+
+            bridge.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn user_message_item_prompt_preview_is_carried_to_completion() {
+            let mut bridge = test_bridge();
+            let user_item = TurnItem::UserMessage(UserMessageItem::new(&[UserInput::Text {
+                text: "\nSummarize this diff\n".to_string(),
+                text_elements: Vec::new(),
+            }]));
+            let started =
+                bridge.ensure_turn_started("thread-1".to_string(), "turn-1".to_string(), None);
+            assert_eq!(started.len(), 1);
+
+            let prompt_preview = bridge.record_prompt_preview("thread-1", "turn-1", &user_item);
+            assert_eq!(prompt_preview, Some("Summarize this diff".to_string()));
+
+            let completed = bridge.complete_turn(Some("turn-1".to_string()));
+            assert_eq!(
+                completed[0].params.as_ref().unwrap()["turn"]["promptPreview"],
+                json!("Summarize this diff")
+            );
+
+            bridge.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn publish_event_user_message_item_prompt_preview_is_carried_to_completion() {
+            let mut bridge = test_bridge();
+            let thread_id = ThreadId::new();
+            let thread_id_string = thread_id.to_string();
+            let prompt = "Prompt published through item/started";
+            let user_item = TurnItem::UserMessage(UserMessageItem::new(&[UserInput::Text {
+                text: format!("\n{prompt}\n"),
+                text_elements: Vec::new(),
+            }]));
+
+            bridge.publish_event(
+                &EventMsg::ItemStarted(codex_protocol::protocol::ItemStartedEvent {
+                    thread_id,
+                    turn_id: "turn-3".to_string(),
+                    item: user_item,
+                }),
+                "unused-event-turn",
+                None,
+            );
+
+            let completed = bridge.complete_turn(Some("turn-3".to_string()));
+            let params = completed[0].params.as_ref().unwrap();
+            assert_eq!(params["threadId"], json!(thread_id_string));
+            assert_eq!(params["turn"]["promptPreview"], json!(prompt));
+
+            bridge.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn legacy_user_message_updates_prompt_preview() {
+            let mut bridge = test_bridge();
+            let event = UserMessageEvent {
+                message: "Review completed turn\ncopy prompt".to_string(),
+                images: None,
+                local_images: Vec::new(),
+                text_elements: Vec::new(),
+            };
+
+            let notifications =
+                bridge.user_message_notifications(&event, "turn-2", Some("thread-2"));
+
+            assert_eq!(notifications.len(), 2);
+            assert_eq!(notifications[0].method, "turn/started");
+            assert_eq!(notifications[1].method, "turn/contextUpdated");
+            assert_eq!(
+                notifications[1].params.as_ref().unwrap()["promptPreview"],
+                json!("Review completed turn\ncopy prompt")
+            );
+
+            let completed = bridge.complete_turn(Some("turn-2".to_string()));
+            assert_eq!(
+                completed[0].params.as_ref().unwrap()["turn"]["promptPreview"],
+                json!("Review completed turn\ncopy prompt")
             );
 
             bridge.shutdown().await;
