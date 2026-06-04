@@ -33,6 +33,7 @@ mod imp {
         thread_id: String,
         turn_id: String,
         prompt_preview: Option<String>,
+        token_usage_baseline: Option<TokenUsageInfo>,
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -68,6 +69,7 @@ mod imp {
         turn_start_order: Vec<String>,
         known_turn_keys: HashSet<String>,
         file_change_started: HashSet<String>,
+        thread_token_usage: HashMap<String, TokenUsageInfo>,
         active_runtime_context: Option<RuntimeContextSnapshot>,
         current_model: Option<String>,
         current_model_provider: Option<String>,
@@ -102,6 +104,7 @@ mod imp {
                 turn_start_order: Vec::new(),
                 known_turn_keys: HashSet::new(),
                 file_change_started: HashSet::new(),
+                thread_token_usage: HashMap::new(),
                 active_runtime_context: None,
                 current_model: None,
                 current_model_provider: None,
@@ -262,9 +265,13 @@ mod imp {
                             .map(|turn| turn.thread_id.clone())
                             .or_else(|| resolved_turn.map(|(thread_id, _)| thread_id))
                             .or(active_thread_id);
+                        let thread_id_for_usage = thread_id.clone();
                         notifications.push(Self::token_usage_notification(
                             info, thread_id, turn_id, turn_key,
                         ));
+                        if let Some(thread_id) = thread_id_for_usage {
+                            self.thread_token_usage.insert(thread_id, info.clone());
+                        }
                     }
                 }
                 EventMsg::PatchApplyBegin(event) => {
@@ -351,12 +358,14 @@ mod imp {
             }
 
             self.known_turn_keys.insert(key.clone());
+            let token_usage_baseline = self.thread_token_usage.get(&thread_id).cloned();
             self.active_turns.insert(
                 key.clone(),
                 ActiveTurnState {
                     thread_id: thread_id.clone(),
                     turn_id: turn_id.clone(),
                     prompt_preview: None,
+                    token_usage_baseline,
                 },
             );
             self.turn_start_order.push(key.clone());
@@ -616,10 +625,15 @@ mod imp {
                         );
                     }
                 }
+                if let Some(active_turn) = self.active_turns.get(key)
+                    && let Some(info) = active_turn.token_usage_baseline.as_ref()
+                {
+                    turn.insert("tokenUsageBaseline".to_string(), token_usage_value(info));
+                }
                 return serde_json::Value::Object(turn);
             }
 
-            json!({
+            let mut turn = json!({
                 "id": turn_id,
                 "key": key,
                 "status": "inProgress",
@@ -633,7 +647,14 @@ mod imp {
                 "approval": self.current_approval.clone(),
                 "sandbox": self.current_sandbox.clone(),
                 "modelContextWindow": model_context_window,
-            })
+            });
+            if let Some(active_turn) = self.active_turns.get(key)
+                && let Some(info) = active_turn.token_usage_baseline.as_ref()
+                && let Some(turn) = turn.as_object_mut()
+            {
+                turn.insert("tokenUsageBaseline".to_string(), token_usage_value(info));
+            }
+            turn
         }
 
         fn token_usage_notification(
@@ -718,10 +739,11 @@ mod imp {
             if let Some(info) = snapshot.token_info.as_ref() {
                 notifications.push(Self::token_usage_notification(
                     info,
-                    Some(thread_id),
+                    Some(thread_id.clone()),
                     Some(turn_id),
                     Some(turn_key),
                 ));
+                self.thread_token_usage.insert(thread_id, info.clone());
             }
             notifications
         }
@@ -1042,6 +1064,7 @@ mod imp {
                 turn_start_order: Vec::new(),
                 known_turn_keys: HashSet::new(),
                 file_change_started: HashSet::new(),
+                thread_token_usage: HashMap::new(),
                 active_runtime_context: None,
                 current_model: Some("parent-model".to_string()),
                 current_model_provider: Some("parent-provider".to_string()),
@@ -1410,6 +1433,25 @@ mod imp {
             assert_eq!(
                 updates[1].params.as_ref().unwrap()["tokenUsage"]["last"]["totalTokens"],
                 json!(12_000)
+            );
+
+            bridge.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn started_turn_carries_prior_thread_token_usage_baseline() {
+            let mut bridge = test_bridge();
+            bridge
+                .thread_token_usage
+                .insert("thread-1".to_string(), token_info(43_000, 100_000));
+
+            let started =
+                bridge.ensure_turn_started("thread-1".to_string(), "turn-2".to_string(), None);
+
+            assert_eq!(started.len(), 1);
+            assert_eq!(
+                started[0].params.as_ref().unwrap()["turn"]["tokenUsageBaseline"]["total"]["totalTokens"],
+                json!(43_000)
             );
 
             bridge.shutdown().await;

@@ -52,6 +52,7 @@ struct RuntimeState {
     cwd: Option<String>,
     display_name: Option<String>,
     active_turns: BTreeMap<String, ActiveTurnSnapshot>,
+    thread_token_usage: BTreeMap<String, JsonValue>,
 }
 
 impl RuntimeState {
@@ -62,6 +63,7 @@ impl RuntimeState {
             cwd: params.cwd.clone(),
             display_name: params.display_name.clone(),
             active_turns: BTreeMap::new(),
+            thread_token_usage: BTreeMap::new(),
         }
     }
 
@@ -199,6 +201,7 @@ impl DaemonState {
                     cwd: params.cwd.clone(),
                     display_name: params.display_name.clone(),
                     active_turns: BTreeMap::new(),
+                    thread_token_usage: BTreeMap::new(),
                 });
             runtime.apply_metadata_update(&params);
             runtime.as_snapshot(runtime_id)
@@ -219,6 +222,7 @@ impl DaemonState {
                     cwd: params.cwd.clone(),
                     display_name: params.display_name.clone(),
                     active_turns: BTreeMap::new(),
+                    thread_token_usage: BTreeMap::new(),
                 });
 
             runtime.pid = params.pid.or(runtime.pid);
@@ -231,6 +235,7 @@ impl DaemonState {
                 .display_name
                 .clone()
                 .or_else(|| runtime.display_name.clone());
+            let mut thread_token_usage = runtime.thread_token_usage.clone();
             runtime.active_turns = params
                 .active_turns
                 .into_iter()
@@ -239,9 +244,17 @@ impl DaemonState {
                         turn_key(turn.thread_id.as_str(), turn.turn_id.as_str())
                     });
                     turn.turn_key = Some(turn_key.clone());
+                    if turn.token_usage_baseline.is_none() {
+                        turn.token_usage_baseline =
+                            thread_token_usage.get(turn.thread_id.as_str()).cloned();
+                    }
+                    if let Some(token_usage) = turn.token_usage.clone() {
+                        thread_token_usage.insert(turn.thread_id.clone(), token_usage);
+                    }
                     (turn_key, turn)
                 })
                 .collect();
+            runtime.thread_token_usage = thread_token_usage;
             runtime.as_snapshot(runtime_id)
         };
 
@@ -261,6 +274,7 @@ impl DaemonState {
                     cwd: None,
                     display_name: None,
                     active_turns: BTreeMap::new(),
+                    thread_token_usage: BTreeMap::new(),
                 });
 
             apply_notification_to_runtime(runtime, &notification)
@@ -600,11 +614,22 @@ fn apply_notification_to_runtime(
     runtime: &mut RuntimeState,
     notification: &HubNotification,
 ) -> bool {
-    if let Some(snapshot) = parse_active_turn_started(notification) {
+    if let Some(mut snapshot) = parse_active_turn_started(notification) {
         let turn_key = snapshot
             .turn_key
             .clone()
             .unwrap_or_else(|| turn_key(snapshot.thread_id.as_str(), snapshot.turn_id.as_str()));
+        if snapshot.token_usage_baseline.is_none() {
+            snapshot.token_usage_baseline = runtime
+                .thread_token_usage
+                .get(snapshot.thread_id.as_str())
+                .cloned();
+        }
+        if let Some(token_usage) = snapshot.token_usage.clone() {
+            runtime
+                .thread_token_usage
+                .insert(snapshot.thread_id.clone(), token_usage);
+        }
         runtime.active_turns.insert(turn_key, snapshot);
         return true;
     }
@@ -614,14 +639,24 @@ fn apply_notification_to_runtime(
     }
 
     if let Some(update) = parse_turn_context_update(notification) {
+        record_thread_token_usage(runtime, &update);
         return apply_turn_context_update(runtime, update);
     }
 
     if let Some(update) = parse_thread_token_usage_update(notification) {
+        record_thread_token_usage(runtime, &update);
         return apply_turn_context_update(runtime, update);
     }
 
     false
+}
+
+fn record_thread_token_usage(runtime: &mut RuntimeState, update: &TurnContextUpdate) {
+    if let (Some(thread_id), Some(token_usage)) = (&update.thread_id, &update.token_usage) {
+        runtime
+            .thread_token_usage
+            .insert(thread_id.clone(), token_usage.clone());
+    }
 }
 
 struct TurnCompletion {
@@ -687,6 +722,7 @@ fn parse_active_turn_started(notification: &HubNotification) -> Option<ActiveTur
         model_context_window: parse_i64_field(turn, "modelContextWindow"),
         context_remaining_percent: parse_i64_field(turn, "contextRemainingPercent"),
         token_usage: turn.get("tokenUsage").cloned(),
+        token_usage_baseline: turn.get("tokenUsageBaseline").cloned(),
         thread_name: parse_string_field(turn, "threadName"),
         latest_label: parse_string_field(turn, "latestLabel"),
     })
@@ -1326,6 +1362,130 @@ mod tests {
         assert_eq!(
             notification["params"]["event"]["type"],
             JsonValue::String("runtimeNotification".to_string())
+        );
+    }
+
+    #[test]
+    fn active_turn_snapshot_carries_prior_thread_token_usage_baseline() {
+        let mut state = DaemonState::default();
+        let prior_usage = serde_json::json!({
+            "total": {
+                "inputTokens": 30000,
+                "cachedInputTokens": 8000,
+                "outputTokens": 4000,
+                "reasoningOutputTokens": 1000,
+                "totalTokens": 43000,
+            },
+            "last": {
+                "inputTokens": 14000,
+                "cachedInputTokens": 3000,
+                "outputTokens": 1200,
+                "reasoningOutputTokens": 300,
+                "totalTokens": 15500,
+            },
+            "modelContextWindow": 128000,
+        });
+        let current_usage = serde_json::json!({
+            "total": {
+                "inputTokens": 90000,
+                "cachedInputTokens": 21000,
+                "outputTokens": 10000,
+                "reasoningOutputTokens": 4500,
+                "totalTokens": 125500,
+            },
+            "last": {
+                "inputTokens": 34000,
+                "cachedInputTokens": 7000,
+                "outputTokens": 3000,
+                "reasoningOutputTokens": 1000,
+                "totalTokens": 39000,
+            },
+            "modelContextWindow": 128000,
+        });
+
+        state.apply_runtime_notification(RuntimeEventParams {
+            runtime_id: "rt-1".to_string(),
+            notification: HubNotification {
+                method: "thread/tokenUsage/updated".to_string(),
+                params: Some(serde_json::json!({
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "turnKey": "thread-1:turn-1",
+                    "tokenUsage": prior_usage,
+                })),
+            },
+        });
+        state.apply_runtime_notification(RuntimeEventParams {
+            runtime_id: "rt-1".to_string(),
+            notification: HubNotification {
+                method: "turn/started".to_string(),
+                params: Some(serde_json::json!({
+                    "threadId": "thread-1",
+                    "turn": {
+                        "id": "turn-2",
+                        "key": "thread-1:turn-2",
+                        "status": "inProgress",
+                    },
+                })),
+            },
+        });
+        state.apply_runtime_notification(RuntimeEventParams {
+            runtime_id: "rt-1".to_string(),
+            notification: HubNotification {
+                method: "thread/tokenUsage/updated".to_string(),
+                params: Some(serde_json::json!({
+                    "threadId": "thread-1",
+                    "turnId": "turn-2",
+                    "turnKey": "thread-1:turn-2",
+                    "tokenUsage": current_usage,
+                })),
+            },
+        });
+
+        assert_eq!(
+            state.snapshot().runtimes[0].active_turns,
+            vec![ActiveTurnSnapshot {
+                turn_key: Some("thread-1:turn-2".to_string()),
+                thread_id: "thread-1".to_string(),
+                turn_id: "turn-2".to_string(),
+                status: Some("inProgress".to_string()),
+                model_context_window: Some(128000),
+                token_usage: Some(serde_json::json!({
+                    "total": {
+                        "inputTokens": 90000,
+                        "cachedInputTokens": 21000,
+                        "outputTokens": 10000,
+                        "reasoningOutputTokens": 4500,
+                        "totalTokens": 125500,
+                    },
+                    "last": {
+                        "inputTokens": 34000,
+                        "cachedInputTokens": 7000,
+                        "outputTokens": 3000,
+                        "reasoningOutputTokens": 1000,
+                        "totalTokens": 39000,
+                    },
+                    "modelContextWindow": 128000,
+                })),
+                token_usage_baseline: Some(serde_json::json!({
+                    "total": {
+                        "inputTokens": 30000,
+                        "cachedInputTokens": 8000,
+                        "outputTokens": 4000,
+                        "reasoningOutputTokens": 1000,
+                        "totalTokens": 43000,
+                    },
+                    "last": {
+                        "inputTokens": 14000,
+                        "cachedInputTokens": 3000,
+                        "outputTokens": 1200,
+                        "reasoningOutputTokens": 300,
+                        "totalTokens": 15500,
+                    },
+                    "modelContextWindow": 128000,
+                })),
+                ..Default::default()
+            }]
         );
     }
 }

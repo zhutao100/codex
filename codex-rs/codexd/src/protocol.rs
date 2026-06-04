@@ -52,6 +52,8 @@ pub struct ActiveTurnSnapshot {
     #[serde(default)]
     pub token_usage: Option<JsonValue>,
     #[serde(default)]
+    pub token_usage_baseline: Option<JsonValue>,
+    #[serde(default)]
     pub thread_name: Option<String>,
     #[serde(default)]
     pub latest_label: Option<String>,

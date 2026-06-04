@@ -122,7 +122,7 @@ Event `type` values:
   - optional active-context fields: `scope`, `taskKind`, `sessionSource`,
     `subAgentSource`, `parentThreadId`, `parentTurnId`, `modelProvider`,
     `thinkingLevel`, `cwd`, `approval`, `sandbox`, `modelContextWindow`,
-    `contextRemainingPercent`, `tokenUsage`, `threadName`
+    `contextRemainingPercent`, `tokenUsage`, `tokenUsageBaseline`, `threadName`
 
 The `notification` in `runtimeNotification` is a generic hub notification forwarded from runtimes. `codexd` interprets `turn/started`, `turn/completed`, `turn/contextUpdated`, `turn/stateUpdated`, and `thread/tokenUsage/updated` to maintain `activeTurns` in snapshots; all notifications are still forwarded as-is.
 
