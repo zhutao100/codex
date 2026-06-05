@@ -464,12 +464,13 @@ For interrupted plan output, trailing partial plan deltas that were not complete
 
 ### Review mode
 
-Pause/continue should initially target regular turns. Review turns have special lifecycle and UI expectations; if a review is active, `/pause` can either:
+Pause/continue targets regular turns and the post-turn completion review workflow.
 
-- fall back to existing review interruption behavior, or
-- reject with "Pause is not available during review."
+- Regular turns resume through `ContinueTask`.
+- Post-turn completion reviews resume by restarting the review delegate for the captured completed-turn context; they do not continue the parent conversation directly.
+- Generic `/review`, compact, and user-shell tasks reject `/pause` with "Pause is not available for this task."
 
-The safer first implementation is to reject pause during review unless `RegularTask` is active.
+When a post-turn completion review is paused, core emits `TurnPaused` without `ExitedReviewMode`, so clients should not render a "review finished" banner. Clients may leave review-mode UI state on `TurnPaused` and re-enter it when `/continue` restarts the review delegate.
 
 ## Failure Handling
 

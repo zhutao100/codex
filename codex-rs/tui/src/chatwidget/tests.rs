@@ -66,6 +66,8 @@ use codex_core::protocol::TokenCountEvent;
 use codex_core::protocol::TokenUsage;
 use codex_core::protocol::TokenUsageInfo;
 use codex_core::protocol::TurnCompleteEvent;
+use codex_core::protocol::TurnPauseReason;
+use codex_core::protocol::TurnPausedEvent;
 use codex_core::protocol::TurnStartedEvent;
 use codex_core::protocol::UndoCompletedEvent;
 use codex_core::protocol::UndoStartedEvent;
@@ -662,6 +664,58 @@ async fn review_restores_context_window_indicator() {
 
     assert_eq!(chat.bottom_pane.context_window_percent(), Some(30));
     assert!(!chat.is_review_mode);
+}
+
+#[tokio::test]
+async fn paused_review_leaves_review_mode_without_finished_banner() {
+    let (mut chat, mut rx, _ops) = make_chatwidget_manual(None).await;
+
+    let context_window = 13_000;
+    let pre_review_tokens = 12_700;
+    let review_tokens = 12_030;
+
+    chat.handle_codex_event(Event {
+        id: "token-before".into(),
+        msg: EventMsg::TokenCount(TokenCountEvent {
+            info: Some(make_token_info(pre_review_tokens, context_window)),
+            rate_limits: None,
+        }),
+    });
+
+    chat.handle_codex_event(Event {
+        id: "review-start".into(),
+        msg: EventMsg::EnteredReviewMode(ReviewRequest {
+            target: ReviewTarget::Custom {
+                instructions: "Review the last completed turn.".to_string(),
+            },
+            user_facing_hint: Some("completed turn".to_string()),
+        }),
+    });
+
+    chat.handle_codex_event(Event {
+        id: "token-review".into(),
+        msg: EventMsg::TokenCount(TokenCountEvent {
+            info: Some(make_token_info(review_tokens, context_window)),
+            rate_limits: None,
+        }),
+    });
+
+    chat.handle_codex_event(Event {
+        id: "turn-paused".into(),
+        msg: EventMsg::TurnPaused(TurnPausedEvent {
+            turn_id: "review-turn".to_string(),
+            reason: TurnPauseReason::UserRequested,
+        }),
+    });
+
+    let rendered = drain_insert_history(&mut rx)
+        .iter()
+        .map(|cell| lines_to_single_string(cell))
+        .collect::<String>();
+    assert!(!chat.is_review_mode);
+    assert_eq!(chat.bottom_pane.context_window_percent(), Some(30));
+    assert!(rendered.contains("Conversation paused."));
+    assert!(!rendered.contains("<< Code review finished >>"));
 }
 
 /// Receiving a TokenCount event without usage clears the context indicator.

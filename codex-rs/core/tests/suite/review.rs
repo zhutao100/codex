@@ -30,8 +30,10 @@ use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_reasoning_item;
 use core_test_support::responses::ev_response_created;
+use core_test_support::responses::mount_response_sequence;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
+use core_test_support::responses::sse_response;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
@@ -534,6 +536,115 @@ async fn review_completed_turn_false_output_does_not_continue() {
         2,
         "false fix_actions_advised should not trigger a continuation request"
     );
+
+    let _codex_home_guard = codex_home;
+    server.verify().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn paused_post_turn_review_continues_review_delegate_not_parent_turn() {
+    let review_json = serde_json::json!({
+        "evaluation": "Inspection coverage: checked after resume.\n\nFindings:\n- None.\n\nFix actions advised: no",
+        "fix_actions_advised": false
+    })
+    .to_string();
+    let review_json_escaped = serde_json::to_string(&review_json).unwrap();
+    let sse_parent = r#"[
+        {"type":"response.output_item.done", "item":{
+            "type":"message", "role":"assistant",
+            "content":[{"type":"output_text","text":"initial done"}]
+        }},
+        {"type":"response.completed", "response": {"id": "__ID__"}}
+    ]"#;
+    let sse_review_paused = r#"[
+        {"type":"response.created", "response": {"id": "__ID__"}}
+    ]"#;
+    let sse_review_resumed = format!(
+        r#"[
+            {{"type":"response.output_item.done", "item":{{
+                "type":"message", "role":"assistant",
+                "content":[{{"type":"output_text","text":{review_json_escaped}}}]
+            }}}},
+            {{"type":"response.completed", "response": {{"id": "__ID__"}}}}
+        ]"#
+    );
+    let server = MockServer::start().await;
+    let request_log = mount_response_sequence(
+        &server,
+        vec![
+            sse_response(load_sse_fixture_with_id_from_str(
+                sse_parent,
+                &Uuid::new_v4().to_string(),
+            )),
+            sse_response(load_sse_fixture_with_id_from_str(
+                sse_review_paused,
+                &Uuid::new_v4().to_string(),
+            ))
+            .set_delay(std::time::Duration::from_secs(5)),
+            sse_response(load_sse_fixture_with_id_from_str(
+                &sse_review_resumed,
+                &Uuid::new_v4().to_string(),
+            )),
+        ],
+    )
+    .await;
+    let codex_home = Arc::new(TempDir::new().unwrap());
+    let codex = new_conversation_for_server(&server, codex_home.clone(), |_| {}).await;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "finish the change".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await
+        .unwrap();
+    let _parent_complete =
+        wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    codex.submit(Op::ReviewCompletedTurn).await.unwrap();
+    let _entered = wait_for_event(&codex, |ev| matches!(ev, EventMsg::EnteredReviewMode(_))).await;
+    wait_for_captured_requests(&request_log, 2).await;
+
+    codex.submit(Op::Pause).await.unwrap();
+    wait_for_pause_without_review_exit(&codex).await;
+
+    codex.submit(Op::Continue).await.unwrap();
+    let _reentered =
+        wait_for_event(&codex, |ev| matches!(ev, EventMsg::EnteredReviewMode(_))).await;
+    let continued = wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnContinued(_))).await;
+    match continued {
+        EventMsg::TurnContinued(event) => {
+            assert_eq!(event.source, TurnContinuationSource::Paused);
+        }
+        other => panic!("expected TurnContinued, got {other:?}"),
+    }
+    let exited = wait_for_event(&codex, |ev| matches!(ev, EventMsg::ExitedReviewMode(_))).await;
+    match exited {
+        EventMsg::ExitedReviewMode(event) => {
+            let output = event
+                .post_turn_completion_review_output
+                .expect("post-turn review output");
+            assert!(output.evaluation.contains("checked after resume"));
+            assert!(!output.fix_actions_advised);
+        }
+        other => panic!("expected ExitedReviewMode, got {other:?}"),
+    }
+    let _review_complete =
+        wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let requests = request_log.requests();
+    assert_eq!(requests.len(), 3);
+    let resumed_delegate_input =
+        serde_json::to_string(&requests[2].input()).expect("serialize resumed delegate input");
+    assert!(
+        resumed_delegate_input.contains("<completed_turn_review_context>"),
+        "resumed request should restart the post-turn review delegate, not continue the parent turn: {resumed_delegate_input}"
+    );
+    assert!(resumed_delegate_input.contains("finish the change"));
+    assert!(resumed_delegate_input.contains("initial done"));
 
     let _codex_home_guard = codex_home;
     server.verify().await;
@@ -1658,6 +1769,41 @@ async fn start_responses_server_with_sse(
     let responses = vec![sse; expected_requests];
     let request_log = mount_sse_sequence(&server, responses).await;
     (server, request_log)
+}
+
+async fn wait_for_captured_requests(request_log: &ResponseMock, expected: usize) {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if request_log.requests().len() >= expected {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {expected} captured requests"));
+}
+
+async fn wait_for_pause_without_review_exit(codex: &CodexThread) {
+    loop {
+        let event = match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            codex.next_event(),
+        )
+        .await
+        {
+            Ok(Ok(event)) => event.msg,
+            Ok(Err(err)) => panic!("stream ended unexpectedly: {err}"),
+            Err(_) => panic!("timeout waiting for pause event"),
+        };
+        match event {
+            EventMsg::ExitedReviewMode(_) => {
+                panic!("post-turn review must not exit review mode while being paused")
+            }
+            EventMsg::TurnPaused(_) => return,
+            _ => {}
+        }
+    }
 }
 
 /// Create a conversation configured to talk to the provided mock server.

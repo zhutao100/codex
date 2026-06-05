@@ -25,6 +25,7 @@ use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::state::CompletedTurnForReview;
 use crate::state::PendingContinuation;
+use crate::state::PendingContinuationTarget;
 use crate::state::TaskKind;
 
 use super::ReviewDelegateConfigParams;
@@ -36,11 +37,25 @@ use super::configure_review_delegate_config;
 #[derive(Clone)]
 pub(crate) struct PostTurnCompletionReviewTask {
     completed_turn: CompletedTurnForReview,
+    resumed_from: Option<PendingContinuation>,
 }
 
 impl PostTurnCompletionReviewTask {
     pub(crate) fn new(completed_turn: CompletedTurnForReview) -> Self {
-        Self { completed_turn }
+        Self {
+            completed_turn,
+            resumed_from: None,
+        }
+    }
+
+    pub(crate) fn resumed(
+        completed_turn: CompletedTurnForReview,
+        resumed_from: PendingContinuation,
+    ) -> Self {
+        Self {
+            completed_turn,
+            resumed_from: Some(resumed_from),
+        }
     }
 }
 
@@ -61,6 +76,19 @@ impl SessionTask for PostTurnCompletionReviewTask {
             1,
             &[],
         );
+
+        if let Some(checkpoint) = self.resumed_from.clone() {
+            session
+                .clone_session()
+                .send_event_raw_flushed(Event {
+                    id: ctx.sub_id.clone(),
+                    msg: EventMsg::TurnContinued(codex_protocol::protocol::TurnContinuedEvent {
+                        continued_from_turn_id: checkpoint.continued_from_turn_id,
+                        source: checkpoint.source,
+                    }),
+                })
+                .await;
+        }
 
         let output = match start_post_turn_completion_review_conversation(
             session.clone(),
@@ -110,8 +138,15 @@ impl SessionTask for PostTurnCompletionReviewTask {
         None
     }
 
-    async fn abort(&self, session: Arc<SessionTaskContext>, ctx: Arc<TurnContext>) {
-        exit_post_turn_completion_review_mode(session.clone_session(), None, ctx).await;
+    async fn abort(
+        &self,
+        session: Arc<SessionTaskContext>,
+        ctx: Arc<TurnContext>,
+        reason: super::TaskStopReason,
+    ) {
+        if !matches!(reason, super::TaskStopReason::Pause(_)) {
+            exit_post_turn_completion_review_mode(session.clone_session(), None, ctx).await;
+        }
     }
 }
 
@@ -283,6 +318,7 @@ async fn record_advisory_and_request_continuation(
             continued_from_turn_id: Some(reviewed_turn_id.to_string()),
             model: Some(ctx.model_info.slug.clone()),
             pause_reason: None,
+            target: PendingContinuationTarget::Regular,
         }))
         .await;
 }

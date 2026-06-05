@@ -61,6 +61,7 @@ impl Session {
                         continued_from_turn_id: None,
                         model: context_stack.last().map(|item| item.model.clone()),
                         pause_reason: None,
+                        target: PendingContinuationTarget::Regular,
                     });
                 }
                 RolloutItem::EventMsg(EventMsg::UserMessage(_)) => {
@@ -86,6 +87,7 @@ impl Session {
                     .as_ref()
                     .map(|item| item.model.clone()),
                 pause_reason: None,
+                target: PendingContinuationTarget::Regular,
             })
         });
 

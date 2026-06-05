@@ -305,6 +305,10 @@ impl ChatWidget {
 
     pub(super) fn on_paused_turn(&mut self) {
         self.finalize_turn();
+        if self.is_review_mode {
+            self.is_review_mode = false;
+            self.restore_pre_review_token_info();
+        }
         self.restore_pending_steers_to_composer_or_reject();
         self.add_info_message(
             "Conversation paused.".to_string(),

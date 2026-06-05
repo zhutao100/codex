@@ -14,12 +14,19 @@ use crate::protocol::TurnPauseReason;
 use crate::session::session::SessionConfiguration;
 use crate::truncate::TruncationPolicy;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PendingContinuationTarget {
+    Regular,
+    PostTurnCompletionReview,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PendingContinuation {
     pub(crate) source: TurnContinuationSource,
     pub(crate) continued_from_turn_id: Option<String>,
     pub(crate) model: Option<String>,
     pub(crate) pause_reason: Option<TurnPauseReason>,
+    pub(crate) target: PendingContinuationTarget,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

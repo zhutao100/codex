@@ -205,9 +205,11 @@ use crate::state::ActiveTurn;
 use crate::state::CompletedTurnForReview;
 use crate::state::CompletedTurnReviewRound;
 use crate::state::PendingContinuation;
+use crate::state::PendingContinuationTarget;
 use crate::state::PreviousTurnSettings;
 use crate::state::SessionServices;
 use crate::state::SessionState;
+use crate::state::TaskKind;
 use crate::state_db;
 use crate::tasks::GhostSnapshotTask;
 use crate::tasks::PostTurnCompletionReviewTask;
@@ -904,6 +906,7 @@ impl Session {
                         continued_from_turn_id: None,
                         model: None,
                         pause_reason: None,
+                        target: PendingContinuationTarget::Regular,
                     });
                 }
                 RolloutItem::EventMsg(EventMsg::ThreadRolledBack(_))
@@ -925,6 +928,7 @@ impl Session {
                 continued_from_turn_id: None,
                 model: None,
                 pause_reason: None,
+                target: PendingContinuationTarget::Regular,
             })
         })
     }
@@ -2214,12 +2218,32 @@ impl Session {
 
     pub async fn pause_task(self: &Arc<Self>) {
         info!("pause received: pause current task, if any");
-        let has_active_turn = { self.active_turn.lock().await.is_some() };
-        if has_active_turn {
-            self.pause_all_tasks(crate::protocol::TurnPauseReason::UserRequested)
+        let active_task = {
+            let active = self.active_turn.lock().await;
+            active.as_ref().and_then(|active_turn| {
+                active_turn
+                    .tasks
+                    .first()
+                    .map(|(sub_id, task)| (sub_id.clone(), task.kind))
+            })
+        };
+        match active_task {
+            Some((_, TaskKind::Regular | TaskKind::PostTurnCompletionReview)) => {
+                self.pause_all_tasks(crate::protocol::TurnPauseReason::UserRequested)
+                    .await;
+            }
+            Some((sub_id, TaskKind::Review | TaskKind::Compact | TaskKind::UserShell)) => {
+                self.send_event_raw(Event {
+                    id: sub_id,
+                    msg: EventMsg::Warning(WarningEvent {
+                        message: "Pause is not available for this task.".to_string(),
+                    }),
+                })
                 .await;
-        } else {
-            self.cancel_mcp_startup().await;
+            }
+            None => {
+                self.cancel_mcp_startup().await;
+            }
         }
     }
 

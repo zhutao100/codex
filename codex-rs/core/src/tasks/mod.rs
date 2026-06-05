@@ -40,6 +40,7 @@ use crate::session::turn_context::TurnContext;
 use crate::session_prefix::TURN_ABORTED_OPEN_TAG;
 use crate::state::ActiveTurn;
 use crate::state::PendingContinuation;
+use crate::state::PendingContinuationTarget;
 use crate::state::RunningTask;
 use crate::state::TaskKind;
 use codex_protocol::config_types::ModeKind;
@@ -82,7 +83,7 @@ fn user_text_messages_for_completed_turn_review(input: &[UserInput]) -> Vec<Stri
 }
 
 #[derive(Clone, Debug)]
-enum TaskStopReason {
+pub(crate) enum TaskStopReason {
     Abort(TurnAbortReason),
     Pause(TurnPauseReason),
 }
@@ -149,9 +150,10 @@ pub(crate) trait SessionTask: Send + Sync + 'static {
         &self,
         session: Arc<SessionTaskContext>,
         ctx: Arc<TurnContext>,
+        reason: TaskStopReason,
     ) -> impl std::future::Future<Output = ()> + Send {
         async move {
-            let _ = (session, ctx);
+            let _ = (session, ctx, reason);
         }
     }
 }
@@ -171,6 +173,7 @@ pub(crate) trait AnySessionTask: Send + Sync + 'static {
         &'a self,
         session: Arc<SessionTaskContext>,
         ctx: Arc<TurnContext>,
+        reason: TaskStopReason,
     ) -> BoxFuture<'a, ()>;
 }
 
@@ -202,8 +205,9 @@ where
         &'a self,
         session: Arc<SessionTaskContext>,
         ctx: Arc<TurnContext>,
+        reason: TaskStopReason,
     ) -> BoxFuture<'a, ()> {
-        Box::pin(SessionTask::abort(self, session, ctx))
+        Box::pin(SessionTask::abort(self, session, ctx, reason))
     }
 }
 
@@ -314,6 +318,7 @@ impl Session {
             continued_from_turn_id: Some(sub_id.clone()),
             model,
             pause_reason: Some(reason),
+            target: PendingContinuationTarget::Regular,
         }))
         .await;
     }
@@ -601,7 +606,7 @@ impl Session {
 
         let session_ctx = Arc::new(SessionTaskContext::new(Arc::clone(self)));
         session_task
-            .abort(session_ctx, Arc::clone(&task.turn_context))
+            .abort(session_ctx, Arc::clone(&task.turn_context), reason.clone())
             .await;
 
         match reason {
@@ -611,6 +616,7 @@ impl Session {
                     continued_from_turn_id: Some(sub_id.clone()),
                     model: Some(task.turn_context.model_info.slug.clone()),
                     pause_reason: None,
+                    target: PendingContinuationTarget::Regular,
                 }))
                 .await;
 
@@ -644,11 +650,31 @@ impl Session {
                 self.send_event(task.turn_context.as_ref(), event).await;
             }
             TaskStopReason::Pause(reason) => {
+                let target = match task.kind {
+                    TaskKind::Regular => Some(PendingContinuationTarget::Regular),
+                    TaskKind::PostTurnCompletionReview => {
+                        Some(PendingContinuationTarget::PostTurnCompletionReview)
+                    }
+                    TaskKind::Review | TaskKind::Compact | TaskKind::UserShell => None,
+                };
+                let Some(target) = target else {
+                    self.clear_pending_continuation().await;
+                    self.send_event(
+                        task.turn_context.as_ref(),
+                        EventMsg::Error(ErrorEvent {
+                            message: "Pause is not available for this task.".to_string(),
+                            codex_error_info: Some(CodexErrorInfo::BadRequest),
+                        }),
+                    )
+                    .await;
+                    return;
+                };
                 self.set_pending_continuation(Some(PendingContinuation {
                     source: TurnContinuationSource::Paused,
                     continued_from_turn_id: Some(sub_id.clone()),
                     model: Some(task.turn_context.model_info.slug.clone()),
                     pause_reason: Some(reason.clone()),
+                    target,
                 }))
                 .await;
                 self.send_event_raw_flushed(Event {

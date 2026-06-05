@@ -130,6 +130,25 @@ pub(crate) async fn spawn_post_turn_completion_review(
     turn_context: Arc<TurnContext>,
     completed_turn: CompletedTurnForReview,
 ) {
+    spawn_post_turn_completion_review_inner(sess, turn_context, completed_turn, None).await;
+}
+
+pub(crate) async fn spawn_paused_post_turn_completion_review(
+    sess: Arc<Session>,
+    turn_context: Arc<TurnContext>,
+    completed_turn: CompletedTurnForReview,
+    checkpoint: PendingContinuation,
+) {
+    spawn_post_turn_completion_review_inner(sess, turn_context, completed_turn, Some(checkpoint))
+        .await;
+}
+
+async fn spawn_post_turn_completion_review_inner(
+    sess: Arc<Session>,
+    turn_context: Arc<TurnContext>,
+    completed_turn: CompletedTurnForReview,
+    checkpoint: Option<PendingContinuation>,
+) {
     let review_request = ReviewRequest {
         target: codex_protocol::protocol::ReviewTarget::Custom {
             instructions: "Review the last completed Codex turn.".to_string(),
@@ -138,10 +157,11 @@ pub(crate) async fn spawn_post_turn_completion_review(
     };
     sess.send_event(&turn_context, EventMsg::EnteredReviewMode(review_request))
         .await;
-    sess.spawn_task(
-        Arc::clone(&turn_context),
-        Vec::new(),
-        PostTurnCompletionReviewTask::new(completed_turn),
-    )
-    .await;
+    let task = if let Some(checkpoint) = checkpoint {
+        PostTurnCompletionReviewTask::resumed(completed_turn, checkpoint)
+    } else {
+        PostTurnCompletionReviewTask::new(completed_turn)
+    };
+    sess.spawn_task(Arc::clone(&turn_context), Vec::new(), task)
+        .await;
 }

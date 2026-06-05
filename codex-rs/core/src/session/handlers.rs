@@ -1,3 +1,4 @@
+use super::review::spawn_paused_post_turn_completion_review;
 use super::review::spawn_post_turn_completion_review;
 use super::review::spawn_review_thread;
 use super::session::Session;
@@ -153,6 +154,7 @@ use crate::mcp::auth::compute_auth_statuses;
 use crate::mcp::collect_mcp_snapshot_from_manager;
 use crate::mcp::effective_mcp_servers;
 use crate::review_prompts::resolve_review_request;
+use crate::state::PendingContinuationTarget;
 use crate::tasks::CompactTask;
 use crate::tasks::ContinueTask;
 use crate::tasks::RegularTask;
@@ -253,12 +255,38 @@ pub async fn continue_last(sess: &Arc<Session>, sub_id: String) {
     } else {
         sess.new_default_turn_with_sub_id(sub_id).await
     };
-    sess.spawn_task(
-        Arc::clone(&turn_context),
-        Vec::new(),
-        ContinueTask::new(checkpoint),
-    )
-    .await;
+    match checkpoint.target {
+        PendingContinuationTarget::Regular => {
+            sess.spawn_task(
+                Arc::clone(&turn_context),
+                Vec::new(),
+                ContinueTask::new(checkpoint),
+            )
+            .await;
+        }
+        PendingContinuationTarget::PostTurnCompletionReview => {
+            let Some(completed_turn) = sess.completed_turn_for_review().await else {
+                sess.set_pending_continuation(Some(checkpoint)).await;
+                sess.send_event_raw(Event {
+                    id: turn_context.sub_id.clone(),
+                    msg: EventMsg::Error(ErrorEvent {
+                        message: "The paused completed-turn review can no longer be continued."
+                            .to_string(),
+                        codex_error_info: Some(CodexErrorInfo::BadRequest),
+                    }),
+                })
+                .await;
+                return;
+            };
+            spawn_paused_post_turn_completion_review(
+                Arc::clone(sess),
+                turn_context,
+                completed_turn,
+                checkpoint,
+            )
+            .await;
+        }
+    }
 }
 
 pub async fn override_turn_context(sess: &Session, sub_id: String, updates: SessionSettingsUpdate) {

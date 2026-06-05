@@ -21,6 +21,7 @@ use crate::protocol::ResumedHistory;
 use crate::protocol::TokenCountEvent;
 use crate::protocol::TokenUsage;
 use crate::protocol::TokenUsageInfo;
+use crate::state::PendingContinuationTarget;
 use crate::state::TaskKind;
 use crate::tasks::SessionTask;
 use crate::tasks::SessionTaskContext;
@@ -294,6 +295,7 @@ async fn rollout_reconstruction_clears_reference_context_item_after_legacy_compa
                 continued_from_turn_id: None,
                 model: None,
                 pause_reason: None,
+                target: PendingContinuationTarget::Regular,
             }),
         }
     );
@@ -329,6 +331,7 @@ async fn rollout_reconstruction_restores_reference_context_item_after_replacemen
                 continued_from_turn_id: None,
                 model: Some(context_item.model.clone()),
                 pause_reason: None,
+                target: PendingContinuationTarget::Regular,
             }),
         }
     );
@@ -429,6 +432,7 @@ fn pending_continuation_from_rollout_uses_incomplete_history_without_pause_event
             continued_from_turn_id: None,
             model: None,
             pause_reason: None,
+            target: PendingContinuationTarget::Regular,
         }),
         Session::pending_continuation_from_rollout(&rollout_items, &reconstructed_history)
     );

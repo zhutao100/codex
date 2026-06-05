@@ -4,6 +4,8 @@
 
 The workflow is present in this project: `Op::ReviewCompletedTurn`, `PostTurnCompletionReviewTask`, `core/post_turn_completion_review_prompt.md`, read-only review delegate configuration, post-turn output parsing, and continuation handoff are wired. Later hardening addressed two observed gaps: review delegates now receive the full compact user/final-assistant interaction history for the session instead of only a single reconstructed pair, and the prompt treats `fix_actions_advised` as a concrete follow-up signal for both bugs and incomplete user-request fulfillment.
 
+Post-turn completion review tasks are pause-aware. `/pause` during the delegate records a paused review continuation and emits `TurnPaused` without `ExitedReviewMode`; `/continue` restarts the post-turn review delegate for the captured completed-turn context. This prevents the TUI from rendering a false `<< Code review finished >>` banner and prevents `/continue` from sampling the parent conversation as a regular continuation.
+
 ## Target Base
 
 This proposal targets this project's current customized code shape with the custom `model_overlay` feature and the custom `review_model_provider` delegate override already present.
