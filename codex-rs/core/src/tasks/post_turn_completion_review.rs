@@ -236,7 +236,7 @@ async fn process_post_turn_completion_review_events(
             _ => {
                 session
                     .clone_session()
-                    .send_event_transient_raw(event)
+                    .send_event_transient_with_id(event.id, event.msg)
                     .await;
             }
         }
@@ -393,11 +393,17 @@ mod tests {
     use codex_protocol::protocol::AskForApproval;
     use codex_protocol::protocol::Event;
     use codex_protocol::protocol::EventMsg;
+    use codex_protocol::protocol::ExecCommandBeginEvent;
+    use codex_protocol::protocol::ExecCommandEndEvent;
+    use codex_protocol::protocol::ExecCommandSource;
+    use codex_protocol::protocol::ReasoningContentDeltaEvent;
     use codex_protocol::protocol::RuntimeContextScope;
     use codex_protocol::protocol::RuntimeContextSnapshot;
     use codex_protocol::protocol::RuntimeContextUpdatedEvent;
     use codex_protocol::protocol::SessionSource;
     use codex_protocol::protocol::SubAgentSource;
+    use codex_protocol::protocol::TurnAbortReason;
+    use codex_protocol::protocol::TurnAbortedEvent;
     use codex_protocol::protocol::TurnCompleteEvent;
     use pretty_assertions::assert_eq;
     use std::path::PathBuf;
@@ -530,5 +536,200 @@ mod tests {
             .await
             .expect("process_post_turn_completion_review_events hung")
             .expect("process join failed");
+    }
+
+    #[tokio::test]
+    async fn process_events_expands_transient_legacy_events() {
+        let (session, ctx, rx_events) =
+            crate::session::tests::make_session_and_context_with_rx().await;
+        let session_ctx = Arc::new(SessionTaskContext::new(session));
+        let (tx_delegate, rx_delegate) = async_channel::bounded(4);
+
+        let process = tokio::spawn(process_post_turn_completion_review_events(
+            session_ctx,
+            ctx,
+            rx_delegate,
+        ));
+
+        tx_delegate
+            .send(Event {
+                id: "delegate-delta".to_string(),
+                msg: EventMsg::ReasoningContentDelta(ReasoningContentDeltaEvent {
+                    thread_id: "delegate-thread".to_string(),
+                    turn_id: "delegate-turn".to_string(),
+                    item_id: "reasoning-item".to_string(),
+                    delta: "checking files".to_string(),
+                    summary_index: 0,
+                }),
+            })
+            .await
+            .expect("send reasoning delta");
+
+        let structured = timeout(Duration::from_secs(1), rx_events.recv())
+            .await
+            .expect("structured event timed out")
+            .expect("structured event");
+        assert_eq!(structured.id, "delegate-delta");
+        assert!(matches!(structured.msg, EventMsg::ReasoningContentDelta(_)));
+
+        let legacy = timeout(Duration::from_secs(1), rx_events.recv())
+            .await
+            .expect("legacy event timed out")
+            .expect("legacy event");
+        assert_eq!(legacy.id, "delegate-delta");
+        assert!(matches!(legacy.msg, EventMsg::AgentReasoningDelta(_)));
+
+        tx_delegate
+            .send(Event {
+                id: "delegate-terminal".to_string(),
+                msg: EventMsg::TurnAborted(TurnAbortedEvent {
+                    reason: TurnAbortReason::Interrupted,
+                }),
+            })
+            .await
+            .expect("send terminal event");
+        drop(tx_delegate);
+
+        timeout(Duration::from_secs(1), process)
+            .await
+            .expect("process_post_turn_completion_review_events hung")
+            .expect("process join failed");
+    }
+
+    #[tokio::test]
+    async fn process_events_preserves_read_reasoning_and_later_exec_cascade() {
+        let (session, ctx, rx_events) =
+            crate::session::tests::make_session_and_context_with_rx().await;
+        let session_ctx = Arc::new(SessionTaskContext::new(session));
+        let (tx_delegate, rx_delegate) = async_channel::bounded(8);
+
+        let process = tokio::spawn(process_post_turn_completion_review_events(
+            session_ctx,
+            ctx,
+            rx_delegate,
+        ));
+
+        let read_begin = exec_begin("call-read", "cat ~/.codex/AGENTS_structured_search.md");
+        let inspect_begin = exec_begin("call-inspect", "git show --stat HEAD");
+        let delegate_events = [
+            Event {
+                id: "read-begin".to_string(),
+                msg: EventMsg::ExecCommandBegin(read_begin.clone()),
+            },
+            Event {
+                id: "read-end".to_string(),
+                msg: EventMsg::ExecCommandEnd(exec_end(
+                    &read_begin,
+                    "structured search guidance\n",
+                )),
+            },
+            Event {
+                id: "reasoning-delta".to_string(),
+                msg: EventMsg::ReasoningContentDelta(ReasoningContentDeltaEvent {
+                    thread_id: "delegate-thread".to_string(),
+                    turn_id: "delegate-turn".to_string(),
+                    item_id: "reasoning-item".to_string(),
+                    delta: "checking files".to_string(),
+                    summary_index: 0,
+                }),
+            },
+            Event {
+                id: "inspect-begin".to_string(),
+                msg: EventMsg::ExecCommandBegin(inspect_begin.clone()),
+            },
+            Event {
+                id: "inspect-end".to_string(),
+                msg: EventMsg::ExecCommandEnd(exec_end(&inspect_begin, "commit abc123\n")),
+            },
+        ];
+
+        for event in delegate_events {
+            tx_delegate.send(event).await.expect("send delegate event");
+        }
+
+        let read_begin = recv_event(&rx_events).await;
+        assert_eq!(read_begin.id, "read-begin");
+        assert!(matches!(read_begin.msg, EventMsg::ExecCommandBegin(_)));
+
+        let read_end = recv_event(&rx_events).await;
+        assert_eq!(read_end.id, "read-end");
+        assert!(matches!(read_end.msg, EventMsg::ExecCommandEnd(_)));
+
+        let structured_reasoning = recv_event(&rx_events).await;
+        assert_eq!(structured_reasoning.id, "reasoning-delta");
+        assert!(matches!(
+            structured_reasoning.msg,
+            EventMsg::ReasoningContentDelta(_)
+        ));
+
+        let legacy_reasoning = recv_event(&rx_events).await;
+        assert_eq!(legacy_reasoning.id, "reasoning-delta");
+        assert!(matches!(
+            legacy_reasoning.msg,
+            EventMsg::AgentReasoningDelta(_)
+        ));
+
+        let inspect_begin = recv_event(&rx_events).await;
+        assert_eq!(inspect_begin.id, "inspect-begin");
+        assert!(matches!(inspect_begin.msg, EventMsg::ExecCommandBegin(_)));
+
+        let inspect_end = recv_event(&rx_events).await;
+        assert_eq!(inspect_end.id, "inspect-end");
+        assert!(matches!(inspect_end.msg, EventMsg::ExecCommandEnd(_)));
+
+        tx_delegate
+            .send(Event {
+                id: "delegate-terminal".to_string(),
+                msg: EventMsg::TurnAborted(TurnAbortedEvent {
+                    reason: TurnAbortReason::Interrupted,
+                }),
+            })
+            .await
+            .expect("send terminal event");
+        drop(tx_delegate);
+
+        timeout(Duration::from_secs(1), process)
+            .await
+            .expect("process_post_turn_completion_review_events hung")
+            .expect("process join failed");
+    }
+
+    fn exec_begin(call_id: &str, raw_cmd: &str) -> ExecCommandBeginEvent {
+        ExecCommandBeginEvent {
+            call_id: call_id.to_string(),
+            process_id: None,
+            turn_id: "delegate-turn".to_string(),
+            command: vec!["bash".to_string(), "-lc".to_string(), raw_cmd.to_string()],
+            cwd: PathBuf::from("/tmp"),
+            parsed_cmd: Vec::new(),
+            source: ExecCommandSource::Agent,
+            interaction_input: None,
+        }
+    }
+
+    fn exec_end(begin: &ExecCommandBeginEvent, output: &str) -> ExecCommandEndEvent {
+        ExecCommandEndEvent {
+            call_id: begin.call_id.clone(),
+            process_id: begin.process_id.clone(),
+            turn_id: begin.turn_id.clone(),
+            command: begin.command.clone(),
+            cwd: begin.cwd.clone(),
+            parsed_cmd: begin.parsed_cmd.clone(),
+            source: begin.source,
+            interaction_input: begin.interaction_input.clone(),
+            stdout: output.to_string(),
+            stderr: String::new(),
+            aggregated_output: output.to_string(),
+            exit_code: 0,
+            duration: Duration::from_millis(5),
+            formatted_output: output.to_string(),
+        }
+    }
+
+    async fn recv_event(rx_events: &async_channel::Receiver<Event>) -> Event {
+        timeout(Duration::from_secs(1), rx_events.recv())
+            .await
+            .expect("event timed out")
+            .expect("event")
     }
 }

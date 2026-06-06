@@ -237,7 +237,9 @@ async fn forward_events(
                 };
                 match msg {
                     // ignore all legacy delta events
-                    EventMsg::AgentMessageDelta(_) | EventMsg::AgentReasoningDelta(_) => {}
+                    EventMsg::AgentMessageDelta(_)
+                    | EventMsg::AgentReasoningDelta(_)
+                    | EventMsg::AgentReasoningRawContentDelta(_) => {}
                     EventMsg::SessionConfigured(event) => {
                         runtime_context.apply_session_configured(event);
                         if !send_runtime_context_update(
@@ -721,6 +723,7 @@ mod tests {
     use super::*;
     use async_channel::bounded;
     use codex_protocol::models::ResponseItem;
+    use codex_protocol::protocol::AgentReasoningRawContentDeltaEvent;
     use codex_protocol::protocol::AgentStatus;
     use codex_protocol::protocol::RawResponseItemEvent;
     use codex_protocol::protocol::TurnAbortReason;
@@ -839,6 +842,65 @@ mod tests {
             ops.iter().any(|op| matches!(op, Op::Shutdown)),
             "expected Shutdown op after cancellation"
         );
+    }
+
+    #[tokio::test]
+    async fn forward_events_filters_legacy_raw_reasoning_delta() {
+        let (tx_events, rx_events) = bounded(SUBMISSION_CHANNEL_CAPACITY);
+        let (tx_sub, _rx_sub) = bounded(SUBMISSION_CHANNEL_CAPACITY);
+        let (_agent_status_tx, agent_status) = watch::channel(AgentStatus::PendingInit);
+        let (session, ctx, _rx_evt) =
+            crate::session::tests::make_session_and_context_with_rx().await;
+        let codex = Arc::new(Codex {
+            next_id: AtomicU64::new(0),
+            tx_sub,
+            rx_event: rx_events,
+            agent_status,
+            session: Arc::clone(&session),
+        });
+
+        let (tx_out, rx_out) = bounded(SUBMISSION_CHANNEL_CAPACITY);
+        let cancel = CancellationToken::new();
+        let forward = tokio::spawn(forward_events(
+            Arc::clone(&codex),
+            tx_out,
+            session,
+            ctx,
+            test_runtime_context(),
+            cancel,
+        ));
+
+        tx_events
+            .send(Event {
+                id: "legacy-raw-delta".to_string(),
+                msg: EventMsg::AgentReasoningRawContentDelta(AgentReasoningRawContentDeltaEvent {
+                    delta: "raw reasoning".to_string(),
+                }),
+            })
+            .await
+            .unwrap();
+        tx_events
+            .send(Event {
+                id: "done".to_string(),
+                msg: EventMsg::TurnAborted(TurnAbortedEvent {
+                    reason: TurnAbortReason::Interrupted,
+                }),
+            })
+            .await
+            .unwrap();
+        drop(tx_events);
+
+        let terminal = timeout(std::time::Duration::from_millis(1000), rx_out.recv())
+            .await
+            .expect("terminal event timed out")
+            .expect("terminal event");
+        assert_eq!("done", terminal.id);
+        assert!(matches!(terminal.msg, EventMsg::TurnAborted(_)));
+
+        timeout(std::time::Duration::from_millis(1000), forward)
+            .await
+            .expect("forward_events hung")
+            .expect("forward_events join error");
     }
 
     #[tokio::test]

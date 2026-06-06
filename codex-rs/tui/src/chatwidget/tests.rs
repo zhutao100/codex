@@ -616,6 +616,81 @@ async fn exited_review_mode_renders_post_turn_completion_output() {
     assert!(rendered.contains("<< Code review finished >>"));
 }
 
+#[tokio::test]
+async fn review_mode_exec_after_completed_read_remains_visible() {
+    let (mut chat, mut rx, _ops) = make_chatwidget_manual(None).await;
+
+    chat.handle_codex_event(Event {
+        id: "review-start".into(),
+        msg: EventMsg::EnteredReviewMode(ReviewRequest {
+            target: ReviewTarget::Custom {
+                instructions: "Review the last completed Codex turn.".to_string(),
+            },
+            user_facing_hint: Some("completed turn".to_string()),
+        }),
+    });
+    chat.handle_codex_event(Event {
+        id: "review-turn".into(),
+        msg: EventMsg::TurnStarted(TurnStartedEvent {
+            model_context_window: None,
+            collaboration_mode_kind: ModeKind::Default,
+        }),
+    });
+    let _ = drain_insert_history(&mut rx);
+
+    let read = begin_exec(
+        &mut chat,
+        "call-read",
+        "cat ~/.codex/AGENTS_structured_search.md",
+    );
+    end_exec(&mut chat, read, "structured search guidance\n", "", 0);
+    assert!(
+        active_blob(&chat).contains("Read AGENTS_structured_search.md"),
+        "completed read should remain visible before the next tool call"
+    );
+
+    let inspect = begin_exec(&mut chat, "call-inspect", "git show --stat HEAD");
+    end_exec(&mut chat, inspect, "commit abc123\n", "", 0);
+
+    let cells = drain_insert_history(&mut rx);
+    let rendered = cells
+        .iter()
+        .map(|cell| lines_to_single_string(cell))
+        .collect::<String>();
+    assert!(
+        rendered.contains("Read AGENTS_structured_search.md"),
+        "expected completed read cell to be committed before later exec, got {rendered:?}"
+    );
+    assert!(
+        rendered.contains("Ran git show --stat HEAD"),
+        "expected later exec cell to render, got {rendered:?}"
+    );
+
+    chat.handle_codex_event(Event {
+        id: "review-end".into(),
+        msg: EventMsg::ExitedReviewMode(ExitedReviewModeEvent {
+            review_output: None,
+            post_turn_completion_review_output: Some(PostTurnCompletionReviewOutputEvent {
+                evaluation: "No follow-up needed.".to_string(),
+                fix_actions_advised: false,
+            }),
+        }),
+    });
+    chat.handle_codex_event(Event {
+        id: "review-turn".into(),
+        msg: EventMsg::TurnComplete(TurnCompleteEvent {
+            last_agent_message: None,
+        }),
+    });
+
+    let final_cells = drain_insert_history(&mut rx);
+    let final_rendered = final_cells
+        .iter()
+        .map(|cell| lines_to_single_string(cell))
+        .collect::<String>();
+    assert!(final_rendered.contains("No follow-up needed."));
+}
+
 /// Exiting review restores the pre-review context window indicator.
 #[tokio::test]
 async fn review_restores_context_window_indicator() {

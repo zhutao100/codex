@@ -269,7 +269,7 @@ async fn process_review_events(
             _ => {
                 session
                     .clone_session()
-                    .send_event_transient_raw(event)
+                    .send_event_transient_with_id(event.id, event.msg)
                     .await;
             }
         }
@@ -402,14 +402,24 @@ mod tests {
     use super::ReviewDelegateInstructionProfile;
     use super::configure_review_delegate_config;
     use super::normalize_review_template_line_endings;
+    use super::process_review_events;
     use super::render_review_exit_success;
     use crate::config::test_config;
     use crate::features::Feature;
     use crate::protocol::AskForApproval;
+    use crate::protocol::Event;
+    use crate::protocol::EventMsg;
+    use crate::protocol::ReasoningContentDeltaEvent;
     use crate::protocol::SandboxPolicy;
+    use crate::protocol::TurnAbortReason;
+    use crate::protocol::TurnAbortedEvent;
+    use crate::tasks::SessionTaskContext;
     use codex_protocol::config_types::WebSearchMode;
     use pretty_assertions::assert_eq;
+    use std::sync::Arc;
     use tempfile::TempDir;
+    use tokio::time::Duration;
+    use tokio::time::timeout;
 
     #[test]
     fn render_review_exit_success_replaces_results_placeholder() {
@@ -425,6 +435,60 @@ mod tests {
             normalize_review_template_line_endings("<user_action>\r\n  <results>\r  None.\r\n"),
             "<user_action>\n  <results>\n  None.\n"
         );
+    }
+
+    #[tokio::test]
+    async fn process_review_events_expands_transient_legacy_events() {
+        let (session, ctx, rx_events) =
+            crate::session::tests::make_session_and_context_with_rx().await;
+        let session_ctx = Arc::new(SessionTaskContext::new(session));
+        let (tx_delegate, rx_delegate) = async_channel::bounded(4);
+
+        let process = tokio::spawn(process_review_events(session_ctx, ctx, rx_delegate));
+
+        tx_delegate
+            .send(Event {
+                id: "delegate-delta".to_string(),
+                msg: EventMsg::ReasoningContentDelta(ReasoningContentDeltaEvent {
+                    thread_id: "delegate-thread".to_string(),
+                    turn_id: "delegate-turn".to_string(),
+                    item_id: "reasoning-item".to_string(),
+                    delta: "checking files".to_string(),
+                    summary_index: 0,
+                }),
+            })
+            .await
+            .expect("send reasoning delta");
+
+        let structured = timeout(Duration::from_secs(1), rx_events.recv())
+            .await
+            .expect("structured event timed out")
+            .expect("structured event");
+        assert_eq!(structured.id, "delegate-delta");
+        assert!(matches!(structured.msg, EventMsg::ReasoningContentDelta(_)));
+
+        let legacy = timeout(Duration::from_secs(1), rx_events.recv())
+            .await
+            .expect("legacy event timed out")
+            .expect("legacy event");
+        assert_eq!(legacy.id, "delegate-delta");
+        assert!(matches!(legacy.msg, EventMsg::AgentReasoningDelta(_)));
+
+        tx_delegate
+            .send(Event {
+                id: "delegate-terminal".to_string(),
+                msg: EventMsg::TurnAborted(TurnAbortedEvent {
+                    reason: TurnAbortReason::Interrupted,
+                }),
+            })
+            .await
+            .expect("send terminal event");
+        drop(tx_delegate);
+
+        timeout(Duration::from_secs(1), process)
+            .await
+            .expect("process_review_events hung")
+            .expect("process join failed");
     }
 
     #[test]

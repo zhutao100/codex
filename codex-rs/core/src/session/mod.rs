@@ -1225,25 +1225,28 @@ impl Session {
     /// Use this for events whose canonical persistence belongs to another
     /// session, such as forwarded delegate events.
     pub(crate) async fn send_event_transient(&self, turn_context: &TurnContext, msg: EventMsg) {
+        self.send_event_transient_with_id(turn_context.sub_id.clone(), msg)
+            .await;
+    }
+
+    /// Send an event to clients without recording it in this session's rollout,
+    /// preserving the caller-provided event id.
+    pub(crate) async fn send_event_transient_with_id(&self, id: String, msg: EventMsg) {
         let show_raw_agent_reasoning = self.show_raw_agent_reasoning();
         let legacy_events = msg.as_legacy_events(show_raw_agent_reasoning);
         let event = Event {
-            id: turn_context.sub_id.clone(),
+            id: id.clone(),
             msg,
         };
         self.send_event_raw_transient(event).await;
 
         for legacy in legacy_events {
             let legacy_event = Event {
-                id: turn_context.sub_id.clone(),
+                id: id.clone(),
                 msg: legacy,
             };
             self.send_event_raw_transient(legacy_event).await;
         }
-    }
-
-    pub(crate) async fn send_event_transient_raw(&self, event: Event) {
-        self.send_event_raw_transient(event).await;
     }
 
     pub(crate) async fn send_event_raw(&self, event: Event) {
