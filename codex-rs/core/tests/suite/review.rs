@@ -1196,7 +1196,9 @@ fn read_rollout_lines(path: &std::path::Path) -> Vec<RolloutLine> {
         .expect("read rollout file")
         .lines()
         .filter(|line| !line.trim().is_empty())
-        .map(|line| serde_json::from_str(line).expect("rollout line"))
+        .map(|line| {
+            serde_json::from_str(line).unwrap_or_else(|err| panic!("rollout line: {err}: {line}"))
+        })
         .collect()
 }
 
@@ -1240,6 +1242,7 @@ fn rollout_event_count(lines: &[RolloutLine], predicate: impl Fn(&EventMsg) -> b
             RolloutItem::SessionMeta(_)
             | RolloutItem::ResponseItem(_)
             | RolloutItem::Compacted(_)
+            | RolloutItem::InterAgentCommunication(_)
             | RolloutItem::TurnContext(_) => false,
         })
         .count()

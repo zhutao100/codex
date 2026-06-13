@@ -1439,6 +1439,7 @@ pub enum EventMsg {
     EnteredReviewMode(EnteredReviewModeEvent),
 
     /// Exited review mode with an optional final result to apply.
+    #[serde(deserialize_with = "deserialize_exited_review_mode_event")]
     ExitedReviewMode(ExitedReviewModeEvent),
 
     RawResponseItem(RawResponseItemEvent),
@@ -1883,6 +1884,47 @@ pub struct ExitedReviewModeEvent {
     #[ts(optional)]
     pub item_id: Option<String>,
     pub review_output: Option<ReviewOutputEvent>,
+}
+
+fn deserialize_exited_review_mode_event<'de, D>(
+    deserializer: D,
+) -> Result<ExitedReviewModeEvent, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    if let Some(review_output) = value.get("review_output") {
+        return Ok(ExitedReviewModeEvent {
+            review_output: deserialize_optional_review_output(review_output)?,
+        });
+    }
+    if let Some(review_output) = value
+        .get("payload")
+        .and_then(|payload| payload.get("review_output"))
+    {
+        return Ok(ExitedReviewModeEvent {
+            review_output: deserialize_optional_review_output(review_output)?,
+        });
+    }
+    if value.get("findings").is_some() || value.get("overall_confidence_score").is_some() {
+        return Ok(ExitedReviewModeEvent {
+            review_output: Some(serde_json::from_value(value).map_err(serde::de::Error::custom)?),
+        });
+    }
+    serde_json::from_value(value).map_err(serde::de::Error::custom)
+}
+
+fn deserialize_optional_review_output<E>(value: &Value) -> Result<Option<ReviewOutputEvent>, E>
+where
+    E: serde::de::Error,
+{
+    if value.is_null() {
+        Ok(None)
+    } else {
+        serde_json::from_value(value.clone())
+            .map(Some)
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 // Individual event payload types matching each `EventMsg` variant.
@@ -5807,6 +5849,33 @@ mod tests {
     }
 
     #[test]
+    fn exited_review_mode_deserializes_nested_review_output() -> Result<()> {
+        let event: EventMsg = serde_json::from_value(json!({
+            "type": "exited_review_mode",
+            "review_output": {
+                "findings": [],
+                "overall_correctness": "",
+                "overall_explanation": "final review assistant output",
+                "overall_confidence_score": 0.0,
+            },
+        }))?;
+
+        match event {
+            EventMsg::ExitedReviewMode(ExitedReviewModeEvent {
+                review_output: Some(review_output),
+            }) => {
+                assert_eq!(
+                    review_output.overall_explanation,
+                    "final review assistant output"
+                );
+            }
+            _ => panic!("expected exited_review_mode event"),
+        }
+
+        Ok(())
+    }
+
+    #[test]
     fn copied_history_uses_persisted_history_mode() -> Result<()> {
         let thread_id = ThreadId::from_string("00000000-0000-0000-0000-000000000001")?;
         let session_meta = RolloutItem::SessionMeta(SessionMetaLine {
@@ -5846,6 +5915,37 @@ mod tests {
             .get_history_mode(ThreadHistoryMode::Paginated),
             ThreadHistoryMode::Paginated
         );
+        Ok(())
+    }
+
+    #[test]
+    fn rollout_line_deserializes_exited_review_mode_payload() -> Result<()> {
+        let line: RolloutLine = serde_json::from_value(json!({
+            "timestamp": "2026-06-13T15:52:13.237Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "exited_review_mode",
+                "review_output": {
+                    "findings": [],
+                    "overall_correctness": "",
+                    "overall_explanation": "final review assistant output",
+                    "overall_confidence_score": 0.0,
+                },
+            },
+        }))?;
+
+        match line.item {
+            RolloutItem::EventMsg(EventMsg::ExitedReviewMode(ExitedReviewModeEvent {
+                review_output: Some(review_output),
+            })) => {
+                assert_eq!(
+                    review_output.overall_explanation,
+                    "final review assistant output"
+                );
+            }
+            _ => panic!("expected exited_review_mode rollout event"),
+        }
+
         Ok(())
     }
 
