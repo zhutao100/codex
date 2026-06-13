@@ -133,6 +133,43 @@ fn older_thread_settings_snapshot_defaults_disabled_plugins_to_empty() -> Result
 }
 
 #[test]
+fn rollout_item_deserializes_nested_review_output() -> Result<()> {
+    let item: RolloutItem = serde_json::from_value(json!({
+        "timestamp": "2026-06-13T15:52:13.237Z",
+        "type": "event_msg",
+        "payload": {
+            "type": "exited_review_mode",
+            "turn_id": "turn-1",
+            "item_id": "review-1",
+            "review_output": {
+                "findings": [],
+                "overall_correctness": "",
+                "overall_explanation": "final review assistant output",
+                "overall_confidence_score": 0.0,
+            },
+        },
+    }))?;
+    let RolloutItem::EventMsg(event) = item else {
+        panic!("expected review rollout event");
+    };
+    assert_eq!(
+        serde_json::to_value(event)?,
+        json!({
+            "type": "exited_review_mode",
+            "turn_id": "turn-1",
+            "item_id": "review-1",
+            "review_output": {
+                "findings": [],
+                "overall_correctness": "",
+                "overall_explanation": "final review assistant output",
+                "overall_confidence_score": 0.0,
+            },
+        })
+    );
+    Ok(())
+}
+
+#[test]
 fn response_item_envelope_accessors_preserve_item() {
     let expected_item = ResponseItem::Message {
         status: None,

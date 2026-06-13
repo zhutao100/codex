@@ -51,6 +51,7 @@ pub mod protocol;
 pub mod realtime;
 pub mod request_permissions;
 pub mod request_user_input;
+mod review_compat;
 pub mod review_format;
 pub mod sandbox;
 pub mod security_risk;

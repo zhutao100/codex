@@ -1724,8 +1724,15 @@ fn rollout_event_count(lines: &[RolloutLine], predicate: impl Fn(&EventMsg) -> b
         .filter(|line| match &line.item {
             RolloutItem::EventMsg(event) => predicate(event),
             RolloutItem::SessionMeta(_)
+            | RolloutItem::InterAgentCommunication(_)
+            | RolloutItem::InterAgentCommunicationMetadata { .. }
             | RolloutItem::ResponseItem(_)
             | RolloutItem::Compacted(_)
+            | RolloutItem::TokenUsageRecord(_)
+            | RolloutItem::WorldState(_)
+            | RolloutItem::SecurityRiskScore(_)
+            | RolloutItem::RetainedContext(_)
+            | RolloutItem::RealtimeItem(_)
             | RolloutItem::TurnContext(_) => false,
         })
         .count()
