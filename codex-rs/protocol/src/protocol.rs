@@ -1762,6 +1762,7 @@ pub enum EventMsg {
     EnteredReviewMode(EnteredReviewModeEvent),
 
     /// Exited review mode with an optional final result to apply.
+    #[serde(deserialize_with = "crate::review_compat::deserialize_exited_review_mode_event")]
     ExitedReviewMode(ExitedReviewModeEvent),
 
     RawResponseItem(RawResponseItemEvent),
