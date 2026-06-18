@@ -1,10 +1,13 @@
 ---
-source: tui/src/history_cell.rs
+source: tui/src/history_cell/tests.rs
 expression: rendered
 ---
 /ps
 
 Background terminals
 
-  • rg "foo" src --glob '**/*. [...]
+  • rg "foo" src --glob '**/*.rs'
+    --max-count 1000 --no-ignore
+    --hidden --follow --glob '!
+    target/**'
     ↳ searching...

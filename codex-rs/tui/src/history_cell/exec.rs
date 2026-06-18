@@ -137,6 +137,7 @@ impl HistoryCell for UnifiedExecProcessesCell {
         }
 
         let prefix = "  • ";
+        let continuation_prefix = "    ";
         let prefix_width = UnicodeWidthStr::width(prefix);
         let truncation_suffix = " [...]";
         let truncation_suffix_width = UnicodeWidthStr::width(truncation_suffix);
@@ -146,40 +147,25 @@ impl HistoryCell for UnifiedExecProcessesCell {
                 break;
             }
             let command = &process.command_display;
-            let (snippet, snippet_truncated) = {
-                let (first_line, has_more_lines) = match command.split_once('\n') {
-                    Some((first, _)) => (first, true),
-                    None => (command.as_str(), false),
-                };
-                let max_graphemes = 80;
-                let mut graphemes = first_line.grapheme_indices(true);
-                if let Some((byte_index, _)) = graphemes.nth(max_graphemes) {
-                    (first_line[..byte_index].to_string(), true)
-                } else {
-                    (first_line.to_string(), has_more_lines)
-                }
-            };
             if wrap_width <= prefix_width {
                 out.push(Line::from(prefix.dim()));
                 shown += 1;
                 continue;
             }
-            let budget = wrap_width.saturating_sub(prefix_width);
-            let mut needs_suffix = snippet_truncated;
-            if !needs_suffix {
-                let (_, remainder, _) = take_prefix_by_width(&snippet, budget);
-                if !remainder.is_empty() {
-                    needs_suffix = true;
-                }
+
+            let mut command_lines: Vec<Line<'static>> = command
+                .lines()
+                .map(|line| Line::from(line.to_string().cyan()))
+                .collect();
+            if command_lines.is_empty() {
+                command_lines.push(Line::from(""));
             }
-            if needs_suffix && budget > truncation_suffix_width {
-                let available = budget.saturating_sub(truncation_suffix_width);
-                let (truncated, _, _) = take_prefix_by_width(&snippet, available);
-                out.push(vec![prefix.dim(), truncated.cyan(), truncation_suffix.dim()].into());
-            } else {
-                let (truncated, _, _) = take_prefix_by_width(&snippet, budget);
-                out.push(vec![prefix.dim(), truncated.cyan()].into());
-            }
+            out.extend(adaptive_wrap_lines(
+                command_lines,
+                RtOptions::new(wrap_width)
+                    .initial_indent(Line::from(prefix.dim()))
+                    .subsequent_indent(Line::from(continuation_prefix.dim())),
+            ));
 
             let chunk_prefix_first = "    ↳ ";
             let chunk_prefix_next = "      ";

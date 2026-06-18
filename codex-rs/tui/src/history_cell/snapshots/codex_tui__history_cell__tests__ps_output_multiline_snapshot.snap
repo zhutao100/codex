@@ -1,12 +1,13 @@
 ---
-source: tui/src/history_cell.rs
+source: tui/src/history_cell/tests.rs
 expression: rendered
 ---
 /ps
 
 Background terminals
 
-  • echo hello [...]
+  • echo hello
+    and then some extra text
     ↳ hello
       done
   • rg "foo" src
