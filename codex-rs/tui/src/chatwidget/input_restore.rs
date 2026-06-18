@@ -4,8 +4,19 @@ use super::*;
 
 impl ChatWidget {
     pub(super) fn handle_steer_rejected_error(&mut self, info: &CodexErrorInfo) -> bool {
-        matches!(info, CodexErrorInfo::ActiveTurnNotSteerable { .. })
-            && self.enqueue_rejected_steer()
+        match info {
+            CodexErrorInfo::ActiveTurnNotSteerable { .. } => self.enqueue_rejected_steer(),
+            CodexErrorInfo::NoActiveTurnToSteer => {
+                self.active_turn_id = None;
+                self.finalize_turn();
+                self.enqueue_pending_steer_as_queued()
+            }
+            CodexErrorInfo::ExpectedTurnMismatch { actual, .. } => {
+                self.active_turn_id = Some(actual.clone());
+                self.enqueue_pending_steer_as_queued()
+            }
+            _ => false,
+        }
     }
 
     pub(super) fn enqueue_rejected_steer(&mut self) -> bool {
@@ -19,6 +30,32 @@ impl ChatWidget {
             .push_back(pending_steer.user_message);
         self.rejected_steer_history_records
             .push_back(pending_steer.history_record);
+        self.refresh_pending_input_preview();
+        true
+    }
+
+    pub(super) fn enqueue_pending_steer_as_queued(&mut self) -> bool {
+        let Some(pending_steer) = self.pending_steers.pop_front() else {
+            tracing::warn!("received steer race error without a matching pending steer");
+            return false;
+        };
+        let id = self.next_queued_user_message_id;
+        self.next_queued_user_message_id = self.next_queued_user_message_id.saturating_add(1);
+        let PendingSteer {
+            target_turn_id: _,
+            user_message,
+            history_record: _,
+            compare_key: _,
+        } = pending_steer;
+        self.queued_user_messages.push_front(QueuedUserMessage {
+            id,
+            text: user_message.text,
+            local_images: user_message.local_images,
+            text_elements: user_message.text_elements,
+            mention_paths: user_message.mention_paths,
+            model_override: None,
+            effort_override: None,
+        });
         self.refresh_pending_input_preview();
         true
     }

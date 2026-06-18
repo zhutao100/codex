@@ -55,6 +55,15 @@ impl ChatWidget {
     }
 
     pub(super) fn queue_user_message(&mut self, user_message: UserMessage) {
+        self.queue_user_message_with_overrides(user_message, None, None);
+    }
+
+    pub(super) fn queue_user_message_with_overrides(
+        &mut self,
+        user_message: UserMessage,
+        model_override: Option<String>,
+        effort_override: Option<Option<ReasoningEffortConfig>>,
+    ) {
         if !self.is_session_configured()
             || self.is_user_turn_pending_or_running()
             || self.is_review_mode
@@ -67,13 +76,13 @@ impl ChatWidget {
                 local_images: user_message.local_images,
                 text_elements: user_message.text_elements,
                 mention_paths: user_message.mention_paths,
-                model_override: None,
-                effort_override: None,
+                model_override,
+                effort_override,
             };
             self.queued_user_messages.push_back(queued);
             self.refresh_pending_input_preview();
         } else {
-            self.submit_user_message(user_message);
+            self.submit_user_message_with_overrides(user_message, model_override, effort_override);
         }
     }
 
@@ -99,6 +108,14 @@ impl ChatWidget {
         text: String,
         collaboration_mode: CollaborationModeMask,
     ) {
+        if self.agent_turn_running
+            && self.active_collaboration_mask.as_ref() != Some(&collaboration_mode)
+        {
+            self.add_error_message(
+                "Cannot switch collaboration mode while a turn is running.".to_string(),
+            );
+            return;
+        }
         self.set_collaboration_mask(collaboration_mode);
         self.submit_user_message(text.into());
     }

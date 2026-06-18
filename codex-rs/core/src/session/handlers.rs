@@ -65,6 +65,20 @@ pub(super) async fn submission_loop(
             Op::UserInput { .. } | Op::UserTurn { .. } => {
                 user_input_or_turn(&sess, sub.id.clone(), sub.op).await;
             }
+            Op::SteerInput {
+                expected_turn_id,
+                items,
+                client_user_message_id,
+            } => {
+                steer_input(
+                    &sess,
+                    sub.id.clone(),
+                    expected_turn_id,
+                    items,
+                    client_user_message_id,
+                )
+                .await;
+            }
             Op::ExecApproval { id, decision } => {
                 exec_approval(&sess, id, decision).await;
             }
@@ -370,6 +384,36 @@ pub async fn user_input_or_turn(sess: &Arc<Session>, sub_id: String, op: Op) {
                 .await;
             sess.spawn_task(Arc::clone(&current_context), items, RegularTask)
                 .await;
+        }
+        Err(err) => {
+            sess.send_event_raw(Event {
+                id: sub_id,
+                msg: EventMsg::Error(err.to_error_event()),
+            })
+            .await;
+        }
+    }
+}
+
+pub async fn steer_input(
+    sess: &Arc<Session>,
+    sub_id: String,
+    expected_turn_id: String,
+    items: Vec<UserInput>,
+    client_user_message_id: Option<String>,
+) {
+    match sess
+        .steer_input_for_turn(
+            items.clone(),
+            Some(expected_turn_id.as_str()),
+            client_user_message_id,
+        )
+        .await
+    {
+        Ok(turn_id) => {
+            if let Some(turn_context) = sess.turn_context_for_sub_id(&turn_id).await {
+                turn_context.otel_manager.user_prompt(&items);
+            }
         }
         Err(err) => {
             sess.send_event_raw(Event {

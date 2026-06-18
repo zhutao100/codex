@@ -281,6 +281,7 @@ use self::turn_context::TurnContext;
 #[derive(Debug, PartialEq)]
 pub enum SteerInputError {
     NoActiveTurn(Vec<UserInput>),
+    ExpectedTurnMismatch { expected: String, actual: String },
     ActiveTurnNotSteerable { turn_kind: NonSteerableTurnKind },
     EmptyInput,
 }
@@ -290,7 +291,14 @@ impl SteerInputError {
         match self {
             Self::NoActiveTurn(_) => ErrorEvent {
                 message: "no active turn to steer".to_string(),
-                codex_error_info: Some(CodexErrorInfo::BadRequest),
+                codex_error_info: Some(CodexErrorInfo::NoActiveTurnToSteer),
+            },
+            Self::ExpectedTurnMismatch { expected, actual } => ErrorEvent {
+                message: format!("expected active turn id `{expected}` but found `{actual}`"),
+                codex_error_info: Some(CodexErrorInfo::ExpectedTurnMismatch {
+                    expected: expected.clone(),
+                    actual: actual.clone(),
+                }),
             },
             Self::ActiveTurnNotSteerable { turn_kind } => {
                 let turn_kind_label = match turn_kind {
@@ -2171,6 +2179,18 @@ impl Session {
 
     /// Inject additional user input into the currently active regular turn.
     pub async fn steer_input(&self, input: Vec<UserInput>) -> Result<(), SteerInputError> {
+        self.steer_input_for_turn(input, None, None)
+            .await
+            .map(|_| ())
+    }
+
+    /// Inject additional user input into the currently active regular turn observed by the caller.
+    pub async fn steer_input_for_turn(
+        &self,
+        input: Vec<UserInput>,
+        expected_turn_id: Option<&str>,
+        client_user_message_id: Option<String>,
+    ) -> Result<String, SteerInputError> {
         if input.is_empty() {
             return Err(SteerInputError::EmptyInput);
         }
@@ -2183,6 +2203,16 @@ impl Session {
         let Some((_, active_task)) = active_turn.tasks.first() else {
             return Err(SteerInputError::NoActiveTurn(input));
         };
+        let active_turn_id = active_task.turn_context.sub_id.clone();
+
+        if let Some(expected_turn_id) = expected_turn_id
+            && expected_turn_id != active_turn_id.as_str()
+        {
+            return Err(SteerInputError::ExpectedTurnMismatch {
+                expected: expected_turn_id.to_string(),
+                actual: active_turn_id,
+            });
+        }
 
         match active_task.kind {
             crate::state::TaskKind::Regular => {}
@@ -2206,9 +2236,9 @@ impl Session {
         let mut ts = active_turn.turn_state.lock().await;
         ts.push_pending_input(TurnInput::UserInput {
             content: input,
-            client_id: None,
+            client_id: client_user_message_id,
         });
-        Ok(())
+        Ok(active_turn_id)
     }
 
     /// Returns the input if there was no task running to inject into

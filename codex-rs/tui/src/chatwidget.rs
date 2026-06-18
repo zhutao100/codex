@@ -435,6 +435,7 @@ pub(crate) struct ChatWidget {
     suppress_session_configured_redraw: bool,
     // User messages queued while a turn is in progress
     queued_user_messages: VecDeque<QueuedUserMessage>,
+    active_turn_id: Option<String>,
     pending_steers: VecDeque<PendingSteer>,
     rejected_steers_queue: VecDeque<UserMessage>,
     rejected_steer_history_records: VecDeque<UserMessageHistoryRecord>,

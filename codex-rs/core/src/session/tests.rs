@@ -1793,6 +1793,44 @@ async fn steer_input_accepts_regular_active_turn() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn steer_input_accepts_matching_expected_turn_id() {
+    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
+    spawn_never_ending_task(&sess, &tc, TaskKind::Regular).await;
+
+    let input = steer_text_input("steer");
+    let turn_id = sess
+        .steer_input_for_turn(input.clone(), Some(tc.sub_id.as_str()), None)
+        .await
+        .expect("matching turn id should accept steer input");
+
+    assert_eq!(turn_id, tc.sub_id.clone());
+    assert_eq!(
+        sess.get_pending_input().await,
+        vec![TurnInput::UserInput {
+            content: input,
+            client_id: None,
+        }]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn steer_input_rejects_mismatched_expected_turn_id_without_mutating_pending_input() {
+    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
+    spawn_never_ending_task(&sess, &tc, TaskKind::Regular).await;
+
+    let expected = "stale-turn".to_string();
+    assert_eq!(
+        sess.steer_input_for_turn(steer_text_input("steer"), Some(expected.as_str()), None,)
+            .await,
+        Err(SteerInputError::ExpectedTurnMismatch {
+            expected,
+            actual: tc.sub_id.clone(),
+        })
+    );
+    assert!(sess.get_pending_input().await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn steer_input_rejects_non_steerable_active_turns() {
     for (task_kind, turn_kind) in [
         (TaskKind::Review, NonSteerableTurnKind::Review),

@@ -180,6 +180,7 @@
             "unauthorized",
             "bad_request",
             "sandbox_error",
+            "no_active_turn_to_steer",
             "thread_rollback_failed",
             "other"
           ],
@@ -329,6 +330,31 @@
             "active_turn_not_steerable"
           ],
           "title": "ActiveTurnNotSteerableCodexErrorInfo",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "expected_turn_mismatch": {
+              "properties": {
+                "actual": {
+                  "type": "string"
+                },
+                "expected": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "actual",
+                "expected"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "expected_turn_mismatch"
+          ],
+          "title": "ExpectedTurnMismatchCodexErrorInfo",
           "type": "object"
         }
       ]

@@ -108,6 +108,7 @@ impl ChatWidget {
 
         let effective_mode = self.effective_collaboration_mode();
         let running_model = model_override
+            .clone()
             .or_else(|| {
                 self.agent_turn_running
                     .then(|| self.running_turn_model.clone())
@@ -141,23 +142,47 @@ impl ChatWidget {
             text_elements,
             mention_paths,
         };
-        let pending_steer = (!render_in_history).then(|| PendingSteer {
-            user_message: submitted_user_message.clone(),
-            history_record: history_record.clone(),
-            compare_key: Self::pending_steer_compare_key_from_inputs(&items),
-        });
-        let op = Op::UserTurn {
-            items,
-            cwd: self.config.cwd.clone(),
-            approval_policy: self.config.approval_policy.value(),
-            sandbox_policy: self.config.sandbox_policy.get().clone(),
-            model: running_model.clone(),
-            effort: running_effort,
-            summary: self.config.model_reasoning_summary,
-            final_output_json_schema: None,
-            collaboration_mode,
-            personality,
-            service_tier: self.config.service_tier.clone(),
+        let pending_steer_compare_key =
+            (!render_in_history).then(|| Self::pending_steer_compare_key_from_inputs(&items));
+        let (op, pending_steer) = if render_in_history {
+            (
+                Op::UserTurn {
+                    items,
+                    cwd: self.config.cwd.clone(),
+                    approval_policy: self.config.approval_policy.value(),
+                    sandbox_policy: self.config.sandbox_policy.get().clone(),
+                    model: running_model.clone(),
+                    effort: running_effort,
+                    summary: self.config.model_reasoning_summary,
+                    final_output_json_schema: None,
+                    collaboration_mode,
+                    personality,
+                    service_tier: self.config.service_tier.clone(),
+                },
+                None,
+            )
+        } else if let Some(expected_turn_id) = self.active_turn_id.clone() {
+            (
+                Op::SteerInput {
+                    expected_turn_id: expected_turn_id.clone(),
+                    items,
+                    client_user_message_id: None,
+                },
+                Some(PendingSteer {
+                    target_turn_id: expected_turn_id,
+                    user_message: submitted_user_message.clone(),
+                    history_record: history_record.clone(),
+                    compare_key: pending_steer_compare_key
+                        .expect("active steer should have a compare key"),
+                }),
+            )
+        } else {
+            self.queue_user_message_with_overrides(
+                submitted_user_message,
+                model_override,
+                effort_override,
+            );
+            return;
         };
 
         if let Err(e) = self.codex_op_tx.send(op) {

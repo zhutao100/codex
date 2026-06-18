@@ -158,6 +158,17 @@ pub enum Op {
         service_tier: Option<String>,
     },
 
+    /// Add user input to the currently active turn without changing turn settings.
+    SteerInput {
+        /// Active turn id observed by the client when the input was submitted.
+        expected_turn_id: String,
+        /// User input items, see `InputItem`.
+        items: Vec<UserInput>,
+        /// Optional client-generated id for correlating the committed user message.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_user_message_id: Option<String>,
+    },
+
     /// Override parts of the persistent turn context for subsequent turns.
     ///
     /// All fields are optional; when omitted, the existing value is preserved.
@@ -1059,6 +1070,11 @@ pub enum CodexErrorInfo {
     /// same-turn steering, for example review, compact, or standalone user-shell turns.
     ActiveTurnNotSteerable {
         turn_kind: NonSteerableTurnKind,
+    },
+    NoActiveTurnToSteer,
+    ExpectedTurnMismatch {
+        expected: String,
+        actual: String,
     },
     ThreadRollbackFailed,
     Other,

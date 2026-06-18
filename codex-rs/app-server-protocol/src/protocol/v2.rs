@@ -140,6 +140,11 @@ pub enum CodexErrorInfo {
         #[ts(rename = "turnKind")]
         turn_kind: NonSteerableTurnKind,
     },
+    NoActiveTurnToSteer,
+    ExpectedTurnMismatch {
+        expected: String,
+        actual: String,
+    },
     Other,
 }
 
@@ -177,6 +182,10 @@ impl From<CoreCodexErrorInfo> for CodexErrorInfo {
                 CodexErrorInfo::ActiveTurnNotSteerable {
                     turn_kind: turn_kind.into(),
                 }
+            }
+            CoreCodexErrorInfo::NoActiveTurnToSteer => CodexErrorInfo::NoActiveTurnToSteer,
+            CoreCodexErrorInfo::ExpectedTurnMismatch { expected, actual } => {
+                CodexErrorInfo::ExpectedTurnMismatch { expected, actual }
             }
             CoreCodexErrorInfo::Other => CodexErrorInfo::Other,
         }

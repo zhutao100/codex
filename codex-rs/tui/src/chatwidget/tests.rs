@@ -1009,6 +1009,7 @@ async fn make_chatwidget_manual(
         frame_requester: FrameRequester::test_dummy(),
         show_welcome_banner: true,
         queued_user_messages: VecDeque::new(),
+        active_turn_id: None,
         pending_steers: VecDeque::new(),
         rejected_steers_queue: VecDeque::new(),
         rejected_steer_history_records: VecDeque::new(),
@@ -1054,7 +1055,7 @@ async fn make_chatwidget_manual(
 fn next_submit_op(op_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Op>) -> Op {
     loop {
         match op_rx.try_recv() {
-            Ok(op @ Op::UserTurn { .. }) => return op,
+            Ok(op @ (Op::UserTurn { .. } | Op::SteerInput { .. })) => return op,
             Ok(_) => continue,
             Err(TryRecvError::Empty) => panic!("expected a submit op but queue was empty"),
             Err(TryRecvError::Disconnected) => panic!("expected submit op but channel closed"),
@@ -1519,7 +1520,7 @@ async fn plan_implementation_popup_shows_once_when_replay_precedes_live_turn_com
             .expect("expected plan collaboration mask");
     chat.set_collaboration_mask(plan_mask);
 
-    chat.on_task_started();
+    chat.on_task_started(Some("turn-1".to_string()));
     chat.on_plan_delta("- Step 1\n- Step 2\n".to_string());
     chat.on_plan_item_completed("- Step 1\n- Step 2\n".to_string());
 
@@ -1594,7 +1595,7 @@ async fn plan_implementation_popup_skips_without_proposed_plan() {
             .expect("expected plan collaboration mask");
     chat.set_collaboration_mask(plan_mask);
 
-    chat.on_task_started();
+    chat.on_task_started(Some("turn-1".to_string()));
     chat.on_plan_update(UpdatePlanArgs {
         explanation: None,
         plan: vec![PlanItemArg {
@@ -1620,7 +1621,7 @@ async fn plan_implementation_popup_shows_after_proposed_plan_output() {
             .expect("expected plan collaboration mask");
     chat.set_collaboration_mask(plan_mask);
 
-    chat.on_task_started();
+    chat.on_task_started(Some("turn-1".to_string()));
     chat.on_plan_delta("- Step 1\n- Step 2\n".to_string());
     chat.on_plan_item_completed("- Step 1\n- Step 2\n".to_string());
     chat.on_task_complete(None, false);
@@ -1643,7 +1644,7 @@ async fn plan_implementation_popup_skips_when_rate_limit_prompt_pending() {
             .expect("expected plan collaboration mask");
     chat.set_collaboration_mask(plan_mask);
 
-    chat.on_task_started();
+    chat.on_task_started(Some("turn-1".to_string()));
     chat.on_plan_update(UpdatePlanArgs {
         explanation: None,
         plan: vec![PlanItemArg {
@@ -2027,7 +2028,7 @@ async fn streaming_final_answer_keeps_task_running_state() {
     let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(None).await;
     chat.thread_id = Some(ThreadId::new());
 
-    chat.on_task_started();
+    chat.on_task_started(Some("turn-1".to_string()));
     chat.on_agent_message_delta("Final answer line\n".to_string());
     chat.on_commit_tick();
 
@@ -2057,7 +2058,7 @@ async fn streaming_final_answer_keeps_task_running_state() {
 async fn preamble_keeps_status_indicator_visible_until_exec_begin() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
 
-    chat.on_task_started();
+    chat.on_task_started(Some("turn-1".to_string()));
     assert_eq!(chat.bottom_pane.status_indicator_visible(), true);
 
     chat.on_agent_message_delta("Preamble line\n".to_string());
@@ -2079,7 +2080,7 @@ async fn preamble_keeps_working_status_snapshot() {
 
     // Regression sequence: a preamble line is committed to history before any exec/tool event.
     // The status row must remain visible so the spinner/shimmer still communicates "working".
-    chat.on_task_started();
+    chat.on_task_started(Some("turn-1".to_string()));
     chat.on_agent_message_delta("Preamble line\n".to_string());
     chat.on_commit_tick();
     drain_insert_history(&mut rx);
@@ -2097,7 +2098,7 @@ async fn preamble_keeps_working_status_snapshot() {
 async fn unified_exec_begin_restores_status_indicator_after_preamble() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
 
-    chat.on_task_started();
+    chat.on_task_started(Some("turn-1".to_string()));
     assert_eq!(chat.bottom_pane.status_indicator_visible(), true);
 
     // Simulate a hidden status row during an active turn.
@@ -2114,7 +2115,7 @@ async fn unified_exec_begin_restores_status_indicator_after_preamble() {
 async fn unified_exec_begin_restores_working_status_snapshot() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
 
-    chat.on_task_started();
+    chat.on_task_started(Some("turn-1".to_string()));
     chat.on_agent_message_delta("Preamble line\n".to_string());
     chat.on_commit_tick();
     drain_insert_history(&mut rx);
@@ -2535,7 +2536,7 @@ async fn exec_end_without_begin_uses_event_command() {
 #[tokio::test]
 async fn exec_history_shows_unified_exec_startup_commands() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
-    chat.on_task_started();
+    chat.on_task_started(Some("turn-1".to_string()));
 
     let begin = begin_exec_with_source(
         &mut chat,
@@ -2562,7 +2563,7 @@ async fn exec_history_shows_unified_exec_startup_commands() {
 #[tokio::test]
 async fn exec_history_shows_unified_exec_tool_calls() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
-    chat.on_task_started();
+    chat.on_task_started(Some("turn-1".to_string()));
 
     let begin = begin_exec_with_source(
         &mut chat,
@@ -2579,7 +2580,7 @@ async fn exec_history_shows_unified_exec_tool_calls() {
 #[tokio::test]
 async fn unified_exec_end_after_task_complete_is_suppressed() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
-    chat.on_task_started();
+    chat.on_task_started(Some("turn-1".to_string()));
 
     let begin = begin_exec_with_source(
         &mut chat,
@@ -2603,7 +2604,7 @@ async fn unified_exec_end_after_task_complete_is_suppressed() {
 #[tokio::test]
 async fn unified_exec_interaction_after_task_complete_is_suppressed() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
-    chat.on_task_started();
+    chat.on_task_started(Some("turn-1".to_string()));
     chat.on_task_complete(None, false);
     let _ = drain_insert_history(&mut rx);
 
@@ -2701,7 +2702,7 @@ async fn unified_exec_wait_before_streamed_agent_message_snapshot() {
 #[tokio::test]
 async fn unified_exec_wait_status_header_updates_on_late_command_display() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
-    chat.on_task_started();
+    chat.on_task_started(Some("turn-1".to_string()));
     chat.unified_exec_processes.push(UnifiedExecProcessSummary {
         key: "proc-1".to_string(),
         call_id: "call-1".to_string(),
@@ -2725,7 +2726,7 @@ async fn unified_exec_wait_status_header_updates_on_late_command_display() {
 #[tokio::test]
 async fn unified_exec_waiting_multiple_empty_snapshots() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
-    chat.on_task_started();
+    chat.on_task_started(Some("turn-1".to_string()));
     begin_unified_exec_startup(&mut chat, "call-wait-1", "proc-1", "just fix");
 
     terminal_interaction(&mut chat, "call-wait-1a", "proc-1", "");
@@ -2753,7 +2754,7 @@ async fn unified_exec_waiting_multiple_empty_snapshots() {
 #[tokio::test]
 async fn unified_exec_empty_then_non_empty_snapshot() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
-    chat.on_task_started();
+    chat.on_task_started(Some("turn-1".to_string()));
     begin_unified_exec_startup(&mut chat, "call-wait-2", "proc-2", "just fix");
 
     terminal_interaction(&mut chat, "call-wait-2a", "proc-2", "");
@@ -2770,7 +2771,7 @@ async fn unified_exec_empty_then_non_empty_snapshot() {
 #[tokio::test]
 async fn unified_exec_non_empty_then_empty_snapshots() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
-    chat.on_task_started();
+    chat.on_task_started(Some("turn-1".to_string()));
     begin_unified_exec_startup(&mut chat, "call-wait-3", "proc-3", "just fix");
 
     terminal_interaction(&mut chat, "call-wait-3a", "proc-3", "pwd\n");
@@ -2888,7 +2889,7 @@ async fn collab_mode_shift_tab_cycles_only_when_enabled_and_idle() {
     assert_eq!(chat.active_collaboration_mode_kind(), ModeKind::Default);
     assert_eq!(chat.current_collaboration_mode(), &initial);
 
-    chat.on_task_started();
+    chat.on_task_started(Some("turn-1".to_string()));
     let before = chat.active_collaboration_mode_kind();
     chat.handle_key_event(KeyEvent::from(KeyCode::BackTab));
     assert_eq!(chat.active_collaboration_mode_kind(), before);
@@ -3286,7 +3287,7 @@ async fn slash_copy_state_is_preserved_during_running_task() {
             last_agent_message: Some("Previous completed reply".to_string()),
         }),
     });
-    chat.on_task_started();
+    chat.on_task_started(Some("turn-1".to_string()));
 
     assert_eq!(
         chat.last_copyable_output,
@@ -4400,6 +4401,7 @@ async fn submitting_during_active_turn_keeps_running_model_and_effort() {
     let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(None).await;
     chat.thread_id = Some(ThreadId::new());
     chat.agent_turn_running = true;
+    chat.active_turn_id = Some("turn-1".to_string());
     chat.running_turn_model = Some("running-model".to_string());
     chat.running_turn_reasoning_effort = Some(ReasoningEffortConfig::High);
 
@@ -4409,11 +4411,12 @@ async fn submitting_during_active_turn_keeps_running_model_and_effort() {
 
     let op = next_submit_op(&mut op_rx);
     match op {
-        Op::UserTurn { model, effort, .. } => {
-            assert_eq!(model, "running-model".to_string());
-            assert_eq!(effort, Some(ReasoningEffortConfig::High));
+        Op::SteerInput {
+            expected_turn_id, ..
+        } => {
+            assert_eq!(expected_turn_id, "turn-1");
         }
-        _ => panic!("expected Op::UserTurn"),
+        _ => panic!("expected Op::SteerInput"),
     }
 
     assert_eq!(chat.running_turn_model.as_deref(), Some("running-model"));
@@ -4428,11 +4431,18 @@ async fn steer_enter_while_active_waits_for_committed_user_message() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(None).await;
     chat.thread_id = Some(ThreadId::new());
     chat.agent_turn_running = true;
+    chat.active_turn_id = Some("turn-1".to_string());
 
     chat.submit_user_message("follow-up while running".into());
 
     let op = next_submit_op(&mut op_rx);
-    assert!(matches!(op, Op::UserTurn { .. }));
+    assert!(matches!(
+        op,
+        Op::SteerInput {
+            expected_turn_id,
+            ..
+        } if expected_turn_id == "turn-1"
+    ));
     assert_eq!(chat.pending_steers.len(), 1);
     assert!(
         drain_insert_history(&mut rx).is_empty(),
@@ -4445,6 +4455,7 @@ async fn committed_user_message_renders_pending_steer_once() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
     chat.thread_id = Some(ThreadId::new());
     chat.agent_turn_running = true;
+    chat.active_turn_id = Some("turn-1".to_string());
 
     chat.submit_user_message("follow-up while running".into());
     drain_insert_history(&mut rx);
@@ -4491,6 +4502,7 @@ async fn committed_user_message_uses_pending_steer_rich_payload() {
         Some(placeholder.to_string()),
     )];
     chat.pending_steers.push_back(PendingSteer {
+        target_turn_id: "turn-1".to_string(),
         user_message: UserMessage {
             text: message.clone(),
             local_images: vec![LocalImageAttachment {
@@ -4542,6 +4554,7 @@ async fn active_turn_not_steerable_moves_pending_steer_to_rejected_queue() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
     chat.thread_id = Some(ThreadId::new());
     chat.agent_turn_running = true;
+    chat.active_turn_id = Some("turn-1".to_string());
 
     chat.submit_user_message("review follow-up".into());
     drain_insert_history(&mut rx);
@@ -4566,6 +4579,75 @@ async fn active_turn_not_steerable_moves_pending_steer_to_rejected_queue() {
     assert!(
         drain_insert_history(&mut rx).is_empty(),
         "rejected steers should not surface as generic errors"
+    );
+}
+
+#[tokio::test]
+async fn no_active_turn_to_steer_requeues_pending_steer_without_generic_error() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.agent_turn_running = true;
+    chat.active_turn_id = Some("turn-1".to_string());
+
+    chat.submit_user_message("late steer".into());
+    drain_insert_history(&mut rx);
+    assert_eq!(chat.pending_steers.len(), 1);
+
+    chat.handle_codex_event(Event {
+        id: "steer-error".into(),
+        msg: EventMsg::Error(ErrorEvent {
+            message: "no active turn to steer".to_string(),
+            codex_error_info: Some(CodexErrorInfo::NoActiveTurnToSteer),
+        }),
+    });
+
+    assert!(!chat.agent_turn_running);
+    assert!(chat.active_turn_id.is_none());
+    assert!(chat.pending_steers.is_empty());
+    assert_eq!(chat.queued_user_messages.len(), 1);
+    assert_eq!(
+        chat.queued_user_messages.front().unwrap().text,
+        "late steer"
+    );
+    assert!(
+        drain_insert_history(&mut rx).is_empty(),
+        "steer races should not surface as generic errors"
+    );
+}
+
+#[tokio::test]
+async fn expected_turn_mismatch_requeues_pending_steer_and_tracks_actual_turn() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.agent_turn_running = true;
+    chat.active_turn_id = Some("turn-1".to_string());
+
+    chat.submit_user_message("stale steer".into());
+    drain_insert_history(&mut rx);
+    assert_eq!(chat.pending_steers.len(), 1);
+
+    chat.handle_codex_event(Event {
+        id: "steer-error".into(),
+        msg: EventMsg::Error(ErrorEvent {
+            message: "expected active turn id `turn-1` but found `turn-2`".to_string(),
+            codex_error_info: Some(CodexErrorInfo::ExpectedTurnMismatch {
+                expected: "turn-1".to_string(),
+                actual: "turn-2".to_string(),
+            }),
+        }),
+    });
+
+    assert!(chat.agent_turn_running);
+    assert_eq!(chat.active_turn_id.as_deref(), Some("turn-2"));
+    assert!(chat.pending_steers.is_empty());
+    assert_eq!(chat.queued_user_messages.len(), 1);
+    assert_eq!(
+        chat.queued_user_messages.front().unwrap().text,
+        "stale steer"
+    );
+    assert!(
+        drain_insert_history(&mut rx).is_empty(),
+        "steer races should not surface as generic errors"
     );
 }
 
@@ -4619,6 +4701,7 @@ async fn pause_after_pending_steer_restores_steer_to_composer() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
     chat.thread_id = Some(ThreadId::new());
     chat.agent_turn_running = true;
+    chat.active_turn_id = Some("turn-1".to_string());
 
     chat.submit_user_message("pause-safe steer".into());
     drain_insert_history(&mut rx);

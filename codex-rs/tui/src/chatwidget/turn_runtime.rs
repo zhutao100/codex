@@ -32,7 +32,8 @@ impl ChatWidget {
         }
     }
 
-    pub(super) fn on_task_started(&mut self) {
+    pub(super) fn on_task_started(&mut self, turn_id: Option<String>) {
+        self.active_turn_id = turn_id;
         self.user_turn_pending_start = false;
         if self.running_turn_model.is_none() {
             if let Some(snapshot) = self
@@ -119,6 +120,7 @@ impl ChatWidget {
         // Mark task stopped and request redraw now that all content is in history.
         self.user_turn_pending_start = false;
         self.agent_turn_running = false;
+        self.active_turn_id = None;
         self.running_turn_model = None;
         self.running_turn_reasoning_effort = None;
         self.update_task_running_state();
@@ -238,6 +240,7 @@ impl ChatWidget {
         // Reset running state and clear streaming buffers.
         self.user_turn_pending_start = false;
         self.agent_turn_running = false;
+        self.active_turn_id = None;
         self.running_turn_model = None;
         self.running_turn_reasoning_effort = None;
         self.update_task_running_state();

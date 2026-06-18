@@ -113,7 +113,10 @@ impl ChatWidget {
                 self.on_agent_reasoning_final();
             }
             EventMsg::AgentReasoningSectionBreak(_) => self.on_reasoning_section_break(),
-            EventMsg::TurnStarted(_) => self.on_task_started(),
+            EventMsg::TurnStarted(_) => {
+                let live_turn_id = (!from_replay).then(|| id.clone()).flatten();
+                self.on_task_started(live_turn_id);
+            }
             EventMsg::TurnComplete(TurnCompleteEvent { last_agent_message }) => {
                 self.on_task_complete(last_agent_message, from_replay)
             }

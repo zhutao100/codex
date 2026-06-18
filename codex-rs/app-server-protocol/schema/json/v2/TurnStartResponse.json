@@ -33,6 +33,7 @@
             "badRequest",
             "threadRollbackFailed",
             "sandboxError",
+            "noActiveTurnToSteer",
             "other"
           ],
           "type": "string"
@@ -181,6 +182,31 @@
             "activeTurnNotSteerable"
           ],
           "title": "ActiveTurnNotSteerableCodexErrorInfo",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "expectedTurnMismatch": {
+              "properties": {
+                "actual": {
+                  "type": "string"
+                },
+                "expected": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "actual",
+                "expected"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "expectedTurnMismatch"
+          ],
+          "title": "ExpectedTurnMismatchCodexErrorInfo",
           "type": "object"
         }
       ]
