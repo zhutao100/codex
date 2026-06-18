@@ -155,10 +155,10 @@ Add a TUI/core integration regression:
 ### Work
 
 1. Add `QueuedInputAction::{Plain, ParseSlash, RunShell}`.
-2. Extend `InputResult::Queued` and `QueuedUserMessage` with action and pending-paste metadata.
+2. Extend `InputResult::Queued` and `QueuedUserMessage` with action metadata; keep pending-paste metadata as a reserved field for future deferred commands that intentionally preserve placeholders.
 3. Move the active-task queue branch before bare/inline slash dispatch while preserving idle slash dispatch and paste-burst newline handling.
 4. Defer slash validation while queueing.
-5. Preserve large-paste placeholders when the deferred command requires them.
+5. Expand large-paste placeholders before enqueue for current deferred commands. Preserve unexpanded placeholders only if a future deferred command requires placeholder identity.
 6. Add dequeue handlers for queued slash and shell actions.
 7. Convert `maybe_send_next_queued_input()` into a bounded drain loop that stops after starting a turn/task or opening a blocking UI.
 8. Keep queue ids, reordering, editing, local images, text elements, mention paths, and model/reasoning overrides intact.
@@ -171,8 +171,7 @@ At enqueue time while a task runs:
 - `/compact`, `/review check regressions`, a settings command, and an unknown slash command produce `ParseSlash` with no immediate dispatch/error;
 - `!echo hi` produces `RunShell` with no execution;
 - leading-space slash produces `Plain`;
-- queue editing/reordering preserves the action;
-- pending paste metadata survives deferred commands that require unexpanded placeholders, for example `/goal`.
+- queue editing/reordering preserves the action.
 
 At dequeue time:
 
@@ -307,12 +306,14 @@ Each commit should keep the workspace compiling and preserve current pause/conti
 Run at minimum:
 
 ```bash
-cargo test -p codex-core --test all pending_input
-cargo test -p codex-core session::tests::task_finish
-cargo test -p codex-tui chatwidget::tests
-cargo test -p codex-tui chat_composer
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+just fmt
+CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-core --test all pending_input
+CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-core session::tests::task_finish
+CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-core session::tests::abort
+CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-tui chat_composer
+CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-tui chatwidget::tests
+CODEX_SANDBOX_NETWORK_DISABLED=1 just fix -p codex-core
+CODEX_SANDBOX_NETWORK_DISABLED=1 just fix -p codex-tui
 ```
 
 Use the package/test selectors available in the branch if exact names differ.
