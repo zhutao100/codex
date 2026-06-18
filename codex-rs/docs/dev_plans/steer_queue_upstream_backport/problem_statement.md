@@ -1,90 +1,128 @@
-# Problem Statement: Steer And Queue Input Backport
+# Problem Statement
 
-## Context
+## Current baseline
 
-This branch supports two mid-turn input modes in the TUI:
+This branch already implements the first generation of the upstream steer backport:
 
-- Enter steer input: send additional instructions immediately while the active turn is still running.
-- Tab queued input: defer the message until the active turn finishes.
+- `tui/src/chatwidget/input_submission.rs` stores active-turn submissions as `PendingSteer` and does not render them immediately.
+- `tui/src/chatwidget.rs::on_committed_user_message(...)` renders a matching pending steer exactly once after core commits it.
+- `core/src/session/mod.rs::steer_input(...)` accepts only regular active turns.
+- `tui/src/chatwidget/input_restore.rs` recovers uncommitted steers across interruption and pause.
+- `tui/src/chatwidget/input_flow.rs` gates queue draining on `user_turn_pending_start || task_running`.
 
-This branch also has `/pause` and `/continue`, which are not part of the upstream branch behavior being compared here. Any backport must preserve those controls and their distinction from interruption.
+The proposal must not reimplement or regress those behaviors.
 
-## Current behavior to fix
+## Problems addressed by this backport
 
-### 1. Enter steer renders before core commits it
+### 1. Queue intent is lost before the item enters the queue
 
-In this branch, `tui/src/chatwidget.rs::submit_user_message_with_overrides(...)` always adds a `history_cell::new_user_prompt(...)` after sending `Op::UserTurn`, including while `agent_turn_running` is true.
+`tui/src/bottom_pane/chat_composer.rs::handle_submission_with_time(...)` parses bare and inline slash commands before it checks `should_queue`.
 
-Core handles the same input later:
+Consequences while a task is running:
 
-1. `core/src/session/handlers.rs::user_input_or_turn(...)` creates a new `TurnContext`.
-2. `Session::inject_input(...)` appends the input to the active turn's pending input if any task is active.
-3. `core/src/session/turn.rs` later drains pending input and records a user-message item before the next sampling request.
+- Tab on `/compact` or `/review ...` reports that the command is unavailable instead of queueing it for later.
+- Slash commands that are available during a task can run immediately even though the user used the queue key.
+- Unknown slash commands are validated at enqueue time rather than dequeue time.
+- Queue state records only text, so it cannot distinguish a literal prompt from deferred slash or shell execution.
 
-As a result, the TUI visible transcript is mutated before core has committed the user message. This is the concrete source of the observed "conversation history changed when Enter was used as steer" behavior.
+Upstream fixes this by queueing first and storing `QueuedInputAction::{Plain, ParseSlash, RunShell}`.
 
-### 2. Live committed user-message events are ignored
+### 2. A late accepted steer can be persisted without being committed to the TUI
 
-`EventMsg::UserMessage(ev)` is handled only when `from_replay` is true. That works only because this branch renders local user prompts eagerly.
+Core pending input in this branch is stored as `Vec<ResponseInputItem>`. If a regular task finishes after accepting a steer but before the turn loop drains it, `core/src/tasks/mod.rs::on_task_finished(...)` writes the converted response item to history but emits no user-message item lifecycle.
 
-After the eager render is removed for active-turn steering, the live user-message event must become the authoritative commit signal. Without that change, accepted pending steers would never appear in the visible transcript.
+The TUI still has the corresponding `PendingSteer`. When `TurnComplete` arrives, it moves that pending steer to the rejected queue and submits it as a new turn. The same user input can therefore be persisted once and submitted again.
 
-### 3. Core accepts steer input into non-steerable active tasks
+Upstream keeps `TurnInput::UserInput { content, client_id }` and, on task completion, emits the same raw/item-started/item-completed/legacy-user-message lifecycle used by the normal drain path before `TurnComplete`.
 
-`Session::inject_input(...)` checks only whether `active_turn` exists. It does not validate the active task kind.
+### 3. Start and steer share one operation and one settings path
 
-The upstream branch rejects same-turn steering for review and compact tasks and reports `CodexErrorInfo::ActiveTurnNotSteerable`. This branch should do the same so a steer typed during review or compaction is not injected into a task that cannot semantically process same-turn instructions.
+The TUI sends `Op::UserTurn` for both a new turn and an active-turn steer. `core/src/session/handlers.rs::user_input_or_turn(...)` calls `new_turn_with_sub_id(...)` and applies `SessionSettingsUpdate` before it knows whether the input will steer the existing turn.
 
-This branch also has `PostTurnCompletionReview` and standalone `UserShell` task kinds. The backport must handle those explicitly: post-turn completion review should be treated as a review task, and standalone user-shell turns should be rejected as a non-steerable user-shell task. Auxiliary user-shell commands already run under the active regular turn and do not need separate handling.
+This creates three correctness risks:
 
-### 4. Pending steers can be lost when work is stopped
+- a stale TUI running flag can steer whichever turn happens to be active rather than the turn the user saw;
+- a steer can mutate session settings even though the active turn continues with its existing frozen `TurnContext`;
+- `submit_user_message_with_mode(...)` can switch collaboration mode during an active turn before submitting the steer.
 
-This branch's task stop paths clear active-turn pending state. For example, `core/src/tasks/mod.rs::take_all_running_tasks(...)` clears pending state before draining tasks, and pause paths intentionally keep continuation state rather than pending user input.
+Upstream's active TUI path uses app-server `turn/steer` with a required `expectedTurnId`, retries a stale-id race once, and sends no new-turn settings with the steer.
 
-Because the TUI does not retain pending steer payloads separately, uncommitted Enter steer input can be lost when the user pauses, interrupts, or hits an error before the active turn drains pending input.
+### 4. Cache-relevant ordering is under-specified by tests
 
-### 5. Queue draining has a start-event race
+This branch verifies that the first request excludes pending input and a later request includes it. Those tests do not prove that the first request input is an exact prefix of the second request input.
 
-`maybe_send_next_queued_input()` checks `bottom_pane.is_task_running()` but does not track the interval after a user turn is submitted and before the TUI receives the turn-start/running event.
+The required normal-path invariant is:
 
-The upstream branch adds `user_turn_pending_start` to block queue auto-drain during that interval. This avoids accidentally starting or draining another queued input before the previous submission has become visible to the lifecycle state.
+```text
+follow_up.input[0..first.input.len()] == first.input
+```
 
-### 6. Queue preview does not distinguish queued, pending, and rejected input
+The appended suffix must retain all durable response items produced before the steer and place the steer after them. Compaction and explicit context rewrites require separate tests because exact-prefix preservation is not expected there.
 
-This branch shows queued messages only. Enter steers that have been submitted but not yet committed are invisible, and steers rejected by review/compact have no dedicated recovery state.
+### 5. Rejected steers are fragmented into multiple future turns
 
-The upstream branch exposes three distinct states in the bottom pane:
+This branch drains one rejected steer at a time. If several Enter submissions are rejected by a review, compact, or standalone user-shell task, each becomes a separate future turn.
 
-- Pending steers: submitted to core, waiting for commit.
-- Rejected steers: could not steer the current task, will be retried at end of turn.
-- Queued messages: next-turn inputs queued by the user.
+Upstream merges all rejected steers, in order, into one next-turn message before ordinary queued input. This better matches the user's attempt to add several instructions to the same active work item.
 
-## Prefix-cache clarification
+### 6. Avoidable steer attempts occur during plan streaming and standalone shell work
 
-A steer is same-turn user input. Once accepted, the next sampling request includes it and the model-visible suffix changes. Therefore, prefix-cache reuse between the pre-steer request and the post-steer request is not a correctness requirement.
+The upstream TUI queues ordinary input when:
 
-The correctness requirement is narrower:
+- a proposed-plan item is still streaming in the TUI; or
+- the only running commands are user-shell commands.
 
-- local visible history must not change before core commits the steer;
-- pending input ordering must be deterministic;
-- queued input must not be merged into the first sample of a fresh explicit prompt;
-- uncommitted steer input must be recoverable if the active task is stopped.
-- request construction must preserve the committed prefix. A post-steer request can append tool output and the new steer, but it should still begin with the previous request input plus committed response items unless compaction or request settings intentionally changed.
+Before this backport, this branch had a plan stream controller but did not use it as a submission gate. It also relied on core rejection for standalone user-shell tasks rather than queueing before submission. Both cases created transient pending-steer state that could not be committed to the active model turn.
 
-## Backport goals
+### 7. Abort cleanup can discard pending input too early
 
-|Goal|Expected outcome|
-|---|---|
-|Commit steer display from core events|Enter steer while a task is running appears as pending preview first, then as one visible user prompt after `EventMsg::UserMessage` or equivalent committed user item.|
-|Separate steer from queue|Enter remains same-turn steer; Tab remains next-turn queue.|
-|Reject non-steerable active tasks|Review and compact tasks do not accept pending steer input; the TUI moves those payloads to rejected-steer queue.|
-|Preserve pending steer payloads|Pause, interrupt, review/compact rejection, and recoverable error paths in this branch's in-place TUI lifecycle do not lose uncommitted user input.|
-|Close queue-drain race|Queued follow-ups do not drain until no user turn is pending or running.|
-|Preserve `/pause` and `/continue`|Upstream interrupt-specific behavior is adapted, not copied over the branch's pause lifecycle.|
+`core/src/tasks/mod.rs::take_all_running_tasks(...)` removes the active turn and calls `clear_pending()` before task cancellation and cleanup. It also clears pending input when an `ActiveTurn` exists with no running task.
+
+Upstream lets the task observe cancellation before clearing pending waiters/input and preserves pending input for an empty active-turn shell. The exact upstream task architecture should not be copied, but those ordering properties should be retained.
+
+### 8. Pending-steer correlation remains content-based
+
+Both branches correlate committed user messages with pending steers using flattened text plus image count. Repeated identical messages can be ambiguous, and skill/mention identity is omitted.
+
+Upstream's protocol supports `clientUserMessageId`, but the upstream TUI currently sends `None`, so this is a shared residual risk rather than an upstream fix already available end to end.
+
+## Required invariants
+
+### Turn identity
+
+- A steer must target the active turn observed by the TUI.
+- Core must atomically validate the expected turn id and task kind before accepting input.
+- A stale turn id must never silently steer a replacement review, compact, continuation, or regular turn.
+
+### Commit semantics
+
+- A TUI pending steer is uncommitted until core emits its user-message lifecycle.
+- Every accepted user steer is either committed exactly once or returned to recoverable TUI state.
+- `TurnComplete` must not precede the commit lifecycle for accepted leftover user input.
+
+### Model-request ordering
+
+- Steering is non-preemptive: already-produced reasoning, assistant messages, tool calls, and tool outputs remain before the steer.
+- In a stable, non-compacting turn, the earlier request input remains an exact prefix of the follow-up request input.
+- Compaction, truncation, rollback, and deliberate context updates are explicit exceptions.
+
+### Queue fidelity
+
+- The queue key must never execute or validate a slash/shell action immediately.
+- Dequeue must preserve whether the item was plain input, a slash command, or a shell command.
+- Queue ids, ordering, editing, images, text elements, mention paths, and model/reasoning overrides must survive the backport.
+- Non-turn commands may be processed while draining, but at most one new user/model turn may be started per drain pass.
+
+### Pause and continue
+
+- `/pause` does not commit pending steers and does not flatten ordinary queued messages into the composer.
+- `/continue` does not add a user message.
+- Queue auto-send remains blocked while a continuation is submitted but has not started.
+- Explicit interrupt behavior may differ from pause, but queued items must not be lost.
 
 ## Non-goals
 
-- Do not remove branch-specific `/pause` and `/continue`.
-- Do not rewrite the TUI around upstream app-server session routing.
-- Do not require upstream `turn/steer` API support for the direct TUI path.
-- Do not treat post-steer prefix-cache invalidation as a bug after the steer has actually been committed into model-visible context.
+- Replacing the TUI's direct operation channel with the upstream app-server session.
+- Porting upstream multi-thread input snapshots or mailbox scheduling as part of this work.
+- Guaranteeing provider-side cache hits after compaction or after a cache-key request field changes.
+- Removing this branch's queue editor, model override, reasoning-effort override, `/pause`, or `/continue` features.
