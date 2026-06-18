@@ -7,6 +7,7 @@ use super::*;
 use crate::line_truncation::truncate_line_with_ellipsis_if_overflow;
 
 use codex_protocol::mcp::is_node_repl_backed_server;
+use unicode_segmentation::UnicodeSegmentation;
 
 #[path = "mcp_result.rs"]
 mod result;
