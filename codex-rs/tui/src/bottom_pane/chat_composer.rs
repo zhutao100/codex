@@ -136,6 +136,8 @@ use super::skill_popup::MentionItem;
 use super::skill_popup::SkillPopup;
 use super::slash_commands;
 use crate::bottom_pane::paste_burst::FlushResult;
+use crate::bottom_pane::prompt_args::PromptExpansion;
+use crate::bottom_pane::prompt_args::PromptExpansionError;
 use crate::bottom_pane::prompt_args::expand_custom_prompt;
 use crate::bottom_pane::prompt_args::expand_if_numeric_with_positional_args;
 use crate::bottom_pane::prompt_args::parse_slash_name;
@@ -2071,10 +2073,7 @@ impl ChatComposer {
             let raw_text = self.textarea.text().to_string();
             let defer_slash_validation = self.slash_commands_enabled()
                 && !raw_text.starts_with(' ')
-                && raw_text.starts_with('/')
-                && parse_slash_name(&raw_text).is_none_or(|(name, _, _)| {
-                    !name.starts_with(&format!("{PROMPTS_CMD_PREFIX}:"))
-                });
+                && raw_text.starts_with('/');
             if let Some((text, text_elements)) =
                 self.prepare_submission_text_with_slash_validation(true, !defer_slash_validation)
             {
@@ -3072,6 +3071,14 @@ impl ChatComposer {
         if let ActivePopup::Command(popup) = &mut self.active_popup {
             popup.set_prompts(prompts);
         }
+    }
+
+    pub(crate) fn expand_custom_prompt_for_text(
+        &self,
+        text: &str,
+        text_elements: &[TextElement],
+    ) -> Result<Option<PromptExpansion>, PromptExpansionError> {
+        expand_custom_prompt(text, text_elements, &self.custom_prompts)
     }
 
     /// Synchronize `self.file_search_popup` with the current text in the textarea.
@@ -5215,6 +5222,89 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "queueing should not emit an immediate error"
+        );
+    }
+
+    #[test]
+    fn prompt_command_queued_while_task_running_defers_expansion() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+
+        let (tx, mut rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            true,
+            sender,
+            false,
+            "Ask Codex to do anything".to_string(),
+            false,
+        );
+        composer.set_task_running(true);
+        composer.set_custom_prompts(vec![CustomPrompt {
+            name: "my-prompt".to_string(),
+            path: "/tmp/my-prompt.md".to_string().into(),
+            content: "Expanded $1".to_string(),
+            description: None,
+            argument_hint: None,
+        }]);
+        composer
+            .textarea
+            .set_text_clearing_elements("/prompts:my-prompt input");
+
+        let (result, _needs_redraw) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(matches!(
+            result,
+            InputResult::Queued {
+                text,
+                action: QueuedInputAction::ParseSlash,
+                ..
+            } if text == "/prompts:my-prompt input"
+        ));
+        assert!(composer.textarea.is_empty());
+        assert!(
+            rx.try_recv().is_err(),
+            "queueing a known prompt should not expand or emit an immediate error"
+        );
+    }
+
+    #[test]
+    fn unknown_prompt_command_queued_while_task_running_defers_validation() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+
+        let (tx, mut rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            true,
+            sender,
+            false,
+            "Ask Codex to do anything".to_string(),
+            false,
+        );
+        composer.set_task_running(true);
+        composer
+            .textarea
+            .set_text_clearing_elements("/prompts:missing input");
+
+        let (result, _needs_redraw) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(matches!(
+            result,
+            InputResult::Queued {
+                text,
+                action: QueuedInputAction::ParseSlash,
+                ..
+            } if text == "/prompts:missing input"
+        ));
+        assert!(composer.textarea.is_empty());
+        assert!(
+            rx.try_recv().is_err(),
+            "queueing an unknown prompt should not emit an immediate error"
         );
     }
 

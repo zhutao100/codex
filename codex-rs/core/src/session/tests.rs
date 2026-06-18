@@ -1935,6 +1935,44 @@ async fn abort_empty_active_turn_preserves_pending_input() {
     assert_eq!(sess.get_pending_input().await, vec![expected]);
 }
 
+#[tokio::test]
+async fn turn_scoped_pending_input_drain_does_not_touch_replacement_turn() {
+    let (sess, _tc, _rx) = make_session_and_context_with_rx().await;
+    let original_active_turn = crate::state::ActiveTurn::default();
+    let original_turn_state = Arc::clone(&original_active_turn.turn_state);
+    let replacement_active_turn = crate::state::ActiveTurn::default();
+    let replacement_turn_state = Arc::clone(&replacement_active_turn.turn_state);
+    let original_pending = TurnInput::UserInput {
+        content: steer_text_input("original pending"),
+        client_id: None,
+    };
+    let replacement_pending = TurnInput::UserInput {
+        content: steer_text_input("replacement pending"),
+        client_id: None,
+    };
+    original_turn_state
+        .lock()
+        .await
+        .push_pending_input(original_pending.clone());
+    replacement_turn_state
+        .lock()
+        .await
+        .push_pending_input(replacement_pending.clone());
+    *sess.active_turn.lock().await = Some(replacement_active_turn);
+
+    assert_eq!(
+        sess.take_pending_input_for_turn_state(&original_turn_state)
+            .await,
+        vec![original_pending]
+    );
+    assert!(
+        !sess
+            .has_pending_input_for_turn_state(&original_turn_state)
+            .await
+    );
+    assert_eq!(sess.get_pending_input().await, vec![replacement_pending]);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn task_finish_persists_leftover_pending_input() {
     let (sess, tc, _rx) = make_session_and_context_with_rx().await;

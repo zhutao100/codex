@@ -261,6 +261,7 @@ impl ChatWidget {
     pub(super) fn on_model_cap_error(&mut self, model: String, reset_after_seconds: Option<u64>) {
         self.with_queue_autosend_suppressed(|this| {
             this.finalize_turn();
+            this.move_pending_steers_to_rejected_queue();
 
             let mut message =
                 format!("Model {model} is at capacity. Please try a different model.");
@@ -294,6 +295,7 @@ impl ChatWidget {
     pub(super) fn on_cyber_policy_error(&mut self) {
         self.with_queue_autosend_suppressed(|this| {
             this.finalize_turn();
+            this.move_pending_steers_to_rejected_queue();
             this.add_to_history(history_cell::new_cyber_policy_error_event());
             this.request_redraw();
         });

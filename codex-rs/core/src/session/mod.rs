@@ -211,6 +211,7 @@ use crate::state::PreviousTurnSettings;
 use crate::state::SessionServices;
 use crate::state::SessionState;
 use crate::state::TaskKind;
+use crate::state::TurnState;
 use crate::state_db;
 use crate::tasks::GhostSnapshotTask;
 use crate::tasks::PostTurnCompletionReviewTask;
@@ -1377,6 +1378,19 @@ impl Session {
             .map(|task| Arc::clone(&task.turn_context))
     }
 
+    pub(crate) async fn turn_state_for_sub_id(
+        &self,
+        sub_id: &str,
+    ) -> Option<Arc<Mutex<TurnState>>> {
+        let active = self.active_turn.lock().await;
+        let active_turn = active.as_ref()?;
+        if active_turn.tasks.contains_key(sub_id) {
+            Some(Arc::clone(&active_turn.turn_state))
+        } else {
+            None
+        }
+    }
+
     async fn active_turn_context_and_cancellation_token(
         &self,
     ) -> Option<(Arc<TurnContext>, CancellationToken)> {
@@ -2259,6 +2273,7 @@ impl Session {
         }
     }
 
+    #[cfg(test)]
     pub async fn get_pending_input(&self) -> Vec<TurnInput> {
         let mut active = self.active_turn.lock().await;
         match active.as_mut() {
@@ -2270,15 +2285,20 @@ impl Session {
         }
     }
 
-    pub async fn has_pending_input(&self) -> bool {
-        let active = self.active_turn.lock().await;
-        match active.as_ref() {
-            Some(at) => {
-                let ts = at.turn_state.lock().await;
-                ts.has_pending_input()
-            }
-            None => false,
-        }
+    pub(crate) async fn take_pending_input_for_turn_state(
+        &self,
+        turn_state: &Arc<Mutex<TurnState>>,
+    ) -> Vec<TurnInput> {
+        let mut ts = turn_state.lock().await;
+        ts.take_pending_input()
+    }
+
+    pub(crate) async fn has_pending_input_for_turn_state(
+        &self,
+        turn_state: &Arc<Mutex<TurnState>>,
+    ) -> bool {
+        let ts = turn_state.lock().await;
+        ts.has_pending_input()
     }
 
     pub async fn interrupt_task(self: &Arc<Self>) {

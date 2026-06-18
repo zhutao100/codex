@@ -20,6 +20,21 @@ pub(super) enum ExportPathSpec {
     Dir(PathBuf),
 }
 
+fn prune_local_images_for_text_elements(
+    local_images: Vec<LocalImageAttachment>,
+    text: &str,
+    text_elements: &[TextElement],
+) -> Vec<LocalImageAttachment> {
+    let placeholders = text_elements
+        .iter()
+        .filter_map(|element| element.placeholder(text).map(str::to_string))
+        .collect::<HashSet<_>>();
+    local_images
+        .into_iter()
+        .filter(|image| placeholders.contains(&image.placeholder))
+        .collect()
+}
+
 pub(super) fn parse_export_args(args: &str, cwd: &Path) -> Result<ParsedExportArgs, String> {
     let mut parsed = ParsedExportArgs::default();
     if args.trim().is_empty() {
@@ -786,6 +801,28 @@ impl ChatWidget {
             self.submit_queued_user_message(queued);
             return QueueDrain::Stop;
         };
+
+        match self
+            .bottom_pane
+            .expand_custom_prompt_for_text(&queued.text, &queued.text_elements)
+        {
+            Ok(Some(expanded)) => {
+                queued.text = expanded.text;
+                queued.text_elements = expanded.text_elements;
+                queued.local_images = prune_local_images_for_text_elements(
+                    queued.local_images,
+                    &queued.text,
+                    &queued.text_elements,
+                );
+                self.submit_queued_user_message(queued);
+                return QueueDrain::Stop;
+            }
+            Ok(None) => {}
+            Err(err) => {
+                self.add_error_message(err.user_message());
+                return QueueDrain::Continue;
+            }
+        }
 
         if name.contains('/') {
             self.submit_queued_user_message(queued);

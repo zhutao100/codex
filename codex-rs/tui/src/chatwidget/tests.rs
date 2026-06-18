@@ -80,6 +80,7 @@ use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::Settings;
+use codex_protocol::custom_prompts::CustomPrompt;
 use codex_protocol::items::PlanItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::openai_models::ModelPreset;
@@ -4669,6 +4670,77 @@ async fn expected_turn_mismatch_requeues_pending_steer_and_tracks_actual_turn() 
 }
 
 #[tokio::test]
+async fn model_cap_error_drains_pending_steer_after_turn_end() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.agent_turn_running = true;
+    chat.active_turn_id = Some("turn-1".to_string());
+
+    chat.submit_user_message("retry after model cap".into());
+    drain_insert_history(&mut rx);
+    assert_matches!(next_submit_op(&mut op_rx), Op::SteerInput { .. });
+    assert_eq!(chat.pending_steers.len(), 1);
+
+    chat.handle_codex_event(Event {
+        id: "model-cap".into(),
+        msg: EventMsg::Error(ErrorEvent {
+            message: "model cap".to_string(),
+            codex_error_info: Some(CodexErrorInfo::ModelCap {
+                model: "gpt-test".to_string(),
+                reset_after_seconds: None,
+            }),
+        }),
+    });
+
+    assert!(chat.pending_steers.is_empty());
+    assert!(chat.rejected_steers_queue.is_empty());
+    match next_submit_op(&mut op_rx) {
+        Op::UserTurn { items, .. } => assert_eq!(
+            items,
+            vec![UserInput::Text {
+                text: "retry after model cap".to_string(),
+                text_elements: Vec::new(),
+            }]
+        ),
+        other => panic!("expected Op::UserTurn, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn cyber_policy_error_drains_pending_steer_after_turn_end() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.agent_turn_running = true;
+    chat.active_turn_id = Some("turn-1".to_string());
+
+    chat.submit_user_message("retry after policy error".into());
+    drain_insert_history(&mut rx);
+    assert_matches!(next_submit_op(&mut op_rx), Op::SteerInput { .. });
+    assert_eq!(chat.pending_steers.len(), 1);
+
+    chat.handle_codex_event(Event {
+        id: "policy-error".into(),
+        msg: EventMsg::Error(ErrorEvent {
+            message: "policy".to_string(),
+            codex_error_info: Some(CodexErrorInfo::CyberPolicy),
+        }),
+    });
+
+    assert!(chat.pending_steers.is_empty());
+    assert!(chat.rejected_steers_queue.is_empty());
+    match next_submit_op(&mut op_rx) {
+        Op::UserTurn { items, .. } => assert_eq!(
+            items,
+            vec![UserInput::Text {
+                text: "retry after policy error".to_string(),
+                text_elements: Vec::new(),
+            }]
+        ),
+        other => panic!("expected Op::UserTurn, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn rejected_steer_drains_before_normal_queue() {
     let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(None).await;
     chat.thread_id = Some(ThreadId::new());
@@ -4843,6 +4915,39 @@ async fn queued_slash_command_dispatches_on_drain() {
     chat.maybe_send_next_queued_input();
 
     assert_matches!(rx.try_recv(), Ok(AppEvent::CodexOp(Op::Compact)));
+    assert!(chat.queued_user_messages.is_empty());
+}
+
+#[tokio::test]
+async fn queued_prompt_command_expands_on_drain() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.bottom_pane.set_custom_prompts(vec![CustomPrompt {
+        name: "my-prompt".to_string(),
+        path: "/tmp/my-prompt.md".to_string().into(),
+        content: "Hello $1".to_string(),
+        description: None,
+        argument_hint: None,
+    }]);
+    chat.queued_user_messages
+        .push_back(queued_message_with_action(
+            1,
+            "/prompts:my-prompt queued",
+            QueuedInputAction::ParseSlash,
+        ));
+
+    chat.maybe_send_next_queued_input();
+
+    match next_submit_op(&mut op_rx) {
+        Op::UserTurn { items, .. } => assert_eq!(
+            items,
+            vec![UserInput::Text {
+                text: "Hello queued".to_string(),
+                text_elements: Vec::new(),
+            }]
+        ),
+        other => panic!("expected Op::UserTurn, got {other:?}"),
+    }
     assert!(chat.queued_user_messages.is_empty());
 }
 

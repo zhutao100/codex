@@ -811,6 +811,15 @@ impl BottomPane {
         self.request_redraw();
     }
 
+    pub(crate) fn expand_custom_prompt_for_text(
+        &self,
+        text: &str,
+        text_elements: &[TextElement],
+    ) -> Result<Option<prompt_args::PromptExpansion>, prompt_args::PromptExpansionError> {
+        self.composer
+            .expand_custom_prompt_for_text(text, text_elements)
+    }
+
     pub(crate) fn composer_is_empty(&self) -> bool {
         self.composer.is_empty()
     }

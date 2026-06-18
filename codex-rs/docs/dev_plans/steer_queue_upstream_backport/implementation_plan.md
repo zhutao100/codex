@@ -69,7 +69,7 @@ Before changing code, retain the existing tests around those behaviors in `tui/s
 1. Introduce branch-local `TurnInput::UserInput { content, client_id }` and `TurnInput::ResponseItem`.
 2. Change `TurnState::pending_input` and helper methods to use `TurnInput`.
 3. Make `Session::steer_input(...)` enqueue typed user input.
-4. Refactor normal pending-input drain to a shared `record_pending_input(...)` helper.
+4. Refactor normal pending-input drain to a shared `record_pending_input(...)` helper and drain only from the turn state captured by the running task.
 5. In `on_task_finished(...)`, capture the completed turn state, drain leftovers from that state, and use the same helper before `TurnComplete`.
 6. Preserve pause semantics: pending input discarded by pause is recovered by the TUI, not committed.
 
@@ -83,6 +83,7 @@ Port/adapt upstream `task_finish_emits_turn_item_lifecycle_for_leftover_pending_
 - assert history persistence;
 - assert `RawResponseItem`, `ItemStarted`, `ItemCompleted`, legacy `UserMessage`, then `TurnComplete`;
 - assert the original text element survives; if client-id plumbing is included in this patch, assert the id survives as well.
+- assert a replacement active turn's pending input is not drained through the old turn state.
 
 Add a TUI/core integration regression:
 
@@ -168,7 +169,7 @@ Add a TUI/core integration regression:
 
 At enqueue time while a task runs:
 
-- `/compact`, `/review check regressions`, a settings command, and an unknown slash command produce `ParseSlash` with no immediate dispatch/error;
+- `/compact`, `/review check regressions`, `/prompts:*`, a settings command, and an unknown slash command produce `ParseSlash` with no immediate dispatch/error or prompt expansion;
 - `!echo hi` produces `RunShell` with no execution;
 - leading-space slash produces `Plain`;
 - queue editing/reordering preserves the action.
@@ -249,12 +250,14 @@ Using the queue key never causes immediate command execution or validation.
 3. Preserve pending input held by an empty active-turn shell.
 4. Add `suppress_queue_autosend` around pause/interrupt/replay restoration windows.
 5. Perform one explicit drain check after state restoration completes.
+6. Move pending steers to the rejected queue before draining after terminal model-cap and policy errors.
 
 ### Tests
 
 - adapt upstream `abort_empty_active_turn_preserves_pending_input`;
 - cancellation does not surface a model-visible approval rejection before `TurnAborted`;
 - pause restores pending steers and leaves ordinary queue unchanged;
+- terminal model-cap and policy errors submit any pending steer once after the turn ends;
 - queue does not auto-send during intermediate restore state.
 
 ## P2-A: Exact pending-steer correlation

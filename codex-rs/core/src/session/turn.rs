@@ -295,6 +295,7 @@ async fn run_turn_inner(
         collaboration_mode_kind: turn_context.collaboration_mode.mode,
     });
     sess.send_event(&turn_context, event).await;
+    let turn_state = sess.turn_state_for_sub_id(&turn_context.sub_id).await;
 
     let (explicit_app_paths, skill_name_counts_lower) = if let Some(checkpoint) = continuation {
         let remove_interrupted_abort = checkpoint.source == TurnContinuationSource::Interrupted;
@@ -362,6 +363,7 @@ async fn run_turn_inner(
                     match run_sampling_request(
                         Arc::clone(&sess),
                         Arc::clone(&turn_context),
+                        turn_state.clone(),
                         Arc::clone(&turn_diff_tracker),
                         &mut client_session,
                         turn_metadata_header.as_deref(),
@@ -562,7 +564,10 @@ async fn run_turn_inner(
         let pending_input = if can_drain_pending_input
             && matches!(pre_compact_notes_state, PreCompactNotesState::Idle)
         {
-            sess.get_pending_input().await
+            match turn_state.as_ref() {
+                Some(turn_state) => sess.take_pending_input_for_turn_state(turn_state).await,
+                None => Vec::new(),
+            }
         } else {
             Vec::new()
         };
@@ -602,6 +607,7 @@ async fn run_turn_inner(
         match run_sampling_request(
             Arc::clone(&sess),
             Arc::clone(&turn_context),
+            turn_state.clone(),
             Arc::clone(&turn_diff_tracker),
             &mut client_session,
             turn_metadata_header.as_deref(),
@@ -1320,6 +1326,7 @@ struct SamplingRequestToolSelection<'a> {
 async fn run_sampling_request(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
+    turn_state: Option<Arc<Mutex<TurnState>>>,
     turn_diff_tracker: SharedTurnDiffTracker,
     client_session: &mut ModelClientSession,
     turn_metadata_header: Option<&str>,
@@ -1379,6 +1386,7 @@ async fn run_sampling_request(
             Arc::clone(&router),
             Arc::clone(&sess),
             Arc::clone(&turn_context),
+            turn_state.clone(),
             client_session,
             turn_metadata_header,
             Arc::clone(&turn_diff_tracker),
@@ -1996,6 +2004,7 @@ async fn try_run_sampling_request(
     router: Arc<ToolRouter>,
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
+    turn_state: Option<Arc<Mutex<TurnState>>>,
     client_session: &mut ModelClientSession,
     turn_metadata_header: Option<&str>,
     turn_diff_tracker: SharedTurnDiffTracker,
@@ -2232,7 +2241,9 @@ async fn try_run_sampling_request(
                     model_needs_follow_up = true;
                     needs_follow_up = true;
                 }
-                needs_follow_up |= sess.has_pending_input().await;
+                if let Some(turn_state) = turn_state.as_ref() {
+                    needs_follow_up |= sess.has_pending_input_for_turn_state(turn_state).await;
+                }
 
                 break Ok(SamplingRequestResult {
                     needs_follow_up,
