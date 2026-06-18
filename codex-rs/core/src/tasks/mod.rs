@@ -43,9 +43,9 @@ use crate::state::PendingContinuation;
 use crate::state::PendingContinuationTarget;
 use crate::state::RunningTask;
 use crate::state::TaskKind;
+use crate::state::TurnInput;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::models::ContentItem;
-use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::user_input::UserInput;
@@ -337,7 +337,7 @@ impl Session {
         task_kind: TaskKind,
     ) {
         let mut active = self.active_turn.lock().await;
-        let mut pending_input = Vec::<ResponseInputItem>::new();
+        let mut pending_input = Vec::<TurnInput>::new();
         let mut should_close_processes = false;
         let mut completed_turn_user_messages = Vec::new();
         if let Some(at) = active.as_mut()
@@ -358,12 +358,10 @@ impl Session {
             .pending_pause_reason_for_turn(turn_context.sub_id.as_str())
             .await;
         if !pending_input.is_empty() && paused_current_turn_reason.is_none() {
-            let pending_response_items = pending_input
-                .into_iter()
-                .map(ResponseItem::from)
-                .collect::<Vec<_>>();
-            self.record_conversation_items(turn_context.as_ref(), &pending_response_items)
-                .await;
+            for pending_input_item in pending_input {
+                self.record_pending_input(turn_context.as_ref(), pending_input_item)
+                    .await;
+            }
         }
         if should_close_processes {
             self.close_unified_exec_processes().await;

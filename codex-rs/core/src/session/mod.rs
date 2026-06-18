@@ -33,6 +33,7 @@ use crate::models_manager::manager::ModelsManager;
 use crate::parse_command::parse_command;
 use crate::parse_turn_item;
 use crate::rollout::session_index;
+use crate::state::TurnInput;
 use crate::stream_events_utils::HandleOutputCtx;
 use crate::stream_events_utils::handle_non_tool_response_item;
 use crate::stream_events_utils::handle_output_item_done;
@@ -2073,6 +2074,44 @@ impl Session {
         self.emit_turn_item_completed(turn_context, turn_item).await;
     }
 
+    pub(crate) async fn record_pending_input(
+        &self,
+        turn_context: &TurnContext,
+        pending_input: TurnInput,
+    ) {
+        match pending_input {
+            TurnInput::UserInput {
+                content,
+                client_id: _,
+            } => {
+                let response_item: ResponseItem = ResponseInputItem::from(content.clone()).into();
+                self.record_user_prompt_and_emit_turn_item(
+                    turn_context,
+                    content.as_slice(),
+                    response_item,
+                )
+                .await;
+            }
+            TurnInput::ResponseItem(item) => {
+                let response_item: ResponseItem = item.into();
+                if let Some(TurnItem::UserMessage(user_message)) = parse_turn_item(&response_item) {
+                    self.record_user_prompt_and_emit_turn_item(
+                        turn_context,
+                        user_message.content.as_slice(),
+                        response_item,
+                    )
+                    .await;
+                } else {
+                    self.record_conversation_items(
+                        turn_context,
+                        std::slice::from_ref(&response_item),
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+
     pub(crate) async fn notify_background_event(
         &self,
         turn_context: &TurnContext,
@@ -2165,7 +2204,10 @@ impl Session {
         }
 
         let mut ts = active_turn.turn_state.lock().await;
-        ts.push_pending_input(input.into());
+        ts.push_pending_input(TurnInput::UserInput {
+            content: input,
+            client_id: None,
+        });
         Ok(())
     }
 
@@ -2179,7 +2221,7 @@ impl Session {
             Some(at) => {
                 let mut ts = at.turn_state.lock().await;
                 for item in input {
-                    ts.push_pending_input(item);
+                    ts.push_pending_input(TurnInput::ResponseItem(item));
                 }
                 Ok(())
             }
@@ -2187,7 +2229,7 @@ impl Session {
         }
     }
 
-    pub async fn get_pending_input(&self) -> Vec<ResponseInputItem> {
+    pub async fn get_pending_input(&self) -> Vec<TurnInput> {
         let mut active = self.active_turn.lock().await;
         match active.as_mut() {
             Some(at) => {

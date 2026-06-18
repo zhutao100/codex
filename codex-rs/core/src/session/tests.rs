@@ -8,6 +8,7 @@ use crate::shell::default_user_shell;
 use crate::tools::format_exec_output_str;
 
 use codex_protocol::ThreadId;
+use codex_protocol::items::TurnItem;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputPayload;
 
@@ -23,6 +24,7 @@ use crate::protocol::TokenUsage;
 use crate::protocol::TokenUsageInfo;
 use crate::state::PendingContinuationTarget;
 use crate::state::TaskKind;
+use crate::state::TurnInput;
 use crate::tasks::SessionTask;
 use crate::tasks::SessionTaskContext;
 use crate::tools::ToolRouter;
@@ -39,6 +41,8 @@ use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::user_input::ByteRange;
+use codex_protocol::user_input::TextElement;
 use std::path::Path;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -1781,7 +1785,10 @@ async fn steer_input_accepts_regular_active_turn() {
 
     assert_eq!(
         sess.get_pending_input().await,
-        vec![ResponseInputItem::from(input)]
+        vec![TurnInput::UserInput {
+            content: input,
+            client_id: None,
+        }]
     );
 }
 
@@ -1915,6 +1922,81 @@ async fn task_finish_persists_leftover_pending_input() {
     assert!(
         history.raw_items().iter().any(|item| item == &expected),
         "expected pending input to be persisted into history on turn completion"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_finish_emits_turn_item_lifecycle_for_leftover_pending_user_input() {
+    let (sess, tc, rx) = make_session_and_context_with_rx().await;
+    sess.spawn_task(
+        Arc::clone(&tc),
+        steer_text_input("active task"),
+        NeverEndingTask {
+            kind: TaskKind::Regular,
+            listen_to_cancellation_token: false,
+        },
+    )
+    .await;
+
+    let text_elements = vec![TextElement::new(
+        ByteRange { start: 0, end: 4 },
+        Some("late".to_string()),
+    )];
+    let input = vec![UserInput::Text {
+        text: "late pending user input".to_string(),
+        text_elements: text_elements.clone(),
+    }];
+    sess.steer_input(input.clone())
+        .await
+        .expect("regular task should accept steer input");
+
+    sess.on_task_finished(Arc::clone(&tc), None, TaskKind::Regular)
+        .await;
+
+    let mut events = Vec::new();
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timeout waiting for event")
+            .expect("event");
+        let is_complete = matches!(event.msg, EventMsg::TurnComplete(_));
+        events.push(event.msg);
+        if is_complete {
+            break;
+        }
+    }
+
+    assert_eq!(events.len(), 5);
+    let expected_response_item: ResponseItem = ResponseInputItem::from(input.clone()).into();
+    assert!(matches!(
+        &events[0],
+        EventMsg::RawResponseItem(event) if event.item == expected_response_item
+    ));
+    assert!(matches!(
+        &events[1],
+        EventMsg::ItemStarted(event)
+            if matches!(&event.item, TurnItem::UserMessage(item) if item.content == input)
+    ));
+    assert!(matches!(
+        &events[2],
+        EventMsg::ItemCompleted(event)
+            if matches!(&event.item, TurnItem::UserMessage(item) if item.content == input)
+    ));
+    assert!(matches!(
+        &events[3],
+        EventMsg::UserMessage(event)
+            if event.message == "late pending user input"
+                && event.text_elements == text_elements
+    ));
+    assert!(matches!(&events[4], EventMsg::TurnComplete(_)));
+
+    let history = sess.clone_history().await;
+    assert!(
+        history
+            .raw_items()
+            .iter()
+            .any(|item| item == &expected_response_item),
+        "expected pending user input to be persisted into history on turn completion"
     );
 }
 

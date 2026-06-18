@@ -11,6 +11,7 @@ use tokio_util::task::AbortOnDropHandle;
 use codex_protocol::dynamic_tools::DynamicToolResponse;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::request_user_input::RequestUserInputResponse;
+use codex_protocol::user_input::UserInput;
 use tokio::sync::oneshot;
 
 use crate::protocol::ReviewDecision;
@@ -53,6 +54,15 @@ pub(crate) struct RunningTask {
     pub(crate) _timer: Option<codex_otel::Timer>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum TurnInput {
+    UserInput {
+        content: Vec<UserInput>,
+        client_id: Option<String>,
+    },
+    ResponseItem(ResponseInputItem),
+}
+
 impl ActiveTurn {
     pub(crate) fn add_task(&mut self, task: RunningTask) {
         let sub_id = task.turn_context.sub_id.clone();
@@ -74,7 +84,7 @@ pub(crate) struct TurnState {
     pending_approvals: HashMap<String, oneshot::Sender<ReviewDecision>>,
     pending_user_input: HashMap<String, oneshot::Sender<RequestUserInputResponse>>,
     pending_dynamic_tools: HashMap<String, oneshot::Sender<DynamicToolResponse>>,
-    pending_input: Vec<ResponseInputItem>,
+    pending_input: Vec<TurnInput>,
 }
 
 impl TurnState {
@@ -130,11 +140,11 @@ impl TurnState {
         self.pending_dynamic_tools.remove(key)
     }
 
-    pub(crate) fn push_pending_input(&mut self, input: ResponseInputItem) {
+    pub(crate) fn push_pending_input(&mut self, input: TurnInput) {
         self.pending_input.push(input);
     }
 
-    pub(crate) fn take_pending_input(&mut self) -> Vec<ResponseInputItem> {
+    pub(crate) fn take_pending_input(&mut self) -> Vec<TurnInput> {
         if self.pending_input.is_empty() {
             Vec::with_capacity(0)
         } else {

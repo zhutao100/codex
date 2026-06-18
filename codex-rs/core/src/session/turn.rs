@@ -566,28 +566,10 @@ async fn run_turn_inner(
         } else {
             Vec::new()
         };
-        let pending_response_items = pending_input
-            .into_iter()
-            .map(ResponseItem::from)
-            .collect::<Vec<ResponseItem>>();
-
-        if !pending_response_items.is_empty() {
-            for response_item in pending_response_items {
-                if let Some(TurnItem::UserMessage(user_message)) = parse_turn_item(&response_item) {
-                    // todo(aibrahim): move pending input to be UserInput only to keep TextElements. context: https://github.com/openai/codex/pull/10656#discussion_r2765522480
-                    sess.record_user_prompt_and_emit_turn_item(
-                        turn_context.as_ref(),
-                        &user_message.content,
-                        response_item,
-                    )
+        if !pending_input.is_empty() {
+            for pending_input_item in pending_input {
+                sess.record_pending_input(turn_context.as_ref(), pending_input_item)
                     .await;
-                } else {
-                    sess.record_conversation_items(
-                        &turn_context,
-                        std::slice::from_ref(&response_item),
-                    )
-                    .await;
-                }
             }
         }
 
