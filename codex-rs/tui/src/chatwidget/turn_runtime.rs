@@ -259,37 +259,44 @@ impl ChatWidget {
     }
 
     pub(super) fn on_model_cap_error(&mut self, model: String, reset_after_seconds: Option<u64>) {
-        self.finalize_turn();
+        self.with_queue_autosend_suppressed(|this| {
+            this.finalize_turn();
 
-        let mut message = format!("Model {model} is at capacity. Please try a different model.");
-        if let Some(seconds) = reset_after_seconds {
-            message.push_str(&format!(
-                " Try again in {}.",
-                format_duration_short(seconds)
-            ));
-        } else {
-            message.push_str(" Try again later.");
-        }
+            let mut message =
+                format!("Model {model} is at capacity. Please try a different model.");
+            if let Some(seconds) = reset_after_seconds {
+                message.push_str(&format!(
+                    " Try again in {}.",
+                    format_duration_short(seconds)
+                ));
+            } else {
+                message.push_str(" Try again later.");
+            }
 
-        self.add_to_history(history_cell::new_warning_event(message));
-        self.request_redraw();
+            this.add_to_history(history_cell::new_warning_event(message));
+            this.request_redraw();
+        });
         self.maybe_send_next_queued_input();
     }
 
     pub(super) fn on_error(&mut self, message: String) {
-        self.finalize_turn();
-        self.move_pending_steers_to_rejected_queue();
-        self.add_to_history(history_cell::new_error_event(message));
-        self.request_redraw();
+        self.with_queue_autosend_suppressed(|this| {
+            this.finalize_turn();
+            this.move_pending_steers_to_rejected_queue();
+            this.add_to_history(history_cell::new_error_event(message));
+            this.request_redraw();
+        });
 
         // After an error ends the turn, try sending the next queued input.
         self.maybe_send_next_queued_input();
     }
 
     pub(super) fn on_cyber_policy_error(&mut self) {
-        self.finalize_turn();
-        self.add_to_history(history_cell::new_cyber_policy_error_event());
-        self.request_redraw();
+        self.with_queue_autosend_suppressed(|this| {
+            this.finalize_turn();
+            this.add_to_history(history_cell::new_cyber_policy_error_event());
+            this.request_redraw();
+        });
 
         // After an error ends the turn, try sending the next queued input.
         self.maybe_send_next_queued_input();
@@ -307,17 +314,19 @@ impl ChatWidget {
     }
 
     pub(super) fn on_paused_turn(&mut self) {
-        self.finalize_turn();
-        if self.is_review_mode {
-            self.is_review_mode = false;
-            self.restore_pre_review_token_info();
-        }
-        self.restore_pending_steers_to_composer_or_reject();
-        self.add_info_message(
-            "Conversation paused.".to_string(),
-            Some("Use `/continue` to resume this turn.".to_string()),
-        );
-        self.request_redraw();
+        self.with_queue_autosend_suppressed(|this| {
+            this.finalize_turn();
+            if this.is_review_mode {
+                this.is_review_mode = false;
+                this.restore_pre_review_token_info();
+            }
+            this.restore_pending_steers_to_composer_or_reject();
+            this.add_info_message(
+                "Conversation paused.".to_string(),
+                Some("Use `/continue` to resume this turn.".to_string()),
+            );
+            this.request_redraw();
+        });
     }
 
     pub(super) fn on_plan_update(&mut self, update: UpdatePlanArgs) {

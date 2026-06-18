@@ -1918,6 +1918,23 @@ async fn abort_gracefully_emits_turn_aborted_only() {
     assert!(rx.try_recv().is_err());
 }
 
+#[tokio::test]
+async fn abort_empty_active_turn_preserves_pending_input() {
+    let (sess, _tc, _rx) = make_session_and_context_with_rx().await;
+    let active_turn = crate::state::ActiveTurn::default();
+    let turn_state = Arc::clone(&active_turn.turn_state);
+    let expected = TurnInput::UserInput {
+        content: steer_text_input("pending steer"),
+        client_id: None,
+    };
+    turn_state.lock().await.push_pending_input(expected.clone());
+    *sess.active_turn.lock().await = Some(active_turn);
+
+    sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
+
+    assert_eq!(sess.get_pending_input().await, vec![expected]);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn task_finish_persists_leftover_pending_input() {
     let (sess, tc, _rx) = make_session_and_context_with_rx().await;

@@ -1022,6 +1022,7 @@ async fn make_chatwidget_manual(
         next_queued_user_message_id: 1,
         queued_edit_state: None,
         suppress_session_configured_redraw: false,
+        suppress_queue_autosend: false,
         pending_notification: None,
         quit_shortcut_expires_at: None,
         quit_shortcut_key: None,
@@ -4812,6 +4813,35 @@ async fn queue_does_not_drain_while_user_turn_is_pending_start() {
         op_rx.try_recv().is_err(),
         "queue should not drain until the pending turn starts or stops"
     );
+}
+
+#[tokio::test]
+async fn queue_autosend_suppression_blocks_intermediate_drain() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.queued_user_messages
+        .push_back(queued_message(1, "queued while restoring"));
+    chat.suppress_queue_autosend = true;
+
+    chat.maybe_send_next_queued_input();
+
+    assert_eq!(chat.queued_user_messages.len(), 1);
+    assert!(op_rx.try_recv().is_err());
+
+    chat.suppress_queue_autosend = false;
+    chat.maybe_send_next_queued_input();
+
+    match next_submit_op(&mut op_rx) {
+        Op::UserTurn { items, .. } => assert_eq!(
+            items,
+            vec![UserInput::Text {
+                text: "queued while restoring".to_string(),
+                text_elements: Vec::new(),
+            }]
+        ),
+        other => panic!("expected Op::UserTurn, got {other:?}"),
+    }
+    assert!(chat.queued_user_messages.is_empty());
 }
 
 #[tokio::test]

@@ -128,6 +128,9 @@ impl ChatWidget {
     }
 
     pub(super) fn maybe_send_next_queued_input(&mut self) {
+        if self.suppress_queue_autosend {
+            return;
+        }
         if self.is_user_turn_pending_or_running()
             || self.queued_edit_state.is_some()
             || !self.bottom_pane.no_modal_or_popup_active()
@@ -172,6 +175,13 @@ impl ChatWidget {
         }
         // Update the list to reflect the remaining queued messages (if any).
         self.refresh_pending_input_preview();
+    }
+
+    pub(super) fn with_queue_autosend_suppressed(&mut self, f: impl FnOnce(&mut Self)) {
+        let previous = self.suppress_queue_autosend;
+        self.suppress_queue_autosend = true;
+        f(self);
+        self.suppress_queue_autosend = previous;
     }
 
     pub(crate) fn submit_user_message_with_mode(

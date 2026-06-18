@@ -120,16 +120,18 @@ impl ChatWidget {
     /// Handle a turn aborted due to user interrupt (Esc).
     /// Keep queued messages in the queue for later.
     pub(super) fn on_interrupted_turn(&mut self, reason: TurnAbortReason) {
-        // Finalize, log a gentle prompt, and clear running state.
-        self.finalize_turn();
-        self.restore_pending_steers_to_composer_or_reject();
+        self.with_queue_autosend_suppressed(|this| {
+            // Finalize, log a gentle prompt, and clear running state.
+            this.finalize_turn();
+            this.restore_pending_steers_to_composer_or_reject();
 
-        if reason != TurnAbortReason::ReviewEnded {
-            self.add_to_history(history_cell::new_error_event(
+            if reason != TurnAbortReason::ReviewEnded {
+                this.add_to_history(history_cell::new_error_event(
                 "Conversation interrupted - tell the model what to do differently. Something went wrong? Hit `/feedback` to report the issue.".to_owned(),
             ));
-        }
+            }
 
-        self.request_redraw();
+            this.request_redraw();
+        });
     }
 }

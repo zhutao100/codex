@@ -437,6 +437,7 @@ pub(crate) struct ChatWidget {
     // When resuming an existing session (selected via resume picker), avoid an
     // immediate redraw on SessionConfigured to prevent a gratuitous UI flicker.
     suppress_session_configured_redraw: bool,
+    suppress_queue_autosend: bool,
     // User messages queued while a turn is in progress
     queued_user_messages: VecDeque<QueuedUserMessage>,
     active_turn_id: Option<String>,

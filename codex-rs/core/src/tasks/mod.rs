@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use futures::future::BoxFuture;
 use tokio::select;
+use tokio::sync::Mutex;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
@@ -44,6 +45,7 @@ use crate::state::PendingContinuationTarget;
 use crate::state::RunningTask;
 use crate::state::TaskKind;
 use crate::state::TurnInput;
+use crate::state::TurnState;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
@@ -86,6 +88,11 @@ fn user_text_messages_for_completed_turn_review(input: &[UserInput]) -> Vec<Stri
 pub(crate) enum TaskStopReason {
     Abort(TurnAbortReason),
     Pause(TurnPauseReason),
+}
+
+struct TakenActiveTasks {
+    tasks: Vec<RunningTask>,
+    turn_state: Arc<Mutex<TurnState>>,
 }
 
 /// Thin wrapper that exposes the parts of [`Session`] task runners need.
@@ -324,9 +331,13 @@ impl Session {
     }
 
     async fn stop_all_tasks(self: &Arc<Self>, reason: TaskStopReason) {
-        for task in self.take_all_running_tasks().await {
+        let Some(taken_tasks) = self.take_all_running_tasks().await else {
+            return;
+        };
+        for task in taken_tasks.tasks {
             self.handle_task_abort(task, reason.clone()).await;
         }
+        taken_tasks.turn_state.lock().await.clear_pending();
         self.close_unified_exec_processes().await;
     }
 
@@ -563,16 +574,21 @@ impl Session {
         *active = Some(turn);
     }
 
-    async fn take_all_running_tasks(&self) -> Vec<RunningTask> {
+    async fn take_all_running_tasks(&self) -> Option<TakenActiveTasks> {
         let mut active = self.active_turn.lock().await;
-        match active.take() {
-            Some(mut at) => {
-                at.clear_pending().await;
-
-                at.drain_tasks()
-            }
-            None => Vec::new(),
+        if active
+            .as_ref()
+            .is_none_or(|active_turn| active_turn.tasks.is_empty())
+        {
+            return None;
         }
+        let mut active_turn = active
+            .take()
+            .expect("active turn with tasks should still be present");
+        Some(TakenActiveTasks {
+            tasks: active_turn.drain_tasks(),
+            turn_state: active_turn.turn_state,
+        })
     }
 
     async fn close_unified_exec_processes(&self) {
