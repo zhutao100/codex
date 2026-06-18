@@ -216,7 +216,7 @@ At most one new turn/task may start per drain call.
 
 - `Plain`: apply the stored model/reasoning overrides when starting the turn.
 - `RunShell`: overrides are not applicable; the queue UI should not offer them for this action.
-- `ParseSlash`: command semantics own model/mode changes. Disable or visibly ignore per-message overrides for recognized command actions. If parsing later falls back to literal user input, apply the stored overrides.
+- `ParseSlash`: command semantics own model/mode changes. The queue UI should not offer per-message overrides for this action; if parsing later falls back to a diagnostic or literal handling path, it should not retain hidden overrides.
 
 Queue editing must retain action and paste metadata when moving between drafts.
 

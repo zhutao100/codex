@@ -97,6 +97,89 @@ pub(super) fn append_text_with_rebased_elements(
     }));
 }
 
+fn build_placeholder_mapping(
+    local_images: Vec<LocalImageAttachment>,
+    next_label: &mut usize,
+) -> (HashMap<String, String>, Vec<LocalImageAttachment>) {
+    let mut mapping = HashMap::new();
+    let mut remapped_images = Vec::new();
+    for attachment in local_images {
+        let new_placeholder = local_image_label_text(*next_label);
+        *next_label += 1;
+        mapping.insert(attachment.placeholder.clone(), new_placeholder.clone());
+        remapped_images.push(LocalImageAttachment {
+            placeholder: new_placeholder,
+            path: attachment.path,
+        });
+    }
+    (mapping, remapped_images)
+}
+
+fn remap_placeholders_in_text(
+    text: String,
+    text_elements: Vec<TextElement>,
+    mapping: &HashMap<String, String>,
+) -> (String, Vec<TextElement>) {
+    if mapping.is_empty() {
+        return (text, text_elements);
+    }
+
+    let mut elements = text_elements;
+    elements.sort_by_key(|element| element.byte_range.start);
+
+    let mut cursor = 0usize;
+    let mut rebuilt = String::new();
+    let mut rebuilt_elements = Vec::new();
+    for mut element in elements {
+        let start = element.byte_range.start.min(text.len());
+        let end = element.byte_range.end.min(text.len());
+        if let Some(segment) = text.get(cursor..start) {
+            rebuilt.push_str(segment);
+        }
+
+        let original = text.get(start..end).unwrap_or("");
+        let placeholder = element.placeholder(&text);
+        let replacement = placeholder
+            .and_then(|placeholder| mapping.get(placeholder))
+            .map(String::as_str)
+            .unwrap_or(original);
+
+        let element_start = rebuilt.len();
+        rebuilt.push_str(replacement);
+        let element_end = rebuilt.len();
+
+        if let Some(remapped) = placeholder.and_then(|placeholder| mapping.get(placeholder)) {
+            element.set_placeholder(Some(remapped.clone()));
+        }
+        element.byte_range = (element_start..element_end).into();
+        rebuilt_elements.push(element);
+        cursor = end;
+    }
+    if let Some(segment) = text.get(cursor..) {
+        rebuilt.push_str(segment);
+    }
+
+    (rebuilt, rebuilt_elements)
+}
+
+fn remap_placeholders_for_message(message: UserMessage, next_label: &mut usize) -> UserMessage {
+    let UserMessage {
+        text,
+        local_images,
+        text_elements,
+        mention_paths,
+    } = message;
+    let (mapping, local_images) = build_placeholder_mapping(local_images, next_label);
+    let (text, text_elements) = remap_placeholders_in_text(text, text_elements, &mapping);
+
+    UserMessage {
+        text,
+        local_images,
+        text_elements,
+        mention_paths,
+    }
+}
+
 pub(super) fn merge_user_messages(messages: impl IntoIterator<Item = UserMessage>) -> UserMessage {
     let mut combined = UserMessage {
         text: String::new(),
@@ -105,18 +188,29 @@ pub(super) fn merge_user_messages(messages: impl IntoIterator<Item = UserMessage
         mention_paths: HashMap::new(),
     };
 
+    let mut next_image_label = 1;
     for (idx, message) in messages.into_iter().enumerate() {
+        let message = remap_placeholders_for_message(message, &mut next_image_label);
         if idx > 0 {
             combined.text.push('\n');
         }
+        let UserMessage {
+            text,
+            local_images,
+            text_elements,
+            mention_paths,
+        } = message;
         append_text_with_rebased_elements(
             &mut combined.text,
             &mut combined.text_elements,
-            &message.text,
-            message.text_elements,
+            &text,
+            text_elements,
         );
-        combined.local_images.extend(message.local_images);
-        combined.mention_paths.extend(message.mention_paths);
+        combined.local_images.extend(local_images);
+        for (name, path) in mention_paths {
+            // Mention paths are keyed by visible name, so keep the first path in text order.
+            combined.mention_paths.entry(name).or_insert(path);
+        }
     }
 
     combined

@@ -2,6 +2,30 @@
 
 use super::*;
 
+fn queued_action_allows_overrides(action: QueuedInputAction) -> bool {
+    matches!(action, QueuedInputAction::Plain)
+}
+
+fn queued_action_meta(action: QueuedInputAction) -> &'static str {
+    match action {
+        QueuedInputAction::Plain => "plain prompt",
+        QueuedInputAction::ParseSlash => "slash command",
+        QueuedInputAction::RunShell => "shell command",
+    }
+}
+
+fn queued_action_override_unavailable_message(action: QueuedInputAction) -> &'static str {
+    match action {
+        QueuedInputAction::Plain => "",
+        QueuedInputAction::ParseSlash => {
+            "Queued slash commands use command behavior; model and thinking overrides apply only to plain queued prompts."
+        }
+        QueuedInputAction::RunShell => {
+            "Queued shell commands run locally and do not use model or thinking overrides."
+        }
+    }
+}
+
 impl ChatWidget {
     pub(super) fn refresh_queued_user_messages(&mut self) {
         self.refresh_pending_input_preview();
@@ -23,6 +47,19 @@ impl ChatWidget {
 
     pub(super) fn send_next_queued_user_message(&mut self) {
         self.maybe_send_next_queued_input();
+    }
+
+    fn queued_user_message_action(&self, id: u64) -> Option<QueuedInputAction> {
+        self.queued_edit_state
+            .as_ref()
+            .and_then(|state| state.drafts.get(&id))
+            .map(|draft| draft.action)
+            .or_else(|| {
+                self.queued_user_messages
+                    .iter()
+                    .find(|message| message.id == id)
+                    .map(|message| message.action)
+            })
     }
 
     pub(super) fn handle_queue_edit_key_event(&mut self, key_event: KeyEvent) -> bool {
@@ -114,17 +151,22 @@ impl ChatWidget {
                     preview = "[image]".to_string();
                 }
 
-                let effective_model = message.model_override.as_deref().unwrap_or(session_model);
-                let effective_effort = message.effort_override.unwrap_or(session_effort);
                 let mut meta_parts: Vec<String> = Vec::new();
                 if !message.local_images.is_empty() {
                     meta_parts.push("img".to_string());
                 }
-                meta_parts.push(format!("model: {effective_model}"));
-                meta_parts.push(format!(
-                    "thinking: {}",
-                    Self::status_line_reasoning_effort_label(effective_effort)
-                ));
+                if queued_action_allows_overrides(message.action) {
+                    let effective_model =
+                        message.model_override.as_deref().unwrap_or(session_model);
+                    let effective_effort = message.effort_override.unwrap_or(session_effort);
+                    meta_parts.push(format!("model: {effective_model}"));
+                    meta_parts.push(format!(
+                        "thinking: {}",
+                        Self::status_line_reasoning_effort_label(effective_effort)
+                    ));
+                } else {
+                    meta_parts.push(queued_action_meta(message.action).to_string());
+                }
 
                 QueuePopupItem {
                     id: message.id,
@@ -261,6 +303,17 @@ impl ChatWidget {
     }
 
     pub(crate) fn open_queue_model_picker(&mut self, id: u64) {
+        let Some(action) = self.queued_user_message_action(id) else {
+            return;
+        };
+        if !queued_action_allows_overrides(action) {
+            self.add_info_message(
+                queued_action_override_unavailable_message(action).to_string(),
+                None,
+            );
+            return;
+        }
+
         let current_override = self
             .queued_edit_state
             .as_ref()
@@ -327,6 +380,17 @@ impl ChatWidget {
     }
 
     pub(crate) fn open_queue_thinking_picker(&mut self, id: u64) {
+        let Some(action) = self.queued_user_message_action(id) else {
+            return;
+        };
+        if !queued_action_allows_overrides(action) {
+            self.add_info_message(
+                queued_action_override_unavailable_message(action).to_string(),
+                None,
+            );
+            return;
+        }
+
         let model_override = self
             .queued_edit_state
             .as_ref()
@@ -454,6 +518,9 @@ impl ChatWidget {
                     }
                 });
             if let Some(mut draft) = base {
+                if !queued_action_allows_overrides(draft.action) {
+                    return;
+                }
                 draft.model_override = model;
                 if let Some(state) = self.queued_edit_state.as_mut() {
                     state.drafts.insert(id, draft);
@@ -471,6 +538,9 @@ impl ChatWidget {
         else {
             return;
         };
+        if !queued_action_allows_overrides(message.action) {
+            return;
+        }
         message.model_override = model;
         self.refresh_queued_user_messages();
         self.request_redraw();
@@ -498,6 +568,9 @@ impl ChatWidget {
                     }
                 });
             if let Some(mut draft) = base {
+                if !queued_action_allows_overrides(draft.action) {
+                    return;
+                }
                 draft.effort_override = effort;
                 if let Some(state) = self.queued_edit_state.as_mut() {
                     state.drafts.insert(id, draft);
@@ -515,6 +588,9 @@ impl ChatWidget {
         else {
             return;
         };
+        if !queued_action_allows_overrides(message.action) {
+            return;
+        }
         message.effort_override = effort;
         self.refresh_queued_user_messages();
         self.request_redraw();
@@ -536,9 +612,14 @@ impl ChatWidget {
                     message.text_elements = draft.text_elements.clone();
                     message.local_images = draft.local_images.clone();
                     message.mention_paths = draft.mention_paths.clone();
-                    message.model_override = draft.model_override.clone();
-                    message.effort_override = draft.effort_override;
                     message.action = draft.action;
+                    if queued_action_allows_overrides(message.action) {
+                        message.model_override = draft.model_override.clone();
+                        message.effort_override = draft.effort_override;
+                    } else {
+                        message.model_override = None;
+                        message.effort_override = None;
+                    }
                     message.pending_pastes = draft.pending_pastes.clone();
                 }
             }
@@ -646,6 +727,11 @@ impl ChatWidget {
             .and_then(|state| state.drafts.get(&id))
             .map(|draft| (draft.model_override.clone(), draft.effort_override))
             .unwrap_or_else(|| (message.model_override.clone(), message.effort_override));
+        let (model_override, effort_override) = if queued_action_allows_overrides(message.action) {
+            (model_override, effort_override)
+        } else {
+            (None, None)
+        };
 
         Some(QueuedUserMessageDraft {
             text: self.bottom_pane.composer_text(),
@@ -670,8 +756,16 @@ impl ChatWidget {
             text_elements: message.text_elements.clone(),
             local_images: message.local_images.clone(),
             mention_paths: message.mention_paths.clone(),
-            model_override: message.model_override.clone(),
-            effort_override: message.effort_override,
+            model_override: if queued_action_allows_overrides(message.action) {
+                message.model_override.clone()
+            } else {
+                None
+            },
+            effort_override: if queued_action_allows_overrides(message.action) {
+                message.effort_override
+            } else {
+                None
+            },
             action: message.action,
             pending_pastes: message.pending_pastes.clone(),
         })
@@ -716,13 +810,19 @@ impl ChatWidget {
             .map(|idx| idx + 1)
             .unwrap_or_default();
 
-        self.bottom_pane.set_footer_hint_override(Some(vec![
+        let mut hints = vec![
             ("Editing".to_string(), format!("{position}/{total}")),
             ("Enter".to_string(), "save".to_string()),
             ("Esc".to_string(), "cancel".to_string()),
             ("Alt+↑/↓".to_string(), "switch".to_string()),
-            ("Alt+M".to_string(), "model".to_string()),
-            ("Alt+T".to_string(), "thinking".to_string()),
-        ]));
+        ];
+        if self
+            .queued_user_message_action(state.selected_id)
+            .is_some_and(queued_action_allows_overrides)
+        {
+            hints.push(("Alt+M".to_string(), "model".to_string()));
+            hints.push(("Alt+T".to_string(), "thinking".to_string()));
+        }
+        self.bottom_pane.set_footer_hint_override(Some(hints));
     }
 }

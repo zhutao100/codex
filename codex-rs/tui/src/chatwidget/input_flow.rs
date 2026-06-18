@@ -31,10 +31,13 @@ impl ChatWidget {
             .queued_user_messages
             .iter()
             .map(|message| {
-                let effective_model = message.model_override.as_deref().unwrap_or(session_model);
-                let effective_effort = message.effort_override.unwrap_or(session_effort);
                 let mut tag = String::new();
-                if message.model_override.is_some() || message.effort_override.is_some() {
+                if matches!(message.action, QueuedInputAction::Plain)
+                    && (message.model_override.is_some() || message.effort_override.is_some())
+                {
+                    let effective_model =
+                        message.model_override.as_deref().unwrap_or(session_model);
+                    let effective_effort = message.effort_override.unwrap_or(session_effort);
                     tag = format!(
                         "[{effective_model} · reasoning {}] ",
                         Self::status_line_reasoning_effort_label(effective_effort)
@@ -103,6 +106,11 @@ impl ChatWidget {
         action: QueuedInputAction,
         pending_pastes: Vec<(String, String)>,
     ) {
+        let (model_override, effort_override) = if matches!(action, QueuedInputAction::Plain) {
+            (model_override, effort_override)
+        } else {
+            (None, None)
+        };
         if !self.is_session_configured()
             || self.is_user_turn_pending_or_running()
             || self.is_review_mode

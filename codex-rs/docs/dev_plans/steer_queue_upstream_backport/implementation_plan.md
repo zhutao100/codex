@@ -161,8 +161,8 @@ Add a TUI/core integration regression:
 5. Expand large-paste placeholders before enqueue for current deferred commands. Preserve unexpanded placeholders only if a future deferred command requires placeholder identity.
 6. Add dequeue handlers for queued slash and shell actions.
 7. Convert `maybe_send_next_queued_input()` into a bounded drain loop that stops after starting a turn/task or opening a blocking UI.
-8. Keep queue ids, reordering, editing, local images, text elements, mention paths, and model/reasoning overrides intact.
-9. Disable model/reasoning override editing for shell/recognized slash actions, or define an explicit fallback-only policy.
+8. Keep queue ids, reordering, editing, local images, text elements, mention paths, and model/reasoning overrides intact for plain queued prompts.
+9. Disable model/reasoning override display and editing for shell and slash command actions.
 
 ### Tests
 
@@ -180,6 +180,7 @@ At dequeue time:
 - an unknown slash diagnostic does not turn into literal model input;
 - a queued shell command runs once;
 - a plain prompt still applies its stored model/reasoning overrides;
+- queued shell and slash commands do not display or accept per-message model/reasoning overrides;
 - at most one turn/task starts per drain call.
 
 ### Acceptance

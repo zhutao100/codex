@@ -4726,6 +4726,109 @@ async fn rejected_steers_merge_into_one_follow_up_turn() {
     assert!(chat.rejected_steer_history_records.is_empty());
 }
 
+#[test]
+fn merged_user_messages_keep_first_mention_path_in_text_order() {
+    let merged = merge_user_messages(vec![
+        UserMessage {
+            text: "$tool first".to_string(),
+            local_images: Vec::new(),
+            text_elements: Vec::new(),
+            mention_paths: HashMap::from([("tool".to_string(), "/tmp/first".to_string())]),
+        },
+        UserMessage {
+            text: "$tool second".to_string(),
+            local_images: Vec::new(),
+            text_elements: Vec::new(),
+            mention_paths: HashMap::from([
+                ("tool".to_string(), "/tmp/second".to_string()),
+                ("other".to_string(), "/tmp/other".to_string()),
+            ]),
+        },
+    ]);
+
+    assert_eq!(
+        merged,
+        UserMessage {
+            text: "$tool first\n$tool second".to_string(),
+            local_images: Vec::new(),
+            text_elements: Vec::new(),
+            mention_paths: HashMap::from([
+                ("tool".to_string(), "/tmp/first".to_string()),
+                ("other".to_string(), "/tmp/other".to_string()),
+            ]),
+        }
+    );
+}
+
+#[tokio::test]
+async fn rejected_steers_merge_relabels_image_placeholders() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(None).await;
+    chat.thread_id = Some(ThreadId::new());
+    let placeholder = "[Image #1]";
+    let first_text = format!("{placeholder} first");
+    let second_text = format!("{placeholder} second");
+    let text_elements = vec![TextElement::new(
+        (0..placeholder.len()).into(),
+        Some(placeholder.to_string()),
+    )];
+    let first_image = PathBuf::from("/tmp/rejected-first.png");
+    let second_image = PathBuf::from("/tmp/rejected-second.png");
+
+    chat.rejected_steers_queue.push_back(UserMessage {
+        text: first_text,
+        local_images: vec![LocalImageAttachment {
+            placeholder: placeholder.to_string(),
+            path: first_image.clone(),
+        }],
+        text_elements: text_elements.clone(),
+        mention_paths: HashMap::from([("first".to_string(), "/tmp/first".to_string())]),
+    });
+    chat.rejected_steer_history_records
+        .push_back(UserMessageHistoryRecord::UserMessageText);
+    chat.rejected_steers_queue.push_back(UserMessage {
+        text: second_text,
+        local_images: vec![LocalImageAttachment {
+            placeholder: placeholder.to_string(),
+            path: second_image.clone(),
+        }],
+        text_elements,
+        mention_paths: HashMap::from([("second".to_string(), "/tmp/second".to_string())]),
+    });
+    chat.rejected_steer_history_records
+        .push_back(UserMessageHistoryRecord::UserMessageText);
+
+    chat.maybe_send_next_queued_input();
+
+    let second_placeholder = "[Image #2]";
+    let merged_text = format!("{placeholder} first\n{second_placeholder} second");
+    let second_start = placeholder.len() + " first\n".len();
+    match next_submit_op(&mut op_rx) {
+        Op::UserTurn { items, .. } => assert_eq!(
+            items,
+            vec![
+                UserInput::LocalImage { path: first_image },
+                UserInput::LocalImage { path: second_image },
+                UserInput::Text {
+                    text: merged_text,
+                    text_elements: vec![
+                        TextElement::new(
+                            (0..placeholder.len()).into(),
+                            Some(placeholder.to_string()),
+                        ),
+                        TextElement::new(
+                            (second_start..second_start + second_placeholder.len()).into(),
+                            Some(second_placeholder.to_string()),
+                        ),
+                    ],
+                },
+            ]
+        ),
+        other => panic!("expected Op::UserTurn, got {other:?}"),
+    }
+    assert!(chat.rejected_steers_queue.is_empty());
+    assert!(chat.rejected_steer_history_records.is_empty());
+}
+
 #[tokio::test]
 async fn queued_slash_command_dispatches_on_drain() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
@@ -4741,6 +4844,44 @@ async fn queued_slash_command_dispatches_on_drain() {
 
     assert_matches!(rx.try_recv(), Ok(AppEvent::CodexOp(Op::Compact)));
     assert!(chat.queued_user_messages.is_empty());
+}
+
+#[tokio::test]
+async fn deferred_command_queue_entries_hide_and_ignore_overrides() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.queued_user_messages
+        .push_back(queued_message_with_action(
+            1,
+            "!pwd",
+            QueuedInputAction::RunShell,
+        ));
+    chat.queued_user_messages
+        .push_back(queued_message_with_action(
+            2,
+            "/compact",
+            QueuedInputAction::ParseSlash,
+        ));
+
+    let items = chat.queue_popup_items();
+    assert_eq!(items[0].meta.as_deref(), Some("shell command"));
+    assert_eq!(items[1].meta.as_deref(), Some("slash command"));
+
+    chat.set_queued_user_message_model_override(1, Some("other-model".to_string()));
+    chat.set_queued_user_message_thinking_override(2, Some(Some(ReasoningEffortConfig::High)));
+
+    assert_eq!(chat.queued_user_messages[0].model_override, None);
+    assert_eq!(chat.queued_user_messages[1].effort_override, None);
+
+    chat.open_queue_model_picker(1);
+    chat.open_queue_thinking_picker(2);
+
+    let rendered = drain_insert_history(&mut rx)
+        .into_iter()
+        .map(|lines| lines_to_single_string(&lines))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("Queued shell commands run locally"));
+    assert!(rendered.contains("Queued slash commands use command behavior"));
 }
 
 #[tokio::test]
