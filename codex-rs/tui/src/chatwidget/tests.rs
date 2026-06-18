@@ -4696,6 +4696,36 @@ async fn rejected_steer_drains_before_normal_queue() {
 }
 
 #[tokio::test]
+async fn rejected_steers_merge_into_one_follow_up_turn() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.rejected_steers_queue
+        .push_back(UserMessage::from("first rejected"));
+    chat.rejected_steer_history_records
+        .push_back(UserMessageHistoryRecord::UserMessageText);
+    chat.rejected_steers_queue
+        .push_back(UserMessage::from("second rejected"));
+    chat.rejected_steer_history_records
+        .push_back(UserMessageHistoryRecord::UserMessageText);
+
+    chat.maybe_send_next_queued_input();
+
+    let op = next_submit_op(&mut op_rx);
+    match op {
+        Op::UserTurn { items, .. } => assert_eq!(
+            items,
+            vec![UserInput::Text {
+                text: "first rejected\nsecond rejected".to_string(),
+                text_elements: Vec::new(),
+            }]
+        ),
+        other => panic!("expected Op::UserTurn, got {other:?}"),
+    }
+    assert!(chat.rejected_steers_queue.is_empty());
+    assert!(chat.rejected_steer_history_records.is_empty());
+}
+
+#[tokio::test]
 async fn queued_slash_command_dispatches_on_drain() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
     chat.thread_id = Some(ThreadId::new());

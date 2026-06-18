@@ -125,9 +125,16 @@ impl ChatWidget {
             && self.queued_edit_state.is_none()
             && self.bottom_pane.no_modal_or_popup_active()
         {
-            if let Some(rejected) = self.rejected_steers_queue.pop_front() {
-                self.rejected_steer_history_records.pop_front();
-                self.submit_user_message(rejected);
+            if !self.rejected_steers_queue.is_empty() {
+                let mut rejected_messages = Vec::new();
+                while let Some(message) = self.rejected_steers_queue.pop_front() {
+                    let history_record = self
+                        .rejected_steer_history_records
+                        .pop_front()
+                        .unwrap_or(UserMessageHistoryRecord::UserMessageText);
+                    rejected_messages.push(user_message_for_history(message, &history_record));
+                }
+                self.submit_user_message(merge_user_messages(rejected_messages));
                 break;
             }
             let Some(queued) = self.queued_user_messages.pop_front() else {
