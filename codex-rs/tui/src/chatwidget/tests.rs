@@ -4815,6 +4815,86 @@ async fn queue_does_not_drain_while_user_turn_is_pending_start() {
 }
 
 #[tokio::test]
+async fn submitted_input_queues_while_plan_stream_is_still_rendering() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.bottom_pane.set_steer_enabled(true);
+    chat.bottom_pane.set_task_running(true);
+    chat.plan_stream_controller = Some(crate::streaming::controller::PlanStreamController::new(
+        None,
+    ));
+    chat.bottom_pane
+        .set_composer_text("follow up".to_string(), Vec::new(), Vec::new());
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert_eq!(chat.queued_user_messages.len(), 1);
+    assert_eq!(chat.queued_user_messages[0].text, "follow up");
+    assert!(
+        op_rx.try_recv().is_err(),
+        "plan stream rendering should defer submitted input"
+    );
+}
+
+#[tokio::test]
+async fn submitted_input_queues_while_only_user_shell_is_running() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.active_turn_id = Some("turn-1".to_string());
+    chat.agent_turn_running = true;
+    chat.bottom_pane.set_steer_enabled(true);
+    chat.bottom_pane.set_task_running(true);
+    chat.running_commands.insert(
+        "shell-1".to_string(),
+        RunningCommand {
+            command: vec!["echo".to_string(), "hi".to_string()],
+            parsed_cmd: Vec::new(),
+            source: ExecCommandSource::UserShell,
+        },
+    );
+    chat.bottom_pane
+        .set_composer_text("follow up".to_string(), Vec::new(), Vec::new());
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert_eq!(chat.queued_user_messages.len(), 1);
+    assert_eq!(chat.queued_user_messages[0].text, "follow up");
+    assert!(chat.pending_steers.is_empty());
+    assert!(
+        op_rx.try_recv().is_err(),
+        "plain input should not steer while only user shell commands are running"
+    );
+}
+
+#[tokio::test]
+async fn user_shell_prompt_still_runs_while_user_shell_is_running() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.active_turn_id = Some("turn-1".to_string());
+    chat.agent_turn_running = true;
+    chat.bottom_pane.set_steer_enabled(true);
+    chat.bottom_pane.set_task_running(true);
+    chat.running_commands.insert(
+        "shell-1".to_string(),
+        RunningCommand {
+            command: vec!["echo".to_string(), "hi".to_string()],
+            parsed_cmd: Vec::new(),
+            source: ExecCommandSource::UserShell,
+        },
+    );
+    chat.bottom_pane
+        .set_composer_text("!pwd".to_string(), Vec::new(), Vec::new());
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert!(chat.queued_user_messages.is_empty());
+    assert_matches!(
+        op_rx.try_recv(),
+        Ok(Op::RunUserShellCommand { command }) if command == "pwd"
+    );
+}
+
+#[tokio::test]
 async fn pause_after_pending_steer_restores_steer_to_composer() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
     chat.thread_id = Some(ThreadId::new());

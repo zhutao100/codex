@@ -509,7 +509,15 @@ impl ChatWidget {
                         text_elements,
                         mention_paths: self.bottom_pane.take_mention_paths(),
                     };
-                    if self.is_session_configured() {
+                    let should_submit_now =
+                        self.is_session_configured() && !self.is_plan_streaming_in_tui();
+                    if should_submit_now {
+                        if self.only_user_shell_commands_running()
+                            && !user_message.text.starts_with('!')
+                        {
+                            self.queue_user_message(user_message);
+                            return;
+                        }
                         // Submitted is only emitted when steer is enabled (Enter sends immediately).
                         // Reset any reasoning header only when we are actually submitting a turn.
                         self.reasoning_buffer.clear();
