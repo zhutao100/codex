@@ -3,6 +3,34 @@
 use super::*;
 
 impl ChatWidget {
+    fn submit_shell_command(&mut self, command: &str) -> QueueDrain {
+        let cmd = command.trim();
+        if cmd.is_empty() {
+            self.app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
+                history_cell::new_info_event(
+                    USER_SHELL_COMMAND_HELP_TITLE.to_string(),
+                    Some(USER_SHELL_COMMAND_HELP_HINT.to_string()),
+                ),
+            )));
+            QueueDrain::Continue
+        } else {
+            self.submit_op(Op::RunUserShellCommand {
+                command: cmd.to_string(),
+            });
+            QueueDrain::Stop
+        }
+    }
+
+    pub(super) fn submit_queued_shell_prompt(&mut self, queued: QueuedUserMessage) -> QueueDrain {
+        match queued.text.strip_prefix('!') {
+            Some(command) => self.submit_shell_command(command),
+            None => {
+                self.submit_queued_user_message(queued);
+                QueueDrain::Stop
+            }
+        }
+    }
+
     pub(super) fn submit_user_message(&mut self, user_message: UserMessage) {
         self.submit_user_message_with_overrides(user_message, None, None);
     }
@@ -25,6 +53,8 @@ impl ChatWidget {
                 mention_paths: user_message.mention_paths,
                 model_override,
                 effort_override,
+                action: QueuedInputAction::Plain,
+                pending_pastes: Vec::new(),
             };
             self.queued_user_messages.push_front(queued);
             self.refresh_queued_user_messages();
@@ -49,19 +79,7 @@ impl ChatWidget {
 
         // Special-case: "!cmd" executes a local shell command instead of sending to the model.
         if let Some(stripped) = text.strip_prefix('!') {
-            let cmd = stripped.trim();
-            if cmd.is_empty() {
-                self.app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
-                    history_cell::new_info_event(
-                        USER_SHELL_COMMAND_HELP_TITLE.to_string(),
-                        Some(USER_SHELL_COMMAND_HELP_HINT.to_string()),
-                    ),
-                )));
-                return;
-            }
-            self.submit_op(Op::RunUserShellCommand {
-                command: cmd.to_string(),
-            });
+            self.submit_shell_command(stripped);
             return;
         }
 

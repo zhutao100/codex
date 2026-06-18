@@ -55,7 +55,16 @@ impl ChatWidget {
     }
 
     pub(super) fn queue_user_message(&mut self, user_message: UserMessage) {
-        self.queue_user_message_with_overrides(user_message, None, None);
+        self.queue_user_message_with_action(user_message, QueuedInputAction::Plain, Vec::new());
+    }
+
+    pub(super) fn queue_user_message_with_action(
+        &mut self,
+        user_message: UserMessage,
+        action: QueuedInputAction,
+        pending_pastes: Vec<(String, String)>,
+    ) {
+        self.queue_user_message_with_options(user_message, None, None, action, pending_pastes);
     }
 
     pub(super) fn queue_user_message_with_overrides(
@@ -63,6 +72,23 @@ impl ChatWidget {
         user_message: UserMessage,
         model_override: Option<String>,
         effort_override: Option<Option<ReasoningEffortConfig>>,
+    ) {
+        self.queue_user_message_with_options(
+            user_message,
+            model_override,
+            effort_override,
+            QueuedInputAction::Plain,
+            Vec::new(),
+        );
+    }
+
+    pub(super) fn queue_user_message_with_options(
+        &mut self,
+        user_message: UserMessage,
+        model_override: Option<String>,
+        effort_override: Option<Option<ReasoningEffortConfig>>,
+        action: QueuedInputAction,
+        pending_pastes: Vec<(String, String)>,
     ) {
         if !self.is_session_configured()
             || self.is_user_turn_pending_or_running()
@@ -78,6 +104,8 @@ impl ChatWidget {
                 mention_paths: user_message.mention_paths,
                 model_override,
                 effort_override,
+                action,
+                pending_pastes,
             };
             self.queued_user_messages.push_back(queued);
             self.refresh_pending_input_preview();
@@ -93,11 +121,34 @@ impl ChatWidget {
         {
             return;
         }
-        if let Some(rejected) = self.rejected_steers_queue.pop_front() {
-            self.rejected_steer_history_records.pop_front();
-            self.submit_user_message(rejected);
-        } else if let Some(queued) = self.queued_user_messages.pop_front() {
-            self.submit_queued_user_message(queued);
+        while !self.is_user_turn_pending_or_running()
+            && self.queued_edit_state.is_none()
+            && self.bottom_pane.no_modal_or_popup_active()
+        {
+            if let Some(rejected) = self.rejected_steers_queue.pop_front() {
+                self.rejected_steer_history_records.pop_front();
+                self.submit_user_message(rejected);
+                break;
+            }
+            let Some(queued) = self.queued_user_messages.pop_front() else {
+                break;
+            };
+            match queued.action {
+                QueuedInputAction::Plain => {
+                    self.submit_queued_user_message(queued);
+                    break;
+                }
+                QueuedInputAction::ParseSlash => {
+                    if self.submit_queued_slash_prompt(queued) == QueueDrain::Stop {
+                        break;
+                    }
+                }
+                QueuedInputAction::RunShell => {
+                    if self.submit_queued_shell_prompt(queued) == QueueDrain::Stop {
+                        break;
+                    }
+                }
+            }
         }
         // Update the list to reflect the remaining queued messages (if any).
         self.refresh_pending_input_preview();

@@ -127,7 +127,10 @@ pub(crate) enum CancellationEvent {
 pub(crate) use chat_composer::ChatComposer;
 pub(crate) use chat_composer::ChatComposerConfig;
 pub(crate) use chat_composer::InputResult;
+pub(crate) use chat_composer::QueuedInputAction;
 use codex_protocol::custom_prompts::CustomPrompt;
+pub(crate) use prompt_args::parse_slash_name;
+pub(crate) use slash_commands::find_builtin_command;
 
 use crate::status_indicator_widget::StatusIndicatorWidget;
 pub(crate) use experimental_features_view::ExperimentalFeatureItem;
@@ -530,6 +533,14 @@ impl BottomPane {
 
     pub(crate) fn composer_text_with_pending(&self) -> String {
         self.composer.current_text_with_pending()
+    }
+
+    pub(crate) fn composer_pending_pastes(&self) -> Vec<(String, String)> {
+        self.composer.pending_pastes()
+    }
+
+    pub(crate) fn set_composer_pending_pastes(&mut self, pending_pastes: Vec<(String, String)>) {
+        self.composer.set_pending_pastes(pending_pastes);
     }
 
     pub(crate) fn apply_external_edit(&mut self, text: String) {

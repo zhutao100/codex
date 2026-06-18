@@ -131,6 +131,8 @@ pub(super) struct QueuedUserMessage {
     pub(super) mention_paths: HashMap<String, String>,
     pub(super) model_override: Option<String>,
     pub(super) effort_override: Option<Option<ReasoningEffortConfig>>,
+    pub(super) action: QueuedInputAction,
+    pub(super) pending_pastes: Vec<(String, String)>,
 }
 
 #[derive(Clone)]
@@ -139,6 +141,7 @@ pub(super) struct QueuedComposerSnapshot {
     pub(super) text_elements: Vec<TextElement>,
     pub(super) local_images: Vec<LocalImageAttachment>,
     pub(super) mention_paths: HashMap<String, String>,
+    pub(super) pending_pastes: Vec<(String, String)>,
 }
 
 #[derive(Clone)]
@@ -149,6 +152,14 @@ pub(super) struct QueuedUserMessageDraft {
     pub(super) mention_paths: HashMap<String, String>,
     pub(super) model_override: Option<String>,
     pub(super) effort_override: Option<Option<ReasoningEffortConfig>>,
+    pub(super) action: QueuedInputAction,
+    pub(super) pending_pastes: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum QueueDrain {
+    Continue,
+    Stop,
 }
 
 pub(super) struct QueuedEditState {

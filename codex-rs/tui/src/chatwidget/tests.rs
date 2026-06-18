@@ -488,6 +488,8 @@ async fn interrupted_turn_keeps_queued_messages_with_images_and_elements() {
         mention_paths: HashMap::new(),
         model_override: None,
         effort_override: None,
+        action: QueuedInputAction::Plain,
+        pending_pastes: Vec::new(),
     });
     chat.queued_user_messages.push_back(QueuedUserMessage {
         id: 2,
@@ -500,6 +502,8 @@ async fn interrupted_turn_keeps_queued_messages_with_images_and_elements() {
         mention_paths: HashMap::new(),
         model_override: None,
         effort_override: None,
+        action: QueuedInputAction::Plain,
+        pending_pastes: Vec::new(),
     });
     chat.refresh_queued_user_messages();
 
@@ -1940,7 +1944,19 @@ fn queued_message(id: u64, text: impl Into<String>) -> QueuedUserMessage {
         mention_paths: HashMap::new(),
         model_override: None,
         effort_override: None,
+        action: QueuedInputAction::Plain,
+        pending_pastes: Vec::new(),
     }
+}
+
+fn queued_message_with_action(
+    id: u64,
+    text: impl Into<String>,
+    action: QueuedInputAction,
+) -> QueuedUserMessage {
+    let mut message = queued_message(id, text);
+    message.action = action;
+    message
 }
 
 #[tokio::test]
@@ -4677,6 +4693,78 @@ async fn rejected_steer_drains_before_normal_queue() {
     }
     assert!(chat.rejected_steers_queue.is_empty());
     assert_eq!(chat.queued_user_messages.len(), 1);
+}
+
+#[tokio::test]
+async fn queued_slash_command_dispatches_on_drain() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.queued_user_messages
+        .push_back(queued_message_with_action(
+            1,
+            "/compact",
+            QueuedInputAction::ParseSlash,
+        ));
+
+    chat.maybe_send_next_queued_input();
+
+    assert_matches!(rx.try_recv(), Ok(AppEvent::CodexOp(Op::Compact)));
+    assert!(chat.queued_user_messages.is_empty());
+}
+
+#[tokio::test]
+async fn queued_unknown_slash_reports_and_continues_to_next_message() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.queued_user_messages
+        .push_back(queued_message_with_action(
+            1,
+            "/does-not-exist",
+            QueuedInputAction::ParseSlash,
+        ));
+    chat.queued_user_messages
+        .push_back(queued_message(2, "after unknown"));
+
+    chat.maybe_send_next_queued_input();
+
+    let cells = drain_insert_history(&mut rx);
+    let rendered = cells
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("Unrecognized command '/does-not-exist'"));
+    match next_submit_op(&mut op_rx) {
+        Op::UserTurn { items, .. } => assert_eq!(
+            items,
+            vec![UserInput::Text {
+                text: "after unknown".to_string(),
+                text_elements: Vec::new(),
+            }]
+        ),
+        other => panic!("expected Op::UserTurn, got {other:?}"),
+    }
+    assert!(chat.queued_user_messages.is_empty());
+}
+
+#[tokio::test]
+async fn queued_shell_prompt_runs_on_drain() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.queued_user_messages
+        .push_back(queued_message_with_action(
+            1,
+            "!echo hi",
+            QueuedInputAction::RunShell,
+        ));
+
+    chat.maybe_send_next_queued_input();
+
+    assert_matches!(
+        op_rx.try_recv(),
+        Ok(Op::RunUserShellCommand { command }) if command == "echo hi"
+    );
+    assert!(chat.queued_user_messages.is_empty());
 }
 
 #[tokio::test]

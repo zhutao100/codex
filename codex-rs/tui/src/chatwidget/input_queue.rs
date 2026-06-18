@@ -22,19 +22,7 @@ impl ChatWidget {
     }
 
     pub(super) fn send_next_queued_user_message(&mut self) {
-        if self.is_user_turn_pending_or_running()
-            || self.queued_edit_state.is_some()
-            || !self.bottom_pane.no_modal_or_popup_active()
-        {
-            return;
-        }
-        if let Some(rejected) = self.rejected_steers_queue.pop_front() {
-            self.rejected_steer_history_records.pop_front();
-            self.submit_user_message(rejected);
-        } else if let Some(queued) = self.queued_user_messages.pop_front() {
-            self.submit_queued_user_message(queued);
-        }
-        self.refresh_pending_input_preview();
+        self.maybe_send_next_queued_input();
     }
 
     pub(super) fn handle_queue_edit_key_event(&mut self, key_event: KeyEvent) -> bool {
@@ -188,6 +176,7 @@ impl ChatWidget {
             text_elements: self.bottom_pane.composer_text_elements(),
             local_images: self.bottom_pane.composer_local_images(),
             mention_paths: self.bottom_pane.composer_mention_paths(),
+            pending_pastes: self.bottom_pane.composer_pending_pastes(),
         };
 
         self.queued_edit_state = Some(QueuedEditState {
@@ -549,6 +538,8 @@ impl ChatWidget {
                     message.mention_paths = draft.mention_paths.clone();
                     message.model_override = draft.model_override.clone();
                     message.effort_override = draft.effort_override;
+                    message.action = draft.action;
+                    message.pending_pastes = draft.pending_pastes.clone();
                 }
             }
         }
@@ -566,6 +557,8 @@ impl ChatWidget {
             local_image_paths,
             state.composer_before_edit.mention_paths,
         );
+        self.bottom_pane
+            .set_composer_pending_pastes(state.composer_before_edit.pending_pastes);
 
         self.refresh_queued_user_messages();
         self.request_redraw();
@@ -634,6 +627,8 @@ impl ChatWidget {
             local_image_paths,
             draft.mention_paths,
         );
+        self.bottom_pane
+            .set_composer_pending_pastes(draft.pending_pastes);
         self.update_queue_edit_footer_hint();
         self.refresh_queued_user_messages();
         self.request_redraw();
@@ -659,6 +654,8 @@ impl ChatWidget {
             mention_paths: self.bottom_pane.composer_mention_paths(),
             model_override,
             effort_override,
+            action: message.action,
+            pending_pastes: self.bottom_pane.composer_pending_pastes(),
         })
     }
 
@@ -675,6 +672,8 @@ impl ChatWidget {
             mention_paths: message.mention_paths.clone(),
             model_override: message.model_override.clone(),
             effort_override: message.effort_override,
+            action: message.action,
+            pending_pastes: message.pending_pastes.clone(),
         })
     }
 
@@ -700,6 +699,8 @@ impl ChatWidget {
             local_image_paths,
             draft.mention_paths,
         );
+        self.bottom_pane
+            .set_composer_pending_pastes(draft.pending_pastes);
     }
 
     pub(super) fn update_queue_edit_footer_hint(&mut self) {

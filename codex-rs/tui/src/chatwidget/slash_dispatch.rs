@@ -767,6 +767,280 @@ impl ChatWidget {
         }
     }
 
+    pub(super) fn submit_queued_slash_prompt(
+        &mut self,
+        mut queued: QueuedUserMessage,
+    ) -> QueueDrain {
+        if !queued.pending_pastes.is_empty() {
+            let (expanded, expanded_elements) = ChatComposer::expand_pending_pastes(
+                &queued.text,
+                queued.text_elements,
+                &queued.pending_pastes,
+            );
+            queued.text = expanded;
+            queued.text_elements = expanded_elements;
+            queued.pending_pastes.clear();
+        }
+
+        let Some((name, rest, rest_offset)) = parse_slash_name(&queued.text) else {
+            self.submit_queued_user_message(queued);
+            return QueueDrain::Stop;
+        };
+
+        if name.contains('/') {
+            self.submit_queued_user_message(queued);
+            return QueueDrain::Stop;
+        }
+
+        let Some(cmd) = self.find_queued_builtin_command(name) else {
+            self.add_info_message(
+                format!(
+                    r#"Unrecognized command '/{name}'. Type "/" for a list of supported commands."#
+                ),
+                None,
+            );
+            return QueueDrain::Continue;
+        };
+
+        if rest.is_empty() {
+            self.dispatch_command(cmd);
+            return self.queued_command_drain_result(cmd);
+        }
+
+        if !cmd.supports_inline_args() {
+            self.submit_queued_user_message(queued);
+            return QueueDrain::Stop;
+        }
+
+        let trimmed_start = rest.trim_start();
+        let leading_trimmed = rest.len().saturating_sub(trimmed_start.len());
+        let trimmed_rest = trimmed_start.trim_end().to_string();
+        let args_elements = Self::slash_command_args_elements(
+            &trimmed_rest,
+            rest_offset + leading_trimmed,
+            &queued.text_elements,
+        );
+
+        match cmd {
+            SlashCommand::Review if !trimmed_rest.is_empty() => {
+                self.submit_op(Op::Review {
+                    review_request: ReviewRequest {
+                        target: ReviewTarget::Custom {
+                            instructions: trimmed_rest,
+                        },
+                        user_facing_hint: None,
+                    },
+                });
+                QueueDrain::Stop
+            }
+            SlashCommand::Rename if !trimmed_rest.is_empty() => {
+                let Some(name) = codex_core::util::normalize_thread_name(&trimmed_rest) else {
+                    self.add_error_message("Thread name cannot be empty.".to_string());
+                    return QueueDrain::Continue;
+                };
+                self.app_event_tx
+                    .send(AppEvent::CodexOp(Op::SetThreadName { name }));
+                QueueDrain::Continue
+            }
+            SlashCommand::Plan if !trimmed_rest.is_empty() => {
+                self.dispatch_command(cmd);
+                if self.active_mode_kind() != ModeKind::Plan {
+                    return self.queued_command_drain_result(cmd);
+                }
+                let user_message = UserMessage {
+                    text: trimmed_rest,
+                    local_images: queued.local_images,
+                    text_elements: args_elements,
+                    mention_paths: queued.mention_paths,
+                };
+                self.submit_user_message(user_message);
+                QueueDrain::Stop
+            }
+            SlashCommand::Export if !trimmed_rest.is_empty() => {
+                match parse_export_args(&trimmed_rest, &self.config.cwd) {
+                    Ok(parsed) => self.start_export(parsed.format, parsed.overrides),
+                    Err(message) => self.add_error_message(message),
+                }
+                QueueDrain::Stop
+            }
+            SlashCommand::Diff => {
+                let diff_view =
+                    match diff_view_override_from_args(&trimmed_rest, self.config.diff_view) {
+                        Ok(view) => view,
+                        Err(message) => {
+                            self.add_error_message(message);
+                            return QueueDrain::Continue;
+                        }
+                    };
+                self.add_diff_in_progress();
+                let tx = self.app_event_tx.clone();
+                let cwd = self.config.cwd.clone();
+                let syntax_theme = self.config.tui_syntax_highlight_theme.clone();
+                let width = self.last_rendered_width.get().unwrap_or(80);
+                tokio::spawn(async move {
+                    let result = match get_git_diff(&cwd, diff_view, width, &syntax_theme).await {
+                        Ok(result) => result,
+                        Err(e) => GitDiffResult::Error(format!("Failed to compute diff: {e}")),
+                    };
+                    tx.send(AppEvent::DiffResult(result));
+                });
+                QueueDrain::Continue
+            }
+            SlashCommand::LegendMode => match parse_progress_legend_mode(&trimmed_rest) {
+                Ok(mode) => {
+                    self.app_event_tx
+                        .send(AppEvent::SetProgressLegendMode { mode });
+                    QueueDrain::Continue
+                }
+                Err(err) => {
+                    self.add_error_message(err);
+                    QueueDrain::Continue
+                }
+            },
+            SlashCommand::Feedback
+            | SlashCommand::New
+            | SlashCommand::Resume
+            | SlashCommand::Session
+            | SlashCommand::Archived
+            | SlashCommand::Fork
+            | SlashCommand::Init
+            | SlashCommand::Compact
+            | SlashCommand::Pause
+            | SlashCommand::Continue
+            | SlashCommand::Review
+            | SlashCommand::ReviewCompletedTurn
+            | SlashCommand::Rename
+            | SlashCommand::Export
+            | SlashCommand::Model
+            | SlashCommand::Personality
+            | SlashCommand::Plan
+            | SlashCommand::Collab
+            | SlashCommand::Agent
+            | SlashCommand::Approvals
+            | SlashCommand::Permissions
+            | SlashCommand::ElevateSandbox
+            | SlashCommand::Experimental
+            | SlashCommand::Copy
+            | SlashCommand::Mention
+            | SlashCommand::CopyCodeBlock
+            | SlashCommand::CopyMessage
+            | SlashCommand::Skills
+            | SlashCommand::Status
+            | SlashCommand::DebugConfig
+            | SlashCommand::Statusline
+            | SlashCommand::Legend
+            | SlashCommand::Mcp
+            | SlashCommand::Apps
+            | SlashCommand::Queue
+            | SlashCommand::Logout
+            | SlashCommand::Quit
+            | SlashCommand::Exit
+            | SlashCommand::Rollout
+            | SlashCommand::Ps
+            | SlashCommand::TestApproval => {
+                self.submit_queued_user_message(queued);
+                QueueDrain::Stop
+            }
+        }
+    }
+
+    fn find_queued_builtin_command(&self, name: &str) -> Option<SlashCommand> {
+        #[cfg(target_os = "windows")]
+        let allow_elevate_sandbox = {
+            let windows_sandbox_level = WindowsSandboxLevel::from_config(&self.config);
+            matches!(windows_sandbox_level, WindowsSandboxLevel::RestrictedToken)
+        };
+        #[cfg(not(target_os = "windows"))]
+        let allow_elevate_sandbox = false;
+
+        find_builtin_command(
+            name,
+            self.collaboration_modes_enabled(),
+            self.connectors_enabled(),
+            self.config.features.enabled(Feature::Personality),
+            allow_elevate_sandbox,
+        )
+    }
+
+    fn queued_command_drain_result(&self, cmd: SlashCommand) -> QueueDrain {
+        if self.is_user_turn_pending_or_running() || !self.bottom_pane.no_modal_or_popup_active() {
+            return QueueDrain::Stop;
+        }
+
+        match cmd {
+            SlashCommand::Status
+            | SlashCommand::DebugConfig
+            | SlashCommand::LegendMode
+            | SlashCommand::Ps
+            | SlashCommand::Mcp
+            | SlashCommand::Apps
+            | SlashCommand::Queue
+            | SlashCommand::Rollout
+            | SlashCommand::Copy
+            | SlashCommand::Diff
+            | SlashCommand::Rename
+            | SlashCommand::Pause
+            | SlashCommand::Continue
+            | SlashCommand::TestApproval => QueueDrain::Continue,
+            SlashCommand::Feedback
+            | SlashCommand::New
+            | SlashCommand::Resume
+            | SlashCommand::Session
+            | SlashCommand::Archived
+            | SlashCommand::Fork
+            | SlashCommand::Init
+            | SlashCommand::Compact
+            | SlashCommand::Review
+            | SlashCommand::ReviewCompletedTurn
+            | SlashCommand::Export
+            | SlashCommand::Model
+            | SlashCommand::Personality
+            | SlashCommand::Plan
+            | SlashCommand::Collab
+            | SlashCommand::Agent
+            | SlashCommand::Approvals
+            | SlashCommand::Permissions
+            | SlashCommand::ElevateSandbox
+            | SlashCommand::Experimental
+            | SlashCommand::Mention
+            | SlashCommand::CopyCodeBlock
+            | SlashCommand::CopyMessage
+            | SlashCommand::Skills
+            | SlashCommand::Statusline
+            | SlashCommand::Legend
+            | SlashCommand::Logout
+            | SlashCommand::Quit
+            | SlashCommand::Exit => QueueDrain::Stop,
+        }
+    }
+
+    fn slash_command_args_elements(
+        rest: &str,
+        rest_offset: usize,
+        text_elements: &[TextElement],
+    ) -> Vec<TextElement> {
+        if rest.is_empty() || text_elements.is_empty() {
+            return Vec::new();
+        }
+        text_elements
+            .iter()
+            .filter_map(|elem| {
+                if elem.byte_range.end <= rest_offset {
+                    return None;
+                }
+                let start = elem.byte_range.start.saturating_sub(rest_offset);
+                let mut end = elem.byte_range.end.saturating_sub(rest_offset);
+                if start >= rest.len() {
+                    return None;
+                }
+                end = end.min(rest.len());
+                (start < end).then_some(
+                    elem.map_range(|_| codex_protocol::user_input::ByteRange { start, end }),
+                )
+            })
+            .collect()
+    }
+
     pub(super) fn open_export_picker(&mut self) {
         if self.current_rollout_path.is_none() {
             self.add_info_message("Export is not available yet.".to_string(), None);

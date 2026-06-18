@@ -55,6 +55,8 @@ impl ChatWidget {
             mention_paths: user_message.mention_paths,
             model_override: None,
             effort_override: None,
+            action: QueuedInputAction::Plain,
+            pending_pastes: Vec::new(),
         });
         self.refresh_pending_input_preview();
         true

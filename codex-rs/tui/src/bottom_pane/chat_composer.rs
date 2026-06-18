@@ -195,10 +195,19 @@ pub enum InputResult {
     Queued {
         text: String,
         text_elements: Vec<TextElement>,
+        action: QueuedInputAction,
+        pending_pastes: Vec<(String, String)>,
     },
     Command(SlashCommand),
     CommandWithArgs(SlashCommand, String, Vec<TextElement>),
     None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueuedInputAction {
+    Plain,
+    ParseSlash,
+    RunShell,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1877,6 +1886,14 @@ impl ChatComposer {
         &mut self,
         record_history: bool,
     ) -> Option<(String, Vec<TextElement>)> {
+        self.prepare_submission_text_with_slash_validation(record_history, true)
+    }
+
+    fn prepare_submission_text_with_slash_validation(
+        &mut self,
+        record_history: bool,
+        validate_slash_commands: bool,
+    ) -> Option<(String, Vec<TextElement>)> {
         let mut text = self.textarea.text().to_string();
         let original_input = text.clone();
         let original_text_elements = self.textarea.text_elements();
@@ -1904,7 +1921,8 @@ impl ChatComposer {
         text = text.trim().to_string();
         text_elements = Self::trim_text_elements(&expanded_input, &text, text_elements);
 
-        if self.slash_commands_enabled()
+        if validate_slash_commands
+            && self.slash_commands_enabled()
             && let Some((name, _rest, _rest_offset)) = parse_slash_name(&text)
         {
             let treat_as_plain_text = input_starts_with_space || name.contains('/');
@@ -1945,7 +1963,7 @@ impl ChatComposer {
             }
         }
 
-        if self.slash_commands_enabled() {
+        if validate_slash_commands && self.slash_commands_enabled() {
             let expanded_prompt =
                 match expand_custom_prompt(&text, &text_elements, &self.custom_prompts) {
                     Ok(expanded) => expanded,
@@ -2001,6 +2019,8 @@ impl ChatComposer {
         should_queue: bool,
         now: Instant,
     ) -> (InputResult, bool) {
+        let should_queue_during_task = should_queue && self.is_task_running;
+
         // If the first line is a bare built-in slash command (no args),
         // dispatch it even when the slash popup isn't visible. This preserves
         // the workflow: type a prefix ("/di"), press Tab to complete to
@@ -2008,7 +2028,7 @@ impl ChatComposer {
         // the '/name' token and our caret-based heuristic hides the popup,
         // but Enter/Ctrl+Shift+Q should still dispatch the command rather than submit
         // literal text.
-        if let Some(result) = self.try_dispatch_bare_slash_command() {
+        if !should_queue_during_task && let Some(result) = self.try_dispatch_bare_slash_command() {
             return (result, true);
         }
 
@@ -2044,6 +2064,33 @@ impl ChatComposer {
             return (InputResult::None, true);
         }
 
+        if should_queue_during_task {
+            if let Some(pasted) = self.paste_burst.flush_before_modified_input() {
+                self.handle_paste(pasted);
+            }
+            let raw_text = self.textarea.text().to_string();
+            let defer_slash_validation = self.slash_commands_enabled()
+                && !raw_text.starts_with(' ')
+                && raw_text.starts_with('/')
+                && parse_slash_name(&raw_text).is_none_or(|(name, _, _)| {
+                    !name.starts_with(&format!("{PROMPTS_CMD_PREFIX}:"))
+                });
+            if let Some((text, text_elements)) =
+                self.prepare_submission_text_with_slash_validation(true, !defer_slash_validation)
+            {
+                return (
+                    InputResult::Queued {
+                        action: Self::queued_input_action(&text, defer_slash_validation),
+                        text,
+                        text_elements,
+                        pending_pastes: Vec::new(),
+                    },
+                    true,
+                );
+            }
+            return (InputResult::None, true);
+        }
+
         let original_input = self.textarea.text().to_string();
         let original_text_elements = self.textarea.text_elements();
         let original_local_image_paths = self
@@ -2062,6 +2109,8 @@ impl ChatComposer {
                     InputResult::Queued {
                         text,
                         text_elements,
+                        action: QueuedInputAction::Plain,
+                        pending_pastes: Vec::new(),
                     },
                     true,
                 )
@@ -2084,6 +2133,16 @@ impl ChatComposer {
             );
             self.pending_pastes = original_pending_pastes;
             (InputResult::None, true)
+        }
+    }
+
+    fn queued_input_action(prepared_text: &str, defer_slash_validation: bool) -> QueuedInputAction {
+        if defer_slash_validation && prepared_text.starts_with('/') {
+            QueuedInputAction::ParseSlash
+        } else if prepared_text.starts_with('!') {
+            QueuedInputAction::RunShell
+        } else {
+            QueuedInputAction::Plain
         }
     }
 
@@ -5122,7 +5181,7 @@ mod tests {
     }
 
     #[test]
-    fn slash_command_disabled_while_task_running_keeps_text() {
+    fn slash_command_queued_while_task_running_defers_validation() {
         use crossterm::event::KeyCode;
         use crossterm::event::KeyEvent;
         use crossterm::event::KeyModifiers;
@@ -5144,24 +5203,19 @@ mod tests {
         let (result, _needs_redraw) =
             composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
-        assert_eq!(InputResult::None, result);
-        assert_eq!("/review these changes", composer.textarea.text());
-
-        let mut found_error = false;
-        while let Ok(event) = rx.try_recv() {
-            if let AppEvent::InsertHistoryCell(cell) = event {
-                let message = cell
-                    .display_lines(80)
-                    .into_iter()
-                    .map(|line| line.to_string())
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                assert!(message.contains("disabled while a task is in progress"));
-                found_error = true;
-                break;
-            }
-        }
-        assert!(found_error, "expected error history cell to be sent");
+        assert!(matches!(
+            result,
+            InputResult::Queued {
+                text,
+                action: QueuedInputAction::ParseSlash,
+                ..
+            } if text == "/review these changes"
+        ));
+        assert!(composer.textarea.is_empty());
+        assert!(
+            rx.try_recv().is_err(),
+            "queueing should not emit an immediate error"
+        );
     }
 
     #[test]

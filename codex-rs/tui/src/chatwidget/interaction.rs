@@ -523,6 +523,8 @@ impl ChatWidget {
                 InputResult::Queued {
                     text,
                     text_elements,
+                    action,
+                    pending_pastes,
                 } => {
                     let user_message = UserMessage {
                         text,
@@ -532,7 +534,7 @@ impl ChatWidget {
                         text_elements,
                         mention_paths: self.bottom_pane.take_mention_paths(),
                     };
-                    self.queue_user_message(user_message);
+                    self.queue_user_message_with_action(user_message, action, pending_pastes);
                 }
                 InputResult::Command(cmd) => {
                     self.dispatch_command(cmd);
