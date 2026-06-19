@@ -1256,6 +1256,8 @@ pub struct ErrorEvent {
     pub message: String,
     #[serde(default)]
     pub codex_error_info: Option<CodexErrorInfo>,
+    #[serde(default)]
+    pub client_user_message_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
@@ -1600,6 +1602,9 @@ pub struct AgentMessageEvent {
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
 pub struct UserMessageEvent {
     pub message: String,
+    /// Client-generated id for correlating a same-turn steer with its committed message.
+    #[serde(default)]
+    pub client_user_message_id: Option<String>,
     /// Image URLs sourced from `UserInput::Image`. These are safe
     /// to replay in legacy UI history events and correspond to images sent to
     /// the model.
@@ -2950,6 +2955,7 @@ mod tests {
     fn user_message_event_serializes_empty_metadata_vectors() -> Result<()> {
         let event = UserMessageEvent {
             message: "hello".to_string(),
+            client_user_message_id: None,
             images: None,
             local_images: Vec::new(),
             text_elements: Vec::new(),
@@ -2960,6 +2966,7 @@ mod tests {
             json_event,
             json!({
                 "message": "hello",
+                "client_user_message_id": null,
                 "local_images": [],
                 "text_elements": [],
             })

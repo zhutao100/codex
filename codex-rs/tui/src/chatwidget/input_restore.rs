@@ -3,28 +3,44 @@
 use super::*;
 
 impl ChatWidget {
-    pub(super) fn handle_steer_rejected_error(&mut self, info: &CodexErrorInfo) -> bool {
+    pub(super) fn handle_steer_rejected_error(
+        &mut self,
+        info: &CodexErrorInfo,
+        client_user_message_id: Option<&str>,
+    ) -> bool {
         match info {
-            CodexErrorInfo::ActiveTurnNotSteerable { .. } => self.enqueue_rejected_steer(),
+            CodexErrorInfo::ActiveTurnNotSteerable { .. } => {
+                self.enqueue_rejected_steer(client_user_message_id)
+            }
             CodexErrorInfo::NoActiveTurnToSteer => {
                 self.active_turn_id = None;
                 self.finalize_turn();
-                self.enqueue_pending_steer_as_queued()
+                self.enqueue_pending_steer_as_queued(client_user_message_id)
             }
             CodexErrorInfo::ExpectedTurnMismatch { actual, .. } => {
                 self.active_turn_id = Some(actual.clone());
-                self.enqueue_pending_steer_as_queued()
+                self.enqueue_pending_steer_as_queued(client_user_message_id)
             }
             _ => false,
         }
     }
 
-    pub(super) fn enqueue_rejected_steer(&mut self) -> bool {
-        let Some(pending_steer) = self.pending_steers.pop_front() else {
+    fn take_pending_steer(&mut self, client_user_message_id: Option<&str>) -> Option<PendingSteer> {
+        let Some(client_user_message_id) = client_user_message_id else {
+            return self.pending_steers.pop_front();
+        };
+        let position = self.pending_steers.iter().position(|pending| {
+            pending.client_user_message_id.as_deref() == Some(client_user_message_id)
+        })?;
+        self.pending_steers.remove(position)
+    }
+
+    pub(super) fn enqueue_rejected_steer(&mut self, client_user_message_id: Option<&str>) -> bool {
+        let Some(pending_steer) = self.take_pending_steer(client_user_message_id) else {
             tracing::warn!(
                 "received active-turn-not-steerable error without a matching pending steer"
             );
-            return false;
+            return true;
         };
         self.rejected_steers_queue
             .push_back(pending_steer.user_message);
@@ -34,15 +50,19 @@ impl ChatWidget {
         true
     }
 
-    pub(super) fn enqueue_pending_steer_as_queued(&mut self) -> bool {
-        let Some(pending_steer) = self.pending_steers.pop_front() else {
+    pub(super) fn enqueue_pending_steer_as_queued(
+        &mut self,
+        client_user_message_id: Option<&str>,
+    ) -> bool {
+        let Some(pending_steer) = self.take_pending_steer(client_user_message_id) else {
             tracing::warn!("received steer race error without a matching pending steer");
-            return false;
+            return true;
         };
         let id = self.next_queued_user_message_id;
         self.next_queued_user_message_id = self.next_queued_user_message_id.saturating_add(1);
         let PendingSteer {
             target_turn_id: _,
+            client_user_message_id: _,
             user_message,
             history_record: _,
             compare_key: _,

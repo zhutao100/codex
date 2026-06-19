@@ -226,6 +226,7 @@ pub async fn continue_last(sess: &Arc<Session>, sub_id: String) {
             msg: EventMsg::Error(ErrorEvent {
                 message: "Cannot continue while a task is already running.".to_string(),
                 codex_error_info: Some(CodexErrorInfo::BadRequest),
+                client_user_message_id: None,
             }),
         })
         .await;
@@ -238,6 +239,7 @@ pub async fn continue_last(sess: &Arc<Session>, sub_id: String) {
             msg: EventMsg::Error(ErrorEvent {
                 message: "There is no paused or interrupted turn to continue.".to_string(),
                 codex_error_info: Some(CodexErrorInfo::BadRequest),
+                client_user_message_id: None,
             }),
         })
         .await;
@@ -287,6 +289,7 @@ pub async fn continue_last(sess: &Arc<Session>, sub_id: String) {
                         message: "The paused completed-turn review can no longer be continued."
                             .to_string(),
                         codex_error_info: Some(CodexErrorInfo::BadRequest),
+                        client_user_message_id: None,
                     }),
                 })
                 .await;
@@ -310,6 +313,7 @@ pub async fn override_turn_context(sess: &Session, sub_id: String, updates: Sess
             msg: EventMsg::Error(ErrorEvent {
                 message: err.to_string(),
                 codex_error_info: Some(CodexErrorInfo::BadRequest),
+                client_user_message_id: None,
             }),
         })
         .await;
@@ -388,7 +392,7 @@ pub async fn user_input_or_turn(sess: &Arc<Session>, sub_id: String, op: Op) {
         Err(err) => {
             sess.send_event_raw(Event {
                 id: sub_id,
-                msg: EventMsg::Error(err.to_error_event()),
+                msg: EventMsg::Error(err.to_error_event(None)),
             })
             .await;
         }
@@ -402,6 +406,7 @@ pub async fn steer_input(
     items: Vec<UserInput>,
     client_user_message_id: Option<String>,
 ) {
+    let error_client_user_message_id = client_user_message_id.clone();
     match sess
         .steer_input_for_turn(
             items.clone(),
@@ -418,7 +423,7 @@ pub async fn steer_input(
         Err(err) => {
             sess.send_event_raw(Event {
                 id: sub_id,
-                msg: EventMsg::Error(err.to_error_event()),
+                msg: EventMsg::Error(err.to_error_event(error_client_user_message_id)),
             })
             .await;
         }
@@ -680,6 +685,7 @@ pub async fn list_remote_skills(sess: &Session, config: &Arc<Config>, sub_id: St
                 msg: EventMsg::Error(ErrorEvent {
                     message: format!("failed to list remote skills: {err}"),
                     codex_error_info: Some(CodexErrorInfo::Other),
+                    client_user_message_id: None,
                 }),
             };
             sess.send_event_raw(event).await;
@@ -714,6 +720,7 @@ pub async fn download_remote_skill(
                 msg: EventMsg::Error(ErrorEvent {
                     message: format!("failed to download remote skill {hazelnut_id}: {err}"),
                     codex_error_info: Some(CodexErrorInfo::Other),
+                    client_user_message_id: None,
                 }),
             };
             sess.send_event_raw(event).await;
@@ -749,6 +756,7 @@ pub async fn thread_rollback(sess: &Arc<Session>, sub_id: String, num_turns: u32
             msg: EventMsg::Error(ErrorEvent {
                 message: "num_turns must be >= 1".to_string(),
                 codex_error_info: Some(CodexErrorInfo::ThreadRollbackFailed),
+                client_user_message_id: None,
             }),
         })
         .await;
@@ -762,6 +770,7 @@ pub async fn thread_rollback(sess: &Arc<Session>, sub_id: String, num_turns: u32
             msg: EventMsg::Error(ErrorEvent {
                 message: "Cannot rollback while a turn is in progress.".to_string(),
                 codex_error_info: Some(CodexErrorInfo::ThreadRollbackFailed),
+                client_user_message_id: None,
             }),
         })
         .await;
@@ -814,6 +823,7 @@ pub async fn set_thread_name(sess: &Arc<Session>, sub_id: String, name: String) 
             msg: EventMsg::Error(ErrorEvent {
                 message: "Thread name cannot be empty.".to_string(),
                 codex_error_info: Some(CodexErrorInfo::BadRequest),
+                client_user_message_id: None,
             }),
         };
         sess.send_event_raw(event).await;
@@ -826,6 +836,7 @@ pub async fn set_thread_name(sess: &Arc<Session>, sub_id: String, name: String) 
             msg: EventMsg::Error(ErrorEvent {
                 message: format!("Failed to set thread name: {e}"),
                 codex_error_info: Some(CodexErrorInfo::Other),
+                client_user_message_id: None,
             }),
         };
         sess.send_event_raw(event).await;
@@ -857,6 +868,7 @@ pub async fn auto_rename_thread(sess: &Arc<Session>, sub_id: String) {
                 msg: EventMsg::Error(ErrorEvent {
                     message: format!("Auto-rename failed: {err}"),
                     codex_error_info: Some(CodexErrorInfo::Other),
+                    client_user_message_id: None,
                 }),
             })
             .await;
@@ -870,6 +882,7 @@ pub async fn auto_rename_thread(sess: &Arc<Session>, sub_id: String) {
             msg: EventMsg::Error(ErrorEvent {
                 message: "Auto-rename failed: empty thread name.".to_string(),
                 codex_error_info: Some(CodexErrorInfo::Other),
+                client_user_message_id: None,
             }),
         })
         .await;
@@ -882,6 +895,7 @@ pub async fn auto_rename_thread(sess: &Arc<Session>, sub_id: String) {
             msg: EventMsg::Error(ErrorEvent {
                 message: format!("Auto-rename failed: {err}"),
                 codex_error_info: Some(CodexErrorInfo::Other),
+                client_user_message_id: None,
             }),
         })
         .await;
@@ -932,6 +946,7 @@ pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
             msg: EventMsg::Error(ErrorEvent {
                 message: "Failed to shutdown rollout recorder".to_string(),
                 codex_error_info: Some(CodexErrorInfo::Other),
+                client_user_message_id: None,
             }),
         };
         sess.send_event_raw(event).await;
@@ -970,6 +985,7 @@ pub async fn review(
                 msg: EventMsg::Error(ErrorEvent {
                     message: err.to_string(),
                     codex_error_info: Some(CodexErrorInfo::Other),
+                    client_user_message_id: None,
                 }),
             };
             sess.send_event(&turn_context, event.msg).await;
@@ -985,6 +1001,7 @@ pub async fn review_completed_turn(sess: &Arc<Session>, sub_id: String) {
                 message: "Cannot review a completed turn while another task is running."
                     .to_string(),
                 codex_error_info: Some(CodexErrorInfo::BadRequest),
+                client_user_message_id: None,
             }),
         })
         .await;
@@ -998,6 +1015,7 @@ pub async fn review_completed_turn(sess: &Arc<Session>, sub_id: String) {
                 message: "No completed Codex turn is available to review yet. Run a normal prompt first, wait for Codex to finish, then use /review-completed-turn."
                     .to_string(),
                 codex_error_info: Some(CodexErrorInfo::BadRequest),
+                client_user_message_id: None,
             }),
         })
         .await;
@@ -1011,6 +1029,7 @@ pub async fn review_completed_turn(sess: &Arc<Session>, sub_id: String) {
                 message: "The last completed turn has no final assistant message to review. Run another prompt or retry after a completed response."
                     .to_string(),
                 codex_error_info: Some(CodexErrorInfo::BadRequest),
+                client_user_message_id: None,
             }),
         })
         .await;

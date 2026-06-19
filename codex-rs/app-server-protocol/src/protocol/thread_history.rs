@@ -282,6 +282,7 @@ mod tests {
         let events = vec![
             EventMsg::UserMessage(UserMessageEvent {
                 message: "First turn".into(),
+                client_user_message_id: None,
                 images: Some(vec!["https://example.com/one.png".into()]),
                 text_elements: Vec::new(),
                 local_images: Vec::new(),
@@ -297,6 +298,7 @@ mod tests {
             }),
             EventMsg::UserMessage(UserMessageEvent {
                 message: "Second turn".into(),
+                client_user_message_id: None,
                 images: None,
                 text_elements: Vec::new(),
                 local_images: Vec::new(),
@@ -371,6 +373,7 @@ mod tests {
         let events = vec![
             EventMsg::UserMessage(UserMessageEvent {
                 message: "Turn start".into(),
+                client_user_message_id: None,
                 images: None,
                 text_elements: Vec::new(),
                 local_images: Vec::new(),
@@ -417,6 +420,7 @@ mod tests {
         let events = vec![
             EventMsg::UserMessage(UserMessageEvent {
                 message: "Please do the thing".into(),
+                client_user_message_id: None,
                 images: None,
                 text_elements: Vec::new(),
                 local_images: Vec::new(),
@@ -429,6 +433,7 @@ mod tests {
             }),
             EventMsg::UserMessage(UserMessageEvent {
                 message: "Let's try again".into(),
+                client_user_message_id: None,
                 images: None,
                 text_elements: Vec::new(),
                 local_images: Vec::new(),
@@ -489,6 +494,7 @@ mod tests {
         let events = vec![
             EventMsg::UserMessage(UserMessageEvent {
                 message: "Please keep working".into(),
+                client_user_message_id: None,
                 images: None,
                 text_elements: Vec::new(),
                 local_images: Vec::new(),
@@ -533,6 +539,7 @@ mod tests {
         let events = vec![
             EventMsg::UserMessage(UserMessageEvent {
                 message: "First".into(),
+                client_user_message_id: None,
                 images: None,
                 text_elements: Vec::new(),
                 local_images: Vec::new(),
@@ -542,6 +549,7 @@ mod tests {
             }),
             EventMsg::UserMessage(UserMessageEvent {
                 message: "Second".into(),
+                client_user_message_id: None,
                 images: None,
                 text_elements: Vec::new(),
                 local_images: Vec::new(),
@@ -552,6 +560,7 @@ mod tests {
             EventMsg::ThreadRolledBack(ThreadRolledBackEvent { num_turns: 1 }),
             EventMsg::UserMessage(UserMessageEvent {
                 message: "Third".into(),
+                client_user_message_id: None,
                 images: None,
                 text_elements: Vec::new(),
                 local_images: Vec::new(),
@@ -610,6 +619,7 @@ mod tests {
         let events = vec![
             EventMsg::UserMessage(UserMessageEvent {
                 message: "One".into(),
+                client_user_message_id: None,
                 images: None,
                 text_elements: Vec::new(),
                 local_images: Vec::new(),
@@ -619,6 +629,7 @@ mod tests {
             }),
             EventMsg::UserMessage(UserMessageEvent {
                 message: "Two".into(),
+                client_user_message_id: None,
                 images: None,
                 text_elements: Vec::new(),
                 local_images: Vec::new(),

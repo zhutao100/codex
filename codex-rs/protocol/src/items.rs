@@ -30,6 +30,8 @@ pub enum TurnItem {
 pub struct UserMessageItem {
     pub id: String,
     pub content: Vec<UserInput>,
+    #[serde(default)]
+    pub client_user_message_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema)]
@@ -94,6 +96,7 @@ impl UserMessageItem {
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             content: content.to_vec(),
+            client_user_message_id: None,
         }
     }
 
@@ -105,6 +108,7 @@ impl UserMessageItem {
             images: Some(self.image_urls()),
             local_images: self.local_image_paths(),
             text_elements: self.text_elements(),
+            client_user_message_id: self.client_user_message_id.clone(),
         })
     }
 

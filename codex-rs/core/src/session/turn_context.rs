@@ -225,6 +225,7 @@ impl Session {
                         msg: EventMsg::Error(ErrorEvent {
                             message: err.to_string(),
                             codex_error_info: Some(CodexErrorInfo::BadRequest),
+                            client_user_message_id: None,
                         }),
                     })
                     .await;

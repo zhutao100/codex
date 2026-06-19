@@ -466,6 +466,7 @@ impl Session {
                             EventMsg::Error(ErrorEvent {
                                 message: format!("Auto-rename failed: {err}"),
                                 codex_error_info: Some(CodexErrorInfo::Other),
+                                client_user_message_id: None,
                             }),
                         )
                         .await;
@@ -480,6 +481,7 @@ impl Session {
                         EventMsg::Error(ErrorEvent {
                             message: "Auto-rename failed: empty thread name.".to_string(),
                             codex_error_info: Some(CodexErrorInfo::Other),
+                            client_user_message_id: None,
                         }),
                     )
                     .await;
@@ -493,6 +495,7 @@ impl Session {
                         EventMsg::Error(ErrorEvent {
                             message: format!("Auto-rename failed: {err}"),
                             codex_error_info: Some(CodexErrorInfo::Other),
+                            client_user_message_id: None,
                         }),
                     )
                     .await;
@@ -678,6 +681,7 @@ impl Session {
                         EventMsg::Error(ErrorEvent {
                             message: "Pause is not available for this task.".to_string(),
                             codex_error_info: Some(CodexErrorInfo::BadRequest),
+                            client_user_message_id: None,
                         }),
                     )
                     .await;

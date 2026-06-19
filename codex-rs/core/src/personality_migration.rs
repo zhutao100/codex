@@ -186,6 +186,7 @@ mod tests {
             timestamp: TEST_TIMESTAMP.to_string(),
             item: RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
                 message: "hello".to_string(),
+                client_user_message_id: None,
                 images: None,
                 local_images: Vec::new(),
                 text_elements: Vec::new(),

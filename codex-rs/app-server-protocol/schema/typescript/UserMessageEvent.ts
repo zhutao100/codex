@@ -5,6 +5,10 @@ import type { TextElement } from "./TextElement";
 
 export type UserMessageEvent = { message: string, 
 /**
+ * Client-generated id for correlating a same-turn steer with its committed message.
+ */
+client_user_message_id: string | null, 
+/**
  * Image URLs sourced from `UserInput::Image`. These are safe
  * to replay in legacy UI history events and correspond to images sent to
  * the model.

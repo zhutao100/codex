@@ -447,6 +447,7 @@ pub(crate) struct ChatWidget {
     user_turn_pending_start: bool,
     last_rendered_user_message_display: Option<UserMessageDisplay>,
     next_queued_user_message_id: u64,
+    next_pending_steer_client_id: u64,
     queued_edit_state: Option<QueuedEditState>,
     // Pending notification to show when unfocused on next Draw
     pending_notification: Option<Notification>,
@@ -642,11 +643,37 @@ impl ChatWidget {
     }
 
     fn on_committed_user_message(&mut self, event: UserMessageEvent, from_replay: bool) {
+        let client_user_message_id = event.client_user_message_id.clone();
         let compare_key = Self::pending_steer_compare_key_from_event(&event);
         let display = UserMessageDisplay::from_event(event);
 
         if from_replay {
             self.on_user_message_display(display);
+            return;
+        }
+
+        if let Some(client_user_message_id) = client_user_message_id {
+            if let Some(position) = self.pending_steers.iter().position(|pending| {
+                pending.client_user_message_id.as_deref() == Some(client_user_message_id.as_str())
+            }) && let Some(pending) = self.pending_steers.remove(position)
+            {
+                self.refresh_pending_input_preview();
+                let display = UserMessageDisplay::from_user_message(user_message_for_history(
+                    pending.user_message,
+                    &pending.history_record,
+                ));
+                self.on_user_message_display(display);
+                return;
+            }
+
+            tracing::warn!(
+                "committed user message with client id did not match a pending steer: {client_user_message_id}"
+            );
+            if !self.is_review_mode
+                && self.last_rendered_user_message_display.as_ref() != Some(&display)
+            {
+                self.on_user_message_display(display);
+            }
             return;
         }
 

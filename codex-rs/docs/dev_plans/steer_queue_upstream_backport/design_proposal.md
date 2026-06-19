@@ -148,7 +148,7 @@ struct PendingSteer {
 }
 ```
 
-Add the id to committed user-message events. Match by client id first and retain the current compare key only as a compatibility fallback for replay or old core events.
+Add the id to committed user-message events and structured steer rejection error events. Match by client id first and retain the current compare key only as a compatibility fallback for replay or old core events.
 
 Client-id adoption can be split into P2 if minimizing the first patch. Typed input and task-finish lifecycle must remain P0.
 

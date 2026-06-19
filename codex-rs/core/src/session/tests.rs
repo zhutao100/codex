@@ -1773,6 +1773,17 @@ async fn steer_input_rejects_empty_input() {
     );
 }
 
+#[test]
+fn steer_input_error_event_preserves_client_user_message_id() {
+    let event =
+        SteerInputError::NoActiveTurn(Vec::new()).to_error_event(Some("client-steer".to_string()));
+
+    assert_eq!(
+        event.client_user_message_id,
+        Some("client-steer".to_string())
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn steer_input_accepts_regular_active_turn() {
     let (sess, tc, _rx) = make_session_and_context_with_rx().await;
@@ -2039,9 +2050,14 @@ async fn task_finish_emits_turn_item_lifecycle_for_leftover_pending_user_input()
         text: "late pending user input".to_string(),
         text_elements: text_elements.clone(),
     }];
-    sess.steer_input(input.clone())
-        .await
-        .expect("regular task should accept steer input");
+    let client_user_message_id = "client-late-pending".to_string();
+    sess.steer_input_for_turn(
+        input.clone(),
+        Some(tc.sub_id.as_str()),
+        Some(client_user_message_id.clone()),
+    )
+    .await
+    .expect("regular task should accept steer input");
 
     sess.on_task_finished(Arc::clone(&tc), None, TaskKind::Regular)
         .await;
@@ -2068,18 +2084,29 @@ async fn task_finish_emits_turn_item_lifecycle_for_leftover_pending_user_input()
     assert!(matches!(
         &events[1],
         EventMsg::ItemStarted(event)
-            if matches!(&event.item, TurnItem::UserMessage(item) if item.content == input)
+            if matches!(
+                &event.item,
+                TurnItem::UserMessage(item)
+                    if item.content == input
+                        && item.client_user_message_id.as_ref() == Some(&client_user_message_id)
+            )
     ));
     assert!(matches!(
         &events[2],
         EventMsg::ItemCompleted(event)
-            if matches!(&event.item, TurnItem::UserMessage(item) if item.content == input)
+            if matches!(
+                &event.item,
+                TurnItem::UserMessage(item)
+                    if item.content == input
+                        && item.client_user_message_id.as_ref() == Some(&client_user_message_id)
+            )
     ));
     assert!(matches!(
         &events[3],
         EventMsg::UserMessage(event)
             if event.message == "late pending user input"
                 && event.text_elements == text_elements
+                && event.client_user_message_id.as_ref() == Some(&client_user_message_id)
     ));
     assert!(matches!(&events[4], EventMsg::TurnComplete(_)));
 

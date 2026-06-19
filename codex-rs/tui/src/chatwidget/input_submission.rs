@@ -3,6 +3,12 @@
 use super::*;
 
 impl ChatWidget {
+    fn next_pending_steer_client_user_message_id(&mut self) -> String {
+        let id = self.next_pending_steer_client_id;
+        self.next_pending_steer_client_id = self.next_pending_steer_client_id.saturating_add(1);
+        format!("tui-steer-{id}")
+    }
+
     fn submit_shell_command(&mut self, command: &str) -> QueueDrain {
         let cmd = command.trim();
         if cmd.is_empty() {
@@ -180,14 +186,16 @@ impl ChatWidget {
                 None,
             )
         } else if let Some(expected_turn_id) = self.active_turn_id.clone() {
+            let client_user_message_id = self.next_pending_steer_client_user_message_id();
             (
                 Op::SteerInput {
                     expected_turn_id: expected_turn_id.clone(),
                     items,
-                    client_user_message_id: None,
+                    client_user_message_id: Some(client_user_message_id.clone()),
                 },
                 Some(PendingSteer {
                     target_turn_id: expected_turn_id,
+                    client_user_message_id: Some(client_user_message_id),
                     user_message: submitted_user_message.clone(),
                     history_record: history_record.clone(),
                     compare_key: pending_steer_compare_key

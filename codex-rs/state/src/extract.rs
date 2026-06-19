@@ -158,6 +158,7 @@ mod tests {
         let mut metadata = metadata_for_test();
         let item = RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
             message: format!("{USER_MESSAGE_BEGIN} actual user request"),
+            client_user_message_id: None,
             images: Some(vec![]),
             local_images: vec![],
             text_elements: vec![],
@@ -177,6 +178,7 @@ mod tests {
         let mut metadata = metadata_for_test();
         let item = RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
             message: String::new(),
+            client_user_message_id: None,
             images: Some(vec!["https://example.com/image.png".to_string()]),
             local_images: vec![],
             text_elements: vec![],
@@ -196,6 +198,7 @@ mod tests {
         let mut metadata = metadata_for_test();
         let item = RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
             message: "   ".to_string(),
+            client_user_message_id: None,
             images: Some(vec![]),
             local_images: vec![],
             text_elements: vec![],

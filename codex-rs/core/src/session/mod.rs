@@ -288,11 +288,12 @@ pub enum SteerInputError {
 }
 
 impl SteerInputError {
-    fn to_error_event(&self) -> ErrorEvent {
+    fn to_error_event(&self, client_user_message_id: Option<String>) -> ErrorEvent {
         match self {
             Self::NoActiveTurn(_) => ErrorEvent {
                 message: "no active turn to steer".to_string(),
                 codex_error_info: Some(CodexErrorInfo::NoActiveTurnToSteer),
+                client_user_message_id,
             },
             Self::ExpectedTurnMismatch { expected, actual } => ErrorEvent {
                 message: format!("expected active turn id `{expected}` but found `{actual}`"),
@@ -300,6 +301,7 @@ impl SteerInputError {
                     expected: expected.clone(),
                     actual: actual.clone(),
                 }),
+                client_user_message_id,
             },
             Self::ActiveTurnNotSteerable { turn_kind } => {
                 let turn_kind_label = match turn_kind {
@@ -312,11 +314,13 @@ impl SteerInputError {
                     codex_error_info: Some(CodexErrorInfo::ActiveTurnNotSteerable {
                         turn_kind: *turn_kind,
                     }),
+                    client_user_message_id,
                 }
             }
             Self::EmptyInput => ErrorEvent {
                 message: "input must not be empty".to_string(),
                 codex_error_info: Some(CodexErrorInfo::BadRequest),
+                client_user_message_id,
             },
         }
     }
@@ -2085,13 +2089,16 @@ impl Session {
         turn_context: &TurnContext,
         input: &[UserInput],
         response_item: ResponseItem,
+        client_user_message_id: Option<String>,
     ) {
         // Persist the user message to history, but emit the turn item from `UserInput` so
         // UI-only `text_elements` are preserved. `ResponseItem::Message` does not carry
         // those spans, and `record_response_item_and_emit_turn_item` would drop them.
         self.record_conversation_items(turn_context, std::slice::from_ref(&response_item))
             .await;
-        let turn_item = TurnItem::UserMessage(UserMessageItem::new(input));
+        let mut user_message_item = UserMessageItem::new(input);
+        user_message_item.client_user_message_id = client_user_message_id;
+        let turn_item = TurnItem::UserMessage(user_message_item);
         self.emit_turn_item_started(turn_context, &turn_item).await;
         self.emit_turn_item_completed(turn_context, turn_item).await;
     }
@@ -2102,15 +2109,13 @@ impl Session {
         pending_input: TurnInput,
     ) {
         match pending_input {
-            TurnInput::UserInput {
-                content,
-                client_id: _,
-            } => {
+            TurnInput::UserInput { content, client_id } => {
                 let response_item: ResponseItem = ResponseInputItem::from(content.clone()).into();
                 self.record_user_prompt_and_emit_turn_item(
                     turn_context,
                     content.as_slice(),
                     response_item,
+                    client_id,
                 )
                 .await;
             }
@@ -2121,6 +2126,7 @@ impl Session {
                         turn_context,
                         user_message.content.as_slice(),
                         response_item,
+                        None,
                     )
                     .await;
                 } else {

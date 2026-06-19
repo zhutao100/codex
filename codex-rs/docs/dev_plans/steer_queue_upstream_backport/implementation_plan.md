@@ -11,10 +11,10 @@ Completed in this branch:
 - P1-A: rejected steers merge into one follow-up turn.
 - P1-B: plan-stream and user-shell queue guards.
 - P1-C: abort cleanup ordering, empty-active-turn pending preservation, and queue autosend suppression.
+- P2-A: client-generated user-message ids for pending-steer commit and error correlation.
 
 Not implemented here:
 
-- P2 client-generated user-message ids for exact duplicate correlation.
 - Optional interrupt-and-immediately-resubmit behavior for explicit Ctrl+C.
 
 ## Baseline: already implemented
@@ -271,16 +271,19 @@ Using the queue key never causes immediate command execution or validation.
 
 ### Work
 
-1. Generate a client user-message id per submission.
-2. Preserve it through core pending input and all committed user-message events.
-3. Match pending steers by id first.
-4. Keep flattened text/image-count matching only as a compatibility fallback.
+Completed:
+
+1. Generate a client user-message id per TUI steer submission.
+2. Preserve it through core pending input, item lifecycle, and committed `UserMessageEvent`.
+3. Return it on structured steer rejection `ErrorEvent`s so late errors remove the matching pending steer instead of the oldest pending steer.
+4. Match pending steers by id first.
+5. Keep flattened text/image-count matching only as a compatibility fallback for replay and old events without ids.
 
 ### Tests
 
-- two identical pending steers commit in the correct order by id;
-- identical text with different skills/mentions does not false-match;
-- replay without client ids still renders correctly.
+- accepted-A/rejected-B interleaving requeues only B by client id while A remains pending for its commit event;
+- leftover pending input commit lifecycle preserves the client id through `ItemStarted`, `ItemCompleted`, and legacy `UserMessage`;
+- replay and old live events without client ids still use the compatibility fallback.
 
 ## P2-B: Optional interrupt-and-submit
 
@@ -316,6 +319,8 @@ CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-core session:
 CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-core session::tests::abort
 CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-tui chat_composer
 CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-tui chatwidget::tests
+just write-app-server-schema
+CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-app-server-protocol
 CODEX_SANDBOX_NETWORK_DISABLED=1 just fix -p codex-core
 CODEX_SANDBOX_NETWORK_DISABLED=1 just fix -p codex-tui
 ```

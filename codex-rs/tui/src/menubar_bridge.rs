@@ -1209,6 +1209,7 @@ mod imp {
             let mut bridge = test_bridge();
             let event = UserMessageEvent {
                 message: "Review completed turn\ncopy prompt".to_string(),
+                client_user_message_id: None,
                 images: None,
                 local_images: Vec::new(),
                 text_elements: Vec::new(),

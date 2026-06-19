@@ -24,6 +24,7 @@ pub(super) struct PendingSteerCompareKey {
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct PendingSteer {
     pub(super) target_turn_id: String,
+    pub(super) client_user_message_id: Option<String>,
     pub(super) user_message: UserMessage,
     pub(super) history_record: UserMessageHistoryRecord,
     pub(super) compare_key: PendingSteerCompareKey,

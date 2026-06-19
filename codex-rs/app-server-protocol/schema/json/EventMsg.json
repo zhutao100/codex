@@ -500,6 +500,13 @@
         {
           "description": "Error while executing a submission",
           "properties": {
+            "client_user_message_id": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "codex_error_info": {
               "anyOf": [
                 {
@@ -825,6 +832,14 @@
         {
           "description": "User/system input message (what was sent to the model)",
           "properties": {
+            "client_user_message_id": {
+              "default": null,
+              "description": "Client-generated id for correlating a same-turn steer with its committed message.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "images": {
               "description": "Image URLs sourced from `UserInput::Image`. These are safe to replay in legacy UI history events and correspond to images sent to the model.",
               "items": {
@@ -5210,6 +5225,13 @@
       "oneOf": [
         {
           "properties": {
+            "client_user_message_id": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "content": {
               "items": {
                 "$ref": "#/definitions/UserInput"
@@ -5609,6 +5631,13 @@
     {
       "description": "Error while executing a submission",
       "properties": {
+        "client_user_message_id": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "codex_error_info": {
           "anyOf": [
             {
@@ -5934,6 +5963,14 @@
     {
       "description": "User/system input message (what was sent to the model)",
       "properties": {
+        "client_user_message_id": {
+          "default": null,
+          "description": "Client-generated id for correlating a same-turn steer with its committed message.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "images": {
           "description": "Image URLs sourced from `UserInput::Image`. These are safe to replay in legacy UI history events and correspond to images sent to the model.",
           "items": {

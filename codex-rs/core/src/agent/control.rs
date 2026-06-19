@@ -251,6 +251,7 @@ mod tests {
         let status = agent_status_from_event(&EventMsg::Error(ErrorEvent {
             message: "boom".to_string(),
             codex_error_info: None,
+            client_user_message_id: None,
         }));
 
         let expected = AgentStatus::Errored("boom".to_string());

@@ -757,6 +757,7 @@ fn error_event_produces_error() {
         EventMsg::Error(codex_core::protocol::ErrorEvent {
             message: "boom".to_string(),
             codex_error_info: Some(CodexErrorInfo::Other),
+            client_user_message_id: None,
         }),
     ));
     assert_eq!(
@@ -817,6 +818,7 @@ fn error_followed_by_task_complete_produces_turn_failed() {
         EventMsg::Error(ErrorEvent {
             message: "boom".to_string(),
             codex_error_info: Some(CodexErrorInfo::Other),
+            client_user_message_id: None,
         }),
     );
     assert_eq!(

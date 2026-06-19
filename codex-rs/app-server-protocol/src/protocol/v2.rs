@@ -3268,6 +3268,7 @@ mod tests {
                     path: "app://demo-app".to_string(),
                 },
             ],
+            client_user_message_id: None,
         });
 
         assert_eq!(

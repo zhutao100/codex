@@ -524,8 +524,13 @@ async fn run_turn_inner(
 
         let initial_input_for_turn: ResponseInputItem = ResponseInputItem::from(input.clone());
         let response_item: ResponseItem = initial_input_for_turn.clone().into();
-        sess.record_user_prompt_and_emit_turn_item(turn_context.as_ref(), &input, response_item)
-            .await;
+        sess.record_user_prompt_and_emit_turn_item(
+            turn_context.as_ref(),
+            &input,
+            response_item,
+            None,
+        )
+        .await;
 
         if !skill_items.is_empty() {
             sess.record_conversation_items(&turn_context, &skill_items)
@@ -794,6 +799,7 @@ async fn run_turn_inner(
                     message: "Invalid image in your last message. Please remove it and try again."
                         .to_string(),
                     codex_error_info: Some(CodexErrorInfo::BadRequest),
+                    client_user_message_id: None,
                 });
                 sess.send_event(&turn_context, event).await;
                 break;

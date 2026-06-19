@@ -56,7 +56,7 @@ Visible TUI history is a separate concern. This branch already avoids rendering 
 |P1|Queue while a plan item is streaming or only user-shell commands are active|Done.|
 |P1|Abort cleanup ordering and empty-active-turn preservation|Done.|
 |P1|Queue auto-send suppression during lifecycle transitions|Done for the branch-local transition windows.|
-|P2|Client-generated user-message ids for exact pending-steer correlation|Useful follow-up; the upstream protocol supports it, but the upstream TUI does not currently use it.|
+|P2|Client-generated user-message ids for exact pending-steer correlation|Done for direct-core TUI steers, committed user-message events, and structured steer rejection recovery.|
 |P2|Interrupt-and-immediately-resubmit pending steers|Optional adaptation for explicit interrupt only; do not apply to `/pause`.|
 |Out of scope|Thread-switch input snapshots, mailbox wakeups, remote-image support, and wholesale app-server migration|Upstream features with broader architectural dependencies.|
 

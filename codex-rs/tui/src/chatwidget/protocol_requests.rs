@@ -130,11 +130,11 @@ impl ChatWidget {
             EventMsg::Error(ErrorEvent {
                 message,
                 codex_error_info,
+                client_user_message_id,
             }) => {
-                if codex_error_info
-                    .as_ref()
-                    .is_some_and(|info| self.handle_steer_rejected_error(info))
-                {
+                if codex_error_info.as_ref().is_some_and(|info| {
+                    self.handle_steer_rejected_error(info, client_user_message_id.as_deref())
+                }) {
                 } else if codex_error_info
                     .as_ref()
                     .is_some_and(|info| matches!(info, CodexErrorInfo::CyberPolicy))

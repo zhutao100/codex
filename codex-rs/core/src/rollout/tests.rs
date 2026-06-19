@@ -1341,6 +1341,7 @@ async fn test_updated_at_uses_file_mtime() -> Result<()> {
         timestamp: ts.to_string(),
         item: RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
             message: "hello".into(),
+            client_user_message_id: None,
             images: None,
             text_elements: Vec::new(),
             local_images: Vec::new(),

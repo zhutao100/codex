@@ -539,6 +539,9 @@ There are additional item-specific events:
 - `ResponseStreamConnectionFailed { httpStatusCode? }`: failure to connect to the response SSE stream
 - `ResponseStreamDisconnected { httpStatusCode? }`: disconnect of the response SSE stream in the middle of a turn before completion
 - `ResponseTooManyFailedAttempts { httpStatusCode? }`
+- `ActiveTurnNotSteerable { turnKind }`: the active turn cannot accept same-turn steering; `turnKind` is `Review`, `Compact`, or `UserShell`
+- `NoActiveTurnToSteer`: same-turn steering was requested after the active turn ended
+- `ExpectedTurnMismatch { expected, actual }`: same-turn steering targeted a stale active turn id
 - `BadRequest`
 - `Unauthorized`
 - `SandboxError`

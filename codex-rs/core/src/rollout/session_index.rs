@@ -649,6 +649,7 @@ mod tests {
         let user = RolloutItem::EventMsg(EventMsg::UserMessage(
             codex_protocol::protocol::UserMessageEvent {
                 message: "help me debug this test".to_string(),
+                client_user_message_id: None,
                 images: None,
                 text_elements: Vec::new(),
                 local_images: Vec::new(),
@@ -662,6 +663,7 @@ mod tests {
         let image_only = RolloutItem::EventMsg(EventMsg::UserMessage(
             codex_protocol::protocol::UserMessageEvent {
                 message: String::new(),
+                client_user_message_id: None,
                 images: Some(vec!["https://example.com/image.png".to_string()]),
                 text_elements: Vec::new(),
                 local_images: Vec::new(),

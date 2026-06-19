@@ -628,6 +628,7 @@ impl CodexErr {
         ErrorEvent {
             message,
             codex_error_info: Some(self.to_codex_protocol_error()),
+            client_user_message_id: None,
         }
     }
 

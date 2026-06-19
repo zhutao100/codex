@@ -162,6 +162,7 @@ async fn resumed_initial_messages_render_history() {
         initial_messages: Some(vec![
             EventMsg::UserMessage(UserMessageEvent {
                 message: "hello from user".to_string(),
+                client_user_message_id: None,
                 images: None,
                 text_elements: Vec::new(),
                 local_images: Vec::new(),
@@ -229,6 +230,7 @@ async fn replayed_user_message_preserves_text_elements_and_local_images() {
         history_entry_count: 0,
         initial_messages: Some(vec![EventMsg::UserMessage(UserMessageEvent {
             message: message.clone(),
+            client_user_message_id: None,
             images: None,
             text_elements: text_elements.clone(),
             local_images: local_images.clone(),
@@ -1021,6 +1023,7 @@ async fn make_chatwidget_manual(
         user_turn_pending_start: false,
         last_rendered_user_message_display: None,
         next_queued_user_message_id: 1,
+        next_pending_steer_client_id: 1,
         queued_edit_state: None,
         suppress_session_configured_redraw: false,
         suppress_queue_autosend: false,
@@ -4074,6 +4077,7 @@ async fn model_cap_error_does_not_switch_models() {
                 model: "boomslang".to_string(),
                 reset_after_seconds: Some(120),
             }),
+            client_user_message_id: None,
         }),
     });
 
@@ -4458,8 +4462,9 @@ async fn steer_enter_while_active_waits_for_committed_user_message() {
         op,
         Op::SteerInput {
             expected_turn_id,
+            client_user_message_id: Some(client_user_message_id),
             ..
-        } if expected_turn_id == "turn-1"
+        } if expected_turn_id == "turn-1" && client_user_message_id == "tui-steer-1"
     ));
     assert_eq!(chat.pending_steers.len(), 1);
     assert!(
@@ -4482,6 +4487,7 @@ async fn committed_user_message_renders_pending_steer_once() {
         id: "user-message".into(),
         msg: EventMsg::UserMessage(UserMessageEvent {
             message: "follow-up while running".to_string(),
+            client_user_message_id: None,
             images: None,
             text_elements: Vec::new(),
             local_images: Vec::new(),
@@ -4497,6 +4503,7 @@ async fn committed_user_message_renders_pending_steer_once() {
         id: "duplicate-user-message".into(),
         msg: EventMsg::UserMessage(UserMessageEvent {
             message: "follow-up while running".to_string(),
+            client_user_message_id: None,
             images: None,
             text_elements: Vec::new(),
             local_images: Vec::new(),
@@ -4521,6 +4528,7 @@ async fn committed_user_message_uses_pending_steer_rich_payload() {
     )];
     chat.pending_steers.push_back(PendingSteer {
         target_turn_id: "turn-1".to_string(),
+        client_user_message_id: None,
         user_message: UserMessage {
             text: message.clone(),
             local_images: vec![LocalImageAttachment {
@@ -4541,6 +4549,7 @@ async fn committed_user_message_uses_pending_steer_rich_payload() {
         id: "user-message".into(),
         msg: EventMsg::UserMessage(UserMessageEvent {
             message: message.clone(),
+            client_user_message_id: None,
             images: None,
             text_elements: Vec::new(),
             local_images: vec![core_image],
@@ -4585,6 +4594,7 @@ async fn active_turn_not_steerable_moves_pending_steer_to_rejected_queue() {
             codex_error_info: Some(CodexErrorInfo::ActiveTurnNotSteerable {
                 turn_kind: NonSteerableTurnKind::Review,
             }),
+            client_user_message_id: None,
         }),
     });
 
@@ -4616,6 +4626,7 @@ async fn no_active_turn_to_steer_requeues_pending_steer_without_generic_error() 
         msg: EventMsg::Error(ErrorEvent {
             message: "no active turn to steer".to_string(),
             codex_error_info: Some(CodexErrorInfo::NoActiveTurnToSteer),
+            client_user_message_id: None,
         }),
     });
 
@@ -4631,6 +4642,70 @@ async fn no_active_turn_to_steer_requeues_pending_steer_without_generic_error() 
         drain_insert_history(&mut rx).is_empty(),
         "steer races should not surface as generic errors"
     );
+}
+
+#[tokio::test]
+async fn no_active_turn_to_steer_requeues_matching_client_id_only() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.agent_turn_running = true;
+    chat.active_turn_id = Some("turn-1".to_string());
+
+    chat.submit_user_message("accepted steer".into());
+    let first_client_id = match next_submit_op(&mut op_rx) {
+        Op::SteerInput {
+            client_user_message_id: Some(client_user_message_id),
+            ..
+        } => client_user_message_id,
+        other => panic!("expected first steer input, got {other:?}"),
+    };
+    chat.submit_user_message("rejected steer".into());
+    let second_client_id = match next_submit_op(&mut op_rx) {
+        Op::SteerInput {
+            client_user_message_id: Some(client_user_message_id),
+            ..
+        } => client_user_message_id,
+        other => panic!("expected second steer input, got {other:?}"),
+    };
+    drain_insert_history(&mut rx);
+    assert_eq!(chat.pending_steers.len(), 2);
+
+    chat.handle_codex_event(Event {
+        id: "late-steer-error".into(),
+        msg: EventMsg::Error(ErrorEvent {
+            message: "no active turn to steer".to_string(),
+            codex_error_info: Some(CodexErrorInfo::NoActiveTurnToSteer),
+            client_user_message_id: Some(second_client_id),
+        }),
+    });
+
+    assert_eq!(chat.pending_steers.len(), 1);
+    assert_eq!(
+        chat.pending_steers.front().unwrap().client_user_message_id,
+        Some(first_client_id.clone())
+    );
+    assert_eq!(chat.queued_user_messages.len(), 1);
+    assert_eq!(
+        chat.queued_user_messages.front().unwrap().text,
+        "rejected steer"
+    );
+
+    chat.handle_codex_event(Event {
+        id: "accepted-user-message".into(),
+        msg: EventMsg::UserMessage(UserMessageEvent {
+            message: "accepted steer".to_string(),
+            client_user_message_id: Some(first_client_id),
+            images: None,
+            text_elements: Vec::new(),
+            local_images: Vec::new(),
+        }),
+    });
+
+    assert!(chat.pending_steers.is_empty());
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(cells.len(), 1);
+    assert!(lines_to_single_string(&cells[0]).contains("accepted steer"));
+    assert_eq!(chat.queued_user_messages.len(), 1);
 }
 
 #[tokio::test]
@@ -4652,6 +4727,7 @@ async fn expected_turn_mismatch_requeues_pending_steer_and_tracks_actual_turn() 
                 expected: "turn-1".to_string(),
                 actual: "turn-2".to_string(),
             }),
+            client_user_message_id: None,
         }),
     });
 
@@ -4689,6 +4765,7 @@ async fn model_cap_error_drains_pending_steer_after_turn_end() {
                 model: "gpt-test".to_string(),
                 reset_after_seconds: None,
             }),
+            client_user_message_id: None,
         }),
     });
 
@@ -4723,6 +4800,7 @@ async fn cyber_policy_error_drains_pending_steer_after_turn_end() {
         msg: EventMsg::Error(ErrorEvent {
             message: "policy".to_string(),
             codex_error_info: Some(CodexErrorInfo::CyberPolicy),
+            client_user_message_id: None,
         }),
     });
 

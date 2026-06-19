@@ -1560,6 +1560,7 @@ mod tests {
                 timestamp: ts.to_rfc3339(),
                 item: RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
                     message: preview.to_string(),
+                    client_user_message_id: None,
                     images: None,
                     text_elements: Vec::new(),
                     local_images: Vec::new(),
