@@ -136,6 +136,10 @@ impl WsStream {
     async fn next(&mut self) -> Option<Result<Message, WsError>> {
         self.rx_message.recv().await
     }
+
+    fn is_closed(&self) -> bool {
+        self.pump_task.is_finished() || self.tx_command.is_closed()
+    }
 }
 
 impl Drop for WsStream {
@@ -181,7 +185,12 @@ impl ResponsesWebsocketConnection {
     }
 
     pub async fn is_closed(&self) -> bool {
-        self.stream.lock().await.is_none()
+        let mut stream = self.stream.lock().await;
+        let closed = stream.as_ref().is_none_or(WsStream::is_closed);
+        if closed {
+            stream.take();
+        }
+        closed
     }
 
     pub async fn stream_request(

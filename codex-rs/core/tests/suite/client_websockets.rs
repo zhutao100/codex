@@ -671,6 +671,49 @@ async fn responses_websocket_reuses_completed_connection_across_turns() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_websocket_reconnects_when_cached_connection_was_closed() {
+    skip_if_no_network!();
+
+    let server = start_websocket_server(vec![
+        vec![vec![
+            ev_response_created("resp-1"),
+            ev_assistant_message("msg-1", "first done"),
+            ev_completed("resp-1"),
+        ]],
+        vec![vec![ev_response_created("resp-2"), ev_completed("resp-2")]],
+    ])
+    .await;
+
+    let mut builder = test_codex();
+    let test = builder
+        .build_with_websocket_server(&server)
+        .await
+        .expect("build websocket codex");
+
+    test.submit_turn("first turn")
+        .await
+        .expect("first turn should complete");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    test.submit_turn("second turn")
+        .await
+        .expect("second turn should reconnect and complete");
+
+    let connections = server.connections();
+    assert_eq!(connections.len(), 2);
+    assert_eq!(connections[0].len(), 1);
+    assert_eq!(connections[1].len(), 1);
+
+    let second = connections[1]
+        .first()
+        .expect("missing reconnected request")
+        .body_json();
+    assert_eq!(second["type"].as_str(), Some("response.create"));
+    assert_eq!(second.get("previous_response_id"), None);
+
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_websocket_creates_on_non_prefix() {
     skip_if_no_network!();
 

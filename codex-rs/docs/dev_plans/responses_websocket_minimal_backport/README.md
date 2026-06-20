@@ -42,6 +42,7 @@ That split is intentional:
 - Same-turn tool round trips retain the current incremental `previous_response_id` behavior.
 - A new logical turn reuses the socket but starts with a full `response.create` and no `previous_response_id`.
 - A paused or cancelled in-flight stream is never returned to the connection cache.
+- A remotely closed cached socket is discarded before a later turn opens a replacement connection.
 - `/continue` reconstructs from durable history and reconnects when the paused stream did not complete.
 - Standalone compaction can keep a healthy socket while clearing the logical continuation chain.
 

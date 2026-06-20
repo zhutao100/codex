@@ -114,6 +114,7 @@ Also test case-insensitive header names and array-valued JSON header representat
 |HTTP 426 on handshake|1 attempted|HTTP request|No|
 |WebSocket retry budget exhausted|No later WebSocket attempt|HTTP request|No|
 |Compaction after completed response|1|Full compacted input, no previous response ID|Yes|
+|Server closes cached completed connection before next turn|2|Full create, no previous response ID|Stale slot dropped before reuse|
 |Provider override changes endpoint|2|Full create|No cross-provider adoption|
 |Auth mode changes ChatGPT/API endpoint|2|Full create|No cross-mode adoption|
 
