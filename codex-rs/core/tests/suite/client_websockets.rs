@@ -714,6 +714,89 @@ async fn responses_websocket_reconnects_when_cached_connection_was_closed() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_websocket_cache_is_scoped_by_provider() {
+    skip_if_no_network_unless_localhost!();
+
+    let primary_server = start_websocket_server(vec![
+        vec![vec![
+            ev_response_created("resp-a1"),
+            ev_completed("resp-a1"),
+        ]],
+        vec![vec![
+            ev_response_created("resp-a2"),
+            ev_completed("resp-a2"),
+        ]],
+    ])
+    .await;
+    let secondary_server = start_websocket_server(vec![vec![vec![
+        ev_response_created("resp-b1"),
+        ev_completed("resp-b1"),
+    ]]])
+    .await;
+
+    let harness = websocket_harness(&primary_server).await;
+    let prompt = prompt_with_input(vec![message_item("hello")]);
+
+    {
+        let mut primary_session = harness.client.new_session();
+        stream_until_complete(&mut primary_session, &harness, &prompt).await;
+    }
+
+    {
+        let mut secondary_session = harness
+            .client
+            .new_session_with_provider(websocket_provider(&secondary_server));
+        stream_until_complete(&mut secondary_session, &harness, &prompt).await;
+    }
+
+    {
+        let mut primary_session = harness.client.new_session();
+        stream_until_complete(&mut primary_session, &harness, &prompt).await;
+    }
+
+    let primary_connections = primary_server.connections();
+    assert_eq!(primary_connections.len(), 2);
+    assert_eq!(primary_connections[0].len(), 1);
+    assert_eq!(primary_connections[1].len(), 1);
+
+    let secondary_connections = secondary_server.connections();
+    assert_eq!(secondary_connections.len(), 1);
+    assert_eq!(secondary_connections[0].len(), 1);
+
+    primary_server.shutdown().await;
+    secondary_server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_websocket_does_not_share_connection_between_live_sessions() {
+    skip_if_no_network_unless_localhost!();
+
+    let server = start_websocket_server(vec![
+        vec![vec![ev_response_created("resp-1"), ev_completed("resp-1")]],
+        vec![vec![ev_response_created("resp-2"), ev_completed("resp-2")]],
+    ])
+    .await;
+
+    let harness = websocket_harness(&server).await;
+    let prompt = prompt_with_input(vec![message_item("hello")]);
+
+    let mut first_session = harness.client.new_session();
+    stream_until_complete(&mut first_session, &harness, &prompt).await;
+
+    let mut second_session = harness.client.new_session();
+    stream_until_complete(&mut second_session, &harness, &prompt).await;
+
+    let connections = server.connections();
+    assert_eq!(connections.len(), 2);
+    assert_eq!(connections[0].len(), 1);
+    assert_eq!(connections[1].len(), 1);
+
+    drop(first_session);
+    drop(second_session);
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_websocket_creates_on_non_prefix() {
     skip_if_no_network_unless_localhost!();
 

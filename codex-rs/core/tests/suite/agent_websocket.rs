@@ -4,14 +4,14 @@ use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::ev_shell_command_call;
 use core_test_support::responses::start_websocket_server;
-use core_test_support::skip_if_no_network;
+use core_test_support::skip_if_no_network_unless_localhost;
 use core_test_support::test_codex::test_codex;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn websocket_test_codex_shell_chain() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    skip_if_no_network_unless_localhost!(Ok(()));
 
     let call_id = "shell-command-call";
     let server = start_websocket_server(vec![vec![

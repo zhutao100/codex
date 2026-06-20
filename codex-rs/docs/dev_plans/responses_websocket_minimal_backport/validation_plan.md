@@ -142,10 +142,15 @@ Directly exercise the cacheability helper:
 - Empty receiver: not cacheable.
 - Closed receiver: not cacheable.
 - Fallback active: not cacheable.
+- Clearing logical continuation before drop returns the physical socket to the cache.
+- Cached provider/auth-mode mismatches are rejected without adopting the socket.
+- HTTP fallback clears the shared cached socket.
 
 ### Concurrency
 
 Create two `ModelClientSession`s from one `ModelClient` before either returns a connection. Verify the one-slot cache is taken atomically and a connection is never shared concurrently. It is acceptable for the second session to open another socket.
+
+Also verify provider overrides use a separate connection and the one-slot cache does not cross provider boundaries.
 
 ## Deferred cross-turn logical chain tests
 

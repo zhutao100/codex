@@ -1361,12 +1361,16 @@ impl WebsocketTelemetry for ApiTelemetry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::CodexAuth;
     use crate::model_provider_info::OLLAMA_OSS_PROVIDER_ID;
     use crate::model_provider_info::built_in_model_providers;
     use codex_api::common::OpenAiVerbosity;
     use codex_api::common::TextControls;
     use codex_protocol::models::ContentItem;
     use codex_protocol::models::FunctionCallOutputPayload;
+    use core_test_support::responses::WebSocketTestServer;
+    use core_test_support::responses::start_websocket_server;
+    use core_test_support::skip_if_no_network_unless_localhost;
     use pretty_assertions::assert_eq;
     use serde_json::json;
     use tokio::sync::oneshot;
@@ -1498,6 +1502,96 @@ mod tests {
             Some(&request),
             Some(&mut closed_rx)
         ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cached_websocket_connection_is_scoped_by_provider_and_auth_mode() {
+        skip_if_no_network_unless_localhost!();
+
+        let server = start_websocket_server(vec![Vec::new()]).await;
+        let provider = test_websocket_provider(&server);
+        let client = test_model_client(provider.clone());
+        let connection = connect_test_websocket(&provider).await;
+
+        client.store_cached_websocket_connection(
+            provider.clone(),
+            Some(AuthMode::ApiKey),
+            connection,
+        );
+
+        let mut other_provider = provider.clone();
+        other_provider.name = "other-provider".to_string();
+        assert!(
+            client
+                .take_cached_websocket_connection(&other_provider, Some(AuthMode::ApiKey))
+                .is_none()
+        );
+        assert!(
+            client
+                .take_cached_websocket_connection(&provider, Some(AuthMode::Chatgpt))
+                .is_none()
+        );
+        assert!(
+            client
+                .take_cached_websocket_connection(&provider, Some(AuthMode::ApiKey))
+                .is_some()
+        );
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fallback_transport_clears_cached_websocket_connection() {
+        skip_if_no_network_unless_localhost!();
+
+        let server = start_websocket_server(vec![Vec::new()]).await;
+        let provider = test_websocket_provider(&server);
+        let client = test_model_client(provider.clone());
+        let connection = connect_test_websocket(&provider).await;
+
+        client.store_cached_websocket_connection(
+            provider.clone(),
+            Some(AuthMode::ApiKey),
+            connection,
+        );
+        let mut session = client.new_session();
+        assert!(session.try_switch_fallback_transport(&test_otel_manager()));
+        assert!(
+            client
+                .take_cached_websocket_connection(&provider, Some(AuthMode::ApiKey))
+                .is_none()
+        );
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clear_websocket_continuation_keeps_physical_connection_cacheable() {
+        skip_if_no_network_unless_localhost!();
+
+        let server = start_websocket_server(vec![Vec::new()]).await;
+        let provider = test_websocket_provider(&server);
+        let client = test_model_client(provider.clone());
+        let connection = connect_test_websocket(&provider).await;
+
+        {
+            let mut session = client.new_session();
+            session.connection = Some(connection);
+            session.connection_auth_mode = Some(Some(AuthMode::ApiKey));
+            session.websocket_last_request = Some(ws_request(vec![user_message_item("hello")]));
+            let (_pending_tx, pending_rx) = oneshot::channel();
+            session.websocket_last_response_rx = Some(pending_rx);
+
+            session.clear_websocket_continuation();
+        }
+
+        assert!(
+            client
+                .take_cached_websocket_connection(&provider, Some(AuthMode::ApiKey))
+                .is_some()
+        );
+
+        server.shutdown().await;
     }
 
     #[test]
@@ -1702,6 +1796,55 @@ mod tests {
         let mut session = client.new_session();
         session.websocket_last_request = Some(previous_request);
         session
+    }
+
+    fn test_websocket_provider(server: &WebSocketTestServer) -> ModelProviderInfo {
+        ModelProviderInfo {
+            name: "test-websocket-provider".to_string(),
+            base_url: Some(format!("{}/v1", server.uri())),
+            env_key: None,
+            env_key_instructions: None,
+            experimental_bearer_token: None,
+            wire_api: WireApi::Responses,
+            query_params: None,
+            http_headers: None,
+            env_http_headers: None,
+            request_max_retries: Some(0),
+            stream_max_retries: Some(0),
+            stream_idle_timeout_ms: Some(5_000),
+            requires_openai_auth: false,
+            supports_websockets: true,
+        }
+    }
+
+    fn test_model_client(provider: ModelProviderInfo) -> ModelClient {
+        ModelClient::new(
+            Some(AuthManager::from_auth_for_testing(CodexAuth::from_api_key(
+                "Test API Key",
+            ))),
+            ThreadId::new(),
+            provider,
+            SessionSource::Exec,
+            None,
+            true,
+            false,
+            false,
+            false,
+            None,
+        )
+    }
+
+    async fn connect_test_websocket(provider: &ModelProviderInfo) -> ApiWebSocketConnection {
+        let request_auth =
+            resolve_request_auth(Some(CodexAuth::from_api_key("Test API Key")), provider)
+                .expect("resolve websocket auth");
+        let api_provider = provider
+            .to_api_provider(request_auth.auth_mode)
+            .expect("api provider");
+        ApiWebSocketResponsesClient::new(api_provider, request_auth.provider)
+            .connect(ApiHeaderMap::new(), default_headers(), None, None)
+            .await
+            .expect("connect websocket")
     }
 
     fn test_otel_manager() -> OtelManager {
