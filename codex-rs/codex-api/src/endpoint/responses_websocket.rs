@@ -187,6 +187,7 @@ impl ResponsesWebsocketConnection {
     pub async fn stream_request(
         &self,
         request: ResponsesWsRequest,
+        turn_state: Option<Arc<OnceLock<String>>>,
     ) -> Result<ResponseStream, ApiError> {
         let (tx_event, rx_event) =
             mpsc::channel::<std::result::Result<ResponseEvent, ApiError>>(1600);
@@ -227,6 +228,7 @@ impl ResponsesWebsocketConnection {
                     request_text,
                     idle_timeout,
                     telemetry,
+                    turn_state.as_deref(),
                 )
                 .await
             };
@@ -487,6 +489,7 @@ async fn run_websocket_response_stream(
     request_text: String,
     idle_timeout: Duration,
     telemetry: Option<Arc<dyn WebsocketTelemetry>>,
+    turn_state: Option<&OnceLock<String>>,
 ) -> Result<(), ApiError> {
     let mut last_server_model: Option<String> = None;
     send_websocket_request(ws_stream, request_text, idle_timeout, telemetry.as_ref()).await?;
@@ -531,6 +534,11 @@ async fn run_websocket_response_stream(
                         continue;
                     }
                 };
+                if let Some(response_turn_state) = event.turn_state()
+                    && let Some(turn_state) = turn_state
+                {
+                    let _ = turn_state.set(response_turn_state);
+                }
                 if event.kind() == "codex.rate_limits" {
                     if let Some(snapshot) = parse_rate_limit_event(&text) {
                         let _ = tx_event.send(Ok(ResponseEvent::RateLimits(snapshot))).await;

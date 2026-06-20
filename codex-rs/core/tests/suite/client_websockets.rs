@@ -46,6 +46,7 @@ const MODEL: &str = "gpt-5.2-codex";
 const OPENAI_BETA_HEADER: &str = "OpenAI-Beta";
 const ORIGINATOR_HEADER: &str = "originator";
 const USER_AGENT_HEADER: &str = "user-agent";
+const X_CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
 const WS_V2_BETA_HEADER_VALUE: &str = "responses_websockets=2026-02-06";
 
 struct WebsocketTestHarness {
@@ -547,6 +548,72 @@ async fn responses_websocket_forwards_turn_metadata_on_initial_and_incremental_c
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_websocket_forwards_turn_state_from_response_metadata() {
+    skip_if_no_network!();
+
+    let server = start_websocket_server(vec![vec![
+        vec![
+            ev_turn_state_metadata("X-Codex-Turn-State", json!("state-a")),
+            ev_response_created("resp-1"),
+            ev_completed("resp-1"),
+        ],
+        vec![
+            ev_turn_state_metadata("x-codex-turn-state", json!("state-b")),
+            ev_response_created("resp-2"),
+            ev_completed("resp-2"),
+        ],
+        vec![ev_response_created("resp-3"), ev_completed("resp-3")],
+    ]])
+    .await;
+
+    let harness = websocket_harness(&server).await;
+    let mut client_session = harness.client.new_session();
+    let prompt_one = prompt_with_input(vec![message_item("hello")]);
+    let prompt_two = prompt_with_input(vec![message_item("hello"), message_item("second")]);
+    let prompt_three = prompt_with_input(vec![
+        message_item("hello"),
+        message_item("second"),
+        message_item("third"),
+    ]);
+
+    stream_until_complete(&mut client_session, &harness, &prompt_one).await;
+    stream_until_complete(&mut client_session, &harness, &prompt_two).await;
+    stream_until_complete(&mut client_session, &harness, &prompt_three).await;
+
+    let connection = server.single_connection();
+    assert_eq!(connection.len(), 3);
+    let first = connection
+        .first()
+        .expect("missing first request")
+        .body_json();
+    let second = connection
+        .get(1)
+        .expect("missing second request")
+        .body_json();
+    let third = connection
+        .get(2)
+        .expect("missing third request")
+        .body_json();
+
+    assert_eq!(
+        first
+            .get("client_metadata")
+            .and_then(|metadata| metadata.get(X_CODEX_TURN_STATE_HEADER)),
+        None
+    );
+    assert_eq!(
+        second["client_metadata"][X_CODEX_TURN_STATE_HEADER].as_str(),
+        Some("state-a")
+    );
+    assert_eq!(
+        third["client_metadata"][X_CODEX_TURN_STATE_HEADER].as_str(),
+        Some("state-a")
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_websocket_creates_on_non_prefix() {
     skip_if_no_network!();
 
@@ -773,6 +840,15 @@ fn assistant_message_item(id: &str, text: &str) -> ResponseItem {
         end_turn: None,
         phase: None,
     }
+}
+
+fn ev_turn_state_metadata(header_name: &str, value: serde_json::Value) -> serde_json::Value {
+    let mut headers = serde_json::Map::new();
+    headers.insert(header_name.to_string(), value);
+    json!({
+        "type": "response.metadata",
+        "headers": headers,
+    })
 }
 
 fn prompt_with_input(input: Vec<ResponseItem>) -> Prompt {

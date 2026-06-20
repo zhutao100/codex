@@ -547,6 +547,15 @@ impl ModelClientSession {
         } = options;
 
         let store = store_override.unwrap_or(false);
+        let mut client_metadata = self
+            .client
+            .build_ws_client_metadata(turn_metadata_header_from_options(options));
+        if let Some(turn_state) = self.turn_state.get() {
+            client_metadata
+                .get_or_insert_with(HashMap::new)
+                .insert(X_CODEX_TURN_STATE_HEADER.to_string(), turn_state.clone());
+        }
+
         let payload = ResponseCreateWsRequest {
             model: model_slug.to_string(),
             instructions: api_prompt.instructions.clone(),
@@ -563,9 +572,7 @@ impl ModelClientSession {
             prompt_cache_key: prompt_cache_key.clone(),
             text: text.clone(),
             generate: None,
-            client_metadata: self
-                .client
-                .build_ws_client_metadata(turn_metadata_header_from_options(options)),
+            client_metadata,
         };
 
         let Some(last_response) = self.get_last_response() else {
@@ -798,7 +805,7 @@ impl ModelClientSession {
                 ))
             })?;
             let stream_result = connection
-                .stream_request(request)
+                .stream_request(request, Some(Arc::clone(&self.turn_state)))
                 .await
                 .map_err(map_api_error)?;
             self.websocket_last_request = Some(last_request);

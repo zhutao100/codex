@@ -27,6 +27,7 @@ use tracing::debug;
 use tracing::trace;
 
 const X_REASONING_INCLUDED_HEADER: &str = "x-reasoning-included";
+const X_CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
 const OPENAI_MODEL_HEADER: &str = "openai-model";
 const TRUSTED_ACCESS_FOR_CYBER_VERIFICATION: &str = "trusted_access_for_cyber";
 
@@ -201,6 +202,16 @@ impl ResponsesStreamEvent {
         })
     }
 
+    pub(crate) fn turn_state(&self) -> Option<String> {
+        if self.kind() != "response.metadata" {
+            return None;
+        }
+
+        self.headers
+            .as_ref()
+            .and_then(header_turn_state_value_from_json)
+    }
+
     pub(crate) fn model_verifications(&self) -> Option<Vec<ModelVerification>> {
         if self.kind() != "response.metadata" {
             return None;
@@ -218,6 +229,17 @@ fn header_openai_model_value_from_json(value: &Value) -> Option<String> {
     headers.iter().find_map(|(name, value)| {
         if name.eq_ignore_ascii_case("openai-model") || name.eq_ignore_ascii_case("x-openai-model")
         {
+            json_value_as_string(value)
+        } else {
+            None
+        }
+    })
+}
+
+fn header_turn_state_value_from_json(value: &Value) -> Option<String> {
+    let headers = value.as_object()?;
+    headers.iter().find_map(|(name, value)| {
+        if name.eq_ignore_ascii_case(X_CODEX_TURN_STATE_HEADER) {
             json_value_as_string(value)
         } else {
             None
@@ -1286,6 +1308,48 @@ mod tests {
             ev.response_model().as_deref(),
             Some(CYBER_RESTRICTED_MODEL_FOR_TESTS)
         );
+    }
+
+    #[test]
+    fn responses_stream_event_turn_state_reads_metadata_headers() {
+        let event: ResponsesStreamEvent = serde_json::from_value(json!({
+            "type": "response.metadata",
+            "headers": {
+                "X-Codex-Turn-State": "state-a"
+            }
+        }))
+        .expect("expected event to deserialize");
+
+        assert_eq!(event.turn_state().as_deref(), Some("state-a"));
+    }
+
+    #[test]
+    fn responses_stream_event_turn_state_reads_first_header_array_value() {
+        let event: ResponsesStreamEvent = serde_json::from_value(json!({
+            "type": "response.metadata",
+            "headers": {
+                "x-codex-turn-state": ["state-a", "state-b"]
+            }
+        }))
+        .expect("expected event to deserialize");
+
+        assert_eq!(event.turn_state().as_deref(), Some("state-a"));
+    }
+
+    #[test]
+    fn responses_stream_event_turn_state_ignores_non_metadata_events() {
+        let event: ResponsesStreamEvent = serde_json::from_value(json!({
+            "type": "response.created",
+            "headers": {
+                "x-codex-turn-state": "state-a"
+            },
+            "response": {
+                "id": "resp-1"
+            }
+        }))
+        .expect("expected event to deserialize");
+
+        assert_eq!(event.turn_state(), None);
     }
 
     #[test]
