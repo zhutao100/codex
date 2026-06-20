@@ -71,7 +71,6 @@ use tokio::sync::oneshot;
 use tokio::sync::oneshot::error::TryRecvError;
 use tokio_tungstenite::tungstenite::Error;
 use tokio_tungstenite::tungstenite::Message;
-use tracing::debug;
 use tracing::warn;
 
 use crate::AuthManager;
@@ -393,18 +392,6 @@ impl ModelClientSession {
         self.connection = None;
         self.websocket_last_request = None;
         self.websocket_last_response_rx = None;
-    }
-
-    pub(crate) async fn send_response_processed(&self, response_id: &str) {
-        let Some(connection) = self.connection.as_ref() else {
-            return;
-        };
-        if let Err(err) = connection
-            .send_response_processed(response_id.to_string())
-            .await
-        {
-            debug!("failed to send response.processed websocket request: {err}");
-        }
     }
 
     fn disable_websockets(&self) -> bool {

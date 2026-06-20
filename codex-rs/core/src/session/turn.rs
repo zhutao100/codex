@@ -2055,7 +2055,6 @@ async fn try_run_sampling_request(
     let mut last_agent_message: Option<String> = None;
     let mut active_item: Option<TurnItem> = None;
     let mut should_emit_turn_diff = false;
-    let mut completed_response_id: Option<String> = None;
     let plan_mode = turn_context.collaboration_mode.mode == ModeKind::Plan;
     let mut plan_mode_state = plan_mode.then(|| PlanModeStreamState::new(&turn_context.sub_id));
     let mut progress_trace_state = ProgressTraceStreamState::default();
@@ -2230,11 +2229,10 @@ async fn try_run_sampling_request(
                     .await;
             }
             ResponseEvent::Completed {
-                response_id,
+                response_id: _,
                 token_usage,
                 end_turn,
             } => {
-                completed_response_id = Some(response_id);
                 progress_trace_state.finalize(&sess, &turn_context).await;
                 if let Some(state) = plan_mode_state.as_mut() {
                     flush_proposed_plan_segments_all(&sess, &turn_context, state).await;
@@ -2359,16 +2357,6 @@ async fn try_run_sampling_request(
             let msg = EventMsg::TurnDiff(TurnDiffEvent { unified_diff });
             sess.clone().send_event(&turn_context, msg).await;
         }
-    }
-
-    if outcome.is_ok()
-        && let Some(response_id) = completed_response_id.as_deref()
-        && turn_context
-            .config
-            .features
-            .enabled(Feature::ResponsesWebsocketResponseProcessed)
-    {
-        client_session.send_response_processed(response_id).await;
     }
 
     outcome

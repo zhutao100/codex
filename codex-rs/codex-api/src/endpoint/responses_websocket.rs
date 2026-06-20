@@ -1,7 +1,6 @@
 use crate::auth::AuthProvider;
 use crate::auth::add_auth_headers_to_header_map;
 use crate::common::ResponseEvent;
-use crate::common::ResponseProcessedWsRequest;
 use crate::common::ResponseStream;
 use crate::common::ResponsesWsRequest;
 use crate::error::ApiError;
@@ -183,29 +182,6 @@ impl ResponsesWebsocketConnection {
 
     pub async fn is_closed(&self) -> bool {
         self.stream.lock().await.is_none()
-    }
-
-    pub async fn send_response_processed(&self, response_id: String) -> Result<(), ApiError> {
-        let request =
-            ResponsesWsRequest::ResponseProcessed(ResponseProcessedWsRequest { response_id });
-        let request_body = serde_json::to_value(&request).map_err(|err| {
-            ApiError::Stream(format!("failed to encode websocket request: {err}"))
-        })?;
-
-        let mut guard = self.stream.lock().await;
-        let Some(ws_stream) = guard.as_mut() else {
-            return Err(ApiError::Stream(
-                "websocket connection is closed".to_string(),
-            ));
-        };
-
-        send_websocket_request(
-            ws_stream,
-            request_body,
-            self.idle_timeout,
-            self.telemetry.as_ref(),
-        )
-        .await
     }
 
     pub async fn stream_request(

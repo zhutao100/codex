@@ -137,8 +137,6 @@ pub enum Feature {
     ResponsesWebsockets,
     /// Use the v2 Responses API WebSocket request protocol.
     ResponsesWebsocketsV2,
-    /// Send `response.processed` acknowledgements over Responses WebSocket.
-    ResponsesWebsocketResponseProcessed,
 }
 
 impl Feature {
@@ -608,12 +606,6 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::ResponsesWebsocketsV2,
         key: "responses_websockets_v2",
-        stage: Stage::UnderDevelopment,
-        default_enabled: false,
-    },
-    FeatureSpec {
-        id: Feature::ResponsesWebsocketResponseProcessed,
-        key: "responses_websocket_response_processed",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
     },
