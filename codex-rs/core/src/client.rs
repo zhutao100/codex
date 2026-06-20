@@ -499,31 +499,26 @@ impl ModelClientSession {
         // Incremental websocket requests are only valid when non-input fields are unchanged and
         // the new input extends the previous request plus output items already returned by the server.
         let previous_request = self.websocket_last_request.as_ref()?;
-        let mut previous_without_input = previous_request.clone();
-        previous_without_input.input.clear();
-        previous_without_input.generate = None;
-        previous_without_input.client_metadata = None;
-        let mut request_without_input = request.clone();
-        request_without_input.input.clear();
-        request_without_input.generate = None;
-        request_without_input.client_metadata = None;
-        if previous_without_input != request_without_input {
+        if !response_create_properties_match(previous_request, request) {
             return None;
         }
 
-        let mut baseline = previous_request.input.clone();
-        if let Some(last_response) = last_response {
-            baseline.extend(last_response.items_added.clone());
+        let after_previous_request = request
+            .input
+            .as_slice()
+            .strip_prefix(previous_request.input.as_slice())?;
+        let delta = match last_response {
+            Some(last_response) => {
+                after_previous_request.strip_prefix(last_response.items_added.as_slice())?
+            }
+            None => after_previous_request,
+        };
+
+        if !allow_empty_delta && delta.is_empty() {
+            return None;
         }
 
-        let baseline_len = baseline.len();
-        if request.input.starts_with(&baseline)
-            && (allow_empty_delta || baseline_len < request.input.len())
-        {
-            Some(request.input[baseline_len..].to_vec())
-        } else {
-            None
-        }
+        Some(delta.to_vec())
     }
 
     fn get_last_response(&mut self) -> Option<LastResponse> {
@@ -924,6 +919,62 @@ fn build_api_prompt(prompt: &Prompt, instructions: String, tools_json: Vec<Value
     }
 }
 
+fn response_create_properties_match(
+    previous: &ResponseCreateWsRequest,
+    current: &ResponseCreateWsRequest,
+) -> bool {
+    let ResponseCreateWsRequest {
+        model: previous_model,
+        instructions: previous_instructions,
+        previous_response_id: _,
+        input: _,
+        tools: previous_tools,
+        tool_choice: previous_tool_choice,
+        parallel_tool_calls: previous_parallel_tool_calls,
+        reasoning: previous_reasoning,
+        store: previous_store,
+        stream: previous_stream,
+        include: previous_include,
+        service_tier: previous_service_tier,
+        prompt_cache_key: previous_prompt_cache_key,
+        text: previous_text,
+        generate: _,
+        client_metadata: _,
+    } = previous;
+
+    let ResponseCreateWsRequest {
+        model: current_model,
+        instructions: current_instructions,
+        previous_response_id: _,
+        input: _,
+        tools: current_tools,
+        tool_choice: current_tool_choice,
+        parallel_tool_calls: current_parallel_tool_calls,
+        reasoning: current_reasoning,
+        store: current_store,
+        stream: current_stream,
+        include: current_include,
+        service_tier: current_service_tier,
+        prompt_cache_key: current_prompt_cache_key,
+        text: current_text,
+        generate: _,
+        client_metadata: _,
+    } = current;
+
+    previous_model == current_model
+        && previous_instructions == current_instructions
+        && previous_tools == current_tools
+        && previous_tool_choice == current_tool_choice
+        && previous_parallel_tool_calls == current_parallel_tool_calls
+        && previous_reasoning == current_reasoning
+        && previous_store == current_store
+        && previous_stream == current_stream
+        && previous_include == current_include
+        && previous_service_tier == current_service_tier
+        && previous_prompt_cache_key == current_prompt_cache_key
+        && previous_text == current_text
+}
+
 fn turn_metadata_header_from_options(options: &ApiResponsesOptions) -> Option<&str> {
     options
         .extra_headers
@@ -1177,9 +1228,12 @@ mod tests {
     use super::*;
     use crate::model_provider_info::OLLAMA_OSS_PROVIDER_ID;
     use crate::model_provider_info::built_in_model_providers;
+    use codex_api::common::OpenAiVerbosity;
+    use codex_api::common::TextControls;
     use codex_protocol::models::ContentItem;
     use codex_protocol::models::FunctionCallOutputPayload;
     use pretty_assertions::assert_eq;
+    use serde_json::json;
     use tokio::sync::oneshot;
 
     #[test]
@@ -1308,6 +1362,102 @@ mod tests {
             session.get_incremental_items(&reordered_request, Some(&last_response), false),
             None
         );
+    }
+
+    #[test]
+    fn incremental_items_respects_empty_delta_setting() {
+        let initial_user = user_message_item("initial prompt");
+        let request = ws_request(vec![initial_user.clone()]);
+        let session = test_client_session(request.clone());
+
+        assert_eq!(
+            session.get_incremental_items(&request, None, true),
+            Some(Vec::new())
+        );
+        assert_eq!(session.get_incremental_items(&request, None, false), None);
+    }
+
+    #[test]
+    fn incremental_items_ignore_request_scoped_transport_fields() {
+        let initial_user = user_message_item("initial prompt");
+        let next_user = user_message_item("next prompt");
+        let previous_request = ws_request(vec![initial_user.clone()]);
+        let session = test_client_session(previous_request);
+        let mut request = ws_request(vec![initial_user, next_user.clone()]);
+
+        request.previous_response_id = Some("resp-ignored".to_string());
+        request.generate = Some(false);
+        request.client_metadata = Some(HashMap::from([(
+            "x-codex-turn-state".to_string(),
+            "turn-state".to_string(),
+        )]));
+
+        assert_eq!(
+            session.get_incremental_items(&request, None, false),
+            Some(vec![next_user])
+        );
+    }
+
+    #[test]
+    fn incremental_items_rejects_changed_request_properties() {
+        let initial_user = user_message_item("initial prompt");
+        let next_user = user_message_item("next prompt");
+
+        let cases: Vec<(&str, fn(&mut ResponseCreateWsRequest))> = vec![
+            ("model", |request| request.model = "other-model".to_string()),
+            ("instructions", |request| {
+                request.instructions = "changed instructions".to_string();
+            }),
+            ("tools", |request| {
+                request.tools = vec![json!({
+                    "type": "function",
+                    "name": "lookup",
+                    "parameters": {"type": "object"}
+                })];
+            }),
+            ("tool_choice", |request| {
+                request.tool_choice = "none".to_string();
+            }),
+            ("parallel_tool_calls", |request| {
+                request.parallel_tool_calls = !request.parallel_tool_calls;
+            }),
+            ("reasoning", |request| {
+                request.reasoning = Some(Reasoning {
+                    effort: Some(ReasoningEffortConfig::High),
+                    summary: Some(ReasoningSummaryConfig::Detailed),
+                });
+            }),
+            ("store", |request| request.store = !request.store),
+            ("stream", |request| request.stream = !request.stream),
+            ("include", |request| {
+                request.include = vec!["reasoning.encrypted_content".to_string()];
+            }),
+            ("service_tier", |request| {
+                request.service_tier = Some("priority".to_string());
+            }),
+            ("prompt_cache_key", |request| {
+                request.prompt_cache_key = Some("other-thread".to_string());
+            }),
+            ("text", |request| {
+                request.text = Some(TextControls {
+                    verbosity: Some(OpenAiVerbosity::High),
+                    format: None,
+                });
+            }),
+        ];
+
+        for (name, mutate) in cases {
+            let previous_request = ws_request(vec![initial_user.clone()]);
+            let session = test_client_session(previous_request);
+            let mut request = ws_request(vec![initial_user.clone(), next_user.clone()]);
+            mutate(&mut request);
+
+            assert_eq!(
+                session.get_incremental_items(&request, None, false),
+                None,
+                "{name} change should force full create"
+            );
+        }
     }
 
     fn assistant_message_item(id: &str, text: &str) -> ResponseItem {
