@@ -32,6 +32,7 @@ use core_test_support::responses::WebSocketConnectionConfig;
 use core_test_support::responses::WebSocketTestServer;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
+use core_test_support::responses::ev_output_text_delta;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::start_websocket_server;
 use core_test_support::responses::start_websocket_server_with_headers;
@@ -727,7 +728,10 @@ async fn responses_websocket_pause_continue_reconnects_after_in_flight_response(
 
     let server = start_websocket_server_with_headers(vec![
         WebSocketConnectionConfig {
-            requests: vec![vec![ev_response_created("resp-pause")]],
+            requests: vec![vec![
+                ev_response_created("resp-pause"),
+                ev_output_text_delta("partial streamed text that must not continue"),
+            ]],
             response_headers: Vec::new(),
             keep_open: true,
         },
@@ -788,6 +792,7 @@ async fn responses_websocket_pause_continue_reconnects_after_in_flight_response(
     let continued_text = continued.to_string();
     assert!(continued_text.contains("start pauseable websocket work"));
     assert!(!continued_text.contains("resp-pause"));
+    assert!(!continued_text.contains("partial streamed text that must not continue"));
 
     server.shutdown().await;
 }
