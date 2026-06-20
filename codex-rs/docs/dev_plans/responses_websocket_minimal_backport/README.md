@@ -16,6 +16,11 @@ Completed in this branch:
 - Carried `x-codex-turn-state` through request-scoped `response.create.client_metadata`, seeded by `response.metadata` when present.
 - Cached only healthy physical WebSocket connections across logical turns, while clearing all logical continuation state at turn boundaries.
 
+Deferred validation work:
+
+- In-flight WebSocket `/pause`/`/continue` E2E coverage with the first connection held open until the WebSocket mock server can accept concurrent scripted connections.
+- Full WebSocket compaction same-socket E2E coverage; the cache-specific continuation-clear behavior is unit-covered.
+
 Deferred optional work:
 
 - Shared custom CA and rustls provider parity for secure WebSockets and HTTP.
@@ -29,7 +34,7 @@ Deferred optional work:
 |2|Serialize WebSocket requests directly to the wire string|Done|Removes an unnecessary full `serde_json::Value` allocation and second traversal.|
 |3|Compare incremental requests by reference|Done|Avoids cloning the full previous request, current request, and history on every tool round trip.|
 |4|Move `x-codex-turn-state` to request-scoped WebSocket metadata|Done|A physical connection can span logical turns only if sticky turn state remains turn-scoped.|
-|5|Reuse only the physical WebSocket connection across logical turns|Done|Removes repeated handshakes while preserving this project's `/pause` and `/continue` durability model.|
+|5|Reuse only the physical WebSocket connection across logical turns|Done (runtime)|Removes repeated handshakes while preserving this project's `/pause` and `/continue` durability model. Deferred E2E validation items are listed above.|
 |6|Custom CA and rustls provider parity|Deferred optional|Fixes enterprise TLS interception and P-521 certificate-chain failures, but requires a small shared TLS prerequisite.|
 |7|Provider-configurable WebSocket connect timeout|Deferred optional|Small operational hardening; not required for the other changes.|
 
