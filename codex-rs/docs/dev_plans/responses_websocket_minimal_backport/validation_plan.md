@@ -130,6 +130,8 @@ The mock server should deliberately keep the first response open after sending a
 
 Do not let the first mock connection close before the pause; otherwise the test proves reconnect-after-close rather than the cache safety rule.
 
+Current validation note: this repository's WebSocket mock server handles scripted connections serially. Holding the first scripted connection open prevents accepting the continued connection, so this series validates the same safety rule with the cacheability helper until the mock server can handle concurrent scripted connections.
+
 ### Drop-state unit tests
 
 Directly exercise the cacheability helper:

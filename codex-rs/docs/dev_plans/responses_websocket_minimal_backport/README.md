@@ -2,21 +2,36 @@
 
 ## Outcome
 
-This plan updates the prior WebSocket backport proposal after inspecting the implementation in this project, the corresponding implementation in the upstream project, the `/pause` and `/continue` lifecycle, and the current Responses WebSocket contract.
+This plan updated the prior WebSocket backport proposal after inspecting the implementation in this project, the corresponding implementation in the upstream project, the `/pause` and `/continue` lifecycle, and the current Responses WebSocket contract.
 
 The previous proposal was based on an older intermediate state. Several changes it proposed are already present in this project, while one proposed addition, `response.processed`, has since been removed from the upstream project and is not part of the current public WebSocket contract.
 
+## Implementation status
+
+Completed in this branch:
+
+- Removed obsolete non-create WebSocket request shapes: `response.processed` and `response.append`.
+- Serialized WebSocket requests directly to the outbound wire string.
+- Replaced clone-heavy incremental request eligibility checks with borrowed comparison and prefix checks.
+- Carried `x-codex-turn-state` through request-scoped `response.create.client_metadata`, seeded by `response.metadata` when present.
+- Cached only healthy physical WebSocket connections across logical turns, while clearing all logical continuation state at turn boundaries.
+
+Deferred optional work:
+
+- Shared custom CA and rustls provider parity for secure WebSockets and HTTP.
+- Provider-configurable WebSocket connect timeout.
+
 ## Recommended sequence
 
-|Order|Change|Recommendation|Why|
+|Order|Change|Status|Why|
 |---|---|---|---|
-|1|Remove dormant non-create WebSocket request paths|Backport|Eliminates obsolete protocol shapes, feature flag plumbing, call sites, and tests.|
-|2|Serialize WebSocket requests directly to the wire string|Backport|Removes an unnecessary full `serde_json::Value` allocation and second traversal.|
-|3|Compare incremental requests by reference|Backport|Avoids cloning the full previous request, current request, and history on every tool round trip.|
-|4|Move `x-codex-turn-state` to request-scoped WebSocket metadata|Backport prerequisite|A physical connection can span logical turns only if sticky turn state remains turn-scoped.|
-|5|Reuse only the physical WebSocket connection across logical turns|Backport in a separate patch after step 4|Removes repeated handshakes while preserving this project's `/pause` and `/continue` durability model.|
-|6|Custom CA and rustls provider parity|Optional, independent patch|Fixes enterprise TLS interception and P-521 certificate-chain failures, but requires a small shared TLS prerequisite.|
-|7|Provider-configurable WebSocket connect timeout|Optional, independent patch|Small operational hardening; not required for the other changes.|
+|1|Remove dormant non-create WebSocket request paths|Done|Eliminates obsolete protocol shapes, feature flag plumbing, call sites, and tests.|
+|2|Serialize WebSocket requests directly to the wire string|Done|Removes an unnecessary full `serde_json::Value` allocation and second traversal.|
+|3|Compare incremental requests by reference|Done|Avoids cloning the full previous request, current request, and history on every tool round trip.|
+|4|Move `x-codex-turn-state` to request-scoped WebSocket metadata|Done|A physical connection can span logical turns only if sticky turn state remains turn-scoped.|
+|5|Reuse only the physical WebSocket connection across logical turns|Done|Removes repeated handshakes while preserving this project's `/pause` and `/continue` durability model.|
+|6|Custom CA and rustls provider parity|Deferred optional|Fixes enterprise TLS interception and P-521 certificate-chain failures, but requires a small shared TLS prerequisite.|
+|7|Provider-configurable WebSocket connect timeout|Deferred optional|Small operational hardening; not required for the other changes.|
 
 ## Deliberate boundary
 
