@@ -33,6 +33,7 @@ use core_test_support::responses::ev_response_created;
 use core_test_support::responses::start_websocket_server;
 use core_test_support::responses::start_websocket_server_with_headers;
 use core_test_support::skip_if_no_network;
+use core_test_support::test_codex::test_codex;
 use futures::StreamExt;
 use opentelemetry_sdk::metrics::InMemoryMetricExporter;
 use pretty_assertions::assert_eq;
@@ -608,6 +609,62 @@ async fn responses_websocket_forwards_turn_state_from_response_metadata() {
     assert_eq!(
         third["client_metadata"][X_CODEX_TURN_STATE_HEADER].as_str(),
         Some("state-a")
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_websocket_reuses_completed_connection_across_turns() {
+    skip_if_no_network!();
+
+    let server = start_websocket_server(vec![vec![
+        vec![
+            ev_turn_state_metadata("x-codex-turn-state", json!("state-a")),
+            ev_response_created("resp-1"),
+            ev_assistant_message("msg-1", "first done"),
+            ev_completed("resp-1"),
+        ],
+        vec![ev_response_created("resp-2"), ev_completed("resp-2")],
+    ]])
+    .await;
+
+    let mut builder = test_codex();
+    let test = builder
+        .build_with_websocket_server(&server)
+        .await
+        .expect("build websocket codex");
+
+    test.submit_turn("first turn")
+        .await
+        .expect("first turn should complete");
+    test.submit_turn("second turn")
+        .await
+        .expect("second turn should complete");
+
+    let connections = server.connections();
+    assert_eq!(connections.len(), 1);
+    let connection = connections.first().expect("missing connection");
+    assert_eq!(connection.len(), 2);
+
+    let first = connection
+        .first()
+        .expect("missing first request")
+        .body_json();
+    let second = connection
+        .get(1)
+        .expect("missing second request")
+        .body_json();
+
+    assert_eq!(first["type"].as_str(), Some("response.create"));
+    assert_eq!(first.get("previous_response_id"), None);
+    assert_eq!(second["type"].as_str(), Some("response.create"));
+    assert_eq!(second.get("previous_response_id"), None);
+    assert_eq!(
+        second
+            .get("client_metadata")
+            .and_then(|metadata| metadata.get(X_CODEX_TURN_STATE_HEADER)),
+        None
     );
 
     server.shutdown().await;

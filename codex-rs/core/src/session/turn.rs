@@ -819,7 +819,7 @@ async fn run_turn_inner(
 
 fn reset_client_session_if_compacted(client_session: &mut ModelClientSession, compacted: bool) {
     if compacted {
-        client_session.reset_websocket_session();
+        client_session.clear_websocket_continuation();
     }
 }
 

@@ -235,7 +235,7 @@ async fn run_compact_task_inner(
         .collect();
     new_history.extend(ghost_snapshots);
     let replacement_history = Some(new_history.clone());
-    client_session.reset_websocket_session();
+    client_session.clear_websocket_continuation();
 
     let compacted_item = CompactedItem {
         message: summary_text.clone(),

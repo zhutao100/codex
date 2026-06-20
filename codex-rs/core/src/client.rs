@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -113,6 +114,7 @@ struct ModelClientState {
     include_timing_metrics: bool,
     beta_features_header: Option<String>,
     disable_websockets: AtomicBool,
+    cached_websocket_connection: StdMutex<Option<CachedWebsocketConnection>>,
 }
 
 /// A session-scoped client for model-provider API calls.
@@ -150,6 +152,7 @@ pub struct ModelClientSession {
     client: ModelClient,
     provider: ModelProviderInfo,
     connection: Option<ApiWebSocketConnection>,
+    connection_auth_mode: Option<Option<AuthMode>>,
     websocket_last_request: Option<ResponseCreateWsRequest>,
     websocket_last_response_rx: Option<oneshot::Receiver<LastResponse>>,
     /// Turn state for sticky routing.
@@ -169,6 +172,21 @@ pub struct ModelClientSession {
 struct LastResponse {
     response_id: String,
     items_added: Vec<ResponseItem>,
+}
+
+struct CachedWebsocketConnection {
+    provider: ModelProviderInfo,
+    auth_mode: Option<AuthMode>,
+    connection: ApiWebSocketConnection,
+}
+
+impl std::fmt::Debug for CachedWebsocketConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachedWebsocketConnection")
+            .field("provider", &self.provider)
+            .field("auth_mode", &self.auth_mode)
+            .finish_non_exhaustive()
+    }
 }
 
 enum WebsocketStreamOutcome {
@@ -208,6 +226,7 @@ impl ModelClient {
                 include_timing_metrics,
                 beta_features_header,
                 disable_websockets: AtomicBool::new(false),
+                cached_websocket_connection: StdMutex::new(None),
             }),
         }
     }
@@ -225,6 +244,7 @@ impl ModelClient {
             client: self.clone(),
             provider,
             connection: None,
+            connection_auth_mode: None,
             websocket_last_request: None,
             websocket_last_response_rx: None,
             turn_state: Arc::new(OnceLock::new()),
@@ -385,13 +405,77 @@ impl ModelClient {
         let request_telemetry: Arc<dyn RequestTelemetry> = telemetry;
         request_telemetry
     }
+
+    fn take_cached_websocket_connection(
+        &self,
+        provider: &ModelProviderInfo,
+        auth_mode: Option<AuthMode>,
+    ) -> Option<ApiWebSocketConnection> {
+        let mut cached = self
+            .state
+            .cached_websocket_connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let connection = cached.take()?;
+
+        if connection.provider == *provider && connection.auth_mode == auth_mode {
+            Some(connection.connection)
+        } else {
+            *cached = Some(connection);
+            None
+        }
+    }
+
+    fn store_cached_websocket_connection(
+        &self,
+        provider: ModelProviderInfo,
+        auth_mode: Option<AuthMode>,
+        connection: ApiWebSocketConnection,
+    ) {
+        let mut cached = self
+            .state
+            .cached_websocket_connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *cached = Some(CachedWebsocketConnection {
+            provider,
+            auth_mode,
+            connection,
+        });
+    }
+
+    fn clear_cached_websocket_connection(&self) {
+        *self
+            .state
+            .cached_websocket_connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
 }
 
 impl ModelClientSession {
-    pub(crate) fn reset_websocket_session(&mut self) {
-        self.connection = None;
+    pub(crate) fn clear_websocket_continuation(&mut self) {
         self.websocket_last_request = None;
         self.websocket_last_response_rx = None;
+    }
+
+    fn drop_websocket_connection(&mut self) {
+        self.connection = None;
+        self.connection_auth_mode = None;
+        self.clear_websocket_continuation();
+    }
+
+    fn take_cacheable_connection(&mut self) -> Option<ApiWebSocketConnection> {
+        let response_finished = websocket_response_finished_for_cache(
+            self.websocket_last_request.as_ref(),
+            self.websocket_last_response_rx.as_mut(),
+        );
+        if response_finished {
+            self.clear_websocket_continuation();
+            self.connection.take()
+        } else {
+            None
+        }
     }
 
     fn disable_websockets(&self) -> bool {
@@ -602,16 +686,28 @@ impl ModelClientSession {
         otel_manager: &OtelManager,
         api_provider: codex_api::Provider,
         api_auth: CoreAuthProvider,
+        auth_mode: Option<AuthMode>,
         options: &ApiResponsesOptions,
     ) -> std::result::Result<&ApiWebSocketConnection, ApiError> {
+        if self.connection.is_some() && self.connection_auth_mode != Some(auth_mode) {
+            self.drop_websocket_connection();
+        }
+        if self.connection.is_none()
+            && let Some(connection) = self
+                .client
+                .take_cached_websocket_connection(&self.provider, auth_mode)
+        {
+            self.connection = Some(connection);
+            self.connection_auth_mode = Some(auth_mode);
+        }
+
         let needs_new = match self.connection.as_ref() {
             Some(conn) => conn.is_closed().await,
             None => true,
         };
 
         if needs_new {
-            self.websocket_last_request = None;
-            self.websocket_last_response_rx = None;
+            self.drop_websocket_connection();
             let mut headers = options.extra_headers.clone();
             headers.extend(build_conversation_headers(options.conversation_id.clone()));
             headers.insert(
@@ -637,6 +733,7 @@ impl ModelClientSession {
                     .await
                     .map_err(|_| ApiError::Transport(TransportError::Timeout))??;
             self.connection = Some(new_conn);
+            self.connection_auth_mode = Some(auth_mode);
         }
 
         self.connection.as_ref().ok_or(ApiError::Stream(
@@ -778,6 +875,7 @@ impl ModelClientSession {
                     otel_manager,
                     api_provider.clone(),
                     api_auth.clone(),
+                    request_auth.auth_mode,
                     &options,
                 )
                 .await
@@ -907,11 +1005,28 @@ impl ModelClientSession {
                 &[("from_wire_api", "responses_websocket")],
             );
 
-            self.connection = None;
-            self.websocket_last_request = None;
-            self.websocket_last_response_rx = None;
+            self.client.clear_cached_websocket_connection();
+            self.drop_websocket_connection();
         }
         activated
+    }
+}
+
+impl Drop for ModelClientSession {
+    fn drop(&mut self) {
+        if self.disable_websockets() {
+            return;
+        }
+
+        let Some(auth_mode) = self.connection_auth_mode else {
+            return;
+        };
+        let Some(connection) = self.take_cacheable_connection() else {
+            return;
+        };
+
+        self.client
+            .store_cached_websocket_connection(self.provider.clone(), auth_mode, connection);
     }
 }
 
@@ -923,6 +1038,19 @@ fn build_api_prompt(prompt: &Prompt, instructions: String, tools_json: Vec<Value
         tools: tools_json,
         parallel_tool_calls: prompt.parallel_tool_calls,
         output_schema: prompt.output_schema.clone(),
+    }
+}
+
+fn websocket_response_finished_for_cache(
+    last_request: Option<&ResponseCreateWsRequest>,
+    last_response_rx: Option<&mut oneshot::Receiver<LastResponse>>,
+) -> bool {
+    match last_response_rx {
+        Some(receiver) => match receiver.try_recv() {
+            Ok(_) => true,
+            Err(TryRecvError::Empty | TryRecvError::Closed) => false,
+        },
+        None => last_request.is_none(),
     }
 }
 
@@ -1243,6 +1371,8 @@ mod tests {
     use serde_json::json;
     use tokio::sync::oneshot;
 
+    type RequestMutation = fn(&mut ResponseCreateWsRequest);
+
     #[test]
     fn service_tier_for_wire_maps_only_openai_provider() {
         let providers = built_in_model_providers();
@@ -1338,6 +1468,39 @@ mod tests {
     }
 
     #[test]
+    fn websocket_response_finished_for_cache_tracks_receiver_state() {
+        assert!(websocket_response_finished_for_cache(None, None));
+
+        let request = ws_request(Vec::new());
+        assert!(!websocket_response_finished_for_cache(Some(&request), None));
+
+        let (completed_tx, mut completed_rx) = oneshot::channel();
+        completed_tx
+            .send(LastResponse {
+                response_id: "resp-1".to_string(),
+                items_added: Vec::new(),
+            })
+            .expect("send completed response");
+        assert!(websocket_response_finished_for_cache(
+            Some(&request),
+            Some(&mut completed_rx)
+        ));
+
+        let (_pending_tx, mut pending_rx) = oneshot::channel();
+        assert!(!websocket_response_finished_for_cache(
+            Some(&request),
+            Some(&mut pending_rx)
+        ));
+
+        let (closed_tx, mut closed_rx) = oneshot::channel::<LastResponse>();
+        drop(closed_tx);
+        assert!(!websocket_response_finished_for_cache(
+            Some(&request),
+            Some(&mut closed_rx)
+        ));
+    }
+
+    #[test]
     fn incremental_items_preserve_prefix_when_steer_appends_after_committed_response() {
         let initial_user = user_message_item("initial prompt");
         let assistant = assistant_message_item("msg-1", "working on it");
@@ -1374,7 +1537,7 @@ mod tests {
     #[test]
     fn incremental_items_respects_empty_delta_setting() {
         let initial_user = user_message_item("initial prompt");
-        let request = ws_request(vec![initial_user.clone()]);
+        let request = ws_request(vec![initial_user]);
         let session = test_client_session(request.clone());
 
         assert_eq!(
@@ -1410,7 +1573,7 @@ mod tests {
         let initial_user = user_message_item("initial prompt");
         let next_user = user_message_item("next prompt");
 
-        let cases: Vec<(&str, fn(&mut ResponseCreateWsRequest))> = vec![
+        let cases: Vec<(&str, RequestMutation)> = vec![
             ("model", |request| request.model = "other-model".to_string()),
             ("instructions", |request| {
                 request.instructions = "changed instructions".to_string();
