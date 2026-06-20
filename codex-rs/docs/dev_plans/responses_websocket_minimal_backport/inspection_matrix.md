@@ -57,7 +57,7 @@ These items were proposed by the earlier plan but are already implemented.
 |---|---|---|---|
 |`response.create`|Implemented and used.|Implemented and used.|Canonical path.|
 |`response.processed`|Type, enum variant, sender, feature flag, turn call site, schema entries, and tests remain.|Removed.|Obsolete. Remove in the first patch.|
-|`response.append`|Public type and enum variant exist but workspace search finds no construction or send path.|Removed.|Dead protocol surface. Do not make its removal a prerequisite; remove only if public API compatibility permits.|
+|`response.append`|Public type and enum variant exist but workspace search finds no construction or send path.|Removed.|Dead protocol surface. Remove in this branch because `codex-api` is used as a workspace-internal crate here.|
 
 ## Upstream-fixed bugs still present here
 

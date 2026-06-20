@@ -14,7 +14,7 @@
 
 |Patch|Scope|Dependency|User-visible effect|
 |---|---|---|---|
-|1|Remove `response.processed`|None|Removes a dormant under-development feature/config key.|
+|1|Remove non-create request paths|None|Removes dormant request types and an under-development feature/config key.|
 |2|Direct request serialization|Patch 1 recommended but not required|None; allocation/CPU reduction.|
 |3|Borrowed incremental comparison|None|None; allocation/CPU reduction.|
 |4|Request-scoped turn state|None|Internal metadata transport change.|
@@ -22,18 +22,20 @@
 |6|Custom CA and rustls provider|Independent|Secure WebSocket and HTTP connectivity behind enterprise CA interception.|
 |7|Configurable connect timeout|Independent|New optional provider configuration.|
 
-## Patch 1 - Remove obsolete `response.processed`
+## Patch 1 - Remove obsolete non-create WebSocket requests
 
 ### Rationale
 
 The current public WebSocket protocol uses client `response.create` messages. The upstream project removed its processed acknowledgement because it no longer carried useful behavior. This project retains the entire path behind an under-development feature flag.
 
+Workspace inspection also finds no construction of `response.append`; keeping that dead public shape would preserve needless wire-shape drift from upstream. This branch treats `codex-api` as workspace-internal for this backport, so remove `response.append` in the same cleanup patch.
+
 ### Changes
 
 |Path|Change|
 |---|---|
-|`codex-api/src/common.rs`|Remove `ResponseProcessedWsRequest` and `ResponsesWsRequest::ResponseProcessed`.|
-|`codex-api/src/lib.rs`|Remove the processed-request re-export.|
+|`codex-api/src/common.rs`|Remove `ResponseAppendWsRequest`, `ResponseProcessedWsRequest`, `ResponsesWsRequest::ResponseAppend`, and `ResponsesWsRequest::ResponseProcessed`.|
+|`codex-api/src/lib.rs`|Remove the append- and processed-request re-exports.|
 |`codex-api/src/endpoint/responses_websocket.rs`|Remove the processed-request import and `ResponsesWebsocketConnection::send_response_processed(...)`.|
 |`core/src/client.rs`|Remove `ModelClientSession::send_response_processed(...)`.|
 |`core/src/session/turn.rs`|Remove the successful-turn acknowledgement branch and the now-unused feature import if applicable.|
@@ -41,18 +43,11 @@ The current public WebSocket protocol uses client `response.create` messages. Th
 |`core/config.schema.json`|Regenerate or remove both schema occurrences of `responses_websocket_response_processed`.|
 |`core/tests/suite/client_websockets.rs`|Remove the enabled/disabled processed-request tests and helper setup.|
 
-### `response.append`
-
-Workspace search finds no construction of `ResponsesWsRequest::ResponseAppend`. It is also absent upstream. Its removal is not required for the functional fix and would change a public `codex-api` type. Handle it as one of:
-
-- Remove it in the same patch if this branch does not promise external `codex-api` compatibility.
-- Otherwise retain the dormant type temporarily and file a separate API cleanup.
-
-Do not add any new acknowledgement or append protocol in its place.
+Do not add any new acknowledgement or append protocol in their place.
 
 ### Acceptance
 
-- No `ResponseProcessed`, `send_response_processed`, or `responses_websocket_response_processed` symbol remains.
+- No `ResponseAppend`, `ResponseProcessed`, `send_response_processed`, or `responses_websocket_response_processed` symbol remains.
 - Successful turns emit no post-completion WebSocket request.
 - Existing ordinary and incremental request tests still pass.
 
@@ -254,7 +249,7 @@ In `core/src/client.rs`:
 - Pass `Some(Arc::clone(&self.turn_state))` to `stream_request(...)`.
 - Do not use a previous turn's lock when adopting a cached connection.
 
-For WebSocket connect, pass `turn_state: None` to the API connector once response-metadata capture is covered. HTTP Responses calls continue using the existing header/response handling.
+For a newly opened WebSocket connection, continue passing the current turn's lock into the API connector so upgrade-response compatibility headers can still seed it. A reused connection must not carry any previous turn lock; request-body `client_metadata` and `response.metadata` establish state for the current turn.
 
 ### Compatibility headers
 
@@ -519,7 +514,7 @@ Do not remove the current feature gates as part of this series. Provider-capabil
 
 ## Suggested commit boundaries
 
-1. `websocket: remove obsolete response.processed path`
+1. `websocket: remove obsolete non-create request paths`
 2. `websocket: serialize requests directly`
 3. `websocket: avoid cloning incremental request history`
 4. `websocket: carry turn state in response.create metadata`

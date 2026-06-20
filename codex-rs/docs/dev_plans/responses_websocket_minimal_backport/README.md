@@ -10,7 +10,7 @@ The previous proposal was based on an older intermediate state. Several changes 
 
 |Order|Change|Recommendation|Why|
 |---|---|---|---|
-|1|Remove the dormant `response.processed` request path|Backport|Eliminates an obsolete protocol shape, feature flag, call site, and tests.|
+|1|Remove dormant non-create WebSocket request paths|Backport|Eliminates obsolete protocol shapes, feature flag plumbing, call sites, and tests.|
 |2|Serialize WebSocket requests directly to the wire string|Backport|Removes an unnecessary full `serde_json::Value` allocation and second traversal.|
 |3|Compare incremental requests by reference|Backport|Avoids cloning the full previous request, current request, and history on every tool round trip.|
 |4|Move `x-codex-turn-state` to request-scoped WebSocket metadata|Backport prerequisite|A physical connection can span logical turns only if sticky turn state remains turn-scoped.|
@@ -55,4 +55,4 @@ The following behavior is already implemented and is excluded from new backport 
 - [`problem_statement.md`](problem_statement.md): inspected architecture, protocol baseline, and corrected problem definition.
 - [`inspection_matrix.md`](inspection_matrix.md): feature-by-feature comparison, remaining gaps, and upstream-fixed bugs still present here.
 - [`design_proposal.md`](design_proposal.md): minimal patch sequence, ownership model, prerequisites, and deferrals.
-- [`validation_plan.md`](validation_plan.md): tests and acceptance criteria for each patch.
+- [`validation_plan.md`](validation_plan.md): tests, local command wrappers, and acceptance criteria for each patch.

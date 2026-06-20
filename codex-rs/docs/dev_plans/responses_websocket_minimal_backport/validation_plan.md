@@ -12,12 +12,12 @@
 
 |Check|Expected result|
 |---|---|
-|`rg -e ResponseProcessed -e send_response_processed -e responses_websocket_response_processed`|No matches in source, tests, or schema.|
+|`rg -e ResponseAppend -e ResponseProcessed -e send_response_processed -e responses_websocket_response_processed`|No matches in source, tests, or schema.|
 |Successful WebSocket turn|Exactly the expected `response.create` requests; no post-completion request.|
 |Feature parsing|The removed under-development feature key is no longer accepted/generated.|
 |Existing incremental tests|Unchanged behavior.|
 
-If `response.append` is also removed, run a workspace-wide symbol search and document the public API decision separately.
+Run a workspace-wide symbol search for both removed request shapes so the public API cleanup remains explicit.
 
 ## Patch 2 - Direct serialization
 
@@ -191,10 +191,10 @@ Run formatting and the focused crates first:
 
 ```shell
 just fmt
-cargo test -p codex-api
-cargo test -p codex-core --test all client_websockets
-cargo test -p codex-core --test all websocket_fallback
-cargo test -p codex-core --test all abort_tasks
+CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-api
+CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-core --test all client_websockets
+CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-core --test all websocket_fallback
+CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-core --test all abort_tasks
 ```
 
 Then run the broader affected workspace tests required by the branch's normal validation policy. Regenerate `core/config.schema.json` through the project's schema command when feature or provider configuration changes.
