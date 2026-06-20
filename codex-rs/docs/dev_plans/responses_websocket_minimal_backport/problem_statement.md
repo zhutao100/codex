@@ -51,7 +51,7 @@ Connection setup already:
 
 ### Request send and response processing
 
-`ResponsesWebsocketConnection::stream_request(...)` currently serializes the request to `serde_json::Value`. `send_websocket_request(...)` serializes that value again to a JSON string and applies the stream idle timeout to the actual send.
+`ResponsesWebsocketConnection::stream_request(...)` serializes the WebSocket request directly to a JSON string and applies the stream idle timeout to the actual send.
 
 The response task:
 
@@ -71,7 +71,7 @@ The response task:
 - A oneshot receiver containing the last completed response ID and returned output items.
 - A fresh `OnceLock<String>` for `x-codex-turn-state`.
 
-A new `ModelClientSession` is constructed for every regular turn and every continued turn. Therefore, the physical WebSocket connection is dropped at the end of each logical turn.
+A new `ModelClientSession` is constructed for every regular turn and every continued turn. Completed healthy sessions may return the physical WebSocket connection to the session-scoped one-slot cache keyed by provider and auth mode; logical continuation state is still cleared at turn boundaries.
 
 ### Incremental request construction
 

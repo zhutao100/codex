@@ -642,9 +642,14 @@ fn serialize_websocket_request(request: &ResponsesWsRequest) -> Result<String, A
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::OpenAiVerbosity;
+    use crate::common::Reasoning;
     use crate::common::ResponseCreateWsRequest;
+    use crate::common::TextControls;
+    use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
     use codex_protocol::models::ContentItem;
     use codex_protocol::models::ResponseItem;
+    use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
     use pretty_assertions::assert_eq;
     use serde_json::json;
     use std::collections::HashMap;
@@ -671,18 +676,27 @@ mod tests {
             })],
             tool_choice: "auto".to_string(),
             parallel_tool_calls: true,
-            reasoning: None,
+            reasoning: Some(Reasoning {
+                effort: Some(ReasoningEffortConfig::High),
+                summary: Some(ReasoningSummaryConfig::Detailed),
+            }),
             store: false,
             stream: true,
             include: vec!["reasoning.encrypted_content".to_string()],
             service_tier: Some("priority".to_string()),
             prompt_cache_key: Some("cache-key".to_string()),
-            text: None,
+            text: Some(TextControls {
+                verbosity: Some(OpenAiVerbosity::High),
+                format: None,
+            }),
             generate: Some(false),
-            client_metadata: Some(HashMap::from([(
-                "traceparent".to_string(),
-                "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01".to_string(),
-            )])),
+            client_metadata: Some(HashMap::from([
+                (
+                    "traceparent".to_string(),
+                    "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01".to_string(),
+                ),
+                ("x-codex-turn-state".to_string(), "turn-state-1".to_string()),
+            ])),
         });
 
         let previous_payload = serde_json::to_value(&request).expect("serialize previous payload");
