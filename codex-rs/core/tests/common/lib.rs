@@ -192,6 +192,12 @@ pub fn sandbox_network_env_var() -> &'static str {
     codex_core::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR
 }
 
+/// Set by `scripts/cargo-local` when its network-disabled profile permits
+/// localhost sockets.
+pub fn localhost_network_env_var() -> &'static str {
+    "CODEX_RS_LOCALHOST_NETWORK_ALLOWED"
+}
+
 pub fn format_with_current_shell(command: &str) -> Vec<String> {
     codex_core::shell::default_user_shell().derive_exec_args(command, true)
 }
@@ -400,6 +406,20 @@ macro_rules! skip_if_no_network {
                 "Skipping test because it cannot execute when network is disabled in a Codex sandbox."
             );
             return $return_value;
+        }
+    }};
+}
+
+#[macro_export]
+macro_rules! skip_if_no_network_unless_localhost {
+    () => {{
+        if ::std::env::var_os($crate::localhost_network_env_var()).is_none() {
+            $crate::skip_if_no_network!();
+        }
+    }};
+    ($return_value:expr $(,)?) => {{
+        if ::std::env::var_os($crate::localhost_network_env_var()).is_none() {
+            $crate::skip_if_no_network!($return_value);
         }
     }};
 }

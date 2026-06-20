@@ -32,7 +32,7 @@ use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::start_websocket_server;
 use core_test_support::responses::start_websocket_server_with_headers;
-use core_test_support::skip_if_no_network;
+use core_test_support::skip_if_no_network_unless_localhost;
 use core_test_support::test_codex::test_codex;
 use futures::StreamExt;
 use opentelemetry_sdk::metrics::InMemoryMetricExporter;
@@ -61,7 +61,7 @@ struct WebsocketTestHarness {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_websocket_streams_request() {
-    skip_if_no_network!();
+    skip_if_no_network_unless_localhost!();
 
     let server = start_websocket_server(vec![vec![vec![
         ev_response_created("resp-1"),
@@ -103,7 +103,7 @@ async fn responses_websocket_streams_request() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[traced_test]
 async fn responses_websocket_emits_websocket_telemetry_events() {
-    skip_if_no_network!();
+    skip_if_no_network_unless_localhost!();
 
     let server = start_websocket_server(vec![vec![vec![
         ev_response_created("resp-1"),
@@ -134,7 +134,7 @@ async fn responses_websocket_emits_websocket_telemetry_events() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_websocket_includes_timing_metrics_header_when_runtime_metrics_enabled() {
-    skip_if_no_network!();
+    skip_if_no_network_unless_localhost!();
 
     let server = start_websocket_server(vec![vec![vec![
         ev_response_created("resp-1"),
@@ -175,7 +175,7 @@ async fn responses_websocket_includes_timing_metrics_header_when_runtime_metrics
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_websocket_omits_timing_metrics_header_when_runtime_metrics_disabled() {
-    skip_if_no_network!();
+    skip_if_no_network_unless_localhost!();
 
     let server = start_websocket_server(vec![vec![vec![
         ev_response_created("resp-1"),
@@ -200,7 +200,7 @@ async fn responses_websocket_omits_timing_metrics_header_when_runtime_metrics_di
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_websocket_emits_reasoning_included_event() {
-    skip_if_no_network!();
+    skip_if_no_network_unless_localhost!();
 
     let server = start_websocket_server_with_headers(vec![WebSocketConnectionConfig {
         requests: vec![vec![ev_response_created("resp-1"), ev_completed("resp-1")]],
@@ -282,7 +282,7 @@ async fn responses_websocket_emits_server_model_event() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_websocket_emits_rate_limit_events() {
-    skip_if_no_network!();
+    skip_if_no_network_unless_localhost!();
 
     let rate_limit_event = json!({
         "type": "codex.rate_limits",
@@ -374,7 +374,7 @@ async fn responses_websocket_emits_rate_limit_events() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_websocket_invalid_request_error_with_status_is_forwarded() {
-    skip_if_no_network!();
+    skip_if_no_network_unless_localhost!();
 
     let invalid_request_error = json!({
         "type": "error",
@@ -404,7 +404,7 @@ async fn responses_websocket_invalid_request_error_with_status_is_forwarded() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_websocket_connection_limit_error_reconnects_and_completes() {
-    skip_if_no_network!();
+    skip_if_no_network_unless_localhost!();
 
     let websocket_connection_limit_error = json!({
         "type": "error",
@@ -444,7 +444,7 @@ async fn responses_websocket_connection_limit_error_reconnects_and_completes() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_websocket_uses_incremental_create_on_prefix() {
-    skip_if_no_network!();
+    skip_if_no_network_unless_localhost!();
 
     let server = start_websocket_server(vec![vec![
         vec![
@@ -489,7 +489,7 @@ async fn responses_websocket_uses_incremental_create_on_prefix() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_websocket_forwards_turn_metadata_on_initial_and_incremental_create() {
-    skip_if_no_network!();
+    skip_if_no_network_unless_localhost!();
 
     let server = start_websocket_server(vec![vec![
         vec![
@@ -550,7 +550,7 @@ async fn responses_websocket_forwards_turn_metadata_on_initial_and_incremental_c
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_websocket_forwards_turn_state_from_response_metadata() {
-    skip_if_no_network!();
+    skip_if_no_network_unless_localhost!();
 
     let server = start_websocket_server(vec![vec![
         vec![
@@ -616,7 +616,7 @@ async fn responses_websocket_forwards_turn_state_from_response_metadata() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_websocket_reuses_completed_connection_across_turns() {
-    skip_if_no_network!();
+    skip_if_no_network_unless_localhost!();
 
     let server = start_websocket_server(vec![vec![
         vec![
@@ -672,7 +672,7 @@ async fn responses_websocket_reuses_completed_connection_across_turns() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_websocket_reconnects_when_cached_connection_was_closed() {
-    skip_if_no_network!();
+    skip_if_no_network_unless_localhost!();
 
     let server = start_websocket_server(vec![
         vec![vec![
@@ -715,7 +715,7 @@ async fn responses_websocket_reconnects_when_cached_connection_was_closed() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_websocket_creates_on_non_prefix() {
-    skip_if_no_network!();
+    skip_if_no_network_unless_localhost!();
 
     let server = start_websocket_server(vec![vec![
         vec![ev_response_created("resp-1"), ev_completed("resp-1")],
@@ -748,7 +748,7 @@ async fn responses_websocket_creates_on_non_prefix() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_websocket_v2_creates_with_previous_response_id_on_prefix() {
-    skip_if_no_network!();
+    skip_if_no_network_unless_localhost!();
 
     let server = start_websocket_server(vec![vec![
         vec![
@@ -790,7 +790,7 @@ async fn responses_websocket_v2_creates_with_previous_response_id_on_prefix() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_websocket_v2_creates_without_previous_response_id_when_non_input_fields_change()
 {
-    skip_if_no_network!();
+    skip_if_no_network_unless_localhost!();
 
     let server = start_websocket_server(vec![vec![
         vec![ev_response_created("resp-1"), ev_completed("resp-1")],
@@ -826,7 +826,7 @@ async fn responses_websocket_v2_creates_without_previous_response_id_when_non_in
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_websocket_v2_after_error_uses_full_create_without_previous_response_id() {
-    skip_if_no_network!();
+    skip_if_no_network_unless_localhost!();
 
     let server = start_websocket_server(vec![
         vec![
@@ -899,7 +899,7 @@ async fn responses_websocket_v2_after_error_uses_full_create_without_previous_re
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_websocket_v2_sets_openai_beta_header() {
-    skip_if_no_network!();
+    skip_if_no_network_unless_localhost!();
 
     let server = start_websocket_server(vec![vec![vec![
         ev_response_created("resp-1"),

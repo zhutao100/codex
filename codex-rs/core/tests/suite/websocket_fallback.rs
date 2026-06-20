@@ -6,7 +6,7 @@ use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
-use core_test_support::skip_if_no_network;
+use core_test_support::skip_if_no_network_unless_localhost;
 use core_test_support::test_codex::test_codex;
 use pretty_assertions::assert_eq;
 use wiremock::Mock;
@@ -17,7 +17,7 @@ use wiremock::matchers::path_regex;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn websocket_fallback_switches_to_http_on_upgrade_required_connect() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    skip_if_no_network_unless_localhost!(Ok(()));
 
     let server = responses::start_mock_server().await;
     Mock::given(method("GET"))
@@ -65,7 +65,7 @@ async fn websocket_fallback_switches_to_http_on_upgrade_required_connect() -> Re
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn websocket_fallback_switches_to_http_after_retries_exhausted() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    skip_if_no_network_unless_localhost!(Ok(()));
 
     let server = responses::start_mock_server().await;
     let response_mock = mount_sse_once(
@@ -107,7 +107,7 @@ async fn websocket_fallback_switches_to_http_after_retries_exhausted() -> Result
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn websocket_fallback_is_sticky_across_turns() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    skip_if_no_network_unless_localhost!(Ok(()));
 
     let server = responses::start_mock_server().await;
     let response_mock = mount_sse_sequence(

@@ -397,6 +397,7 @@ run_cargo_command() {
             -u http_proxy \
             -u no_proxy \
             CODEX_SANDBOX=seatbelt \
+            CODEX_RS_LOCALHOST_NETWORK_ALLOWED=1 \
             "${cargo_bin}" "$@"
     else
         "${cargo_bin}" "$@"
@@ -476,6 +477,7 @@ if should_wrap_network_disabled; then
         -u http_proxy \
         -u no_proxy \
         CODEX_SANDBOX=seatbelt \
+        CODEX_RS_LOCALHOST_NETWORK_ALLOWED=1 \
         "${cargo_bin}" "${argv[@]}"
 fi
 
