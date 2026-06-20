@@ -1,135 +1,149 @@
 # Responses WebSocket Minimal Backport - Problem Statement
 
-## Target
+## Scope
 
-This proposal targets this project and compares it with the upstream project.
+This document covers the Responses API WebSocket transport in this project and compares it with the upstream project. It also treats this project's `/pause` and `/continue` implementation as a first-class lifecycle constraint.
 
-The goal is not to cherry-pick the upstream project. The goal is a minimal surfaced backport plan for the remaining Responses WebSocket correctness fixes and feature gaps that still matter after this project's existing partial backport.
+The inspected implementation surfaces are:
 
-## Current External Contract
+|Concern|This project paths|
+|---|---|
+|Wire request and stream types|`codex-api/src/common.rs`|
+|WebSocket connection, pump, send, receive, and error mapping|`codex-api/src/endpoint/responses_websocket.rs`|
+|Shared Responses stream parsing|`codex-api/src/sse/responses.rs`|
+|Transport selection, incremental request construction, retry, and fallback|`core/src/client.rs`|
+|Mapped-stream cancellation|`core/src/client_common.rs`; `core/src/client.rs`|
+|Compaction invalidation|`core/src/compact.rs`; `core/src/session/turn.rs`|
+|Turn lifecycle and `/continue` reconstruction|`core/src/session/turn.rs`; `core/src/tasks/*`; `core/src/session/rollout_reconstruction.rs`|
+|Feature flags and schema|`core/src/features.rs`; `core/config.schema.json`|
+|WebSocket integration tests|`core/tests/suite/client_websockets.rs`; `core/tests/suite/websocket_fallback.rs`|
 
-The current WebSocket Mode contract is the v2 shape:
+## Protocol baseline
 
-- Connect to `/v1/responses` over WebSocket.
-- Start each turn with `response.create`.
-- Continue by sending another `response.create` with `previous_response_id` and only the new input items.
-- Optionally prewarm by sending `response.create` with `generate: false`; the returned response ID can be chained by a later generated turn.
-- Treat connection-local previous-response state as an optimization, not durable history.
-- Expect one in-flight response per connection and reconnect when the 60-minute connection limit is reached.
-- Treat WebSocket `type: "error"` payloads as application-level errors; examples include `previous_response_not_found` and `websocket_connection_limit_reached`.
+External contract reference: `https://developers.openai.com/api/docs/guides/websocket-mode`.
 
-## Inspection Summary
+The current Responses WebSocket contract uses a persistent `/v1/responses` connection and client-sent `response.create` messages. Continuation sends the previous response ID and only newly appended input. `generate: false` is an optional request warmup. Requests on one connection are sequential, the service retains only the latest connection-local response state, and a connection is limited to 60 minutes.
 
-### What this project already has
+Important consequences for this project:
 
-This project has already incorporated a substantial subset of the upstream project's WebSocket fixes. Do not re-port these as if they were absent.
+1. `response.processed` is not required by the current contract.
+2. A healthy physical connection is reusable independently of whether the client chooses to reuse the server's previous-response cache.
+3. Cross-turn `previous_response_id` reuse is an optimization, not a prerequisite for cross-turn socket reuse.
+4. After standalone `/responses/compact`, the client must start a new chain with full compacted input and no previous response ID.
+5. After a failed continuation or a reconnect where the prior response is not available, the safe recovery path is a full request.
 
-|Area|This project status|Relevant paths|
-|---|---|---|
-|v2 `response.create` continuation|The OpenAI WebSocket path constructs `ResponsesWsRequest::ResponseCreate` for both initial and incremental requests, using `previous_response_id` for valid deltas.|`core/src/client.rs`; `codex-api/src/common.rs`|
-|`generate` field|`ResponseCreateWsRequest` already includes `generate: Option<bool>`.|`codex-api/src/common.rs`|
-|Body-level `client_metadata` field|`ResponseCreateWsRequest` already includes `client_metadata: Option<HashMap<String, String>>`; this project currently populates turn metadata, subagent, and parent-thread IDs.|`codex-api/src/common.rs`; `core/src/client.rs`|
-|Incremental comparison normalization|`generate` and `client_metadata` are cleared before comparing non-input request fields, avoiding false misses for transient WebSocket-only fields.|`core/src/client.rs`|
-|SSE fixture suppression|WebSocket transport is disabled while `CODEX_RS_SSE_FIXTURE` is set.|`core/src/client.rs`|
-|HTTP fallback on `426 Upgrade Required`|Connect-time 426 maps to a local `FallbackToHttp` outcome and activates session-scoped HTTP fallback.|`core/src/client.rs`; `core/tests/suite/websocket_fallback.rs`|
-|Connect timeout|WebSocket connect is bounded by `DEFAULT_WEBSOCKET_CONNECT_TIMEOUT`.|`core/src/client.rs`|
-|Default v2 beta header|WebSocket connects send `OpenAI-Beta: responses_websockets=2026-02-06`.|`core/src/client.rs`|
-|Header merge precedence|Provider headers, extra headers, and default headers are merged with HTTP-compatible precedence.|`codex-api/src/endpoint/responses_websocket.rs`|
-|Background pump|`WsStream` has a pump task that continuously reads, responds to ping frames, and serializes writes.|`codex-api/src/endpoint/responses_websocket.rs`|
-|Drop-on-terminal-error|Terminal stream errors drop the failed stream instead of awaiting a graceful close handshake.|`codex-api/src/endpoint/responses_websocket.rs`|
-|Wrapped WebSocket errors|`type: "error"` payloads are parsed before ordinary Responses stream events; non-success statuses map to HTTP-like transport errors.|`codex-api/src/endpoint/responses_websocket.rs`|
-|60-minute connection-limit retry|`websocket_connection_limit_reached` maps to `ApiError::Retryable`.|`codex-api/src/endpoint/responses_websocket.rs`; `core/tests/suite/client_websockets.rs`|
-|`response.incomplete` and `end_turn`|Shared stream parsing handles `response.incomplete` and preserves `response.completed.response.end_turn`.|`codex-api/src/sse/responses.rs`; `codex-api/src/common.rs`|
-|Turn-scoped reset hook|`reset_websocket_session()` clears connection, last request, and last response receiver.|`core/src/client.rs`|
+## Current implementation in this project
 
-### What the upstream project has beyond this project
+### Connection and frame pump
 
-|Area|Upstream project behavior|This project behavior|Impact|
-|---|---|---|---|
-|`response.processed` acknowledgement|Adds `ResponseProcessedWsRequest`, `ResponsesWsRequest::ResponseProcessed`, `ResponsesWebsocketConnection::send_response_processed()`, a feature flag, and call sites after successful turn processing and remote compaction.|No `response.processed` request type or feature flag.|The server never receives an explicit processed acknowledgement from this project. This is the highest-value remaining protocol gap.|
-|Request send timeout|Wraps WebSocket request frame send in the stream idle timeout.|Sends request frames without a timeout; connect and receive are bounded, but a stuck send path is not.|A pathological or wedged WebSocket write can hang longer than intended.|
-|Consumer-drop cancellation|Cancels the stream-mapping task when the core `ResponseStream` consumer is dropped.|The mapping task keeps polling the provider stream until another event, error, or timeout.|A paused, interrupted, or cancelled turn can leave response processing alive longer than intended.|
-|Handshake `openai-model` handling|Reads `openai-model` from the handshake and emits `ResponseEvent::ServerModel`.|Ignores `openai-model`.|Server model reroute information is invisible.|
-|Streaming model metadata|`ResponsesStreamEvent` can extract model headers from stream payloads and emit deduplicated `ServerModel` events.|No stream-level model metadata extraction.|Model changes during or after request processing are invisible.|
-|Model verification recommendations|Parses `model_verifications` from stream metadata and emits `ResponseEvent::ModelVerifications`.|No event type or parser.|Account-verification recommendations are dropped.|
-|Custom-tool input delta|Parses `response.custom_tool_call_input.delta` into `ResponseEvent::ToolCallInputDelta`.|No event type or parser.|Large custom-tool input streams are not surfaced incrementally.|
-|Provider error classification|Maps `cyber_policy`, `server_is_overloaded`, and `slow_down` to dedicated stream errors.|Falls through to generic retryable stream handling.|Some non-retryable or overload conditions can get the wrong retry/user-facing behavior.|
-|Per-message deflate|Uses a WebSocket config with `permessage-deflate` enabled.|Uses default tungstenite config.|Higher bandwidth and less parity with the upstream transport. This may require the upstream tungstenite fork or equivalent dependency support.|
-|Custom CA for WebSocket TLS|Uses the upstream custom-CA rustls helper and `connect_async_tls_with_config`.|Uses `connect_async` with default TLS behavior.|Not a WebSocket-only bug in this project unless custom-CA support is ported generally; otherwise an optional enterprise parity feature.|
-|Cross-turn WebSocket cache|Caches a `WebsocketSession` in `ModelClient`, moves it into new turn sessions, and invalidates it on window-generation changes/fallback.|WebSocket sessions are turn-scoped by design.|Later turns cannot use active-socket continuation latency benefits. This interacts with `/pause` and `/continue`; keep it second-stage.|
-|Preconnect|Can open a WebSocket before the generated turn request.|No preconnect method.|The first generated WebSocket request pays connect latency.|
-|Request prewarm|Can send `response.create` with `generate: false` and consume the warmup completion before the generated turn.|The request shape has `generate`, but no prewarm path uses it.|No request-state warmup latency benefit.|
-|Trace and identity metadata|Adds installation ID, window ID, W3C trace context, and request-start timestamp into `client_metadata`.|Only turn metadata, subagent, and parent-thread IDs are populated.|Reduced observability and weaker parity with upstream diagnostics.|
-|Richer rate-limit parsing|Supports multiple metered-limit header families and limit identifiers in `RateLimitSnapshot`.|Parses the legacy/default rate-limit snapshot shape.|Multi-limit rate-limit details are collapsed or ignored. This depends on protocol schema changes and is not WebSocket-only.|
-|`ResponseStream.upstream_request_id` and response debug context|Carries upstream request IDs and richer response debug metadata.|Not present in the WebSocket `ResponseStream` shape.|Useful for diagnostics, but not required for WebSocket correctness.|
+`codex-api/src/endpoint/responses_websocket.rs` owns one `WsStream` pump per connection. The pump serializes outgoing writes through a command channel, continuously reads incoming frames, responds to Ping frames, suppresses Pong frames, and forwards data or close frames to the response loop.
 
-## Bugs fixed upstream that remain present here
+`ResponsesWebsocketConnection` holds the pump behind an async mutex. The mutex enforces one in-flight response per connection, matching the protocol's sequential request model.
 
-|Bug|Status in this project|Minimal fix stance|
-|---|---|---|
-|Unbounded WebSocket send|A `ws_stream.send(...)` is awaited directly. Connect and receive have timeouts, but send does not.|Add `send_websocket_request(...)` and wrap the send in `idle_timeout`, matching upstream behavior without pulling in the upstream telemetry/inference-trace refactor.|
-|No `response.processed` acknowledgement|No request type, API method, feature flag, or call site exists.|Backport the request type and method; gate call sites behind a new under-development feature. This is a small protocol extension with clear tests.|
-|Consumer-drop cancellation leak|The core mapper has no cancellation token tied to `ResponseStream::drop`.|Add a drop-triggered cancellation token so pause, interruption, and cancellation stop mapper polling promptly.|
-|Server model metadata dropped|Handshake `openai-model` and stream model headers are ignored.|Add `ResponseEvent::ServerModel`, handshake parsing, and stream metadata parsing. Initially log or forward through existing event plumbing; avoid importing unrelated upstream UX.|
-|Model verification metadata dropped|No `ModelVerifications` event exists.|Add parser/event support only if this project has a consumer or wants to preserve this server signal for later UI work.|
-|Custom-tool input deltas dropped|`response.custom_tool_call_input.delta` is ignored by shared stream parsing.|Add a parser and event. Route through core only when the consumer can use it; otherwise keep this optional.|
-|Underclassified stream errors|`cyber_policy`, `server_is_overloaded`, and `slow_down` use generic fallback handling.|Classify them in shared Responses parsing without importing broader upstream UX.|
-|No per-message deflate|Default WebSocket config is used.|Port only if dependency support is available with a small Cargo change. If the upstream tungstenite fork is required, treat it as a prerequisite decision, not an incidental patch.|
-|No WebSocket custom-CA parity|This project does not have the upstream custom-CA helper.|Do not make this a prerequisite for other WebSocket fixes. Port it only if enterprise/custom-CA support is desired globally.|
+Connection setup already:
 
-## Already-fixed items to exclude from new backport work
+- Converts the Responses URL to `ws` or `wss`.
+- Merges provider, request, and default headers.
+- Sends the WebSocket beta header.
+- Enables `permessage-deflate`.
+- Captures `x-reasoning-included`, `x-models-etag`, `openai-model`, and the handshake `x-codex-turn-state` value.
+- Uses a bounded connect timeout in `core/src/client.rs`.
 
-The following items are already present in this project and should be treated as validation targets, not proposed implementation work:
+### Request send and response processing
 
-- SSE fixture suppression for WebSockets.
-- 426 fallback to HTTP.
-- v2 `response.create` incremental path for OpenAI WebSocket requests.
-- `ResponseCreateWsRequest.generate` and `client_metadata` fields.
-- Excluding `generate` and `client_metadata` from incremental request equality.
-- Background WebSocket pump for ping/pong.
-- Dropping failed streams instead of waiting for close handshake.
-- Wrapped WebSocket error mapping.
-- `websocket_connection_limit_reached` retryability.
-- `response.incomplete` and `response.completed.end_turn` parsing.
-- Default `OpenAI-Beta: responses_websockets=2026-02-06` handshake header.
-- Connect timeout.
+`ResponsesWebsocketConnection::stream_request(...)` currently serializes the request to `serde_json::Value`. `send_websocket_request(...)` serializes that value again to a JSON string and applies the stream idle timeout to the actual send.
+
+The response task:
+
+- Emits handshake-derived server metadata.
+- Parses wrapped `type: "error"` events into HTTP-like transport errors.
+- Handles the 60-minute `websocket_connection_limit_reached` error as retryable.
+- Parses rate-limit, server-model, and model-verification events.
+- Delegates normal Responses events to `process_responses_event(...)`.
+- Drops the underlying stream immediately on a terminal error rather than waiting for a close handshake.
+
+### Core client lifetime
+
+`ModelClient` is session-scoped. `ModelClientSession` is explicitly turn-scoped and currently owns:
+
+- One lazily opened `ResponsesWebsocketConnection`.
+- The last full `ResponseCreateWsRequest` for same-turn incremental comparison.
+- A oneshot receiver containing the last completed response ID and returned output items.
+- A fresh `OnceLock<String>` for `x-codex-turn-state`.
+
+A new `ModelClientSession` is constructed for every regular turn and every continued turn. Therefore, the physical WebSocket connection is dropped at the end of each logical turn.
+
+### Incremental request construction
+
+Within a turn, `prepare_websocket_request(...)` can send an incremental `response.create` when:
+
+- The non-input request properties are unchanged.
+- Current input starts with the previous request input followed by the output items returned by the server.
+- The last response completed and has a non-empty response ID.
+
+The current comparison is correct but allocation-heavy. `get_incremental_items(...)` clones both requests, clears ignored fields, clones the prior input and response items into a baseline, and then allocates the outgoing delta.
+
+### Retry and fallback
+
+WebSocket use requires provider capability, the project feature gate, no SSE fixture, and no prior session-scoped fallback. The client:
+
+- Recovers once from 401 where supported.
+- Falls back immediately on HTTP 426.
+- Reconnects after the 60-minute connection-limit error.
+- Clears the connection and continuation state after terminal stream failure.
+- Permanently switches the Codex session to HTTP after the WebSocket retry budget is exhausted.
+
+### Stream cancellation
+
+The core `ResponseStream` owns a cancellation token. Dropping the consumer cancels the mapper task, so a paused or interrupted turn stops polling the provider stream promptly.
+
+This does not make an in-flight physical socket reusable. The lower-level WebSocket response task may still be completing or tearing down. Connection caching must therefore treat an unfulfilled last-response receiver as non-cacheable.
 
 ## `/pause` and `/continue` constraints
 
-This project's `/pause` and `/continue` behavior is the main local constraint on any acceleration work.
+This project persists an explicit `PendingContinuation`, emits `TurnPaused` and `TurnContinued`, repairs rollout/history state, and starts continuation through the normal turn sampling loop.
 
-Backported changes must preserve these invariants:
+The key invariants are:
 
-- `/pause` must not persist a synthetic user prompt.
-- `/continue` must rebuild from durable completed history, not partial text/reasoning/tool deltas.
-- A stream aborted by `/pause`, cancellation, interruption, or stream error must not leave reusable WebSocket incremental state.
-- A previous response ID is safe only after `response.completed` has been processed and the completed response has been integrated into durable state.
-- `generate: false` warmup responses are setup artifacts, not assistant output to record in rollout history.
-- Cross-turn WebSocket caching must be invalidated on pause, interruption, compaction, rollback, fallback, and any stream error unless the latest completed chain is explicitly known safe.
+- `/pause` does not synthesize a new user prompt.
+- `/continue` rebuilds model input from durable completed history.
+- Partial text, reasoning deltas, and partially observed tool calls are not a reusable model-response boundary.
+- A response ID is safe for logical continuation only after `response.completed` and after the corresponding output is durably integrated.
+- A paused, interrupted, cancelled, or failed in-flight response must not be reused as a previous-response chain.
+- A physical socket may be reused only when no prior request remains in flight on it.
 
-The safe initial rule remains:
+These invariants make automatic upstream-style caching of the entire `WebsocketSession` too broad for the first backport.
 
-> WebSocket incremental state is reusable only after a completed response. Any pause, stream error, cancellation, compaction, rollback, or rollout rewrite clears it.
+## Corrected problem definition
+
+The remaining high-value work is narrower than the previous proposal:
+
+|Problem|Type|Impact|
+|---|---|---|
+|Dormant `response.processed` protocol and feature plumbing remains|Protocol cleanup|Maintains an obsolete request shape and lifecycle branch that upstream removed.|
+|Request serialization constructs an intermediate JSON tree|Performance bug|Extra traversal and memory proportional to full request/history size.|
+|Incremental eligibility clones full requests and history|Performance bug|Repeated O(history) copies on tool-heavy turns.|
+|The physical connection is dropped at every logical turn boundary|Feature gap|Repeated handshake latency and loss of connection-level transport state.|
+|Turn state is captured at upgrade rather than response-request scope|Reuse prerequisite|A cached physical connection cannot safely carry distinct logical turns until this state is request-scoped.|
+|WebSocket TLS ignores the project's custom enterprise CA needs|Environment-specific correctness gap|`wss` can fail behind TLS interception even when the correct CA is configured.|
+|Connect timeout is fixed at 10 seconds|Operational gap|Providers cannot tune slow or failing handshake behavior.|
+
+## Goals
+
+- Backport bug fixes without importing the upstream provider/auth/session refactors.
+- Preserve the current feature gates and HTTP fallback policy.
+- Preserve same-turn incremental behavior.
+- Reuse a healthy physical connection across turns without changing durable conversation semantics.
+- Make request-scoped turn state a minimal prerequisite rather than porting the full upstream metadata architecture.
+- Keep TLS work independent so it does not block protocol and allocation fixes.
 
 ## Non-goals
 
-Do not include these in the minimal backport:
-
-- The upstream project's `core/src/session/*` refactor.
-- The upstream provider/auth stack rewrite.
-- The upstream inference-trace and full response-debug telemetry refactor.
-- Full startup prewarm scheduling.
-- Full model-reroute/trusted-access/account-verification UX.
-- Realtime/WebRTC changes unrelated to Responses WebSocket.
-- Broad protocol schema changes for multi-limit rate limits unless they are already being ported for non-WebSocket reasons.
-
-## Recommended Backport Levels
-
-|Level|Contents|Rationale|
-|---|---|---|
-|P0 correctness|Bound request send, add `response.processed` request support and feature-gated call sites, cancel mapped streams on consumer drop|Fixes the remaining small correctness/protocol gaps with low dependency cost.|
-|P1 parser and error parity|`ServerModel`, model verification metadata, custom-tool input deltas, provider stream error classification|Preserves server signals currently dropped by this project and keeps retry/user-facing behavior aligned with upstream.|
-|P2 transport hardening|`permessage-deflate`; custom CA only if the prerequisite custom-CA helper is intentionally ported|Improves transport parity without blocking P0/P1.|
-|P3 observability metadata|W3C trace metadata, installation/window IDs, request-start timestamp|Improves diagnostics; can be incremental and does not change prompt/history behavior.|
-|P4 acceleration|Preconnect, request prewarm, optional cross-turn cached WebSocket session with explicit invalidation|Adds latency wins after correctness and parser parity are stable.|
-|P5 broad diagnostics/rate limits|`upstream_request_id`, response debug context, multi-limit rate-limit schema|Useful but not WebSocket-minimal; defer unless adjacent work already touches these schema and telemetry paths.|
+- Cherry-picking upstream modules as-is.
+- Removing the project's WebSocket feature gates.
+- Porting startup scheduling, request prewarm, or full preconnect orchestration in the first series.
+- Porting the upstream auth/provider abstraction.
+- Porting the full inference-trace, response-debug, or canonical metadata architecture.
+- Reusing `previous_response_id` across logical turns in the first connection-cache patch.
+- Changing `/pause` or `/continue` user-visible semantics.
+- Broad rate-limit or app-server schema changes unrelated to the transport fixes.
