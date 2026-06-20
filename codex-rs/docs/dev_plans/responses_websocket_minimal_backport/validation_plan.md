@@ -113,7 +113,7 @@ Also test case-insensitive header names and array-valued JSON header representat
 |Server sends connection-limit error|2 within retry flow|Full create after reconnect|Old connection no|
 |HTTP 426 on handshake|1 attempted|HTTP request|No|
 |WebSocket retry budget exhausted|No later WebSocket attempt|HTTP request|No|
-|Compaction after completed response|1|Full compacted input, no previous response ID|Cache behavior unit-covered; full E2E deferred|
+|Compaction after completed response|1|Full compacted input, no previous response ID|Yes|
 |Server closes cached completed connection before next turn|2|Full create, no previous response ID|Stale slot dropped before reuse|
 |Provider override changes endpoint|2|Full create|No cross-provider adoption|
 |Auth mode changes ChatGPT/API endpoint|2|Full create|No cross-mode adoption|
@@ -152,17 +152,15 @@ Create two `ModelClientSession`s from one `ModelClient` before either returns a 
 
 Also verify provider overrides use a separate connection and the one-slot cache does not cross provider boundaries.
 
-### Deferred compaction integration test shape
+### Compaction integration test shape
 
-Status: deferred for full session-level E2E coverage.
-
-The full WebSocket compaction integration test should drive:
+The WebSocket compaction integration test should drive:
 
 1. A completed ordinary turn that returns a physical WebSocket connection to the cache.
 2. A manual or automatic compaction turn that reuses that physical socket.
 3. A later ordinary turn that reuses the same physical socket, sends a full compacted input, and omits `previous_response_id`.
 
-Current validation note: `clear_websocket_continuation_keeps_physical_connection_cacheable` covers the cache-specific compaction behavior, and the existing compact suites cover history replacement separately. The missing piece is the combined same-socket WebSocket E2E assertion.
+Current validation note: `responses_websocket_compacted_followup_reuses_connection_with_full_create` covers same-socket reuse and full post-compaction input at the WebSocket client layer. `clear_websocket_continuation_keeps_physical_connection_cacheable` covers the cache-specific continuation clear used by session compaction, and the existing compact suites cover history replacement separately.
 
 ## Deferred cross-turn logical chain tests
 

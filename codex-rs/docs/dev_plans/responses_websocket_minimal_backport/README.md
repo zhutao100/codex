@@ -16,10 +16,6 @@ Completed in this branch:
 - Carried `x-codex-turn-state` through request-scoped `response.create.client_metadata`, seeded by `response.metadata` when present.
 - Cached only healthy physical WebSocket connections across logical turns, while clearing all logical continuation state at turn boundaries.
 
-Deferred validation work:
-
-- Full WebSocket compaction same-socket E2E coverage; the cache-specific continuation-clear behavior is unit-covered.
-
 Deferred optional work:
 
 - Shared custom CA and rustls provider parity for secure WebSockets and HTTP.

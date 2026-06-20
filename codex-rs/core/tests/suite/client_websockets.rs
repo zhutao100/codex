@@ -798,6 +798,70 @@ async fn responses_websocket_pause_continue_reconnects_after_in_flight_response(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_websocket_compacted_followup_reuses_connection_with_full_create() {
+    skip_if_no_network_unless_localhost!();
+
+    let server = start_websocket_server(vec![vec![
+        vec![
+            ev_response_created("resp-1"),
+            ev_assistant_message("msg-1", "first done"),
+            ev_completed("resp-1"),
+        ],
+        vec![
+            ev_response_created("resp-compact"),
+            ev_assistant_message("msg-compact", "compact summary"),
+            ev_completed("resp-compact"),
+        ],
+        vec![ev_response_created("resp-2"), ev_completed("resp-2")],
+    ]])
+    .await;
+
+    let harness = websocket_harness(&server).await;
+    let first_prompt = prompt_with_input(vec![message_item("first turn")]);
+    let compact_prompt = prompt_with_input(vec![message_item("summarize the first turn")]);
+    let compacted_summary = "COMPACTED SUMMARY: first turn";
+    let followup_prompt = prompt_with_input(vec![
+        message_item(compacted_summary),
+        message_item("second turn after compact"),
+    ]);
+
+    {
+        let mut session = harness.client.new_session();
+        stream_until_complete(&mut session, &harness, &first_prompt).await;
+    }
+    {
+        let mut session = harness.client.new_session();
+        stream_until_complete(&mut session, &harness, &compact_prompt).await;
+    }
+    {
+        let mut session = harness.client.new_session();
+        stream_until_complete(&mut session, &harness, &followup_prompt).await;
+    }
+
+    let connections = server.connections();
+    assert_eq!(connections.len(), 1);
+    let connection = connections.first().expect("missing connection");
+    assert_eq!(connection.len(), 3);
+
+    let compact = connection
+        .get(1)
+        .expect("missing compact request")
+        .body_json();
+    let followup = connection
+        .get(2)
+        .expect("missing post-compact request")
+        .body_json();
+    assert_eq!(compact.get("previous_response_id"), None);
+    assert_eq!(followup["type"].as_str(), Some("response.create"));
+    assert_eq!(followup.get("previous_response_id"), None);
+    let followup_text = followup.to_string();
+    assert!(followup_text.contains(compacted_summary));
+    assert!(followup_text.contains("second turn after compact"));
+
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_websocket_cache_is_scoped_by_provider() {
     skip_if_no_network_unless_localhost!();
 

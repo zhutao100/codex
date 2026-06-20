@@ -389,13 +389,10 @@ Connection-reused telemetry is useful but not a prerequisite. The smallest addit
 - The first turn's same-turn tool follow-up still uses `previous_response_id`.
 - A paused in-flight turn followed by `/continue` uses a second handshake and full create.
 - A stream error followed by another turn uses a second handshake.
+- A completed turn followed by compaction retains the connection but sends full compacted input.
 - A provider override does not adopt a connection created for another provider.
 - ChatGPT-auth and API-key endpoint modes do not share a cached connection.
 - Session-level fallback clears the cache.
-
-Deferred E2E validation:
-
-- A completed turn followed by compaction retains the connection but sends full compacted input. Current cache-specific coverage verifies that clearing logical continuation makes the physical socket cacheable; the combined session-level WebSocket E2E remains deferred.
 
 ## Deferred Patch 5b - Cross-turn logical chain reuse
 
