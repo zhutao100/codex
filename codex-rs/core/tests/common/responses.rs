@@ -11,6 +11,7 @@ use futures::StreamExt;
 use serde_json::Value;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
+use tokio::task::JoinSet;
 use tokio_tungstenite::accept_hdr_async_with_config;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::extensions::ExtensionsConfig;
@@ -272,6 +273,7 @@ impl WebSocketHandshake {
 pub struct WebSocketConnectionConfig {
     pub requests: Vec<Vec<Value>>,
     pub response_headers: Vec<(String, String)>,
+    pub keep_open: bool,
 }
 
 pub struct WebSocketTestServer {
@@ -865,6 +867,7 @@ pub async fn start_websocket_server(connections: Vec<Vec<Vec<Value>>>) -> WebSoc
         .map(|requests| WebSocketConnectionConfig {
             requests,
             response_headers: Vec::new(),
+            keep_open: false,
         })
         .collect();
     start_websocket_server_with_headers(connections).await
@@ -886,96 +889,109 @@ pub async fn start_websocket_server_with_headers(
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
 
     let task = tokio::spawn(async move {
+        let mut tasks = JoinSet::new();
         loop {
-            let accept_res = tokio::select! {
-                _ = &mut shutdown_rx => return,
-                accept_res = listener.accept() => accept_res,
-            };
-            let (stream, _) = match accept_res {
-                Ok(value) => value,
-                Err(_) => return,
-            };
-            let connection = {
-                let mut pending = connections.lock().unwrap();
-                pending.pop_front()
-            };
-
-            let Some(connection) = connection else {
-                continue;
-            };
-
-            let response_headers = connection.response_headers.clone();
-            let handshake_log = Arc::clone(&handshakes);
-            let callback = move |req: &Request, mut response: Response| {
-                let headers = req
-                    .headers()
-                    .iter()
-                    .filter_map(|(name, value)| {
-                        value
-                            .to_str()
-                            .ok()
-                            .map(|value| (name.as_str().to_string(), value.to_string()))
-                    })
-                    .collect();
-                handshake_log
-                    .lock()
-                    .unwrap()
-                    .push(WebSocketHandshake { headers });
-
-                let headers_mut = response.headers_mut();
-                for (name, value) in &response_headers {
-                    if let (Ok(name), Ok(value)) = (
-                        HeaderName::from_bytes(name.as_bytes()),
-                        HeaderValue::from_str(value),
-                    ) {
-                        headers_mut.insert(name, value);
-                    }
+            let has_pending_connection = !connections.lock().unwrap().is_empty();
+            tokio::select! {
+                _ = &mut shutdown_rx => {
+                    tasks.abort_all();
+                    while tasks.join_next().await.is_some() {}
+                    return;
                 }
+                Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
+                accept_res = listener.accept(), if has_pending_connection => {
+                    let (stream, _) = match accept_res {
+                        Ok(value) => value,
+                        Err(_) => return,
+                    };
+                    let connection = {
+                        let mut pending = connections.lock().unwrap();
+                        pending.pop_front()
+                    };
 
-                Ok(response)
-            };
-
-            let mut ws_stream = match accept_hdr_async_with_config(
-                stream,
-                callback,
-                Some(websocket_accept_config()),
-            )
-            .await
-            {
-                Ok(ws) => ws,
-                Err(_) => continue,
-            };
-
-            let connection_index = {
-                let mut log = requests.lock().unwrap();
-                log.push(Vec::new());
-                log.len() - 1
-            };
-            for request_events in connection.requests {
-                let Some(Ok(message)) = ws_stream.next().await else {
-                    break;
-                };
-                if let Some(body) = parse_ws_request_body(message) {
-                    let mut log = requests.lock().unwrap();
-                    if let Some(connection_log) = log.get_mut(connection_index) {
-                        connection_log.push(WebSocketRequest { body });
-                    }
-                }
-
-                for event in &request_events {
-                    let Ok(payload) = serde_json::to_string(event) else {
+                    let Some(connection) = connection else {
                         continue;
                     };
-                    if ws_stream.send(Message::Text(payload.into())).await.is_err() {
-                        break;
-                    }
+
+                    let requests = Arc::clone(&requests);
+                    let handshakes = Arc::clone(&handshakes);
+                    tasks.spawn(async move {
+                        let response_headers = connection.response_headers.clone();
+                        let handshake_log = Arc::clone(&handshakes);
+                        let callback = move |req: &Request, mut response: Response| {
+                            let headers = req
+                                .headers()
+                                .iter()
+                                .filter_map(|(name, value)| {
+                                    value
+                                        .to_str()
+                                        .ok()
+                                        .map(|value| (name.as_str().to_string(), value.to_string()))
+                                })
+                                .collect();
+                            handshake_log
+                                .lock()
+                                .unwrap()
+                                .push(WebSocketHandshake { headers });
+
+                            let headers_mut = response.headers_mut();
+                            for (name, value) in &response_headers {
+                                if let (Ok(name), Ok(value)) = (
+                                    HeaderName::from_bytes(name.as_bytes()),
+                                    HeaderValue::from_str(value),
+                                ) {
+                                    headers_mut.insert(name, value);
+                                }
+                            }
+
+                            Ok(response)
+                        };
+
+                        let mut ws_stream = match accept_hdr_async_with_config(
+                            stream,
+                            callback,
+                            Some(websocket_accept_config()),
+                        )
+                        .await
+                        {
+                            Ok(ws) => ws,
+                            Err(_) => return,
+                        };
+
+                        let connection_index = {
+                            let mut log = requests.lock().unwrap();
+                            log.push(Vec::new());
+                            log.len() - 1
+                        };
+                        for request_events in connection.requests {
+                            let Some(Ok(message)) = ws_stream.next().await else {
+                                break;
+                            };
+                            if let Some(body) = parse_ws_request_body(message) {
+                                let mut log = requests.lock().unwrap();
+                                if let Some(connection_log) = log.get_mut(connection_index) {
+                                    connection_log.push(WebSocketRequest { body });
+                                }
+                            }
+
+                            for event in &request_events {
+                                let Ok(payload) = serde_json::to_string(event) else {
+                                    continue;
+                                };
+                                if ws_stream.send(Message::Text(payload.into())).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+
+                        if connection.keep_open {
+                            std::future::pending::<()>().await;
+                        } else {
+                            let _ = ws_stream.close(None).await;
+                        }
+                    });
                 }
-            }
-
-            let _ = ws_stream.close(None).await;
-
-            if connections.lock().unwrap().is_empty() {
-                return;
+                else => return,
             }
         }
     });

@@ -18,7 +18,6 @@ Completed in this branch:
 
 Deferred validation work:
 
-- In-flight WebSocket `/pause`/`/continue` E2E coverage with the first connection held open until the WebSocket mock server can accept concurrent scripted connections.
 - Full WebSocket compaction same-socket E2E coverage; the cache-specific continuation-clear behavior is unit-covered.
 
 Deferred optional work:

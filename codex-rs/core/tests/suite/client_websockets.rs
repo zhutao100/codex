@@ -13,6 +13,8 @@ use codex_core::X_RESPONSESAPI_INCLUDE_TIMING_METRICS_HEADER;
 use codex_core::error::CodexErr;
 use codex_core::features::Feature;
 use codex_core::models_manager::manager::ModelsManager;
+use codex_core::protocol::EventMsg;
+use codex_core::protocol::Op;
 use codex_core::protocol::SessionSource;
 use codex_otel::OtelManager;
 use codex_otel::TelemetryAuthMode;
@@ -24,6 +26,7 @@ use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
+use codex_protocol::user_input::UserInput;
 use core_test_support::load_default_config_for_test;
 use core_test_support::responses::WebSocketConnectionConfig;
 use core_test_support::responses::WebSocketTestServer;
@@ -33,7 +36,9 @@ use core_test_support::responses::ev_response_created;
 use core_test_support::responses::start_websocket_server;
 use core_test_support::responses::start_websocket_server_with_headers;
 use core_test_support::skip_if_no_network_unless_localhost;
+use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
+use core_test_support::wait_for_event;
 use futures::StreamExt;
 use opentelemetry_sdk::metrics::InMemoryMetricExporter;
 use pretty_assertions::assert_eq;
@@ -205,6 +210,7 @@ async fn responses_websocket_emits_reasoning_included_event() {
     let server = start_websocket_server_with_headers(vec![WebSocketConnectionConfig {
         requests: vec![vec![ev_response_created("resp-1"), ev_completed("resp-1")]],
         response_headers: vec![("X-Reasoning-Included".to_string(), "true".to_string())],
+        keep_open: false,
     }])
     .await;
 
@@ -245,6 +251,7 @@ async fn responses_websocket_emits_server_model_event() {
     let server = start_websocket_server_with_headers(vec![WebSocketConnectionConfig {
         requests: vec![vec![ev_response_created("resp-1"), ev_completed("resp-1")]],
         response_headers: vec![("OpenAI-Model".to_string(), "gpt-5.3-codex".to_string())],
+        keep_open: false,
     }])
     .await;
 
@@ -316,6 +323,7 @@ async fn responses_websocket_emits_rate_limit_events() {
             ("X-Models-Etag".to_string(), "etag-123".to_string()),
             ("X-Reasoning-Included".to_string(), "true".to_string()),
         ],
+        keep_open: false,
     }])
     .await;
 
@@ -714,6 +722,77 @@ async fn responses_websocket_reconnects_when_cached_connection_was_closed() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_websocket_pause_continue_reconnects_after_in_flight_response() {
+    skip_if_no_network_unless_localhost!();
+
+    let server = start_websocket_server_with_headers(vec![
+        WebSocketConnectionConfig {
+            requests: vec![vec![ev_response_created("resp-pause")]],
+            response_headers: Vec::new(),
+            keep_open: true,
+        },
+        WebSocketConnectionConfig {
+            requests: vec![vec![
+                ev_response_created("resp-continued"),
+                ev_completed("resp-continued"),
+            ]],
+            response_headers: Vec::new(),
+            keep_open: false,
+        },
+    ])
+    .await;
+
+    let mut builder = test_codex();
+    let test = builder
+        .build_with_websocket_server(&server)
+        .await
+        .expect("build websocket codex");
+
+    submit_user_input(&test, "start pauseable websocket work").await;
+
+    wait_for_websocket_request_count(&server, 0, 1).await;
+    test.codex.submit(Op::Pause).await.expect("pause turn");
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnPaused(_))
+    })
+    .await;
+
+    test.codex
+        .submit(Op::Continue)
+        .await
+        .expect("continue turn");
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnContinued(_))
+    })
+    .await;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    wait_for_websocket_request_count(&server, 1, 1).await;
+    let handshakes = server.handshakes();
+    assert_eq!(handshakes.len(), 2);
+
+    let connections = server.connections();
+    assert_eq!(connections.len(), 2);
+    assert_eq!(connections[0].len(), 1);
+    assert_eq!(connections[1].len(), 1);
+
+    let continued = connections[1]
+        .first()
+        .expect("missing continued request")
+        .body_json();
+    assert_eq!(continued["type"].as_str(), Some("response.create"));
+    assert_eq!(continued.get("previous_response_id"), None);
+    let continued_text = continued.to_string();
+    assert!(continued_text.contains("start pauseable websocket work"));
+    assert!(!continued_text.contains("resp-pause"));
+
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_websocket_cache_is_scoped_by_provider() {
     skip_if_no_network_unless_localhost!();
 
@@ -1046,6 +1125,41 @@ fn prompt_with_input_and_instructions(input: Vec<ResponseItem>, instructions: &s
         text: instructions.to_string(),
     };
     prompt
+}
+
+async fn submit_user_input(test: &TestCodex, text: &str) {
+    test.codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: text.to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await
+        .expect("submit user input");
+}
+
+async fn wait_for_websocket_request_count(
+    server: &WebSocketTestServer,
+    connection_index: usize,
+    expected_requests: usize,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let request_count = server
+            .connections()
+            .get(connection_index)
+            .map_or(0, Vec::len);
+        if request_count >= expected_requests {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for websocket connection {connection_index} to receive {expected_requests} request(s); saw {request_count}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 fn websocket_provider(server: &WebSocketTestServer) -> ModelProviderInfo {

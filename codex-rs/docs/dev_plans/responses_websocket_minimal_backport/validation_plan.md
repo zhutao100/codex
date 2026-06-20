@@ -108,7 +108,7 @@ Also test case-insensitive header names and array-valued JSON header representat
 |---|---:|---|---|
 |Two successful ordinary turns|1|Full create, no previous response ID|Yes|
 |First turn has multiple tool round trips, then second turn|1|Full create; same-turn follow-up was incremental|Yes|
-|Pause while first response is in flight, then `/continue`|2|Full create from durable history|Deferred E2E; helper coverage only|
+|Pause while first response is in flight, then `/continue`|2|Full create from durable history|No after pause|
 |Consumer drops after provider stream error|2 on next turn|Full create|No|
 |Server sends connection-limit error|2 within retry flow|Full create after reconnect|Old connection no|
 |HTTP 426 on handshake|1 attempted|HTTP request|No|
@@ -118,9 +118,7 @@ Also test case-insensitive header names and array-valued JSON header representat
 |Provider override changes endpoint|2|Full create|No cross-provider adoption|
 |Auth mode changes ChatGPT/API endpoint|2|Full create|No cross-mode adoption|
 
-### Deferred `/pause` integration test shape
-
-Status: deferred until the WebSocket mock server can accept concurrent scripted connections while one scripted connection remains open.
+### `/pause` integration test shape
 
 The mock server should deliberately keep the first response open after sending a non-terminal delta. The test should:
 
@@ -133,7 +131,7 @@ The mock server should deliberately keep the first response open after sending a
 
 Do not let the first mock connection close before the pause; otherwise the test proves reconnect-after-close rather than the cache safety rule.
 
-Current validation note: this repository's WebSocket mock server handles scripted connections serially. Holding the first scripted connection open prevents accepting the continued connection, so this series validates the same safety rule with the cacheability helper until the mock server can handle concurrent scripted connections.
+Current validation note: `responses_websocket_pause_continue_reconnects_after_in_flight_response` covers this with a concurrent scripted WebSocket server and a first connection that remains open until test shutdown.
 
 ### Drop-state unit tests
 
