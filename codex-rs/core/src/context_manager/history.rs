@@ -169,8 +169,7 @@ impl ContextManager {
     /// Returns true when a tool image was replaced, false otherwise.
     pub(crate) fn replace_last_turn_images(&mut self, placeholder: &str) -> bool {
         let Some(index) = self.items.iter().rposition(|item| {
-            matches!(item, ResponseItem::FunctionCallOutput { .. })
-                || matches!(item, ResponseItem::Message { role, .. } if role == "user")
+            matches!(item, ResponseItem::FunctionCallOutput { .. }) || is_user_turn_boundary(item)
         }) else {
             return false;
         };
@@ -195,7 +194,6 @@ impl ContextManager {
                 }
                 replaced
             }
-            ResponseItem::Message { role, .. } if role == "user" => false,
             _ => false,
         }
     }
