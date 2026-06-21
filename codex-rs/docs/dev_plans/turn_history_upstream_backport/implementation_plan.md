@@ -1,209 +1,226 @@
 # Implementation Plan
 
-## Patch 0: Freeze target behavior with tests
+## 1. Patch boundaries
 
-Add tests with the production patches so stale documentation cannot drive accidental regressions. The tests should fail against the pre-fix implementation, but do not land a deliberately failing commit in this drop-in branch.
+### Mandatory source files
 
-### Files
+- `core/src/session/rollout_reconstruction.rs`
+- `core/src/session/tests.rs`
+- `core/src/session/turn.rs` only if a small helper/signature change is needed for compaction-aware continuation derivation
 
-- `core/src/session/tests.rs` for reconstruction coverage; split a dedicated module only if the test file becomes unwieldy
-- `core/src/context_manager/history_tests.rs`
-- pause/continue tests near the existing continuation coverage
+### Optional organization-only file
 
-### Required regression tests
+- `core/src/session/rollout_reconstruction_tests.rs` if moving the growing replay test set improves maintainability; do not require the move for correctness.
 
-1. Bare trailing `TurnContext` does not hydrate reference or previous settings.
-2. Rollback after a non-user compaction context record restores history and metadata from the same surviving user turn.
-3. Legacy compaction does not include `build_initial_context` from the resume turn.
-4. `DoNotInject` compacted replacement clears reference but preserves previous settings.
-5. A contextual user message does not stop invalid-image sanitization.
-6. Continuation does not create a new replay checkpoint.
-7. Existing reconstruction assertions that treat resume-time context as legacy-compaction history, or derive previous settings from an adjacent compacted baseline, are updated to the new invariants rather than duplicated.
+### Files inspected but not expected to change
 
-## Patch 1: Fix the invalid-image boundary
-
-### File
-
+- `core/src/session/mod.rs`
 - `core/src/context_manager/history.rs`
+- `core/src/context_manager/normalize.rs`
+- `core/src/compact.rs`
+- `core/src/compact_remote.rs`
+- `core/src/rollout/policy.rs`
+- `core/src/client.rs`
+- `protocol/src/protocol.rs`
+- `protocol/src/openai_models.rs`
 
-### Change
+A mandatory change to any protocol or rollout item should trigger scope review before implementation.
 
-Use `is_user_turn_boundary` in `replace_last_turn_images`.
+## 2. Phase 0: lock current live invariants
 
-### Tests
+Update or add tests that demonstrate behavior already present:
 
-- offending tool image followed by a contextual user item is replaced;
-- offending tool image before a real user boundary is not crossed;
-- user-supplied images remain untouched.
+- context recording sets the reference baseline but not previous settings;
+- recording a real user commits previous settings;
+- `replace_compacted_history(..., None, ...)` clears reference context but preserves previous settings;
+- invalid-image recovery ignores contextual user messages;
+- work notes are not real user boundaries.
 
-This patch is independent and can land first.
+These tests prevent the replay fix from accidentally changing the live path to resemble stale assumptions.
 
-## Patch 2: Split reference baseline from previous-turn commitment
+## 3. Phase 1: introduce replay metadata types
 
-### Files
+In `core/src/session/rollout_reconstruction.rs`:
 
-- `core/src/state/session.rs`
-- `core/src/session/mod.rs`
-- `core/src/session/turn.rs`
-- compaction tests in `core/src/session/tests.rs` or `core/src/compact.rs`
+1. Add private `ReplayMetadata` and `MetadataCheckpoint` types.
+2. Add a private replay-epoch type or equivalent local variables.
+3. Replace `context_stack` with:
+   - `pending_context`;
+   - `current_metadata`;
+   - `epoch_base_metadata`;
+   - post-base checkpoint vector;
+   - compaction adjacency/provenance flags.
+4. Add small helper methods for:
+   - committing a real user boundary;
+   - applying a compaction checkpoint;
+   - restoring metadata after rollback;
+   - recognizing adjacent post-compaction context.
 
-### Changes
+Keep history materialization in the existing forward pass. Do not port upstream reverse replay in this phase.
 
-1. Add or expose a narrow setter for `previous_turn_settings`.
-2. Remove previous-settings assignment from `record_context_updates_and_set_reference_context_item`.
-3. Commit previous settings immediately after `record_user_prompt_and_emit_turn_item` succeeds on the regular explicit-input path.
-4. Leave the continuation path unchanged; it has no new explicit input.
-5. Stop deriving previous settings in `replace_compacted_history`.
-6. Split `clear_turn_context_baseline` semantics so callers can clear only the reference baseline or all reconstructed metadata.
+## 4. Phase 2: commit metadata only at real user boundaries
 
-### Invariants to assert
+For each `RolloutItem::ResponseItem`:
 
-- cancellation before user recording does not advance previous settings;
-- normal user recording does advance them;
-- compacting with `reference_context_item = None` preserves them;
-- a compact task without a user boundary never advances them.
+- record it through `ContextManager` exactly as today;
+- use the same `is_user_turn_boundary_response_item`/`is_user_turn_boundary` predicate as history rollback;
+- commit `pending_context` and push one checkpoint only at that boundary;
+- carry existing metadata for a later steering boundary without a new `TurnContext`.
 
-## Patch 3: Replace `context_stack` with replay epochs
+For ordinary `TurnContext`:
 
-### File
+- replace the pending candidate;
+- do not update reconstructed state immediately.
 
-- `core/src/session/rollout_reconstruction.rs`
+Acceptance gate:
 
-### Suggested private helpers
+- a rollout containing only `TurnContext` hydrates neither reference context nor previous settings;
+- `TurnContext + real user` hydrates both;
+- contextual user messages and work notes do not commit the candidate.
+
+## 5. Phase 3: add compaction replay epochs
+
+At `Compacted`:
+
+1. Materialize exact `replacement_history` when present.
+2. Clear pending context.
+3. Preserve previous settings.
+4. Clear reference context.
+5. reset post-base checkpoints;
+6. mark the replacement as opaque;
+7. arm one-record adjacency recognition.
+
+For an immediately following `TurnContext`:
+
+- re-establish reference context in both current and epoch-base metadata;
+- leave previous settings unchanged;
+- mark the replacement as mid-turn/injected-context provenance.
+
+Any other item disarms adjacency.
+
+Acceptance gate:
+
+- standalone/manual compaction resumes with old previous settings and no reference baseline;
+- mid-turn compaction resumes with old/current committed previous settings and the adjacent reference baseline;
+- the adjacent context does not create a fake rollback turn.
+
+## 6. Phase 4: align rollback with checkpoints
+
+Replace numeric truncation of context records with checkpoint restoration.
+
+Algorithm:
+
+```text
+history.drop_last_n_user_turns(N)
+
+if N <= post_base_checkpoints.len:
+    remove N checkpoints
+    restore last checkpoint or epoch base
+else if epoch is opaque:
+    clear metadata conservatively
+    start a new opaque epoch from surviving history
+else:
+    clear metadata
+```
+
+Clear `pending_context` and stale continuation hints after rollback.
+
+Acceptance gate:
+
+- stray/bare contexts never consume rollback slots;
+- rollback within post-compaction appended turns restores exact metadata;
+- rollback crossing replacement history returns `None` metadata rather than a stale model/context;
+- repeated rollback markers remain cumulative.
+
+## 7. Phase 5: fix legacy compaction reconstruction
+
+Change only the legacy fallback from resume-time initial context to an empty initial context:
 
 ```rust
-fn commit_user_boundary(state: &mut ReplayState);
-fn apply_compaction(state: &mut ReplayState, ...);
-fn attach_compaction_reference(state: &mut ReplayState, item: &TurnContextItem);
-fn apply_rollback(state: &mut ReplayState, num_turns: u32);
-fn reconstructed_continuation_model(state: &ReplayState) -> Option<String>;
+compact::build_compacted_history(Vec::new(), &user_messages, &compacted.message)
 ```
 
-Keep replay state private to this module. Do not add protocol fields.
+Update the current test that expects resume-time context injection.
 
-### Processing order details
+Acceptance gate:
 
-For each item:
+- reconstructing the same legacy rollout under two different current cwd/policy/instruction contexts yields the same historical compacted prefix;
+- reference context is clear afterward;
+- previous settings survive when a prior committed user turn supplies them.
 
-1. Determine whether it is the directly adjacent post-compaction `TurnContext` before clearing the adjacency flag.
-2. Materialize history using the existing truncation policy.
-3. Commit metadata only on `is_user_turn_boundary_response_item`.
-4. Ignore the duplicate `EventMsg::UserMessage` for turn counting.
-5. Discard `pending_context` at every rollback and at `Compacted`; also clear pending continuation and the post-compaction attachment flag on rollback.
-6. Keep existing normal-output persistence/retruncation and replacement-checkpoint installation semantics unchanged.
+## 8. Phase 6: make continuation compaction-aware
 
-### Conservative fallback
+Keep `history_needs_continuation` focused on raw history. In reconstruction, suppress its fallback when the latest relevant tail is a standalone/pre-turn compaction with no later real user boundary.
 
-If rollback crosses the current epoch base, set:
+Use `current_metadata.previous_turn_settings.model` for `PendingContinuation.model`.
 
-```rust
-reference_context_item = None;
-previous_turn_settings = None;
-pending_context = None;
-epoch = ReplayEpoch::from_base(ReplayMetadata::default());
-```
+Acceptance gate:
 
-Resetting the epoch is required so a later real user turn and a second rollback operate on the already-truncated state rather than stale pre-rollback checkpoints. Do not guess from the last remaining user-role item in replacement history.
+- manual compaction does not hydrate a regular continuation;
+- mid-turn compaction interrupted before assistant completion does;
+- explicit interrupted user/tool tails continue to work;
+- `/continue` still performs no context/user/skill reinjection.
 
-## Patch 4: Correct legacy compaction reconstruction
+## 9. Phase 7: integration and cache checks
 
-### File
-
-- `core/src/session/rollout_reconstruction.rs`
-
-### Change
-
-Use an empty initial context when rebuilding a `CompactedItem` with no `replacement_history`.
-
-### Result
-
-- historical content is stable across resume settings;
-- the reconstructed reference baseline is cleared;
-- the next regular turn appends canonical current context.
-
-### Compatibility test
-
-Reconstruct the same legacy rollout under two different resume-time working directories/policies and assert that reconstructed history is identical before the next turn injects context.
-
-## Patch 5: Integrate rollback and resume paths
-
-### Files
-
-- `core/src/session/mod.rs`
-- `core/src/session/handlers.rs`
-- `core/src/session/rollout_reconstruction.rs`
-
-### Checks
-
-1. `record_initial_history` installs reconstructed history, reference, previous settings, pending continuation, and token state together.
-2. `reconstruct_for_thread_rollback` uses the same replay path before persisting/emitting `ThreadRolledBack`.
-3. The no-rollout fallback truncates history and clears all uncertain metadata.
-4. `initial_context_seeded` follows reference-baseline presence, not previous-settings presence.
-5. Pending continuation selects its model only from committed metadata.
-
-## Patch 6: Cache-shape and continuation regression checks
-
-No cache protocol change is proposed, but tests should verify the backport does not alter request construction.
-
-### Files
-
-- `core/src/client.rs` tests
-- turn/continuation integration tests
-
-### Assertions
-
-- a normal second sampling request remains previous input + returned model items + new tool/pending items;
-- unchanged non-input properties still permit incremental WebSocket requests;
-- compaction still clears WebSocket continuation;
-- `/continue` cleanup still removes the incomplete tail before prompt construction;
-- no replay metadata item becomes a model `ResponseItem`;
-- same-policy resume reproduces live output truncation, while changed-policy behavior remains explicitly covered rather than accidentally altered;
-- replacement-history checkpoints remain exempt from item-by-item retruncation.
-
-## Patch 7: Optional `comp_hash` feature
-
-Implement only after the mandatory series is stable and only if the active model metadata endpoint supplies meaningful hashes. See `conditional_features.md`.
-
-## File-level change summary
-
-|File|Mandatory change|
-|---|---|
-|`core/src/context_manager/history.rs`|Real-user boundary for invalid-image recovery|
-|`core/src/state/session.rs`|Clarify/split metadata setters if needed|
-|`core/src/session/turn.rs`|Commit previous settings after user input|
-|`core/src/session/mod.rs`|Preserve previous settings during compaction; install reconstruction coherently|
-|`core/src/session/rollout_reconstruction.rs`|Pending context, epochs, checkpoints, conservative rollback, legacy compaction fix|
-|`core/src/session/handlers.rs`|Use coherent reconstruction/fallback metadata clearing|
-|Tests near the files above|Regression and old-rollout compatibility coverage|
-
-## Verification commands
-
-Run from the repository root. Use the branch-local Cargo wrapper and the network-disabled test environment:
+Run the focused tests in `test_matrix.md`, then the surrounding suites. At minimum:
 
 ```bash
-CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-core context_manager
-CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-core rollout_reconstruction
-CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-core pause
-CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-core continue
-CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-core thread_rollback
-CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-core compact
-CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-core websocket
-CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local clippy -p codex-core --all-targets --all-features -- -D warnings
-just fmt
+cargo fmt --all -- --check
+cargo test -p codex-core rollout_reconstruction
+cargo test -p codex-core thread_rollback
+cargo test -p codex-core history_needs_continuation
+cargo test -p codex-core prompt_caching
+cargo test -p codex-core compact
 ```
 
-Use the exact package/test filters available in this branch if individual names differ. The final mandatory verification is:
+Test filters may need adjustment to match the workspace harness. Also run the full `codex-core` test target used by this branch before merge.
 
-```bash
-CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-core
-```
+Inspect request bodies in prompt-cache tests rather than relying only on token counters:
 
-## Review gates
+- ordinary second-turn input starts with first-turn input;
+- settings updates append after the reusable prefix;
+- compaction establishes a new deterministic base;
+- replay does not inject current context before an old legacy summary.
 
-- No mandatory patch changes the serialized rollout schema.
-- No persisted `UserMessage` event is counted in addition to its `ResponseItem`.
-- No compaction operation updates previous-turn settings by itself.
-- No bare `TurnContext` hydrates previous settings at the end of replay.
-- No current resume-time context is inserted into a historical legacy compaction.
-- `/continue` remains user-boundary-free.
-- A conservative baseline clear is preferred over stale metadata when rollback crosses compacted history.
+## 10. Review checklist
+
+### Correctness
+
+- [ ] Same predicate defines history and metadata user boundaries.
+- [ ] Bare context remains uncommitted.
+- [ ] Post-compaction adjacent context changes reference only.
+- [ ] Compaction preserves previous settings.
+- [ ] Rollback never decrements metadata for a non-user task.
+- [ ] Opaque-base crossing clears uncertain metadata.
+- [ ] Legacy compaction is independent of resume-time context.
+- [ ] Continuation model comes from committed previous settings.
+
+### Branch compatibility
+
+- [ ] Work notes remain contextual.
+- [ ] `GhostSnapshot` remains retained raw and omitted from prompts.
+- [ ] `/pause` and `/continue` event behavior is unchanged.
+- [ ] Local and remote compaction produce equivalent replay metadata semantics.
+- [ ] Post-turn review/delegate contexts do not become user checkpoints.
+- [ ] Old rollout JSON parses without migration.
+
+### Scope control
+
+- [ ] No lifecycle event persistence added.
+- [ ] No protocol fields added.
+- [ ] No upstream response variants imported.
+- [ ] No cache-key or request-shape change.
+- [ ] No change to live previous-setting commitment order.
+
+## 11. Rollout strategy
+
+Land as one correctness series with tests adjacent to each behavioral change. Avoid a mechanical upstream cherry-pick. The branch-local implementation should remain easy to remove later if a complete lifecycle/reverse-replay subsystem is intentionally ported.
+
+A useful internal metric after deployment is the count of resumes where:
+
+- no reference baseline is reconstructed and full context is appended;
+- a pending continuation is inferred from history rather than an explicit interrupt;
+- rollback crosses an opaque compaction base.
+
+Metrics are optional and must not become prerequisites for the fix.

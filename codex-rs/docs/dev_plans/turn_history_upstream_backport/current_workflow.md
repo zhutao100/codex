@@ -1,275 +1,242 @@
-# Current Turn and History Workflow
+# Current Agent-Loop and History Workflow
 
 ## 1. State model
 
-This branch has three related but distinct representations:
+This branch has four related but non-identical representations.
 
-|Representation|Primary location|Purpose|
+|Representation|Owner|Purpose|
 |---|---|---|
-|Raw in-memory history|`ContextManager::items` in `core/src/context_manager/history.rs`|Canonical live transcript, oldest to newest|
-|Prepared prompt history|`ContextManager::prepare_items_for_prompt_with_modalities`|A cloned, normalized, modality-compatible request body|
-|Rollout history|`RolloutItem` records governed by `core/src/rollout/policy.rs`|Durable reconstruction, rollback, resume, and analysis input|
+|Raw conversation history|`ContextManager.items` in `core/src/context_manager/history.rs`|Canonical in-memory `ResponseItem` transcript used for later turns.|
+|Prompt projection|`ContextManager::prepare_items_for_prompt_with_modalities`|A cloned, normalized, modality-compatible request input.|
+|Rollout log|`RolloutItem` records filtered by `core/src/rollout/policy.rs`|Durable resume/fork/rollback source.|
+|Turn metadata|`reference_context_item`, `previous_turn_settings`, `pending_continuation`|Context-diff baseline, latest committed user-turn settings, and branch-local continuation state.|
 
-Two metadata values influence later turns:
-
-- `ContextManager::reference_context_item`: the model-visible settings baseline used to emit only context changes on the next regular turn.
-- `SessionState::previous_turn_settings`: settings from the latest surviving real user turn, currently only the model slug, used by pre-turn model-downshift compaction.
-
-These values describe different facts and must not be treated as aliases:
-
-- the reference baseline says which context snapshot is represented in model-visible history;
-- previous-turn settings say which model accepted the latest surviving real user turn.
-
-Compaction can intentionally clear the first while preserving the second.
+These representations intentionally differ. A raw item can be retained but omitted from the prompt, or persisted in an untruncated form and reconstructed into a truncated live form.
 
 ## 2. Regular turn sequence
 
-`core/src/session/turn.rs::run_turn` rejects empty input and enters `run_turn_inner`.
+`run_turn` rejects empty explicit input and calls `run_turn_inner`. The important ordering in `core/src/session/turn.rs` is:
 
-The regular-turn path is:
-
-1. Emit `TurnStarted`. This is a client lifecycle event and is not persisted by this branch's rollout policy.
-2. Run previous-model inline compaction when switching from a larger context-window model and the history exceeds the new model's limit.
-3. Run current-model automatic compaction if still at or above the active limit. The branch-specific preserved-work-notes flow may sample notes before compacting.
-4. Call `record_context_updates_and_set_reference_context_item`:
-   - inject full initial context if no reference baseline exists;
-   - otherwise append settings changes relative to the reference baseline;
-   - persist a `RolloutItem::TurnContext` even when no model-visible update was required;
-   - update both the live reference baseline and, currently, `previous_turn_settings`.
+1. Emit `TurnStarted`. The event is delivered but filtered out of the rollout in this branch.
+2. If the model changed and the current context is too large for the new model, optionally compact using the previous model.
+3. If the current history already exceeds the automatic compaction limit, run pre-turn compaction. The branch-local work-notes path may first ask the model to produce preserved notes.
+4. Call `record_context_updates_and_set_reference_context_item`.
+   - Append a full initial context when no reference baseline exists.
+   - Otherwise append settings/context deltas, or a full fallback bundle for older baseline shapes.
+   - Persist `RolloutItem::TurnContext`.
+   - Set the live reference baseline.
+   - Do **not** update `previous_turn_settings`.
 5. Resolve skills, connectors, and dependencies.
-6. Record the explicit user prompt through `record_user_prompt_and_emit_turn_item`.
-7. Record skill-injection items.
-8. Start the branch-specific ghost snapshot.
-9. Enter the sampling loop.
+6. Record the explicit user `ResponseItem` in history and rollout.
+7. Commit `previous_turn_settings` to the current model.
+8. Emit the user turn item events; `EventMsg::UserMessage` is persisted by the rollout policy.
+9. Append branch-local skill/context injections, if any.
+10. Optionally start a `GhostSnapshot` for undo.
+11. Enter the multi-round sampling loop.
 
-The durable ordering for an ordinary turn is therefore approximately:
+The ordering separates a candidate context baseline from a committed real user turn. A failure after step 4 but before step 6 can leave a durable `TurnContext` with no corresponding real user boundary; this is the central replay association problem.
 
-```text
-[context-update ResponseItem ...]
-TurnContext
-user ResponseItem
-UserMessage event
-[skill/context ResponseItem ...]
-[model item, tool output, model item ...]
-```
+## 3. Multi-round sampling within one logical turn
 
-`TurnStarted` and `TurnComplete` are not durable boundaries in this branch.
-
-### Current early-commit gap
-
-Step 4 happens before dependency resolution and before the explicit user item is durable. A cancellation in that interval can leave a `TurnContext` with no real user boundary. Live state also advances `previous_turn_settings` too early. The backport proposal corrects this without reordering model-visible context items.
-
-## 3. Multi-round sampling within one turn
-
-Each sampling iteration builds a request from the complete live history:
-
-```rust
-sess.prompt_history(turn_context.as_ref()).await
-```
-
-Completed model response items and completed tool outputs are appended to history. The next request therefore contains:
+For every sampling round, `run_turn_inner` calls `sess.prompt_history(turn_context)` unless it is in the special pre-compaction work-notes capture state. `prompt_history` clones the current raw history and applies prompt projection. Therefore each round includes everything durably completed before it:
 
 ```text
-all prior turns
-+ current user input
-+ model response items completed so far
-+ tool outputs completed so far
-+ any pending input admitted at the current boundary
+initial/context items
+real user input
+model reasoning/message/tool call
+completed tool output
+queued steering input, when drained
+next model round
+...
 ```
 
-The loop terminates when the model no longer requires follow-up and no other follow-up source remains.
+Completed model items are recorded as stream items complete. Tool calls are persisted before execution; their outputs are persisted after the tool future resolves. A follow-up model request therefore sees the completed call/output pair.
 
-### Pending input ordering
+Partial stream deltas that never become a completed `ResponseItem` are not conversation history. An interrupted process or stream can therefore preserve completed items while losing an incomplete assistant text delta, a live tool future, or unrecorded process state.
 
-This branch already has the important upstream ordering behavior:
+### Fresh input versus queued steering
 
-- a fresh explicit turn initializes `can_drain_pending_input` to `false`, so the explicit input is sampled first;
-- a continuation initializes it to `true`, because there is no new explicit user item;
-- after a successful response, pending input may be drained before the next request;
-- during preserved-work-notes capture, pending input is deferred;
-- after mid-turn compaction, pending input remains deferred while model/tool continuation still needs the next request.
+For a new explicit turn, `can_drain_pending_input` starts as `false`. The explicit input is recorded and sampled before pending input is drained. After a successful sampling round it becomes `true`, and queued steering is appended before a later sampling round.
 
-No additional pending-input backport is needed.
+For `/continue`, explicit input is empty and `can_drain_pending_input` starts as `true`. Continuation first cleans the interrupted tail and then permits queued input to be appended.
 
-## 4. `/pause` and `/continue`
+### Client-session scope
 
-`continue_turn` calls the same inner loop with an empty input and a `PendingContinuation`.
+`ModelClientSession` is reused across retries and rounds within one logical turn. It is not reused across separate explicit user turns. This distinction matters for the WebSocket `previous_response_id` optimization described below.
 
-Before sampling it:
+## 4. Raw-history admission and mutation
 
-1. optionally removes the trailing interrupted marker;
-2. trims an incomplete dangling tool-call tail from in-memory history;
-3. applies equivalent cleanup to the rollout;
-4. emits `TurnContinued`;
-5. deliberately skips context update injection, a new user item, and new skill injection.
+`ContextManager::record_items` processes oldest-to-newest and admits the following shapes.
 
-Continuation resumes from the last durable model-visible boundary. It does not create a synthetic user turn and must not create a new metadata checkpoint during replay.
+|Item|Raw-history behavior|Rollout behavior|Prompt behavior|
+|---|---|---|---|
+|Non-system `Message`|Preserved exactly|Persisted|Sent, subject to image stripping and later compaction/rollback.|
+|System-role `Message`|Dropped|A directly persisted system response item would be filtered by live admission on replay|Not sent from history. Base instructions use a separate request field.|
+|`Reasoning`|Preserved|Persisted|Sent. Encrypted content participates in token estimates.|
+|Function/custom/local-shell call|Preserved|Persisted|Sent; missing outputs are synthesized in the prompt clone.|
+|Function/custom tool output|Truncated at live admission using the turn truncation policy plus serialization headroom|The original item passed to `record_conversation_items` is persisted|Reconstructed sessions reapply the resume-time truncation policy.|
+|`WebSearchCall`|Preserved|Persisted|Sent.|
+|`Compaction` response item|Preserved|Persisted|Sent when present as an API item. Distinct from `RolloutItem::Compacted`.|
+|`GhostSnapshot`|Preserved as a branch-local exception|Persisted|Removed from the prompt clone.|
+|`Other`|Dropped|Not persisted|Not sent.|
 
-What survives a pause:
+### Mutating operations
 
-- completed `ResponseItem`s already recorded in history;
-- completed tool outputs;
-- the real user boundary and its committed context metadata;
-- pending-continuation metadata reconstructed from an interrupted abort or an incomplete history tail.
+The raw vector is append-only during ordinary turns, but the following operations rewrite it:
 
-What does not survive as a resumable execution object:
+- local or remote compaction calls `replace_compacted_history`;
+- thread rollback truncates at a real user boundary and removes immediately preceding contextual update items;
+- invalid-image recovery replaces images in the latest tool output within the latest real user turn;
+- local/remote compaction prompt fitting can remove old or trailing items from a cloned compaction source;
+- `/continue` can remove an interrupted abort marker and trim an incomplete dangling-call tail.
 
-- partial stream deltas that never became a completed `ResponseItem`;
-- an in-flight process or tool future as a live OS/runtime object;
-- a dangling call tail that continuation cleanup removes before resampling.
+## 5. Prompt projection
 
-## 5. Preservation at each layer
+`ContextManager::prepare_items_for_prompt_with_modalities` operates on a clone. It does not normally rewrite raw history.
 
-`record_conversation_items` sends the same input slice down three different paths in this order:
+The projection applies these deterministic transformations:
 
-```text
-record_into_history(items)             // processed live copy
-persist_rollout_response_items(items)  // original input items
-send_raw_response_items(items)         // original input items
-```
-
-That ordering creates an important distinction between live history and durable lineage.
-
-### 5.1 Live raw history
-
-`ContextManager::record_items` accepts model/API items plus the branch-specific `GhostSnapshot`.
-
-|Item|Live raw-history behavior|
-|---|---|
-|Non-system `Message`|Cloned exactly at record time|
-|`Reasoning`|Cloned exactly, including encrypted content|
-|`FunctionCall`, `CustomToolCall`, `LocalShellCall`, `WebSearchCall`, `Compaction`|Cloned exactly|
-|`FunctionCallOutput`|Recorded after text/content truncation using the turn policy multiplied by `1.2`|
-|`CustomToolCallOutput`|Recorded after output-text truncation using the same serialization budget|
-|`GhostSnapshot`|Retained specially even though it is not an API message|
-|System-role `Message`|Dropped|
-|`ResponseItem::Other`|Dropped|
-
-Thus, later requests in the same live session see the processed/truncated output.
-
-### 5.2 Normal rollout records and resume
-
-`persist_rollout_response_items` clones the original `ResponseItem`s supplied to `record_conversation_items`; it does not serialize the processed copies held by `ContextManager`.
-
-|Item|Normal rollout behavior|Reconstruction behavior|
-|---|---|---|
-|Persistable non-output item|Original item is stored|Recorded into live history under normal acceptance rules|
-|Function/custom tool output|Original, pre-truncation item is stored|Truncated again using the resume turn's active truncation policy|
-|System-role `Message` supplied through this path|Stored because rollout policy persists all messages|Dropped again by `ContextManager::record_items`|
-|`ResponseItem::Other`|Filtered by rollout policy|Never reconstructed|
-|`GhostSnapshot`|Stored|Restored to raw history and omitted from model prompts|
+1. Insert synthetic function/custom-tool outputs containing `"aborted"` immediately after calls that have no output.
+2. Remove outputs whose matching call is absent.
+3. When the selected model lacks image input, replace message and tool-output images with a text placeholder.
+4. Remove every `GhostSnapshot`.
 
 Consequences:
 
-- output truncation is stable for the remainder of one live session;
-- a normal resume reconstructs outputs from the original rollout item and may produce a different historical item if the active truncation policy changed;
-- the upstream branch retains this replay behavior, so changing it is not part of the minimal upstream-alignment proposal.
+- raw history and model-visible history can differ;
+- a dangling call may remain in raw history while every request sees a synthetic completed pair;
+- switching between image-capable and text-only models can change the projected historical prefix even without mutating raw history;
+- prompt projection is stable for the same raw items and model modalities.
 
-### 5.3 Compaction replacement checkpoints
+The normal agent loop waits for a tool output before issuing a follow-up request. Synthetic outputs primarily protect interrupted, resumed, or malformed tails.
 
-A `CompactedItem.replacement_history` is different from normal item-by-item rollout lineage. It stores the already constructed live replacement vector, and reconstruction installs it with `ContextManager::replace` without reprocessing or retruncating its items.
+## 6. Cross-turn context carryover
 
-The checkpoint therefore preserves that replacement vector exactly, including any output truncation, summary selection, preserved work notes, and ghost snapshots already present when compaction completed. Older rollout records remain on disk but no longer contribute to later reconstructed prompts before the checkpoint.
+Two metadata values serve different purposes.
 
-## 6. What prompt preparation changes or omits
+### `reference_context_item`
 
-Prompt construction clones raw history and applies transformations to the clone. Except for invalid-image recovery, these transformations do not rewrite raw history.
+This is the baseline for context-diff generation. Before a new user item, `record_context_updates_and_set_reference_context_item` compares the current `TurnContext` with this baseline and appends only the required update items when possible.
 
-|Transformation|Prompt effect|Raw-history effect|
-|---|---|---|
-|Missing output after function/custom/shell call|Insert synthetic output with `"aborted"`|None|
-|Output whose matching call is absent|Remove orphan output|None|
-|Model lacks image modality|Replace message/tool images with a fixed text placeholder|None|
-|`GhostSnapshot`|Remove from prompt|None|
+A compaction using `InitialContextInjection::DoNotInject` clears this baseline because the replacement no longer contains canonical current-context items. A mid-turn compaction using `BeforeLastUserMessage` reinserts canonical context immediately before the last real user message and sets a new baseline.
 
-This means exact preservation must be stated at the correct layer:
+### `previous_turn_settings`
 
-- most accepted items are exact in live raw history;
-- live tool outputs may already be truncated;
-- normal rollout lineage retains original tool outputs and retruncates them on reconstruction;
-- compacted replacement checkpoints retain their already processed vector;
-- the prompt is a normalized projection, not a byte-for-byte copy of raw history.
+This represents the newest committed real user turn. In this branch it currently contains the model slug. It is committed only after the user `ResponseItem` is recorded. Previous-model compaction reads it to decide whether an oversized history should first be compacted by the model that produced the prior conversation.
 
-## 7. Destructive history operations
+Live compaction does not clear it. The replay implementation currently derives it from the last replayed `TurnContext`, which is not equivalent and causes confirmed resume/rollback defects.
 
-These operations intentionally stop carrying the full prior transcript forward:
+## 7. Compaction preservation semantics
 
-### Compaction
+Compaction is an intentional cache and history rebase. It does not preserve the detailed transcript token-for-token.
 
-`core/src/compact.rs` builds replacement history from selected historical user messages plus a generated summary. Depending on `InitialContextInjection`, it may insert current initial context before the last real user message. Preserved work notes and ghost snapshots are then appended. `CompactedItem.replacement_history` is the canonical durable checkpoint.
+### Local compaction
 
-Everything omitted from replacement history is no longer part of later prompts, even though older rollout records may still exist before the checkpoint.
+`core/src/compact.rs` builds a replacement from:
 
-### Rollback
+- selected recent real user messages and persisted turn-abort markers, bounded by `COMPACT_USER_MESSAGE_MAX_TOKENS`;
+- a generated summary represented as a user message;
+- optional current canonical context inserted before the last real user message for mid-turn compaction;
+- optional preserved session work notes;
+- every `GhostSnapshot`, so `/undo` remains available.
 
-`ContextManager::drop_last_n_user_turns`:
+It omits detailed assistant messages, reasoning, tool calls, and tool outputs except insofar as the summary carries their meaning. New compactions persist the exact replacement in `CompactedItem.replacement_history`.
 
-- identifies a boundary as every user-role `ResponseItem::Message` that is not recognized as contextual;
-- excludes user instructions, skill instructions, session prefixes, shell-command wrappers, and preserved work notes;
-- counts admitted pending/steer user messages independently because each is another non-contextual user `ResponseItem`;
-- also counts synthetic user-role records not covered by the contextual predicate, including compacted summary messages and retained turn-aborted markers;
-- truncates from the selected boundary;
-- walks backward over contiguous contextual user/developer update messages immediately preceding that boundary.
+The local compaction request itself uses a cloned source history plus a synthetic compaction prompt. If the request exceeds the model window, the implementation removes oldest items from that cloned source until it fits. The source comment says this preserves a prefix cache, but removing the oldest item necessarily changes the prefix; the operative goal is keeping recent history, not preserving the prior exact prefix.
 
-This per-message boundary is the existing rollback unit in this branch. The current rollout reconstruction then truncates its `context_stack` by the same numeric count, independently of which boundaries survived. That independent counting is the main replay bug addressed by this proposal.
+### Remote compaction
 
-### Continuation cleanup
+`core/src/compact_remote.rs` sends the projected history to the compact endpoint and receives a replacement history. It then optionally injects canonical context, preserved work notes, and `GhostSnapshot` items, and persists the exact resulting replacement.
 
-`prepare_history_for_continuation` may remove a trailing interrupted marker and incomplete tool tail. `RolloutRecorder::clean_for_continue` mirrors the durable cleanup.
+### Replay
 
-### Invalid-image recovery
+When `replacement_history` is present, replay can reproduce the compacted raw history exactly. For legacy compactions where it is absent, this branch currently rebuilds the summary using resume-time initial context; that historical reinjection is one selected backport defect.
 
-`replace_last_turn_images` rewrites the most recent eligible function output image to text. Its current reverse scan stops at any user-role message, including contextual user messages. Upstream stops at a real user-turn boundary; that narrower fix is included in the backport.
+## 8. Pause and continuation
 
-The rewrite currently changes only live raw history. It does not amend the already persisted original `ResponseItem`, so a restart before a later replacement checkpoint can reconstruct the original image and encounter the same provider rejection again. Upstream does not provide a directly backportable durability fix in the inspected path; changing rollout rewrite semantics is outside the mandatory proposal.
+`/pause` and `/continue` are branch-local features. Lifecycle events for them are not persisted by `core/src/rollout/policy.rs`.
 
-## 8. Token accounting
+Continuation does not create a synthetic user message and does not repeat normal-turn context, skill, or connector injection. It:
 
-The branch maintains per-item local estimates and combines them with server usage:
+1. optionally removes the trailing interrupted abort marker;
+2. trims the incomplete history tail beginning at the first dangling call after the latest real user boundary;
+3. applies equivalent cleanup to the rollout;
+4. emits transient `TurnContinued` state;
+5. resumes sampling from the remaining completed history.
 
-- the server's last reported total is the base;
-- locally recorded items after the last model-generated item are added;
-- historical encrypted reasoning estimates are additionally included when the server did not account for them;
-- inline base64 image payload bytes are replaced by a fixed model-visible image estimate rather than counted as text.
+It preserves completed assistant/reasoning/call/output items. It cannot preserve partial text deltas, an in-flight tool future, a child process's live state, or an unpersisted continuation event.
 
-The post-model-tail accounting is already present and does not need backport work.
+`history_needs_continuation` excludes contextual user/developer items when examining the tail. However, a compacted replacement normally ends in a summary encoded as a real user message. Without compaction provenance, a standalone compaction can therefore be misclassified as an unfinished regular turn after replay.
 
-## 9. Prefix-cache and WebSocket reuse
+## 9. Rollback behavior
 
-Two mechanisms should be kept distinct.
+`ContextManager::drop_last_n_user_turns` counts only `is_user_turn_boundary` messages:
 
-### Server prompt-prefix cache
+```text
+role == "user" && content is not contextual state
+```
 
-Requests carry `prompt_cache_key = conversation_id`. Across turns, the client sends the complete prompt history. Appending context diffs, a user message, and later response/tool items while leaving the old history unchanged preserves the old request as a structural prefix of the new request.
+If all real user turns are removed, it preserves any prefix that existed before the first real user boundary. For a partial rollback it also walks backward from the cut and removes contiguous contextual developer/user update items attached to the rolled-back turn.
 
-This is the cache-friendly path described in [Unrolling the Codex agent loop](https://openai.com/index/unrolling-the-codex-agent-loop/): prior conversation items are included in later requests, and an exact old prefix can be reused.
+Current rollout reconstruction applies the same numeric rollback independently to a `Vec<TurnContextItem>`. Since bare context records and compaction tasks can add `TurnContext` without adding a real user boundary, history and metadata can select different surviving turns.
 
-### Turn-scoped WebSocket continuation
+## 10. Token accounting
 
-A single `ModelClientSession` is reused across retries and sampling rounds within one logical turn. It sends only an incremental suffix with `previous_response_id` when both conditions hold:
+The history tracks a per-item estimate and a server-reported token snapshot.
 
-1. the new input begins with the previous input followed by the server-returned items;
-2. non-input request properties are exactly equal.
+The current total is approximated as:
 
-Compared properties include model, instructions, tools, tool choice, parallel-call setting, reasoning, store, stream, include, service tier, prompt-cache key, and text/output configuration.
+```text
+latest server total
++ locally estimated items after the last model-generated item
++ older encrypted reasoning estimates when the server total did not include them
+```
 
-A fresh `ModelClientSession` is created for the next logical turn, so this `previous_response_id` optimization is primarily within-turn in this branch. Server-side prefix caching can still span turns through the stable prompt-cache key and append-only input.
+Inline base64 image transport bytes are replaced with a fixed model-visible image estimate rather than counted as text. `GhostSnapshot` contributes zero estimated tokens because it is removed before prompting.
 
-### Operations and cache impact
+These estimates guide auto-compaction but are not tokenizer-exact.
 
-|Operation|Prefix effect|
-|---|---|
-|Append a normal user turn or completed tool round|Preserves the previous prompt prefix|
-|Append only settings differences|Preserves the previous prompt prefix and minimizes suffix growth|
-|Live output truncation|Cache-friendly for the remainder of that live session because the processed item is stable|
-|Resume with a different truncation policy|Can change an old output reconstructed from original rollout lineage and therefore break the exact historical prefix|
-|Replacement-history checkpoint|Preserves the checkpoint vector exactly on reconstruction; establishes a new durable base|
-|Prompt normalization with unchanged raw tail|Usually deterministic; a newly completed call/output can change normalization only near the tail|
-|Compaction|Replaces history; invalidates continuity from the rewrite point|
-|Rollback|Truncates history; invalidates continuation from the latest request, although an older prefix may still be cached|
-|Continuation cleanup|Rewrites the tail and clears direct continuation assumptions|
-|Invalid-image sanitization|Rewrites an earlier item in the current turn|
-|Switch model/tools/instructions/reasoning/schema/service tier|May preserve input history but disables WebSocket incremental reuse because request properties differ|
-|Unnecessary full context reinjection|Keeps older bytes but grows a redundant suffix and reduces effective cache/context efficiency|
+## 11. Prefix-cache and WebSocket effects
 
-The proposed replay fixes primarily improve cache behavior indirectly: they prevent stale metadata from causing duplicate context reinjection and ensure rollback/resume choose the same surviving baseline as the history they reconstruct.
+There are two separate reuse mechanisms.
+
+### Server-side prompt prefix cache
+
+Every request uses the conversation ID as `prompt_cache_key`. The key can help route related requests, but reusable content still depends on an exact token prefix.
+
+Ordinary turns are deliberately append-oriented:
+
+```text
+request N input
++ model output/tool output
++ context deltas
++ next user input
+```
+
+`core/tests/suite/prompt_caching.rs` verifies that later request input preserves earlier input as a prefix and that settings changes are appended rather than rewritten.
+
+### WebSocket incremental continuation
+
+Within a turn, `ModelClientSession::get_incremental_items` sends only a suffix with `previous_response_id` when:
+
+- non-input request properties are unchanged;
+- the new input begins with the previous request input;
+- the remaining suffix begins with items returned by the previous server response.
+
+This is stricter than server prefix caching and is turn-scoped. Compaction explicitly clears WebSocket continuation state.
+
+### Operation matrix
+
+|Operation|Raw-history effect|Server prefix-cache effect|WebSocket continuation effect|
+|---|---|---|---|
+|Normal completed item|Append|Preserves prior prefix|Eligible when request properties and returned-item ordering match.|
+|Context/settings delta|Append|Preserves prior prefix|May be eligible in the same turn; across explicit turns a new client session is used.|
+|Queued steering|Append|Preserves prior prefix|Eligible after committed server output.|
+|Prompt-only normalization|Raw unchanged; projected suffix/pairs may differ|Stable when raw history and modalities are unchanged|Must still satisfy exact projected input checks.|
+|Compaction|Replace|Old prefix is lost; replacement becomes a new cache base|Cleared.|
+|Rollback|Truncate/rewrite|Reuses only whatever surviving prefix still exactly matches a prior request|Prior continuation cannot be assumed.|
+|Invalid-image recovery|Mutate latest tool output|Breaks the prefix at the mutated item|Incremental check fails until a new base is established.|
+|Image-capability switch|Raw unchanged; old projected images change|Breaks projected prefix at the first affected image|Request-property/modal input mismatch prevents continuation.|
+|Model/tool/instruction/schema change|Input may remain append-only|Input prefix may still cache, but non-input request changes can reduce overall reuse|Rejected by the incremental request-property comparison.|
+
+Replay metadata bugs can indirectly reduce cache reuse by causing unnecessary full-context reinjection or incorrect model-switch updates. They are first correctness defects; cache loss is a secondary symptom.

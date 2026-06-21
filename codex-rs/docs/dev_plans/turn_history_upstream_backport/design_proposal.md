@@ -1,113 +1,20 @@
 # Design Proposal
 
-## 1. Design principles
+## 1. Design objective
 
-1. Port semantics, not upstream architecture.
-2. Keep the existing rollout wire format in the mandatory patch.
-3. Use the same non-contextual user `ResponseItem` boundaries as `ContextManager::drop_last_n_user_turns`; do not invent lifecycle segmentation that this branch cannot persist.
-4. Treat `TurnContext` before a user boundary as a candidate, not a committed user turn.
-5. Treat a `TurnContext` immediately following `Compacted` as compacted-history reference metadata, not previous-turn settings.
-6. Preserve `/continue` as a continuation of the existing user turn.
-7. Prefer conservative full reinjection over a stale baseline when an old compacted prefix makes association unprovable.
+Repair replay semantics with the smallest branch-appropriate change:
 
-## 2. Required invariant split
+- no new persisted lifecycle events;
+- no rollout schema migration;
+- no change to normal live-turn ordering;
+- no upstream window/realtime/inter-agent prerequisites;
+- preserve branch-local `/pause`, `/continue`, work notes, and `GhostSnapshot` behavior.
 
-Maintain two independent metadata values:
+The replay implementation must stop treating `TurnContext` as a user-turn counter. It should instead treat it as a candidate that becomes committed only at a real user boundary, except for the explicit post-compaction baseline record.
 
-```rust
-reference_context_item: Option<TurnContextItem>
-previous_turn_settings: Option<PreviousTurnSettings>
-```
+## 2. Target metadata model
 
-### Reference context
-
-Meaning: the settings snapshot represented by model-visible context messages in the current history and safe to use as the next diff baseline.
-
-It may be established by:
-
-- context updates preceding a real user turn;
-- full context inserted into compacted replacement history.
-
-It may be cleared by:
-
-- compaction with `InitialContextInjection::DoNotInject`;
-- legacy compaction whose historical context cannot be reconstructed;
-- conservative rollback across an opaque compacted prefix.
-
-### Previous-turn settings
-
-Meaning: settings from the latest surviving real user turn.
-
-It changes only when:
-
-- a real user boundary commits a pending `TurnContext`;
-- rollback restores an older committed user-turn checkpoint;
-- reconstruction cannot prove an older value and clears it.
-
-Compaction alone must not update it.
-
-## 3. Live-path changes
-
-### 3.1 Keep context records before user input
-
-Do not move model-visible context update messages after the user prompt. Their current order is intentional:
-
-```text
-context differences
-TurnContext metadata
-real user message
-```
-
-The `TurnContext` remains a durable candidate that replay later associates with the following real user boundary.
-
-### 3.2 Stop committing previous settings in the context-update helper
-
-Change `record_context_updates_and_set_reference_context_item` so it:
-
-- computes and records full context or differences;
-- persists `RolloutItem::TurnContext`;
-- advances the live `reference_context_item`;
-- does **not** set `previous_turn_settings`.
-
-After `record_user_prompt_and_emit_turn_item` completes, commit:
-
-```rust
-sess.set_previous_turn_settings(Some(PreviousTurnSettings {
-    model: turn_context.model_info.slug.clone(),
-}))
-.await;
-```
-
-This matches the durable user boundary while retaining current prompt ordering.
-
-### 3.3 Preserve previous settings through compaction
-
-Change `replace_compacted_history` so replacement updates:
-
-- raw history;
-- `reference_context_item`;
-- `initial_context_seeded`;
-
-but leaves `previous_turn_settings` unchanged.
-
-Split the current all-in-one baseline clear into explicit operations, for example:
-
-```rust
-clear_reference_context_baseline()
-clear_all_reconstructed_turn_metadata()
-```
-
-The fallback rollback path may use the second. Normal `DoNotInject` compaction uses only the first through replacement state.
-
-## 4. Branch-local replay state machine
-
-This branch cannot directly adopt upstream reverse segmentation because it does not durably persist `TurnStarted`/`TurnComplete` and its `TurnContextItem` has no turn ID.
-
-Use a forward state machine over existing records.
-
-### 4.1 Replay state
-
-Conceptual structures:
+Introduce internal replay-only state in `core/src/session/rollout_reconstruction.rs`.
 
 ```rust
 #[derive(Clone)]
@@ -116,93 +23,201 @@ struct ReplayMetadata {
     previous_turn_settings: Option<PreviousTurnSettings>,
 }
 
+#[derive(Clone)]
+struct MetadataCheckpoint {
+    after_user_boundary: ReplayMetadata,
+}
+
 struct ReplayEpoch {
-    base: ReplayMetadata,
-    committed_user_turns: Vec<ReplayMetadata>,
-}
-
-struct ReplayState {
-    metadata: ReplayMetadata,
-    pending_context: Option<TurnContextItem>,
-    epoch: ReplayEpoch,
-    turn_context_may_attach_to_compaction: bool,
+    base_metadata: ReplayMetadata,
+    checkpoints: Vec<MetadataCheckpoint>,
+    replacement_is_opaque: bool,
 }
 ```
 
-An epoch begins at session start or immediately after each `Compacted` record. Replacement history is an opaque base: it may contain selected old user messages and a summary, but this branch lacks enough identifiers to reconstruct per-original-turn metadata inside it.
+The exact names are not important. The invariants are:
 
-### 4.2 Event rules
+- `pending_context` is not committed metadata;
+- every checkpoint corresponds to one `is_user_turn_boundary` observed after the current opaque replacement base;
+- `base_metadata` is the state at the latest compaction/rewrite epoch;
+- previous settings and reference context are stored independently.
 
-|Rollout item|History action|Metadata action|
-|---|---|---|
-|Non-boundary `ResponseItem`|Record with current truncation policy|Clear the immediate-compaction attachment flag|
-|Real user-boundary `ResponseItem`|Record as above|Clear the attachment flag; commit `pending_context`; push one user-turn checkpoint; clear pending continuation|
-|`TurnContext(ctx)` immediately after `Compacted`|No model-input action|Set reference baseline to `ctx`; update epoch base; do not change previous settings|
-|Other `TurnContext(ctx)`|No model-input action|Replace `pending_context` with `ctx`|
-|`Compacted` with replacement|Replace raw history|Discard pending context, clear reference, preserve previous settings, start new epoch, permit only the directly following item to attach as compacted baseline|
-|Legacy `Compacted`|Rebuild compacted history without initial context|Same metadata reset as replacement compaction|
-|`ThreadRolledBack(N)`|Call `drop_last_n_user_turns(N)`|Discard `pending_context`, pending continuation, and the attachment flag; pop up to N checkpoints from the current epoch; restore the matching snapshot or epoch base; if N crosses the epoch base, clear uncertain metadata and reset the epoch|
-|Interrupted `TurnAborted`|No history action here|Set pending continuation using committed previous settings, then reference model as fallback|
-|Persisted `UserMessage` event|No history action|May clear pending continuation; never count it as a second user boundary|
-|Other events/session metadata|No turn-count action|Do not preserve the immediate-compaction attachment flag unless the implementation proves such records can be interposed safely|
+## 3. Replay state
 
-### 4.3 Real user-boundary commit
-
-On `ResponseItem` satisfying `is_user_turn_boundary`:
+The forward scan should maintain:
 
 ```text
-if pending_context exists:
-    reference_context_item = pending_context
-    previous_turn_settings.model = pending_context.model
+history
+current_metadata
+pending_context
+current_epoch
+awaiting_adjacent_post_compact_context
+latest_compaction_tail_kind
+explicit_interrupt_hint
+```
 
-push snapshot(reference_context_item, previous_turn_settings)
+Suggested compaction-tail classification:
+
+```rust
+enum CompactionTailKind {
+    None,
+    StandaloneOrPreTurn,
+    MidTurnWithInjectedContext,
+}
+```
+
+This is internal provenance, not a persisted protocol field.
+
+## 4. Event semantics
+
+### 4.1 `RolloutItem::ResponseItem`
+
+Always feed the item through `ContextManager::record_items`, preserving existing filtering and truncation.
+
+If `is_user_turn_boundary(response_item)` is false:
+
+- do not commit `pending_context`;
+- do not push a metadata checkpoint;
+- contextual user messages, preserved work notes, developer updates, assistant output, reasoning, calls, outputs, and `GhostSnapshot` remain non-boundaries.
+
+If it is true:
+
+1. If `pending_context` exists, set:
+
+   ```text
+   current.reference_context_item = pending_context
+   current.previous_turn_settings.model = pending_context.model
+   ```
+
+2. If no pending context exists, carry current metadata forward. This covers queued steering within an already committed turn context and legacy/malformed records without context evidence.
+3. Push a checkpoint containing the resulting metadata.
+4. Clear `pending_context`.
+5. Mark that real user work occurred after the latest compaction.
+6. Clear any older interruption hint that predates this user boundary.
+
+The `ResponseItem` is the commitment evidence because live code persists it before committing `previous_turn_settings` and before emitting `UserMessage`. A crash between those steps must still reconstruct the accepted user boundary.
+
+### 4.2 Ordinary `RolloutItem::TurnContext`
+
+When the item is not immediately adjacent to a `Compacted` record:
+
+```text
+pending_context = item
+```
+
+Do not immediately update current metadata. If another ordinary context appears before a real user boundary, the newest candidate wins. This matches the latest context that would have applied to that user item while preventing task-only or cancelled contexts from becoming previous settings.
+
+### 4.3 Adjacent post-compaction `TurnContext`
+
+`replace_compacted_history` persists `Compacted` and the optional reference context in one ordered batch. Therefore a `TurnContext` immediately following `Compacted` has distinct semantics:
+
+- canonical context was inserted into the replacement history;
+- set `current.reference_context_item` to that item;
+- update `current_epoch.base_metadata.reference_context_item` to the same item;
+- do **not** change `previous_turn_settings`;
+- do not push a user checkpoint;
+- classify the compaction tail as `MidTurnWithInjectedContext`.
+
+Any intervening rollout record cancels the adjacency interpretation.
+
+### 4.4 `RolloutItem::Compacted`
+
+History:
+
+- if `replacement_history` exists, replace history exactly;
+- otherwise collect historical user messages and rebuild with `Vec::new()` initial context plus the persisted summary.
+
+Metadata:
+
+```text
+current.reference_context_item = None
+current.previous_turn_settings = previous committed value
 pending_context = None
+current_epoch.base_metadata = current
+current_epoch.checkpoints.clear()
+current_epoch.replacement_is_opaque = true
+awaiting_adjacent_post_compact_context = true
+latest_compaction_tail_kind = StandaloneOrPreTurn
 ```
 
-Push a checkpoint even for old rollouts where no candidate exists. The checkpoint keeps rollback counts aligned, while metadata remains unchanged or unknown.
+The replacement is opaque because its retained user messages and summary do not provide a bijection to original metadata checkpoints. This is why rollback can be exact only for user boundaries appended after that base.
 
-### 4.4 Direct post-compaction attachment
+### 4.5 `ThreadRolledBack(N)`
 
-Current `replace_compacted_history` persists:
+First call the existing history operation:
+
+```rust
+history.drop_last_n_user_turns(N);
+```
+
+Then update metadata using the post-base checkpoint count.
+
+#### Rollback contained within current epoch
+
+When `N <= checkpoints.len()`:
+
+1. Remove the newest `N` checkpoints.
+2. Restore current metadata from the new last checkpoint, or from `base_metadata` when no checkpoint remains.
+3. Clear `pending_context` and interruption hints.
+
+History and metadata now remove the same post-base user boundaries.
+
+#### Rollback crosses the opaque replacement base
+
+When `N > checkpoints.len()` and the epoch has an opaque replacement:
+
+- history has removed one or more user boundaries represented only inside replacement history;
+- exact historical metadata cannot be recovered from this branch's existing rollout schema;
+- clear both reference context and previous settings conservatively;
+- clear checkpoints and pending context;
+- treat the surviving rewritten history as a new opaque epoch.
+
+Retaining a guessed value is worse than appending canonical context and re-establishing metadata on the next real user turn.
+
+#### Rollback with no compaction base
+
+When no opaque base exists and `N` removes all known checkpoints, restore the initial empty metadata.
+
+### 4.6 Interruption and user events
+
+`EventMsg::TurnAborted(Interrupted)` records an interruption hint. `EventMsg::UserMessage` may clear an older hint, but it must not be required to commit metadata because it can be missing after a crash that occurred after the user response item was persisted.
+
+Other event messages do not affect replay metadata unless already handled by existing history/continuation logic.
+
+## 5. Continuation derivation
+
+Keep `history_needs_continuation` as the raw-history predicate. Add replay provenance around it.
 
 ```text
-Compacted
-TurnContext   // only when replacement history contains injected initial context
+incomplete = history_needs_continuation(reconstructed_history)
+standalone_compaction_only =
+    latest compaction tail is StandaloneOrPreTurn
+    && no real user boundary was appended after that compaction
+
+pending = incomplete && !standalone_compaction_only
 ```
 
-as adjacent records in one persistence call. That exact adjacency is the only safe branch-local signal that the context item describes replacement history without a new user turn. This relies on the existing full initial-context builder emitting at least one `ResponseItem` before a normal turn's `TurnContext`; preserve that ordering and cover it with a regression test.
+When pending:
 
-Do not leave the attachment flag active across a `ResponseItem`. This distinguishes:
+- source remains `Interrupted` for compatibility with the branch-local continuation type;
+- model comes from `current_metadata.previous_turn_settings`, not from the reference baseline;
+- target remains `Regular`;
+- explicit interruption evidence can determine source priority but must still satisfy the incomplete-history check.
 
-```text
-Compacted
-TurnContext         // compacted replacement baseline
-```
+This yields the required cases:
 
-from:
+|Tail|Result|
+|---|---|
+|Ordinary user with no final assistant|Pending continuation.|
+|Interrupted dangling call|Pending continuation after cleanup.|
+|Standalone/manual compaction summary only|No regular continuation.|
+|Pre-turn compaction with no later user|No regular continuation.|
+|Mid-turn compaction plus adjacent context and no later assistant|Pending continuation.|
+|Any tail ending in a final assistant message|No continuation.|
 
-```text
-Compacted
-context ResponseItem
-TurnContext
-user ResponseItem   // next normal turn candidate
-```
+## 6. Legacy compaction behavior
 
-A pre-compaction task `TurnContext` is discarded when `Compacted` is processed.
-
-### 4.5 Rollback within and across epochs
-
-Let `K` be the number of committed real-user checkpoints after the latest compaction.
-
-- `N < K`: pop N checkpoints and restore the new last checkpoint.
-- `N == K`: restore the epoch base.
-- `N > K`: history rollback crosses into the opaque compacted base. Apply the history truncation, clear pending context plus both committed metadata fields, and reset the epoch to an empty/unknown base because this branch cannot prove which historical context belongs to the remaining selected messages.
-
-The next regular turn then injects full current context. This is intentionally conservative and backward compatible. A second rollback operates on the reset epoch and the already-truncated history, never on stale checkpoints from before the first rollback.
-
-## 5. Legacy compaction reconstruction
-
-Replace resume-time initial-context injection with:
+For `replacement_history: None`, reconstruct only evidence known at the historical point:
 
 ```rust
 let rebuilt = compact::build_compacted_history(
@@ -212,65 +227,48 @@ let rebuilt = compact::build_compacted_history(
 );
 ```
 
-After any such legacy compaction:
+Then:
 
-- `reference_context_item = None`;
-- the next regular turn performs full context injection;
-- `previous_turn_settings` remains the latest committed real-user setting only when replay can still prove it; otherwise it is cleared conservatively.
+- clear reference context;
+- preserve committed previous settings;
+- allow the next normal turn to append current canonical context at the end;
+- do not try to synthesize a historical `TurnContext` from the resume-time `TurnContext`.
 
-This keeps current settings at the current end of history rather than inserting them at an old checkpoint.
+This matches upstream's deterministic fallback while avoiding its broader replay infrastructure.
 
-## 6. Pending continuation
+## 7. Why not persist lifecycle events in the mandatory patch
 
-Reconstruction should choose the continuation model from committed metadata:
+Persisted lifecycle IDs would produce a cleaner long-term model, but adding them here is not a narrow prerequisite. It would require defining lifecycle semantics for:
 
-```text
-previous_turn_settings.model
-or reference_context_item.model
-or None
-```
+- explicit user turns with queued steering;
+- standalone local and remote compaction;
+- inline auto-compaction before and during turns;
+- `/pause` and `/continue`;
+- post-turn review and delegate workflows;
+- interrupted tasks and old rollouts without IDs.
 
-An uncommitted `pending_context` must never choose the continuation model.
+The proposed checkpoint design uses evidence already persisted and directly matches this branch's existing history rollback unit.
 
-A `/continue` execution records no new user boundary and therefore does not append a checkpoint. Its later completed items remain part of the original user turn's durable history.
+## 8. Prefix-cache properties of the design
 
-## 7. Invalid-image boundary fix
+The design does not alter ordinary prompt construction. It improves cache behavior indirectly:
 
-Change the reverse stop condition in `ContextManager::replace_last_turn_images` from:
+- a valid post-compaction reference avoids redundant full-context reinjection;
+- clearing uncertain metadata after an opaque rollback avoids emitting a wrong delta against a stale baseline;
+- deterministic legacy reconstruction prevents resume-time settings from changing an old prefix;
+- false compaction continuation requests are eliminated.
 
-```rust
-matches!(item, ResponseItem::Message { role, .. } if role == "user")
-```
+Compaction and rollback remain intentional rebases. No design should claim to preserve the pre-rewrite exact prefix.
 
-to:
+## 9. Compatibility
 
-```rust
-is_user_turn_boundary(item)
-```
+- Existing rollout JSON remains valid.
+- No new required field is introduced.
+- Old replacement-bearing compactions become more accurately replayed.
+- Legacy replacement-less compactions change reconstructed prompt shape intentionally by removing historically inaccurate current context.
+- In-memory live behavior remains unchanged.
+- `/continue` continues to operate on completed durable items only.
 
-No other upstream history-version or image-detail machinery is required.
+## 10. Failure policy
 
-## 8. Backward compatibility
-
-|Rollout shape|Result|
-|---|---|
-|Current rollout with `TurnContext` before every user|Fully associated by forward commit|
-|Bare trailing `TurnContext`|Ignored for durable settings at end of replay|
-|Old rollout with user messages but no `TurnContext`|History restored; metadata remains previous/unknown; next turn safely reinjects if needed|
-|Replacement compaction followed by adjacent `TurnContext`|Reference baseline restored; previous settings unchanged|
-|Replacement compaction without `TurnContext`|Reference cleared|
-|Legacy compaction without replacement|Rebuilt without current context; reference cleared|
-|Continuation records without a new user|No new turn checkpoint|
-|Rollback crossing replacement-history base|History still rolled back; uncertain metadata cleared|
-
-## 9. Non-goals
-
-- Adding persisted lifecycle turn IDs in the mandatory patch.
-- Porting upstream reverse/lazy rollout readers.
-- Changing response item schemas.
-- Replacing the branch's `/pause` or preserved-work-notes workflows.
-- Changing compaction summary selection.
-- Making WebSocket continuation cross logical turns.
-- Porting body-after-prefix compaction accounting.
-- Changing normal rollout output persistence or resume-time retruncation semantics.
-- Making invalid-image recovery rewrite already persisted rollout records.
+When evidence is ambiguous, prefer conservative metadata clearing over a stale association. The next normal turn can safely append a full canonical context and commit new previous settings after its user boundary. This costs tokens once but preserves correctness.

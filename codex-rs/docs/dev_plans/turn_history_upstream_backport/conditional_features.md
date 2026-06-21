@@ -1,116 +1,195 @@
 # Conditional and Deferred Upstream Features
 
-## 1. Compaction compatibility hash
+## 1. Decision rule
 
-### Value
+The mandatory replay fix should not absorb upstream infrastructure merely because it appears nearby in the current upstream tree. A follow-up feature is eligible only when:
 
-The upstream branch can compact when the model's compaction compatibility changes even if the model slug is unchanged or the context-window downshift predicate does not fire.
+1. it solves a demonstrated problem in this branch;
+2. its data source is available and stable here;
+3. its minimal dependency set can be isolated;
+4. it preserves branch-local pause/continue, work-note, and undo behavior;
+5. it has focused tests independent of unrelated upstream protocol expansion.
 
-The rule is deliberately conservative:
-
-```text
-compact only when previous.comp_hash and current.comp_hash are both present and differ
-```
-
-A missing hash does not imply incompatibility.
-
-### Minimal dependency scope
-
-Port only these pieces:
-
-1. Add `comp_hash: Option<String>` with a serde default to `ModelInfo` in `protocol/src/openai_models.rs`.
-2. Thread it through model metadata decoding and branch-local model overlays:
-   - `core/src/models_manager/manager.rs`
-   - `core/src/models_manager/model_info.rs`
-   - `core/src/models_manager/overlay.rs`
-   - affected constructors/tests.
-3. Add the optional field to `TurnContextItem` and `PreviousTurnSettings` with backward-compatible defaults.
-4. Populate it in `TurnContext::to_turn_context_item`.
-5. Restore it through the new committed replay checkpoints.
-6. Add `comp_hash_changed` to `maybe_run_previous_model_inline_compact` before the existing context-window downshift test.
-7. Compact with the previous model context when the hash differs.
-
-### Gate
-
-Do not land the trigger merely with an always-`None` field. First verify that the model metadata source used by this branch provides stable values. Otherwise the added schema and plumbing have no behavior and create maintenance cost.
-
-## 2. Body-after-prefix compaction budget
+## 2. Conditional: compaction compatibility hash
 
 ### Upstream behavior
 
-`AutoCompactTokenLimitScope::BodyAfterPrefix` tracks an estimated prefill at the start of a compaction window. Auto-compaction can then budget growth after that prefix while still enforcing the model's absolute context window.
+The upstream branch carries `comp_hash: Option<String>` through:
 
-This is relevant to prefix-cache economics: a stable large prefix can remain cached while the active body is allowed a separate growth budget.
+- `ModelInfo` in `protocol/src/openai_models.rs`;
+- `TurnContextItem` in `protocol/src/protocol.rs`;
+- `TurnContext::to_turn_context_item` in `core/src/session/turn_context.rs`;
+- `PreviousTurnSettings` in `core/src/session/mod.rs`;
+- rollout reconstruction;
+- the previous-model compaction decision in `core/src/session/turn.rs`.
 
-### Minimal prerequisites are still broad
+Compaction is triggered for a hash change only when both previous and current hashes are present and differ. Missing metadata does not force compaction.
 
-A correct port requires all of the following as one coherent unit:
+### Problem solved
 
-- configuration enum and parsing;
-- session state for compaction-window prefill;
-- history helper for tokens after the last model-generated item/body boundary;
-- absolute full-context-window enforcement;
-- pre-turn and post-sampling token-status calculations;
-- compaction-window reset/advance semantics;
-- resume reconstruction of window number/ID or an explicitly simpler branch-local substitute;
-- tests for total-scope and body-scope behavior across compaction, resume, and model switch.
+A model slug can remain constant while its compaction prompt/contract changes. The hash lets the agent rebase history before continuing under an incompatible compaction regime.
 
-Porting only the enum or only the token subtraction would risk exceeding the real context window. Defer this feature from the minimal correctness series.
+### Minimal prerequisite scope
 
-## 3. Persisted lifecycle IDs and reverse replay
+If the model metadata source used by this branch supplies a stable hash, port only:
 
-### Upstream value
+1. `ModelInfo.comp_hash` with serde default.
+2. `ModelInfoPatch` and `ModelInfoPatchToml` support in `core/src/models_manager/overlay.rs` when local overlays must set it.
+3. `TurnContextItem.comp_hash` as an optional backward-compatible field.
+4. `PreviousTurnSettings.comp_hash`.
+5. propagation in `TurnContext::to_turn_context_item` and replay checkpoints.
+6. a helper equivalent to:
 
-Turn IDs on lifecycle/context records let upstream reverse replay:
+   ```rust
+   fn comp_hash_changed(previous: Option<&str>, current: Option<&str>) -> bool {
+       matches!((previous, current), (Some(previous), Some(current)) if previous != current)
+   }
+   ```
 
-- associate incomplete, completed, and aborted records;
-- skip exactly N newest real user-turn segments;
-- select the newest surviving replacement checkpoint;
-- stop reading older rollout data once required metadata is known;
-- support future lazy rollout loading.
+7. focused live and resume tests.
 
-### Why it is not the minimal dependency
+Do not port history windows, realtime flags, or upstream replay segments as prerequisites.
 
-This branch currently does not persist `TurnStarted` or `TurnComplete`, has no turn ID on `TurnContextItem`, and has custom continuation semantics. A complete port would touch:
+### Gate
 
-- protocol event schemas;
-- rollout persistence policy;
-- every turn/task producer;
-- abort and completion emission;
-- old-rollout compatibility;
-- pause/continue cleanup;
-- reconstruction and rollback tests;
-- clients that deserialize lifecycle events.
+Do not land this feature when every model resolves to `None`. Optional fields alone create maintenance cost without behavior.
 
-The branch-local epoch/checkpoint design fixes the known correctness bugs with existing records. Lifecycle IDs remain a reasonable future migration if exact rollback through compacted historical turns or lazy replay becomes a requirement.
+### Required tests
 
-## 4. Auto-compaction window IDs
+- same slug, hashes A/B: compaction runs;
+- same slug, same hash: compaction does not run;
+- either hash missing: compaction does not run;
+- resume restores previous hash from a committed user checkpoint;
+- bare `TurnContext` hash does not become previous settings;
+- old rollout without the field remains readable.
 
-Window numbers/IDs help upstream coordinate body-after-prefix accounting, explicit new-window requests, hooks, and reconstruction. Without those consumers, adding IDs alone has no value. Defer with the body-after-prefix feature.
+## 3. Conditional: context-window downshift without model-slug change
 
-## 5. History versioning
+### Upstream behavior
 
-`history_version` is useful when another component holds a cursor into history and must detect replacement, rollback, or image rewrite. This branch's prompt construction clones current raw history each time and does not need a version token for the proposed fix.
+The upstream previous-model compaction path also reacts when the effective context window becomes smaller, even if the slug is unchanged.
 
-Port it only alongside a concrete cursor/guardian consumer.
+### Minimal scope
 
-## 6. Image-detail token estimation
+This can be added after replay metadata is correct by extending `PreviousTurnSettings` with the minimum previous window/budget evidence required by the decision. Do not infer it from the current model catalog during replay; persist the historical value if correctness depends on it.
 
-Upstream decodes dimensions and distinguishes richer image-detail modes. This branch already prevents base64 transport bytes from dominating estimates by substituting a fixed resized-image cost.
+### Gate
 
-A separate accuracy improvement could port dimension-aware estimates, but it is independent of turn/history correctness and may require protocol fields absent here.
+Add only if this branch can switch model metadata/window configuration under a stable slug in production. Otherwise the existing model-change path is sufficient.
 
-## 7. Upstream protocol and ecosystem changes
+### Tests
 
-Do not pull these as prerequisites for the mandatory backport:
+- same slug, smaller current window, oversized history: compact before sampling;
+- same slug, equal/larger window: no new compaction;
+- resume preserves historical window evidence;
+- missing historical window uses conservative existing behavior.
 
-- typed inter-agent communication;
-- tool-search and image-generation response variants;
-- realtime state;
-- hook/plugin session-start lifecycle;
-- remote compaction v2;
-- shared output-truncation crate migration;
-- item-ID assignment;
-- prompt guardian/history cursors.
+## 4. Deferred: persisted lifecycle IDs and reverse replay
 
-Each should be evaluated against a branch-local feature requirement rather than inherited through textual cherry-picking.
+### Value
+
+Upstream lifecycle persistence enables:
+
+- precise grouping of non-user tasks and user turns;
+- newest-to-oldest rollback selection;
+- early stopping at the newest surviving replacement base;
+- future lazy rollout loading.
+
+### Why it is not a minimal prerequisite
+
+This branch filters `TurnStarted`, `TurnComplete`, `TurnPaused`, and `TurnContinued`. Adding them changes durable behavior and requires task-by-task semantics. A coherent port must cover:
+
+- IDs on `TurnStarted`, `TurnComplete`, `TurnAborted`, and `TurnContext`;
+- persistence policy;
+- normal turns with queued steering;
+- standalone and inline compaction;
+- `/pause` and `/continue` boundaries;
+- post-turn review/delegate tasks;
+- old rollouts with absent IDs;
+- fork/truncation utilities that count user turns;
+- migration and duplicate-event behavior.
+
+### Prerequisite test before adoption
+
+Define the rollback unit for multiple real user/steering messages inside one lifecycle. Upstream's audited reverse metadata path counts a segment once, while forward history rollback counts instruction boundaries. Resolve and test that semantic before copying the architecture.
+
+## 5. Deferred: history version
+
+Upstream increments a history version on rewrites. This can invalidate derived caches or detect mutation across asynchronous work.
+
+This branch currently clears WebSocket continuation explicitly around compaction and constructs prompt history under session state access. No confirmed stale-derived-history bug requires the version counter. Port only alongside a consumer that needs it.
+
+Minimal future scope:
+
+- counter in `ContextManager`;
+- increment on replace, rollback, invalid-image mutation, and other rewrites;
+- no increment for pure prompt projection;
+- tests for every mutation path;
+- explicit consumer semantics.
+
+## 6. Deferred: body-after-prefix token budgeting
+
+### Value
+
+Upstream can compact based on the model-visible body after a reusable prefix rather than only total history size. This may reduce unnecessary compaction for large stable prefixes.
+
+### Dependency surface
+
+- token accounting split by prefix/body;
+- model metadata/feature signaling;
+- prompt construction agreement about the prefix boundary;
+- compaction decisions and tests across model switches;
+- interaction with settings updates, images, and request properties.
+
+This is an optimization and should not be coupled to replay correctness.
+
+## 7. Deferred: compaction windows and window IDs
+
+Upstream persists window number/ID metadata and advances it after compaction. The feature supports request headers, observability, replay, and newer storage behavior.
+
+A minimal port is not isolated because it touches:
+
+- `CompactedItem` schema;
+- session state;
+- client metadata headers;
+- resume/fork semantics;
+- local and remote compaction;
+- tests and telemetry.
+
+Do not add placeholder fields without consumers.
+
+## 8. Deferred: remote compaction v2 and expanded compaction phases
+
+The upstream branch has newer remote compaction behavior, reasons/phases, and model capabilities. Port only from a separate product requirement. The replay fix already treats `replacement_history` as an opaque exact base and therefore remains compatible with future replacement producers.
+
+## 9. Deferred: expanded response items and inter-agent communication
+
+Upstream history and replay support item variants absent from this branch, including newer tool/search/image/inter-agent flows. Mechanical enum backports require protocol, API, event mapping, persistence, token estimation, normalization, and UI changes.
+
+Do not add unreachable variants to satisfy upstream match arms. When a feature is intentionally ported, audit it end-to-end:
+
+```text
+API decode -> ResponseItem -> live history -> rollout -> replay -> prompt projection -> token estimate -> UI/event mapping
+```
+
+## 10. Not needed: upstream module and crate chores
+
+The following are implementation-location changes, not behavioral prerequisites:
+
+- rollout policy moved into a separate crate/module;
+- truncation helpers moved/shared;
+- test modules split or renamed;
+- visibility and import cleanup;
+- telemetry field additions unrelated to selected decisions.
+
+Keep this branch's layout unless a selected feature requires a move.
+
+## 11. Recommended sequencing
+
+1. Land the mandatory replay/legacy/continuation patch.
+2. Observe whether model metadata supplies a meaningful `comp_hash`.
+3. Port `comp_hash` as a focused optional-field series if the gate is met.
+4. Evaluate same-slug context-window downshift independently.
+5. Consider lifecycle/reverse replay only as a dedicated architecture project with branch-local task semantics specified first.
+
+This ordering avoids turning a narrow correctness fix into an upstream synchronization effort.

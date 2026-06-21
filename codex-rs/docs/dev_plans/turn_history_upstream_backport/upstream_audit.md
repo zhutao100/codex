@@ -1,129 +1,154 @@
-# Upstream Turn and History Audit
+# Upstream Audit and Classification
 
-## Scope and comparison method
+## 1. Comparison basis
 
-The comparison focuses on behavior, not textual similarity. The upstream branch has substantial protocol, session, compaction-window, hook, plugin, multi-agent, and client refactors that are not prerequisites for the branch-local fixes.
+The audit compares corresponding live-turn, history, compaction, rollout, and replay paths in this branch and the upstream branch. The upstream branch has undergone broader protocol and architecture work, so a textual diff is not a safe backport strategy. The useful unit of comparison is behavioral invariant.
 
-The most relevant upstream code is:
+## 2. Summary matrix
 
-- `core/src/session/turn.rs`
-- `core/src/context_manager/history.rs`
-- `core/src/session/rollout_reconstruction.rs`
-- `core/src/session/rollout_reconstruction_tests.rs`
-- `core/src/session/mod.rs`
-- `protocol/src/protocol.rs`
-- `protocol/src/openai_models.rs`
+|Behavior|This branch|Upstream branch|Classification|Backport decision|
+|---|---|---|---|---|
+|Record real user item before committing previous settings|Present|Present|Already fixed/aligned|No action.|
+|Keep previous settings when compaction clears reference context|Present live; replay loses it in some cases|Present in replay|Replay bug remains here|Backport minimal replay fix.|
+|Invalid-image scan stops at a real user boundary|Present|Present|Already fixed/aligned|No action.|
+|Fresh explicit input precedes queued steering|Present|Present|Aligned behavior|No action.|
+|Prompt-copy call/output normalization and modality stripping|Present|Present, expanded for new item types|Aligned core behavior|No action.|
+|Exact replacement history for new compactions|Present|Present|Aligned behavior|No action.|
+|Bare `TurnContext` does not become previous settings|Absent in replay|Present|Upstream bug fix|Backport semantics without lifecycle subsystem.|
+|Rollback counts metadata and user turns coherently|Absent in replay|Present through turn segments|Upstream bug fix|Backport branch-local checkpoints.|
+|Legacy compaction avoids current-context historical injection|Absent|Present|Upstream bug fix|Backport directly.|
+|Persisted `TurnStarted`/`TurnComplete` lifecycle boundaries|Filtered out|Persisted|New upstream infrastructure|Defer.|
+|Reverse segmented replay and early stop at replacement base|Absent|Present|New upstream architecture|Defer; emulate only required semantics.|
+|Compaction compatibility hash (`comp_hash`)|Absent|Present|New feature/correctness guard|Conditional.|
+|Context-window downshift under same model|Model-change path only|Expanded|New feature|Conditional/defer.|
+|History version and compaction windows|Absent|Present|New infrastructure|Defer.|
+|Body-after-prefix compaction budgeting|Absent|Present|New optimization|Defer.|
+|Realtime, inter-agent, plugin, hook, and expanded response-item replay|Branch-specific older model|Present|Upstream feature growth|Do not import for this patch.|
+|`/pause`, `/continue`, work-note carryover, `GhostSnapshot`|Present|Not equivalent|Deliberate branch divergence|Preserve and add compatibility tests.|
 
-## 1. Behavior already present in this branch
+## 3. Confirmed upstream fixes worth backporting
 
-These were once plausible backport candidates, but current inspection shows they are already implemented.
+### 3.1 Replay segments associate metadata with real user work
 
-|Behavior|This-branch evidence|Decision|
-|---|---|---|
-|Previous larger-model compaction before downshift|`maybe_run_previous_model_inline_compact` in `core/src/session/turn.rs`|No action|
-|Fresh explicit input sampled before queued steer|`can_drain_pending_input = input.is_empty()` and follow-up gating|No action|
-|Post-model-tail token estimates|`ContextManager::get_total_token_usage`|No action|
-|Text-only model image stripping|`normalize::strip_images_when_unsupported`|No action|
-|Replacement history persisted for local/remote compaction|`CompactedItem.replacement_history` and `replace_compacted_history`|No action|
-|WebSocket continuation cleared after compaction|`clear_websocket_continuation` and turn-loop reset handling|No action|
-|Reference context item persisted and restored|`TurnContextItem`, `reference_context_item`, rollout reconstruction|Keep, fix semantics|
-|Preserved work notes are contextual, not real user turns|`is_contextual_user_message_content`|No action|
-|Continuation without a new user item|`continue_turn`, history/rollout cleanup|Preserve exactly|
-|Normal rollout stores original tool outputs and reconstruction reapplies the active truncation policy|`record_conversation_items` persists the original input slice; replay calls `record_items`|Shared behavior; not an upstream fix|
+The upstream `core/src/session/rollout_reconstruction.rs` scans newest-to-oldest and groups records into `ActiveReplaySegment`s bounded by persisted turn lifecycle events. A segment can contain `TurnContext`, compaction metadata, abort state, and response items, but it counts against rollback only when there is evidence of a real instruction/user turn.
 
-## 2. Features added by the upstream branch
+This fixes the key category error in this branch: `TurnContext` records are metadata candidates, not user-turn counters.
 
-These are genuine upstream additions, but not all are suitable for the minimal backport.
+A direct cherry-pick is inappropriate because upstream replay relies on:
 
-|Feature|Upstream behavior|Minimal-backport decision|
-|---|---|---|
-|Persisted lifecycle turn IDs|`TurnStarted`, `TurnComplete`, `TurnAborted`, and `TurnContextItem` can be associated by turn ID|Defer; current rollout policy does not persist start/complete boundaries|
-|Reverse segmented rollout reconstruction|Replays newest-to-oldest, skips rolled-back real user lifecycle segments, then materializes only the surviving suffix|Do not transplant; this branch's existing rollback unit is each non-contextual user `ResponseItem`, so reproduce the consistency invariant with a forward branch-local state machine|
-|Reshaped `TurnContextItem` schema|Adds turn ID, workspace/date/timezone, permission/network, `comp_hash`, multi-agent, and realtime fields while removing several branch-specific snapshot fields|Do not transplant; add only a field with a concrete branch-local consumer, such as conditional `comp_hash`|
-|Compaction compatibility hash|Compacts with the previous model when both models supply different `comp_hash` values, even when the slug/context window test would not trigger|Conditional follow-up|
-|`AutoCompactTokenLimitScope::BodyAfterPrefix`|Budgets growth after an established cached prefix while separately enforcing the full context window|Defer; requires config, window-prefill, token-tail, and compaction-window state|
-|Auto-compaction window number/ID|Persists compaction window metadata and can explicitly start a new window|Defer|
-|History versioning|Bumps a version on whole-history rewrites for newer prompt/guardian cursors|Defer; no current consumer|
-|Typed inter-agent history|Treats persisted inter-agent communication as model input and user-turn-equivalent replay segments|Not applicable to this branch's delegate protocol|
-|Realtime transition settings|Tracks realtime active state in previous settings and context updates|Not applicable without realtime support|
-|Expanded response protocol|Tool search, image generation, encrypted outputs, new compaction items, image detail, and related normalization|Defer unless independently required|
-|More accurate image estimates|Decodes image dimensions and caches estimates, including original-detail behavior|Lower priority; current protocol and fixed resized-image estimate are sufficient for this backport|
+- persisted `TurnStarted` and `TurnComplete` events;
+- turn IDs carried by lifecycle and `TurnContext` records;
+- reference states distinguishing never-set, explicitly-cleared, and latest;
+- history windows and replacement bases;
+- newer response and inter-agent variants.
 
-## 3. Upstream bug fixes still needed in this branch
+The selected backport reproduces the invariant using existing forward records and real user `ResponseItem` boundaries.
 
-### A. Rollback couples history and metadata to the same user-turn segments
+### 3.2 Rollback skips non-user tasks
 
-Upstream reconstruction identifies real user lifecycle segments and applies `ThreadRolledBack` by skipping those segments. `previous_turn_settings`, reference context, replacement-history checkpoint, and compaction metadata are selected from the same surviving segments.
+Upstream tests cover completed turns, incomplete turns, and standalone non-user tasks. Rollback decrements its pending count only for segments that contain real user work. This prevents compaction or other task metadata from consuming a rollback slot.
 
-The minimal backport should not copy that exact counting unit: without durable lifecycle IDs, this branch already defines rollback through `ContextManager::drop_last_n_user_turns`, which counts non-contextual user `ResponseItem`s. The portable bug fix is the invariant that history and metadata use the same branch-local boundary population.
+This branch should obtain the same result with one metadata checkpoint per real user boundary after the current replay epoch.
 
-This branch instead:
+### 3.3 Bare context does not hydrate resume metadata
 
-```text
-history.drop_last_n_user_turns(N)
-context_stack.truncate(context_stack.len() - N)
-```
+Upstream replay can attach a `TurnContext` to a segment while still refusing to use it as `previous_turn_settings` unless the segment is a surviving user turn. This prevents an early-cancelled or task-only context record from becoming the apparent latest model.
 
-The two structures count different things. A `TurnContext` can be emitted by an incomplete turn or a compaction task without a real user boundary. After such records, rollback can preserve one history turn while selecting metadata from another.
+The minimal equivalent is a `pending_context` candidate committed only when replay observes `is_user_turn_boundary`.
 
-**Classification:** correctness bug; backport now.
+### 3.4 Legacy compaction is deterministic with respect to resume-time context
 
-### B. Bare `TurnContext` does not hydrate durable settings
+For a legacy `CompactedItem` without `replacement_history`, upstream rebuilds compacted history with `Vec::new()` as the initial context. It then clears the reconstructed reference baseline so canonical context is appended at the current end on the next turn.
 
-Upstream explicitly tests that a `TurnContext` unaccompanied by a real user turn does not become `previous_turn_settings` or the durable reference baseline.
+This avoids inserting current cwd, policy, instructions, or model context at an old historical position. The change is local and should be backported.
 
-This branch pushes every `TurnContext` onto `context_stack` and unconditionally selects the last one at EOF. The normal live path can persist the record before the user item, and compaction tasks also emit a pre-compaction `TurnContext`.
+### 3.5 Previous settings and reference baseline are independent
 
-**Classification:** correctness bug; backport now.
+Upstream replay separately derives:
 
-### C. Legacy compaction does not inject current resume-time initial context into historical history
+- previous settings from the newest surviving user turn;
+- reference context from the newest surviving user baseline or an explicit compaction clear.
 
-For a legacy `CompactedItem` without `replacement_history`, upstream rebuilds using:
+This matches the live semantics already present in this branch. The selected replay design restores that separation.
 
-```rust
-compact::build_compacted_history(Vec::new(), &user_messages, &compacted.message)
-```
+## 4. New upstream features not required by the confirmed fix
 
-It also clears the reference baseline so the next regular turn injects canonical current context at the end of the resumed history.
+### Persisted lifecycle events and reverse/lazy replay
 
-This branch calls `build_initial_context(turn_context)` while reconstructing the historical compaction point. Resume-time policy, working directory, instructions, personality, or other settings can therefore be inserted into an old position and produce a non-deterministic prompt.
+This is the upstream foundation for precise turn segmentation and efficient resume from the newest replacement checkpoint. It is valuable long term but not minimal. Porting it safely would require auditing every branch-local task that emits or suppresses lifecycle events, especially `/pause`, `/continue`, compaction, post-turn review, delegates, and undo.
 
-**Classification:** correctness and prompt-shape bug; backport now.
+### `comp_hash`
 
-### D. Previous-turn settings are committed at the real user boundary and are independent of the reference baseline
+Upstream model metadata includes a compaction-compatibility hash. `PreviousTurnSettings` and `TurnContextItem` carry it, and the turn path can compact when the model slug is unchanged but the compaction contract changed. This is useful only if the model catalog used by this branch supplies a stable hash.
 
-Upstream records context updates first, records accepted input, and only then sets `previous_turn_settings`. Its compacted-history replacement updates history/reference state without deriving previous settings from the compacted reference item.
+### Context-window downshift handling
 
-This branch sets previous settings before the user item and resets them inside `replace_compacted_history` from `reference_context_item`. A `DoNotInject` compaction therefore clears knowledge of the latest real user model even though compaction did not roll back that user turn.
+Upstream previous-model compaction also considers a smaller context window even when the model slug remains unchanged. This branch's current helper is primarily model-change-oriented. The feature is separable but should be considered together with `comp_hash` and model metadata provenance.
 
-**Classification:** correctness bug affecting downshift compaction and resume metadata; backport now.
+### History versions and windows
 
-### E. Invalid-image recovery stops at a real user boundary
+Upstream tracks history rewrites and compaction windows, including IDs/numbers used by newer storage and replay paths. They support observability, lazy history, and newer compaction semantics rather than the immediate replay correctness fix.
 
-Upstream's `replace_last_turn_images` reverse scan uses `is_user_turn_boundary(item)`. This branch stops at every user-role message. A contextual user item after a tool image can prevent sanitization of the image that actually belongs to the current real turn.
+### Body-after-prefix budget
 
-**Classification:** narrow correctness bug; backport now.
+Upstream can reason about tokens after a reusable prefix when deciding compaction. Porting it would touch token accounting, model metadata, request construction, and tests. It is an optimization, not a prerequisite.
 
-## 4. Upstream chores not needed for this branch
+### Expanded protocol and tools
 
-|Upstream change|Why it is not a prerequisite here|
+Upstream history handles newer response variants, inter-agent communication, image generation, tool search, encrypted outputs, realtime state, plugins, hooks, and related telemetry. These are feature additions, not defects in this branch's existing item universe.
+
+## 5. Deliberate branch divergence to preserve
+
+|Branch-local behavior|Backport constraint|
 |---|---|
-|Move truncation helpers to `codex_utils_output_truncation`|Source-layout migration; current helpers already implement required behavior|
-|`ContextManager::history_version`|Serves newer prompt/guardian cursor architecture absent here|
-|`ContextManager::into_raw_items`|Convenience API, not a semantic requirement|
-|Mixed initial-context developer-bundle rollback repair|Upstream can place contextual and non-contextual fragments in one developer message; this branch emits separate messages from `build_initial_context`|
-|New tool-search/image-generation normalization arms|Variants do not exist in this branch's current protocol|
-|Typed inter-agent boundary rules|This branch's delegate workflow has different persisted shapes|
-|Realtime transition fields|No matching runtime feature|
-|Remote compaction v2 and compaction-window plumbing|Independent upstream architecture|
-|Hook/plugin/session-start integration|Not required to fix turn/history replay|
-|Item-ID assignment during replacement history|Independent protocol/client feature|
-|Eliding an unchanged `TurnContextItem`|Upstream can return early when the full snapshot equals the reference; this branch's per-turn record is useful to the minimal ID-free association strategy and should remain|
+|`/pause` and `/continue` without a synthetic user item|Replay changes must continue to infer and hydrate `PendingContinuation` without importing upstream lifecycle assumptions.|
+|Auto-compact session work notes|Work-note messages remain contextual/non-boundary items and survive compaction as currently designed.|
+|`GhostSnapshot` and `/undo`|Snapshots remain durable raw items, omitted from model prompts, and preserved across compaction.|
+|Post-turn completion/review flows|Non-user task metadata must not become a user checkpoint.|
+|Existing rollout schema|Old rollout files must remain readable; no mandatory migration.|
 
-## 5. Classification summary
+## 6. Bugs already fixed in this branch
 
-|Category|Backport now|Conditional|Defer/not applicable|
-|---|---|---|---|
-|Upstream features|None required for core fix|`comp_hash` compatibility trigger|Lifecycle IDs, reverse lazy replay, body-after-prefix scope, window IDs, history version, realtime, typed inter-agent|
-|Upstream bug fixes|Replay alignment, bare context, legacy compaction, previous-settings timing/decoupling, image boundary|None|Mixed developer-bundle repair is structurally unnecessary here|
-|Upstream chores|None|None|Shared-crate moves, protocol expansion, hooks/plugins, remote compaction v2|
+The earlier version of this plan incorrectly treated the following as outstanding. Source inspection and tests show they are already fixed:
+
+1. **Previous settings committed too early:** false. `record_context_updates_and_set_reference_context_item` does not set them; `record_user_prompt_and_emit_turn_item` commits after recording the user response item.
+2. **Compaction clears live previous settings:** false. `replace_compacted_history` changes history/reference state but leaves `previous_turn_settings` intact.
+3. **Invalid-image recovery stops at any user-role message:** false. `replace_last_turn_images` already uses `is_user_turn_boundary`.
+
+No backport patch should disturb these behaviors.
+
+## 7. Confirmed defects remaining only in this branch
+
+- independent `context_stack` and history rollback counters;
+- bare `TurnContext` hydration;
+- loss of previous settings after a compaction with no adjacent post-compaction context;
+- post-compaction context incorrectly becoming previous settings without a user boundary;
+- resume-time initial context injected at a legacy compaction point;
+- pending continuation model selected from the reference baseline instead of committed previous settings;
+- standalone compaction summary eligible for false unfinished-turn inference.
+
+## 8. Upstream regressions and audit risks
+
+No upstream-only regression was confirmed strongly enough to propose a corrective backport.
+
+One upstream-only case should receive an explicit test before its replay design is adopted wholesale: multiple non-contextual user/steering messages can occur within one persisted lifecycle segment, while forward history rollback counts individual instruction boundaries. The audited reverse replay currently records only a boolean `counts_as_user_turn` per segment. Whether this is a defect depends on the intended rollback unit, so it is an upstream review item rather than a confirmed bug in this plan.
+
+Shared limitations, not upstream regressions:
+
+- pre-turn compaction does not fully account for incoming context/user items before deciding whether compaction is sufficient;
+- local compaction's “preserve cache” comment is inaccurate when it removes oldest input;
+- legacy compaction necessarily produces a temporary non-canonical prompt shape until current context is appended again.
+
+## 9. Chore changes not needed here
+
+Do not pull these into the minimal patch merely to resemble upstream:
+
+- rollout policy crate relocation;
+- shared truncation crate/module moves;
+- response enum exhaustiveness changes for variants absent here;
+- telemetry, analytics, plugin, and hook plumbing;
+- window/realtime/inter-agent fields in `TurnContextItem`;
+- widespread visibility/module-layout refactors;
+- upstream test-support reorganizations.
+
+They add merge risk without improving the selected invariants.
