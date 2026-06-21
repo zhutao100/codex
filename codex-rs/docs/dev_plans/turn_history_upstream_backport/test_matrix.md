@@ -25,6 +25,7 @@ Use distinct model names and context values so an accidental selection is visibl
 |R6|`TurnContext(A), user` with user event absent|Metadata commits from the response item.|
 |R7|`TurnContext(A), UserMessage event` without user response item|No metadata commit. Event alone is not history evidence.|
 |R8|multiple pending contexts before one real user|Newest pending context commits; earlier context records do not create checkpoints.|
+|R9|`TurnContext(A), user, assistant, TurnContext(B), review_rollout_user, assistant`|Reference B may be restored, but previous settings remain A; review synthetic output does not commit previous-turn settings.|
 
 ## 3. Rollback
 

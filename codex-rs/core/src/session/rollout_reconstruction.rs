@@ -37,6 +37,12 @@ impl ReplayMetadata {
             });
         }
     }
+
+    fn commit_reference_context(&mut self, pending_context: Option<TurnContextItem>) {
+        if let Some(context_item) = pending_context {
+            self.reference_context_item = Some(context_item);
+        }
+    }
 }
 
 impl ReplayEpoch {
@@ -92,7 +98,7 @@ impl Session {
         let mut pending_context: Option<TurnContextItem> = None;
         let mut awaiting_adjacent_post_compaction_context = false;
         let mut latest_compaction_tail_kind = CompactionTailKind::None;
-        let mut real_user_after_latest_compaction = false;
+        let mut checkpoint_after_latest_compaction = false;
 
         for item in rollout_items {
             match item {
@@ -103,9 +109,13 @@ impl Session {
                         turn_context.truncation_policy,
                     );
                     if is_user_turn_boundary_response_item(response_item) {
-                        current_metadata.commit_user_boundary(pending_context.take());
+                        if turn::is_review_rollout_user_message(response_item) {
+                            current_metadata.commit_reference_context(pending_context.take());
+                        } else {
+                            current_metadata.commit_user_boundary(pending_context.take());
+                        }
                         current_epoch.push_checkpoint(&current_metadata);
-                        real_user_after_latest_compaction = true;
+                        checkpoint_after_latest_compaction = true;
                     }
                 }
                 RolloutItem::Compacted(compacted) => {
@@ -125,7 +135,7 @@ impl Session {
                     current_epoch.reset_to_base(current_metadata.clone());
                     awaiting_adjacent_post_compaction_context = true;
                     latest_compaction_tail_kind = CompactionTailKind::StandaloneOrPreTurn;
-                    real_user_after_latest_compaction = false;
+                    checkpoint_after_latest_compaction = false;
                 }
                 RolloutItem::TurnContext(item) => {
                     if awaiting_adjacent_post_compaction_context {
@@ -144,7 +154,7 @@ impl Session {
                     let turns_to_drop = usize::try_from(rollback.num_turns).unwrap_or(usize::MAX);
                     let crosses_epoch_base =
                         turns_to_drop > current_epoch.post_base_checkpoints.len();
-                    real_user_after_latest_compaction = current_epoch.apply_rollback(
+                    checkpoint_after_latest_compaction = current_epoch.apply_rollback(
                         &mut current_metadata,
                         &mut pending_context,
                         rollback.num_turns,
@@ -169,7 +179,7 @@ impl Session {
         let history = history.raw_items().to_vec();
         let suppress_compaction_continuation = latest_compaction_tail_kind
             == CompactionTailKind::StandaloneOrPreTurn
-            && !real_user_after_latest_compaction;
+            && !checkpoint_after_latest_compaction;
         let pending_continuation = (history_needs_continuation(&history)
             && !suppress_compaction_continuation)
             .then(|| PendingContinuation {

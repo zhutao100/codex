@@ -83,6 +83,18 @@ fn assistant_message(text: &str) -> ResponseItem {
     }
 }
 
+fn review_rollout_user_message(text: &str) -> ResponseItem {
+    ResponseItem::Message {
+        id: Some("review_rollout_user".to_string()),
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: text.to_string(),
+        }],
+        end_turn: None,
+        phase: None,
+    }
+}
+
 fn context_item_with_model(turn_context: &TurnContext, model: &str) -> TurnContextItem {
     let mut item = turn_context.to_turn_context_item();
     item.model = model.to_string();
@@ -312,6 +324,60 @@ async fn rollout_reconstruction_does_not_commit_contextual_user_message() {
             history: vec![work_notes],
             reference_context_item: None,
             previous_turn_settings: None,
+            pending_continuation: None,
+        }
+    );
+}
+
+#[tokio::test]
+async fn rollout_reconstruction_review_output_does_not_commit_previous_settings() {
+    let (session, turn_context) = make_session_and_context().await;
+    let first_context = context_item_with_model(&turn_context, "first-model");
+    let review_context = context_item_with_model(&turn_context, "review-model");
+    let replacement_history = vec![user_message("summary")];
+    let context_items = session.build_initial_context(&turn_context).await;
+    let review_user = review_rollout_user_message("User initiated a review task.\nreview result");
+    let review_assistant = ResponseItem::Message {
+        id: Some("review_rollout_assistant".to_string()),
+        role: "assistant".to_string(),
+        content: vec![ContentItem::OutputText {
+            text: "review result".to_string(),
+        }],
+        end_turn: None,
+        phase: None,
+    };
+    let mut expected_history = replacement_history.clone();
+    expected_history.extend(context_items.clone());
+    expected_history.push(review_user.clone());
+    expected_history.push(review_assistant.clone());
+    let mut rollout_items = vec![
+        RolloutItem::TurnContext(first_context.clone()),
+        RolloutItem::ResponseItem(user_message("first")),
+        RolloutItem::ResponseItem(assistant_message("first reply")),
+        RolloutItem::Compacted(CompactedItem {
+            message: "summary".to_string(),
+            replacement_history: Some(replacement_history),
+        }),
+    ];
+    rollout_items.extend(context_items.into_iter().map(RolloutItem::ResponseItem));
+    rollout_items.extend([
+        RolloutItem::TurnContext(review_context.clone()),
+        RolloutItem::ResponseItem(review_user),
+        RolloutItem::ResponseItem(review_assistant),
+    ]);
+
+    let reconstructed = session
+        .reconstruct_history_from_rollout(&turn_context, &rollout_items)
+        .await;
+
+    assert_eq!(
+        reconstructed,
+        ReconstructedRollout {
+            history: expected_history,
+            reference_context_item: Some(review_context),
+            previous_turn_settings: Some(PreviousTurnSettings {
+                model: first_context.model,
+            }),
             pending_continuation: None,
         }
     );
@@ -709,6 +775,14 @@ fn preserved_work_notes_are_not_user_turn_boundaries() {
     let work_notes = crate::compact::preserved_work_notes_message("notes");
 
     assert!(!turn::is_user_turn_boundary_response_item(&work_notes));
+}
+
+#[test]
+fn review_rollout_user_messages_are_detected() {
+    let review_user = review_rollout_user_message("review result");
+
+    assert!(turn::is_user_turn_boundary_response_item(&review_user));
+    assert!(turn::is_review_rollout_user_message(&review_user));
 }
 
 #[test]

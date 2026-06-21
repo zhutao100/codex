@@ -1137,12 +1137,19 @@ fn user_message_texts_for_review(item: &ResponseItem) -> Option<Vec<String>> {
     (!texts.is_empty()).then_some(texts)
 }
 
-fn is_review_rollout_user_message(item: &ResponseItem) -> bool {
-    let ResponseItem::Message { role, content, .. } = item else {
+pub(super) fn is_review_rollout_user_message(item: &ResponseItem) -> bool {
+    let ResponseItem::Message {
+        id, role, content, ..
+    } = item
+    else {
         return false;
     };
-    role == "user"
-        && content.iter().any(|item| match item {
+    if role != "user" {
+        return false;
+    }
+
+    id.as_deref() == Some("review_rollout_user")
+        || content.iter().any(|item| match item {
             ContentItem::InputText { text } | ContentItem::OutputText { text } => {
                 text.contains("User initiated a review task.")
             }
