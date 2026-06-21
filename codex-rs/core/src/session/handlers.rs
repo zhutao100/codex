@@ -799,7 +799,7 @@ pub async fn thread_rollback(sess: &Arc<Session>, sub_id: String, num_turns: u32
     // Replace with the raw items. We don't want to replace with a normalized
     // version of the history.
     sess.replace_history(history.raw_items().to_vec()).await;
-    sess.clear_turn_context_baseline().await;
+    sess.clear_reconstructed_turn_metadata().await;
     sess.recompute_token_usage(turn_context.as_ref()).await;
 
     sess.send_event_raw_flushed(Event {

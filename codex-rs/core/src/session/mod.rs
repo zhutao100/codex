@@ -1744,12 +1744,6 @@ impl Session {
             state
                 .history
                 .set_reference_context_item(reference_context_item.clone());
-            state.previous_turn_settings =
-                reference_context_item
-                    .as_ref()
-                    .map(|item| PreviousTurnSettings {
-                        model: item.model.clone(),
-                    });
             state.initial_context_seeded = reference_context_item.is_some();
         }
 
@@ -1771,10 +1765,19 @@ impl Session {
         state.previous_turn_settings.clone()
     }
 
-    pub(crate) async fn clear_turn_context_baseline(&self) {
+    pub(crate) async fn set_previous_turn_settings(
+        &self,
+        previous_turn_settings: Option<PreviousTurnSettings>,
+    ) {
+        let mut state = self.state.lock().await;
+        state.previous_turn_settings = previous_turn_settings;
+    }
+
+    pub(crate) async fn clear_reconstructed_turn_metadata(&self) {
         let mut state = self.state.lock().await;
         state.history.set_reference_context_item(None);
         state.previous_turn_settings = None;
+        state.pending_continuation = None;
         state.initial_context_seeded = false;
     }
 
@@ -1817,10 +1820,7 @@ impl Session {
         state.initial_context_seeded = true;
         state
             .history
-            .set_reference_context_item(Some(current_context_item.clone()));
-        state.previous_turn_settings = Some(PreviousTurnSettings {
-            model: current_context_item.model,
-        });
+            .set_reference_context_item(Some(current_context_item));
     }
 
     pub(crate) async fn seed_initial_context_if_needed(&self, turn_context: &TurnContext) {
@@ -2096,6 +2096,10 @@ impl Session {
         // those spans, and `record_response_item_and_emit_turn_item` would drop them.
         self.record_conversation_items(turn_context, std::slice::from_ref(&response_item))
             .await;
+        self.set_previous_turn_settings(Some(PreviousTurnSettings {
+            model: turn_context.model_info.slug.clone(),
+        }))
+        .await;
         let mut user_message_item = UserMessageItem::new(input);
         user_message_item.client_user_message_id = client_user_message_id;
         let turn_item = TurnItem::UserMessage(user_message_item);

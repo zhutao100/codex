@@ -680,6 +680,25 @@ async fn record_context_updates_and_set_reference_context_item_injects_full_cont
         session.reference_context_item().await,
         Some(turn_context.to_turn_context_item())
     );
+    assert_eq!(session.previous_turn_settings().await, None);
+}
+
+#[tokio::test]
+async fn record_user_prompt_commits_previous_turn_settings() {
+    let (session, turn_context) = make_session_and_context().await;
+    session
+        .record_context_updates_and_set_reference_context_item(&turn_context)
+        .await;
+
+    session
+        .record_user_prompt_and_emit_turn_item(
+            &turn_context,
+            &steer_text_input("hello"),
+            user_message("hello"),
+            None,
+        )
+        .await;
+
     assert_eq!(
         session.previous_turn_settings().await,
         Some(PreviousTurnSettings {
@@ -796,6 +815,12 @@ async fn record_initial_history_reconstructs_forked_transcript() {
 async fn replace_compacted_history_sets_reference_context_item() {
     let (session, turn_context) = make_session_and_context().await;
     let reference_context_item = turn_context.to_turn_context_item();
+    let previous_turn_settings = PreviousTurnSettings {
+        model: "previous-model".to_string(),
+    };
+    session
+        .set_previous_turn_settings(Some(previous_turn_settings.clone()))
+        .await;
     let replacement_history = vec![user_message("summary")];
     let compacted_item = CompactedItem {
         message: "summary".to_string(),
@@ -819,15 +844,19 @@ async fn replace_compacted_history_sets_reference_context_item() {
     );
     assert_eq!(
         session.previous_turn_settings().await,
-        Some(PreviousTurnSettings {
-            model: reference_context_item.model
-        })
+        Some(previous_turn_settings)
     );
 }
 
 #[tokio::test]
 async fn replace_compacted_history_clears_reference_context_item() {
     let (session, turn_context) = make_session_and_context().await;
+    let previous_turn_settings = PreviousTurnSettings {
+        model: turn_context.model_info.slug.clone(),
+    };
+    session
+        .set_previous_turn_settings(Some(previous_turn_settings.clone()))
+        .await;
     session
         .record_context_updates_and_set_reference_context_item(&turn_context)
         .await;
@@ -842,7 +871,10 @@ async fn replace_compacted_history_clears_reference_context_item() {
         .await;
 
     assert_eq!(session.reference_context_item().await, None);
-    assert_eq!(session.previous_turn_settings().await, None);
+    assert_eq!(
+        session.previous_turn_settings().await,
+        Some(previous_turn_settings)
+    );
 }
 
 #[tokio::test]
