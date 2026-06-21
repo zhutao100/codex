@@ -1,5 +1,9 @@
 # Design Proposal
 
+## Status
+
+Implemented in this branch. The design remains the durable reference for the replay state machine and selected non-goals.
+
 ## 1. Design objective
 
 Repair replay semantics with the smallest branch-appropriate change:
@@ -109,7 +113,7 @@ Do not immediately update current metadata. If another ordinary context appears 
 
 ### 4.3 Adjacent post-compaction `TurnContext`
 
-`replace_compacted_history` persists `Compacted` and the optional reference context in one ordered batch. Therefore a `TurnContext` immediately following `Compacted` has distinct semantics:
+`replace_compacted_history` persists `Compacted` and the optional reference context in one ordered batch. Therefore a `TurnContext` immediately following `Compacted` with no intervening rollout item has distinct semantics:
 
 - canonical context was inserted into the replacement history;
 - set `current.reference_context_item` to that item;
@@ -118,7 +122,7 @@ Do not immediately update current metadata. If another ordinary context appears 
 - do not push a user checkpoint;
 - classify the compaction tail as `MidTurnWithInjectedContext`.
 
-Any intervening rollout record cancels the adjacency interpretation.
+Any intervening rollout record cancels the adjacency interpretation. A standalone/pre-turn compaction followed by a later normal user turn is therefore not ambiguous: the normal turn appends context response items before its `TurnContext`, so replay treats that `TurnContext` as a pending candidate for the later user boundary.
 
 ### 4.4 `RolloutItem::Compacted`
 

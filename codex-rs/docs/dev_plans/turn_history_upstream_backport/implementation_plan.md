@@ -1,10 +1,15 @@
 # Implementation Plan
 
+## Status
+
+Completed in this branch. The implementation kept the mandatory patch inside replay reconstruction, plus tests and removal of a stale test-only continuation reconstruction helper in `core/src/session/mod.rs`.
+
 ## 1. Patch boundaries
 
 ### Mandatory source files
 
 - `core/src/session/rollout_reconstruction.rs`
+- `core/src/session/mod.rs` for removing the obsolete test-only continuation reconstruction helper
 - `core/src/session/tests.rs`
 - `core/src/session/turn.rs` only if a small helper/signature change is needed for compaction-aware continuation derivation
 
@@ -12,9 +17,8 @@
 
 - `core/src/session/rollout_reconstruction_tests.rs` if moving the growing replay test set improves maintainability; do not require the move for correctness.
 
-### Files inspected but not expected to change
+### Files inspected but not otherwise changed
 
-- `core/src/session/mod.rs`
 - `core/src/context_manager/history.rs`
 - `core/src/context_manager/normalize.rs`
 - `core/src/compact.rs`
@@ -96,7 +100,7 @@ For an immediately following `TurnContext`:
 - leave previous settings unchanged;
 - mark the replacement as mid-turn/injected-context provenance.
 
-Any other item disarms adjacency.
+Any other rollout item disarms adjacency. This matters for standalone compaction followed by a later normal turn: the next turn appends context response items before persisting its `TurnContext`, so it is not mistaken for same-batch mid-turn context injection.
 
 Acceptance gate:
 
@@ -166,12 +170,12 @@ Acceptance gate:
 Run the focused tests in `test_matrix.md`, then the surrounding suites. At minimum:
 
 ```bash
-cargo fmt --all -- --check
-cargo test -p codex-core rollout_reconstruction
-cargo test -p codex-core thread_rollback
-cargo test -p codex-core history_needs_continuation
-cargo test -p codex-core prompt_caching
-cargo test -p codex-core compact
+just fmt
+CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-core rollout_reconstruction
+CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-core thread_rollback
+CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-core history_needs_continuation
+CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-core prompt_caching
+CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-core compact
 ```
 
 Test filters may need adjustment to match the workspace harness. Also run the full `codex-core` test target used by this branch before merge.
@@ -187,31 +191,31 @@ Inspect request bodies in prompt-cache tests rather than relying only on token c
 
 ### Correctness
 
-- [ ] Same predicate defines history and metadata user boundaries.
-- [ ] Bare context remains uncommitted.
-- [ ] Post-compaction adjacent context changes reference only.
-- [ ] Compaction preserves previous settings.
-- [ ] Rollback never decrements metadata for a non-user task.
-- [ ] Opaque-base crossing clears uncertain metadata.
-- [ ] Legacy compaction is independent of resume-time context.
-- [ ] Continuation model comes from committed previous settings.
+- [x] Same predicate defines history and metadata user boundaries.
+- [x] Bare context remains uncommitted.
+- [x] Post-compaction adjacent context changes reference only.
+- [x] Compaction preserves previous settings.
+- [x] Rollback never decrements metadata for a non-user task.
+- [x] Opaque-base crossing clears uncertain metadata.
+- [x] Legacy compaction is independent of resume-time context.
+- [x] Continuation model comes from committed previous settings.
 
 ### Branch compatibility
 
-- [ ] Work notes remain contextual.
-- [ ] `GhostSnapshot` remains retained raw and omitted from prompts.
-- [ ] `/pause` and `/continue` event behavior is unchanged.
-- [ ] Local and remote compaction produce equivalent replay metadata semantics.
-- [ ] Post-turn review/delegate contexts do not become user checkpoints.
-- [ ] Old rollout JSON parses without migration.
+- [x] Work notes remain contextual.
+- [x] `GhostSnapshot` remains retained raw and omitted from prompts.
+- [x] `/pause` and `/continue` event behavior is unchanged.
+- [x] Local and remote compaction produce equivalent replay metadata semantics.
+- [x] Post-turn review/delegate contexts do not become user checkpoints.
+- [x] Old rollout JSON parses without migration.
 
 ### Scope control
 
-- [ ] No lifecycle event persistence added.
-- [ ] No protocol fields added.
-- [ ] No upstream response variants imported.
-- [ ] No cache-key or request-shape change.
-- [ ] No change to live previous-setting commitment order.
+- [x] No lifecycle event persistence added.
+- [x] No protocol fields added.
+- [x] No upstream response variants imported.
+- [x] No cache-key or request-shape change.
+- [x] No change to live previous-setting commitment order.
 
 ## 11. Rollout strategy
 

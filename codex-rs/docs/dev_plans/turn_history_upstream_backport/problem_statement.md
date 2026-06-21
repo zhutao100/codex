@@ -1,5 +1,9 @@
 # Problem Statement
 
+## Status
+
+Fixed in this branch. This document records the defects that motivated the completed replay backport and the invariants covered by regression tests.
+
 ## 1. Required invariant
 
 Resume, fork, live rollback, and continuation must reconstruct metadata from the same surviving instruction boundaries as history:
@@ -22,7 +26,7 @@ A compaction can clear `reference_context_item` while preserving `previous_turn_
 
 ## 2. Root cause
 
-`core/src/session/rollout_reconstruction.rs` currently keeps:
+Before this backport, `core/src/session/rollout_reconstruction.rs` kept:
 
 ```rust
 let mut history = ContextManager::new();
@@ -53,7 +57,7 @@ TurnContext(model=B)
 end of rollout
 ```
 
-Current replay hydrates:
+Old replay hydrated:
 
 ```text
 reference_context_item = B
@@ -112,11 +116,11 @@ TurnContext(current)
 
 The adjacent context says canonical current context was inserted into the replacement. It re-establishes `reference_context_item`. It does not represent a new user turn and must not overwrite `previous_turn_settings` by itself.
 
-Current replay uses it for both values.
+Old replay used it for both values.
 
 ### 3.5 Legacy compaction injects current context into historical history
 
-For `replacement_history: None`, this branch calls:
+Before this backport, `replacement_history: None` replay called:
 
 ```rust
 compact::build_compacted_history(
@@ -132,7 +136,7 @@ This is historically incorrect and changes a long prompt prefix based on when th
 
 ### 3.6 Continuation model follows the wrong metadata value
 
-Current replay builds `PendingContinuation.model` from `context_stack.last()`, which is also the reconstructed reference baseline. After compaction, the reference can be intentionally absent or can be re-established by a context-only record. The continuation model should instead come from the newest committed real user turn.
+Old replay built `PendingContinuation.model` from `context_stack.last()`, which was also the reconstructed reference baseline. After compaction, the reference can be intentionally absent or can be re-established by a context-only record. The continuation model should instead come from the newest committed real user turn.
 
 ### 3.7 Standalone compaction can look like an interrupted regular turn
 

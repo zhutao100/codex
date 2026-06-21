@@ -34,7 +34,7 @@ These representations intentionally differ. A raw item can be retained but omitt
 10. Optionally start a `GhostSnapshot` for undo.
 11. Enter the multi-round sampling loop.
 
-The ordering separates a candidate context baseline from a committed real user turn. A failure after step 4 but before step 6 can leave a durable `TurnContext` with no corresponding real user boundary; this is the central replay association problem.
+The ordering separates a candidate context baseline from a committed real user turn. A failure after step 4 but before step 6 can leave a durable `TurnContext` with no corresponding real user boundary; replay treats that record as an uncommitted candidate.
 
 ## 3. Multi-round sampling within one logical turn
 
@@ -124,7 +124,7 @@ A compaction using `InitialContextInjection::DoNotInject` clears this baseline b
 
 This represents the newest committed real user turn. In this branch it currently contains the model slug. It is committed only after the user `ResponseItem` is recorded. Previous-model compaction reads it to decide whether an oversized history should first be compacted by the model that produced the prior conversation.
 
-Live compaction does not clear it. The replay implementation currently derives it from the last replayed `TurnContext`, which is not equivalent and causes confirmed resume/rollback defects.
+Live compaction does not clear it. Replay now derives it from committed real user boundaries rather than from the last replayed `TurnContext`, so task-only or cancelled context records do not become previous-turn settings.
 
 ## 7. Compaction preservation semantics
 
@@ -150,7 +150,7 @@ The local compaction request itself uses a cloned source history plus a syntheti
 
 ### Replay
 
-When `replacement_history` is present, replay can reproduce the compacted raw history exactly. For legacy compactions where it is absent, this branch currently rebuilds the summary using resume-time initial context; that historical reinjection is one selected backport defect.
+When `replacement_history` is present, replay reproduces the compacted raw history exactly. For legacy compactions where it is absent, replay rebuilds the summary with an empty initial-context prefix rather than injecting resume-time context at the historical compaction point.
 
 ## 8. Pause and continuation
 
@@ -166,7 +166,7 @@ Continuation does not create a synthetic user message and does not repeat normal
 
 It preserves completed assistant/reasoning/call/output items. It cannot preserve partial text deltas, an in-flight tool future, a child process's live state, or an unpersisted continuation event.
 
-`history_needs_continuation` excludes contextual user/developer items when examining the tail. However, a compacted replacement normally ends in a summary encoded as a real user message. Without compaction provenance, a standalone compaction can therefore be misclassified as an unfinished regular turn after replay.
+`history_needs_continuation` excludes contextual user/developer items when examining the tail. A compacted replacement normally ends in a summary encoded as a real user message, so replay also tracks whether the latest compaction tail was standalone/pre-turn or same-batch mid-turn context injection. Standalone/pre-turn compaction without a later real user boundary does not hydrate a regular continuation.
 
 ## 9. Rollback behavior
 
@@ -178,7 +178,7 @@ role == "user" && content is not contextual state
 
 If all real user turns are removed, it preserves any prefix that existed before the first real user boundary. For a partial rollback it also walks backward from the cut and removes contiguous contextual developer/user update items attached to the rolled-back turn.
 
-Current rollout reconstruction applies the same numeric rollback independently to a `Vec<TurnContextItem>`. Since bare context records and compaction tasks can add `TurnContext` without adding a real user boundary, history and metadata can select different surviving turns.
+Rollout reconstruction restores metadata from checkpoints that are pushed only at real user boundaries. Bare context records and compaction tasks can add `TurnContext` without adding a real user boundary, so they remain pending candidates and do not consume rollback slots.
 
 ## 10. Token accounting
 

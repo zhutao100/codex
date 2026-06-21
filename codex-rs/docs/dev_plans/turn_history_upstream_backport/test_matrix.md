@@ -47,7 +47,7 @@ Use distinct model names and context values so an accidental selection is visibl
 |C1|complete A, standalone local `Compacted(replacement)`|Exact replacement; reference none; previous A.|
 |C2|complete A, standalone remote `Compacted(replacement)`|Same metadata semantics as C1.|
 |C3|complete A/current user, `Compacted(replacement), TurnContext(B)` adjacent|Exact replacement; reference B; previous remains the committed user model, not changed solely by B.|
-|C4|`Compacted(replacement), EventMsg(...), TurnContext(B)`|No adjacency special case; B is pending until a later real user.|
+|C4|`Compacted(replacement), EventMsg(...), TurnContext(B)` or `Compacted(replacement), context response items, TurnContext(B)`|No adjacency special case; B is pending until a later real user.|
 |C5|pre-turn compaction, then `TurnContext(B), user, assistant`|Replacement base followed by committed B metadata.|
 |C6|compaction clears an earlier pending context|Pending context cannot leak through the replacement.|
 |C7|multiple compactions|Newest replacement is the active opaque base; previous settings carry through until a later user commits new settings.|

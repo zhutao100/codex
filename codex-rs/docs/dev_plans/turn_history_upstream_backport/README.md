@@ -1,8 +1,8 @@
-# Turn History and Upstream Backport Plan
+# Turn History Replay Backport
 
 ## Scope
 
-This plan audits the agent-loop and conversation-history behavior in this branch against the upstream branch, with emphasis on:
+This note records the completed backport of turn-history replay fixes from the upstream branch, with emphasis on:
 
 - multi-round history carryover within a turn and across turns;
 - exact versus lossy preservation during normal sampling, compaction, rollback, resume, fork, pause, and continuation;
@@ -21,6 +21,16 @@ The primary code paths are:
 - `core/src/rollout/policy.rs`
 - `core/src/client.rs`
 
+## Status
+
+Implemented in this branch. The source patch is intentionally limited to replay reconstruction and adjacent tests:
+
+- replay metadata now commits only at real user boundaries;
+- compaction replacement history is treated as an opaque replay epoch;
+- legacy compaction fallback no longer injects resume-time initial context;
+- pending continuation inference is compaction-aware and uses committed previous-turn settings for its model;
+- no protocol, rollout schema, lifecycle event, prompt-cache, or live turn-order change was required.
+
 ## Executive conclusion
 
 The normal live turn path is already substantially correct. In particular, this branch already:
@@ -33,16 +43,16 @@ The normal live turn path is already substantially correct. In particular, this 
 - creates each sampling request from the current full history;
 - persists exact replacement history for new local and remote compactions.
 
-The high-value gap is rollout replay. `core/src/session/rollout_reconstruction.rs` independently counts every `TurnContext` and every real user boundary, then applies the same rollback count to both populations. Those populations are not equivalent. This can hydrate metadata from an incomplete or non-user task, select the wrong metadata after rollback, lose the previous model across manual compaction, and infer a false `/continue` checkpoint from a compaction summary.
+The high-value gap was rollout replay. `core/src/session/rollout_reconstruction.rs` previously counted every `TurnContext` and every real user boundary as if they were the same population, then applied the same rollback count to both. Those populations are not equivalent. The implementation now keeps pending context candidates separate from committed checkpoints, so incomplete or non-user tasks cannot hydrate previous-turn metadata.
 
 ## Selected minimal backport
 
 |Area|Decision|Rationale|
 |---|---|---|
-|Replay metadata checkpoints|Backport now|Align metadata with the same real user boundaries used by history rollback.|
-|Compaction replay epochs|Backport now|Preserve previous-turn settings, explicitly clear/re-establish the reference baseline, and avoid pretending compacted history maps one-to-one to original turns.|
-|Legacy compaction reconstruction|Backport now|Stop injecting resume-time context at a historical compaction point.|
-|Compaction-aware continuation inference|Backport now|Avoid treating a standalone compaction summary as an interrupted regular turn.|
+|Replay metadata checkpoints|Backported|Align metadata with the same real user boundaries used by history rollback.|
+|Compaction replay epochs|Backported|Preserve previous-turn settings, explicitly clear/re-establish the reference baseline, and avoid pretending compacted history maps one-to-one to original turns.|
+|Legacy compaction reconstruction|Backported|Stop injecting resume-time context at a historical compaction point.|
+|Compaction-aware continuation inference|Backported|Avoid treating a standalone compaction summary as an interrupted regular turn.|
 |Persisted lifecycle IDs and reverse replay|Defer|Upstream solution is broader than required and conflicts with branch-local task semantics unless ported as a coherent subsystem.|
 |`comp_hash` compatibility|Conditional|Useful only when this branch's model metadata source supplies a stable non-empty hash.|
 |History windows, body-after-prefix budgets, remote compaction v2|Defer|Large dependency surface; not required for the confirmed defects.|
@@ -64,7 +74,7 @@ The pair has two distinct metadata components:
 
 Compaction may intentionally clear the first while preserving the second.
 
-## Patch series
+## Implemented Patch Series
 
 1. Replace stale replay expectations with regression cases that encode live-state invariants.
 2. Introduce branch-local pending-context and real-user metadata checkpoints in `core/src/session/rollout_reconstruction.rs`.

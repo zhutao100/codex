@@ -9,14 +9,14 @@ The audit compares corresponding live-turn, history, compaction, rollout, and re
 |Behavior|This branch|Upstream branch|Classification|Backport decision|
 |---|---|---|---|---|
 |Record real user item before committing previous settings|Present|Present|Already fixed/aligned|No action.|
-|Keep previous settings when compaction clears reference context|Present live; replay loses it in some cases|Present in replay|Replay bug remains here|Backport minimal replay fix.|
+|Keep previous settings when compaction clears reference context|Present live and replay|Present in replay|Backported replay fix|Done.|
 |Invalid-image scan stops at a real user boundary|Present|Present|Already fixed/aligned|No action.|
 |Fresh explicit input precedes queued steering|Present|Present|Aligned behavior|No action.|
 |Prompt-copy call/output normalization and modality stripping|Present|Present, expanded for new item types|Aligned core behavior|No action.|
 |Exact replacement history for new compactions|Present|Present|Aligned behavior|No action.|
-|Bare `TurnContext` does not become previous settings|Absent in replay|Present|Upstream bug fix|Backport semantics without lifecycle subsystem.|
-|Rollback counts metadata and user turns coherently|Absent in replay|Present through turn segments|Upstream bug fix|Backport branch-local checkpoints.|
-|Legacy compaction avoids current-context historical injection|Absent|Present|Upstream bug fix|Backport directly.|
+|Bare `TurnContext` does not become previous settings|Present in replay|Present|Backported semantics without lifecycle subsystem|Done.|
+|Rollback counts metadata and user turns coherently|Present through branch-local checkpoints|Present through turn segments|Backported invariant|Done.|
+|Legacy compaction avoids current-context historical injection|Present|Present|Backported fix|Done.|
 |Persisted `TurnStarted`/`TurnComplete` lifecycle boundaries|Filtered out|Persisted|New upstream infrastructure|Defer.|
 |Reverse segmented replay and early stop at replacement base|Absent|Present|New upstream architecture|Defer; emulate only required semantics.|
 |Compaction compatibility hash (`comp_hash`)|Absent|Present|New feature/correctness guard|Conditional.|
@@ -117,7 +117,7 @@ The earlier version of this plan incorrectly treated the following as outstandin
 
 No backport patch should disturb these behaviors.
 
-## 7. Confirmed defects remaining only in this branch
+## 7. Confirmed defects fixed by this backport
 
 - independent `context_stack` and history rollback counters;
 - bare `TurnContext` hydration;
