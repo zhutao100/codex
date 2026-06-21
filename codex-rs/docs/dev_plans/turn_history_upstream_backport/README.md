@@ -28,7 +28,7 @@ The proposal does **not** transplant the upstream session, protocol, lifecycle, 
 
 ## Recommended patch series
 
-1. Add regression tests for replay, compaction, rollback, continuation, and invalid-image boundaries.
+1. Add regression tests for replay, compaction, rollback, continuation, and invalid-image boundaries with the corresponding fixes rather than landing failing-test commits.
 2. Split the live reference-context baseline from `previous_turn_settings` commitment.
 3. Replace the independent `context_stack` replay with a branch-local pending-context and replay-epoch state machine.
 4. Rebuild legacy compactions without current resume-time initial context.

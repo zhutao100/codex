@@ -1,8 +1,8 @@
 # Implementation Plan
 
-## Patch 0: Freeze current behavior with tests
+## Patch 0: Freeze target behavior with tests
 
-Add tests before production changes so stale documentation cannot drive accidental regressions.
+Add tests with the production patches so stale documentation cannot drive accidental regressions. The tests should fail against the pre-fix implementation, but do not land a deliberately failing commit in this drop-in branch.
 
 ### Files
 
@@ -10,7 +10,7 @@ Add tests before production changes so stale documentation cannot drive accident
 - `core/src/context_manager/history_tests.rs`
 - pause/continue tests near the existing continuation coverage
 
-### Required red tests
+### Required regression tests
 
 1. Bare trailing `TurnContext` does not hydrate reference or previous settings.
 2. Rollback after a non-user compaction context record restores history and metadata from the same surviving user turn.
@@ -178,21 +178,25 @@ Implement only after the mandatory series is stable and only if the active model
 
 ## Verification commands
 
-Run from the repository root:
+Run from the repository root. Use the branch-local Cargo wrapper and the network-disabled test environment:
 
 ```bash
-cargo test -p codex-core context_manager
-cargo test -p codex-core rollout_reconstruction
-cargo test -p codex-core pause
-cargo test -p codex-core continue
-cargo test -p codex-core thread_rollback
-cargo test -p codex-core compact
-cargo test -p codex-core websocket
-cargo clippy -p codex-core --all-targets --all-features -- -D warnings
-cargo fmt --check
+CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-core context_manager
+CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-core rollout_reconstruction
+CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-core pause
+CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-core continue
+CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-core thread_rollback
+CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-core compact
+CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-core websocket
+CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local clippy -p codex-core --all-targets --all-features -- -D warnings
+just fmt
 ```
 
-Use the exact package/test filters available in this branch if individual names differ. The final mandatory verification is the complete `codex-core` test suite.
+Use the exact package/test filters available in this branch if individual names differ. The final mandatory verification is:
+
+```bash
+CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-core
+```
 
 ## Review gates
 
