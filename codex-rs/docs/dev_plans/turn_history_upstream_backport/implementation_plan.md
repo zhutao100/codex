@@ -92,7 +92,7 @@ At `Compacted`:
 4. Clear reference context.
 5. reset post-base checkpoints;
 6. mark the replacement as opaque;
-7. arm one-record adjacency recognition.
+7. arm one-record adjacency recognition only when `replacement_history` is present.
 
 For an immediately following `TurnContext`:
 
@@ -100,7 +100,7 @@ For an immediately following `TurnContext`:
 - leave previous settings unchanged;
 - mark the replacement as mid-turn/injected-context provenance.
 
-Any other rollout item disarms adjacency. This matters for standalone compaction followed by a later normal turn: the next turn appends context response items before persisting its `TurnContext`, so it is not mistaken for same-batch mid-turn context injection.
+Any other rollout item disarms adjacency. Legacy compactions without `replacement_history` also do not arm adjacency, because their rebuilt history intentionally lacks canonical context. This matters for standalone compaction followed by a later normal turn: the next turn appends context response items before persisting its `TurnContext`, so it is not mistaken for same-batch mid-turn context injection.
 
 Acceptance gate:
 
@@ -206,7 +206,7 @@ Inspect request bodies in prompt-cache tests rather than relying only on token c
 - [x] `GhostSnapshot` remains retained raw and omitted from prompts.
 - [x] `/pause` and `/continue` event behavior is unchanged.
 - [x] Local and remote compaction produce equivalent replay metadata semantics.
-- [x] Post-turn review/delegate contexts do not become user checkpoints.
+- [x] Post-turn review/delegate contexts do not commit previous-turn settings; review synthetic output only carries current metadata into rollback checkpoints.
 - [x] Old rollout JSON parses without migration.
 
 ### Scope control

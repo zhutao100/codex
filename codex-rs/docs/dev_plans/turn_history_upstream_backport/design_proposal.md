@@ -113,7 +113,7 @@ Do not immediately update current metadata. If another ordinary context appears 
 
 ### 4.3 Adjacent post-compaction `TurnContext`
 
-`replace_compacted_history` persists `Compacted` and the optional reference context in one ordered batch. Therefore a `TurnContext` immediately following `Compacted` with no intervening rollout item has distinct semantics:
+`replace_compacted_history` persists `Compacted` with exact `replacement_history` and the optional reference context in one ordered batch. Therefore a `TurnContext` immediately following an exact-replacement `Compacted` with no intervening rollout item has distinct semantics:
 
 - canonical context was inserted into the replacement history;
 - set `current.reference_context_item` to that item;
@@ -140,11 +140,13 @@ pending_context = None
 current_epoch.base_metadata = current
 current_epoch.checkpoints.clear()
 current_epoch.replacement_is_opaque = true
-awaiting_adjacent_post_compact_context = true
+awaiting_adjacent_post_compact_context = replacement_history.is_some()
 latest_compaction_tail_kind = StandaloneOrPreTurn
 ```
 
 The replacement is opaque because its retained user messages and summary do not provide a bijection to original metadata checkpoints. This is why rollback can be exact only for user boundaries appended after that base.
+
+Legacy compactions without `replacement_history` do not arm adjacency because the rebuilt history intentionally lacks resume-time canonical context.
 
 ### 4.5 `ThreadRolledBack(N)`
 

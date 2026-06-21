@@ -119,6 +119,7 @@ impl Session {
                     }
                 }
                 RolloutItem::Compacted(compacted) => {
+                    let has_exact_replacement = compacted.replacement_history.is_some();
                     if let Some(replacement) = &compacted.replacement_history {
                         history.replace(replacement.clone());
                     } else {
@@ -133,7 +134,7 @@ impl Session {
                     current_metadata.reference_context_item = None;
                     pending_context = None;
                     current_epoch.reset_to_base(current_metadata.clone());
-                    awaiting_adjacent_post_compaction_context = true;
+                    awaiting_adjacent_post_compaction_context = has_exact_replacement;
                     latest_compaction_tail_kind = CompactionTailKind::StandaloneOrPreTurn;
                     checkpoint_after_latest_compaction = false;
                 }

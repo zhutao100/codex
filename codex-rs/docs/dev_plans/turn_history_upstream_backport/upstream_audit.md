@@ -104,7 +104,7 @@ Upstream history handles newer response variants, inter-agent communication, ima
 |`/pause` and `/continue` without a synthetic user item|Replay changes must continue to infer and hydrate `PendingContinuation` without importing upstream lifecycle assumptions.|
 |Auto-compact session work notes|Work-note messages remain contextual/non-boundary items and survive compaction as currently designed.|
 |`GhostSnapshot` and `/undo`|Snapshots remain durable raw items, omitted from model prompts, and preserved across compaction.|
-|Post-turn completion/review flows|Non-user task metadata must not become a user checkpoint.|
+|Post-turn completion/review flows|Non-user task metadata must not commit previous-turn settings; synthetic review output can carry current metadata in rollback checkpoints.|
 |Existing rollout schema|Old rollout files must remain readable; no mandatory migration.|
 
 ## 6. Bugs already fixed in this branch

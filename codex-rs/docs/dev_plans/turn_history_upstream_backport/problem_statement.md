@@ -189,7 +189,7 @@ The solution must preserve:
 ## 7. Success criteria
 
 1. A normal `TurnContext` becomes committed metadata only when a real user boundary is recorded.
-2. Contextual user items, work notes, and non-user tasks never create metadata checkpoints.
+2. Contextual user items, work notes, and non-user tasks never commit previous-turn settings. Synthetic review output may carry the current metadata into a rollback checkpoint so replay stays aligned with history rollback.
 3. Rollback removes the same number of replay checkpoints as real user boundaries removed from post-compaction history.
 4. A compaction preserves previous settings but clears reference context unless an adjacent post-compaction context explicitly re-establishes it.
 5. Crossing an opaque replacement-history base clears uncertain metadata rather than retaining a stale value.

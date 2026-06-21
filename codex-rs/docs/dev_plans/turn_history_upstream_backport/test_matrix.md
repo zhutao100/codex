@@ -73,7 +73,7 @@ Use distinct model names and context values so an accidental selection is visibl
 |L2|same rollout reconstructed under cwd/policy contexts X and Y|Historical compacted prefix is identical.|
 |L3|complete A followed by legacy standalone compaction|Reference none; previous A.|
 |L4|legacy compaction followed by `TurnContext(B), user B`|B commits normally after the opaque base.|
-|L5|legacy compaction followed by adjacent `TurnContext(B)`|Reference B; previous unchanged; no fake user checkpoint.|
+|L5|legacy compaction followed by adjacent `TurnContext(B)` with no later user|Reference remains none because rebuilt legacy history did not include B; previous unchanged; B remains an uncommitted pending candidate.|
 
 ## 7. Continuation
 

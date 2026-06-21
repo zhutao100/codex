@@ -417,6 +417,41 @@ async fn rollout_reconstruction_clears_reference_context_item_after_legacy_compa
 }
 
 #[tokio::test]
+async fn rollout_reconstruction_ignores_adjacent_context_after_legacy_compaction() {
+    let (session, turn_context) = make_session_and_context().await;
+    let first_context = context_item_with_model(&turn_context, "first-model");
+    let legacy_context = context_item_with_model(&turn_context, "legacy-adjacent-model");
+    let rollout_items = vec![
+        RolloutItem::TurnContext(first_context.clone()),
+        RolloutItem::ResponseItem(user_message("hello")),
+        RolloutItem::ResponseItem(assistant_message("hi")),
+        RolloutItem::Compacted(CompactedItem {
+            message: "summary".to_string(),
+            replacement_history: None,
+        }),
+        RolloutItem::TurnContext(legacy_context),
+    ];
+    let expected_history =
+        compact::build_compacted_history(Vec::new(), &["hello".to_string()], "summary");
+
+    let reconstructed = session
+        .reconstruct_history_from_rollout(&turn_context, &rollout_items)
+        .await;
+
+    assert_eq!(
+        reconstructed,
+        ReconstructedRollout {
+            history: expected_history,
+            reference_context_item: None,
+            previous_turn_settings: Some(PreviousTurnSettings {
+                model: first_context.model,
+            }),
+            pending_continuation: None,
+        }
+    );
+}
+
+#[tokio::test]
 async fn rollout_reconstruction_restores_reference_context_item_after_replacement_history() {
     let (session, turn_context) = make_session_and_context().await;
     let previous_context = context_item_with_model(&turn_context, "previous-model");
