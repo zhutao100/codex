@@ -11,6 +11,8 @@ use codex_core::protocol::RolloutItem;
 use codex_core::protocol::TurnContextItem;
 use codex_core::protocol::WarningEvent;
 use codex_protocol::ThreadId;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::ResponseItem;
 use core::time::Duration;
 use core_test_support::load_default_config_for_test;
 use core_test_support::wait_for_event;
@@ -38,7 +40,18 @@ fn resume_history(
 
     InitialHistory::Resumed(ResumedHistory {
         conversation_id: ThreadId::default(),
-        history: vec![RolloutItem::TurnContext(turn_ctx)],
+        history: vec![
+            RolloutItem::TurnContext(turn_ctx),
+            RolloutItem::ResponseItem(ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "previous request".to_string(),
+                }],
+                end_turn: None,
+                phase: None,
+            }),
+        ],
         rollout_path: rollout_path.to_path_buf(),
     })
 }

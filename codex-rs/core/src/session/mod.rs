@@ -903,50 +903,6 @@ impl Session {
         })
     }
 
-    #[cfg(test)]
-    fn pending_continuation_from_rollout(
-        rollout_items: &[RolloutItem],
-        reconstructed_history: &[ResponseItem],
-    ) -> Option<PendingContinuation> {
-        let mut pending_event: Option<PendingContinuation> = None;
-
-        for item in rollout_items {
-            match item {
-                RolloutItem::EventMsg(EventMsg::TurnAborted(ev))
-                    if ev.reason == TurnAbortReason::Interrupted =>
-                {
-                    pending_event = Some(PendingContinuation {
-                        source: TurnContinuationSource::Interrupted,
-                        continued_from_turn_id: None,
-                        model: None,
-                        pause_reason: None,
-                        target: PendingContinuationTarget::Regular,
-                    });
-                }
-                RolloutItem::EventMsg(EventMsg::ThreadRolledBack(_))
-                | RolloutItem::EventMsg(EventMsg::UserMessage(_)) => {
-                    pending_event = None;
-                }
-                RolloutItem::ResponseItem(response_item)
-                    if is_user_turn_boundary_response_item(response_item) =>
-                {
-                    pending_event = None;
-                }
-                _ => {}
-            }
-        }
-
-        pending_event.or_else(|| {
-            history_needs_continuation(reconstructed_history).then_some(PendingContinuation {
-                source: TurnContinuationSource::Interrupted,
-                continued_from_turn_id: None,
-                model: None,
-                pause_reason: None,
-                target: PendingContinuationTarget::Regular,
-            })
-        })
-    }
-
     pub(crate) async fn update_settings(
         &self,
         updates: SessionSettingsUpdate,

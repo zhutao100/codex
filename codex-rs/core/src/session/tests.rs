@@ -83,6 +83,12 @@ fn assistant_message(text: &str) -> ResponseItem {
     }
 }
 
+fn context_item_with_model(turn_context: &TurnContext, model: &str) -> TurnContextItem {
+    let mut item = turn_context.to_turn_context_item();
+    item.model = model.to_string();
+    item
+}
+
 fn developer_texts(items: &[ResponseItem]) -> Vec<&str> {
     items
         .iter()
@@ -266,11 +272,57 @@ async fn rollout_reconstruction_restores_reference_context_item_after_regular_tu
 }
 
 #[tokio::test]
+async fn rollout_reconstruction_does_not_commit_bare_context() {
+    let (session, turn_context) = make_session_and_context().await;
+    let context_item = turn_context.to_turn_context_item();
+    let rollout_items = vec![RolloutItem::TurnContext(context_item)];
+
+    let reconstructed = session
+        .reconstruct_history_from_rollout(&turn_context, &rollout_items)
+        .await;
+
+    assert_eq!(
+        reconstructed,
+        ReconstructedRollout {
+            history: Vec::new(),
+            reference_context_item: None,
+            previous_turn_settings: None,
+            pending_continuation: None,
+        }
+    );
+}
+
+#[tokio::test]
+async fn rollout_reconstruction_does_not_commit_contextual_user_message() {
+    let (session, turn_context) = make_session_and_context().await;
+    let context_item = turn_context.to_turn_context_item();
+    let work_notes = crate::compact::preserved_work_notes_message("notes");
+    let rollout_items = vec![
+        RolloutItem::TurnContext(context_item),
+        RolloutItem::ResponseItem(work_notes.clone()),
+    ];
+
+    let reconstructed = session
+        .reconstruct_history_from_rollout(&turn_context, &rollout_items)
+        .await;
+
+    assert_eq!(
+        reconstructed,
+        ReconstructedRollout {
+            history: vec![work_notes],
+            reference_context_item: None,
+            previous_turn_settings: None,
+            pending_continuation: None,
+        }
+    );
+}
+
+#[tokio::test]
 async fn rollout_reconstruction_clears_reference_context_item_after_legacy_compaction() {
     let (session, turn_context) = make_session_and_context().await;
     let context_item = turn_context.to_turn_context_item();
     let rollout_items = vec![
-        RolloutItem::TurnContext(context_item),
+        RolloutItem::TurnContext(context_item.clone()),
         RolloutItem::ResponseItem(user_message("hello")),
         RolloutItem::ResponseItem(assistant_message("hi")),
         RolloutItem::Compacted(CompactedItem {
@@ -278,11 +330,8 @@ async fn rollout_reconstruction_clears_reference_context_item_after_legacy_compa
             replacement_history: None,
         }),
     ];
-    let expected_history = compact::build_compacted_history(
-        session.build_initial_context(&turn_context).await,
-        &["hello".to_string()],
-        "summary",
-    );
+    let expected_history =
+        compact::build_compacted_history(Vec::new(), &["hello".to_string()], "summary");
 
     let reconstructed = session
         .reconstruct_history_from_rollout(&turn_context, &rollout_items)
@@ -293,14 +342,10 @@ async fn rollout_reconstruction_clears_reference_context_item_after_legacy_compa
         ReconstructedRollout {
             history: expected_history,
             reference_context_item: None,
-            previous_turn_settings: None,
-            pending_continuation: Some(PendingContinuation {
-                source: TurnContinuationSource::Interrupted,
-                continued_from_turn_id: None,
-                model: None,
-                pause_reason: None,
-                target: PendingContinuationTarget::Regular,
+            previous_turn_settings: Some(PreviousTurnSettings {
+                model: context_item.model,
             }),
+            pending_continuation: None,
         }
     );
 }
@@ -308,14 +353,18 @@ async fn rollout_reconstruction_clears_reference_context_item_after_legacy_compa
 #[tokio::test]
 async fn rollout_reconstruction_restores_reference_context_item_after_replacement_history() {
     let (session, turn_context) = make_session_and_context().await;
-    let context_item = turn_context.to_turn_context_item();
+    let previous_context = context_item_with_model(&turn_context, "previous-model");
+    let compacted_context = context_item_with_model(&turn_context, "compacted-model");
     let replacement_history = vec![user_message("summary")];
     let rollout_items = vec![
+        RolloutItem::TurnContext(previous_context.clone()),
+        RolloutItem::ResponseItem(user_message("hello")),
+        RolloutItem::ResponseItem(assistant_message("hi")),
         RolloutItem::Compacted(CompactedItem {
             message: "summary".to_string(),
             replacement_history: Some(replacement_history.clone()),
         }),
-        RolloutItem::TurnContext(context_item.clone()),
+        RolloutItem::TurnContext(compacted_context.clone()),
     ];
 
     let reconstructed = session
@@ -326,17 +375,49 @@ async fn rollout_reconstruction_restores_reference_context_item_after_replacemen
         reconstructed,
         ReconstructedRollout {
             history: replacement_history,
-            reference_context_item: Some(context_item.clone()),
+            reference_context_item: Some(compacted_context),
             previous_turn_settings: Some(PreviousTurnSettings {
-                model: context_item.model.clone()
+                model: previous_context.model.clone()
             }),
             pending_continuation: Some(PendingContinuation {
                 source: TurnContinuationSource::Interrupted,
                 continued_from_turn_id: None,
-                model: Some(context_item.model.clone()),
+                model: Some(previous_context.model.clone()),
                 pause_reason: None,
                 target: PendingContinuationTarget::Regular,
             }),
+        }
+    );
+}
+
+#[tokio::test]
+async fn rollout_reconstruction_suppresses_standalone_compaction_continuation() {
+    let (session, turn_context) = make_session_and_context().await;
+    let context_item = turn_context.to_turn_context_item();
+    let replacement_history = vec![user_message("summary")];
+    let rollout_items = vec![
+        RolloutItem::TurnContext(context_item.clone()),
+        RolloutItem::ResponseItem(user_message("hello")),
+        RolloutItem::ResponseItem(assistant_message("hi")),
+        RolloutItem::Compacted(CompactedItem {
+            message: "summary".to_string(),
+            replacement_history: Some(replacement_history.clone()),
+        }),
+    ];
+
+    let reconstructed = session
+        .reconstruct_history_from_rollout(&turn_context, &rollout_items)
+        .await;
+
+    assert_eq!(
+        reconstructed,
+        ReconstructedRollout {
+            history: replacement_history,
+            reference_context_item: None,
+            previous_turn_settings: Some(PreviousTurnSettings {
+                model: context_item.model
+            }),
+            pending_continuation: None,
         }
     );
 }
@@ -372,6 +453,128 @@ async fn rollout_reconstruction_thread_rollback_recomputes_reference_context_ite
             previous_turn_settings: Some(PreviousTurnSettings {
                 model: first_context.model
             }),
+            pending_continuation: None,
+        }
+    );
+}
+
+#[tokio::test]
+async fn rollout_reconstruction_thread_rollback_ignores_bare_context() {
+    let (session, turn_context) = make_session_and_context().await;
+    let first_context = context_item_with_model(&turn_context, "first-model");
+    let bare_context = context_item_with_model(&turn_context, "bare-model");
+    let rollout_items = vec![
+        RolloutItem::TurnContext(first_context),
+        RolloutItem::ResponseItem(user_message("first")),
+        RolloutItem::ResponseItem(assistant_message("first reply")),
+        RolloutItem::TurnContext(bare_context),
+        RolloutItem::EventMsg(EventMsg::ThreadRolledBack(ThreadRolledBackEvent {
+            num_turns: 1,
+        })),
+    ];
+
+    let reconstructed = session
+        .reconstruct_history_from_rollout(&turn_context, &rollout_items)
+        .await;
+
+    assert_eq!(
+        reconstructed,
+        ReconstructedRollout {
+            history: Vec::new(),
+            reference_context_item: None,
+            previous_turn_settings: None,
+            pending_continuation: None,
+        }
+    );
+}
+
+#[tokio::test]
+async fn rollout_reconstruction_thread_rollback_restores_compaction_epoch_metadata() {
+    let (session, turn_context) = make_session_and_context().await;
+    let first_context = context_item_with_model(&turn_context, "first-model");
+    let second_context = context_item_with_model(&turn_context, "second-model");
+    let replacement_history = vec![user_message("summary")];
+    let post_compaction_context_items = session.build_initial_context(&turn_context).await;
+    let mut rollout_items = vec![
+        RolloutItem::TurnContext(first_context.clone()),
+        RolloutItem::ResponseItem(user_message("first")),
+        RolloutItem::ResponseItem(assistant_message("first reply")),
+        RolloutItem::Compacted(CompactedItem {
+            message: "summary".to_string(),
+            replacement_history: Some(replacement_history.clone()),
+        }),
+    ];
+    rollout_items.extend(
+        post_compaction_context_items
+            .into_iter()
+            .map(RolloutItem::ResponseItem),
+    );
+    rollout_items.extend([
+        RolloutItem::TurnContext(second_context),
+        RolloutItem::ResponseItem(user_message("second")),
+        RolloutItem::ResponseItem(assistant_message("second reply")),
+        RolloutItem::EventMsg(EventMsg::ThreadRolledBack(ThreadRolledBackEvent {
+            num_turns: 1,
+        })),
+    ]);
+
+    let reconstructed = session
+        .reconstruct_history_from_rollout(&turn_context, &rollout_items)
+        .await;
+
+    assert_eq!(
+        reconstructed,
+        ReconstructedRollout {
+            history: replacement_history,
+            reference_context_item: None,
+            previous_turn_settings: Some(PreviousTurnSettings {
+                model: first_context.model
+            }),
+            pending_continuation: None,
+        }
+    );
+}
+
+#[tokio::test]
+async fn rollout_reconstruction_thread_rollback_crossing_compaction_clears_metadata() {
+    let (session, turn_context) = make_session_and_context().await;
+    let first_context = context_item_with_model(&turn_context, "first-model");
+    let second_context = context_item_with_model(&turn_context, "second-model");
+    let replacement_history = vec![user_message("summary")];
+    let post_compaction_context_items = session.build_initial_context(&turn_context).await;
+    let mut rollout_items = vec![
+        RolloutItem::TurnContext(first_context),
+        RolloutItem::ResponseItem(user_message("first")),
+        RolloutItem::ResponseItem(assistant_message("first reply")),
+        RolloutItem::Compacted(CompactedItem {
+            message: "summary".to_string(),
+            replacement_history: Some(replacement_history),
+        }),
+    ];
+    rollout_items.extend(
+        post_compaction_context_items
+            .into_iter()
+            .map(RolloutItem::ResponseItem),
+    );
+    rollout_items.extend([
+        RolloutItem::TurnContext(second_context),
+        RolloutItem::ResponseItem(user_message("second")),
+        RolloutItem::ResponseItem(assistant_message("second reply")),
+        RolloutItem::EventMsg(EventMsg::ThreadRolledBack(ThreadRolledBackEvent {
+            num_turns: 2,
+        })),
+    ]);
+
+    let reconstructed = session
+        .reconstruct_history_from_rollout(&turn_context, &rollout_items)
+        .await;
+
+    assert_eq!(
+        reconstructed,
+        ReconstructedRollout {
+            history: Vec::new(),
+            reference_context_item: None,
+            previous_turn_settings: None,
             pending_continuation: None,
         }
     );
@@ -424,11 +627,15 @@ async fn record_initial_history_restores_resumed_reference_context_item() {
     );
 }
 
-#[test]
-fn pending_continuation_from_rollout_uses_incomplete_history_without_pause_event() {
+#[tokio::test]
+async fn rollout_reconstruction_uses_incomplete_history_without_pause_event() {
+    let (session, turn_context) = make_session_and_context().await;
     let original_user = user_message("original request");
     let rollout_items = vec![RolloutItem::ResponseItem(original_user.clone())];
-    let reconstructed_history = vec![original_user];
+
+    let reconstructed = session
+        .reconstruct_history_from_rollout(&turn_context, &rollout_items)
+        .await;
 
     assert_eq!(
         Some(PendingContinuation {
@@ -438,12 +645,14 @@ fn pending_continuation_from_rollout_uses_incomplete_history_without_pause_event
             pause_reason: None,
             target: PendingContinuationTarget::Regular,
         }),
-        Session::pending_continuation_from_rollout(&rollout_items, &reconstructed_history)
+        reconstructed.pending_continuation
     );
+    assert_eq!(vec![original_user], reconstructed.history);
 }
 
-#[test]
-fn pending_continuation_from_rollout_ignores_custom_pause_event() {
+#[tokio::test]
+async fn rollout_reconstruction_ignores_custom_pause_event() {
+    let (session, turn_context) = make_session_and_context().await;
     let original_user = user_message("original request");
     let later_user = user_message("new request");
     let later_assistant = assistant_message("new response");
@@ -456,11 +665,15 @@ fn pending_continuation_from_rollout_ignores_custom_pause_event() {
         RolloutItem::ResponseItem(later_user.clone()),
         RolloutItem::ResponseItem(later_assistant.clone()),
     ];
-    let reconstructed_history = vec![original_user, later_user, later_assistant];
 
+    let reconstructed = session
+        .reconstruct_history_from_rollout(&turn_context, &rollout_items)
+        .await;
+
+    assert_eq!(None, reconstructed.pending_continuation);
     assert_eq!(
-        None,
-        Session::pending_continuation_from_rollout(&rollout_items, &reconstructed_history)
+        vec![original_user, later_user, later_assistant],
+        reconstructed.history
     );
 }
 
@@ -2477,11 +2690,7 @@ async fn sample_rollout(
     let summary1 = "summary one";
     let snapshot1 = live_history.clone().for_prompt();
     let user_messages1 = collect_user_messages(&snapshot1);
-    let rebuilt1 = compact::build_compacted_history(
-        session.build_initial_context(turn_context).await,
-        &user_messages1,
-        summary1,
-    );
+    let rebuilt1 = compact::build_compacted_history(Vec::new(), &user_messages1, summary1);
     live_history.replace(rebuilt1);
     rollout_items.push(RolloutItem::Compacted(CompactedItem {
         message: summary1.to_string(),
@@ -2515,11 +2724,7 @@ async fn sample_rollout(
     let summary2 = "summary two";
     let snapshot2 = live_history.clone().for_prompt();
     let user_messages2 = collect_user_messages(&snapshot2);
-    let rebuilt2 = compact::build_compacted_history(
-        session.build_initial_context(turn_context).await,
-        &user_messages2,
-        summary2,
-    );
+    let rebuilt2 = compact::build_compacted_history(Vec::new(), &user_messages2, summary2);
     live_history.replace(rebuilt2);
     rollout_items.push(RolloutItem::Compacted(CompactedItem {
         message: summary2.to_string(),

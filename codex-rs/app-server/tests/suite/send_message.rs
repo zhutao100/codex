@@ -573,7 +573,7 @@ fn content_texts(content: &[ContentItem]) -> Vec<&str> {
 }
 
 fn append_rollout_turn_context(path: &Path, timestamp: &str, model: &str) -> std::io::Result<()> {
-    let line = RolloutLine {
+    let context_line = RolloutLine {
         timestamp: timestamp.to_string(),
         item: RolloutItem::TurnContext(TurnContextItem {
             cwd: PathBuf::from("/"),
@@ -590,9 +590,22 @@ fn append_rollout_turn_context(path: &Path, timestamp: &str, model: &str) -> std
             truncation_policy: None,
         }),
     };
-    let serialized = serde_json::to_string(&line).map_err(std::io::Error::other)?;
+    let user_line = RolloutLine {
+        timestamp: timestamp.to_string(),
+        item: RolloutItem::ResponseItem(ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "committed previous-model request".to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        }),
+    };
+    let context_serialized = serde_json::to_string(&context_line).map_err(std::io::Error::other)?;
+    let user_serialized = serde_json::to_string(&user_line).map_err(std::io::Error::other)?;
     std::fs::OpenOptions::new()
         .append(true)
         .open(path)?
-        .write_all(format!("{serialized}\n").as_bytes())
+        .write_all(format!("{context_serialized}\n{user_serialized}\n").as_bytes())
 }
