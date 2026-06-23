@@ -111,28 +111,49 @@ impl WorldStateSection for TestWorldStateSection {
     }
 }
 
+fn test_world_state() -> WorldState {
+    let mut state = WorldState::default();
+    state.add_section(TestWorldStateSection);
+    state
+}
+
 #[test]
 fn world_state_baseline_deduplicates_until_history_is_replaced() {
-    let world_state = || {
-        let mut state = WorldState::default();
-        state.add_section(TestWorldStateSection);
-        state
-    };
     let mut history = ContextManager::new();
 
-    let (initial_fragments, initial_item) = history.update_world_state(&world_state());
+    let (initial_fragments, initial_item) = history.update_world_state(&test_world_state());
     assert_eq!(1, initial_fragments.len());
     assert!(initial_item.is_some_and(|item| item.full));
 
-    let (unchanged_fragments, unchanged_item) = history.update_world_state(&world_state());
+    let (unchanged_fragments, unchanged_item) = history.update_world_state(&test_world_state());
     assert!(unchanged_fragments.is_empty());
     assert_eq!(unchanged_item, None);
 
     history.replace(Vec::new());
 
-    let (replacement_fragments, replacement_item) = history.update_world_state(&world_state());
+    let (replacement_fragments, replacement_item) = history.update_world_state(&test_world_state());
     assert_eq!(1, replacement_fragments.len());
     assert!(replacement_item.is_some_and(|item| item.full));
+}
+
+#[test]
+fn world_state_baseline_deduplicates_until_history_is_truncated() {
+    let mut history =
+        create_history_with_items(vec![user_msg("u1"), assistant_msg("a1"), user_msg("u2")]);
+
+    let (initial_fragments, initial_item) = history.update_world_state(&test_world_state());
+    assert_eq!(1, initial_fragments.len());
+    assert!(initial_item.is_some_and(|item| item.full));
+
+    let (unchanged_fragments, unchanged_item) = history.update_world_state(&test_world_state());
+    assert!(unchanged_fragments.is_empty());
+    assert_eq!(unchanged_item, None);
+
+    history.drop_last_n_user_turns(/*num_turns*/ 1);
+
+    let (truncated_fragments, truncated_item) = history.update_world_state(&test_world_state());
+    assert_eq!(1, truncated_fragments.len());
+    assert!(truncated_item.is_some_and(|item| item.full));
 }
 
 #[test]

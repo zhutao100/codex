@@ -415,6 +415,7 @@ impl ContextManager {
             .fold(0i64, i64::saturating_add);
         self.total_item_tokens = self.total_item_tokens.saturating_sub(removed_tokens);
         self.history_version = self.history_version.saturating_add(1);
+        self.world_state_baseline = None;
     }
 
     fn update_item_token_estimate(&mut self, index: usize) {
