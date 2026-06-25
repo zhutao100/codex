@@ -67,6 +67,7 @@ impl ChatWidget {
 
         self.mcp_startup_status = None;
         self.update_task_running_state();
+        self.request_pending_usage_output_insertion();
         self.maybe_send_next_queued_input();
         self.request_redraw();
     }

@@ -5929,6 +5929,42 @@ async fn mcp_startup_complete_does_not_clear_running_task() {
 }
 
 #[tokio::test]
+async fn mcp_startup_complete_requests_pending_usage_output_insertion() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    let (cell, _handle) =
+        super::tokens::new_token_activity_output(super::tokens::TokenActivityView::Daily);
+    chat.completed_token_activity_output = Some(cell);
+
+    chat.handle_codex_event(Event {
+        id: "mcp-1".into(),
+        msg: EventMsg::McpStartupUpdate(McpStartupUpdateEvent {
+            server: "alpha".into(),
+            status: McpStartupStatus::Starting,
+        }),
+    });
+
+    assert!(chat.bottom_pane.is_task_running());
+    while rx.try_recv().is_ok() {}
+
+    chat.handle_codex_event(Event {
+        id: "mcp-2".into(),
+        msg: EventMsg::McpStartupComplete(McpStartupCompleteEvent {
+            ready: vec!["alpha".into()],
+            ..Default::default()
+        }),
+    });
+
+    let mut saw_commit = false;
+    while let Ok(event) = rx.try_recv() {
+        if matches!(event, AppEvent::CommitPendingUsageOutput) {
+            saw_commit = true;
+            break;
+        }
+    }
+    assert!(saw_commit, "expected pending usage commit request");
+}
+
+#[tokio::test]
 async fn background_event_updates_status_header() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
 
