@@ -137,6 +137,7 @@ impl ChatWidget {
         if !from_replay {
             self.move_pending_steers_to_rejected_queue();
         }
+        self.request_pending_usage_output_insertion();
 
         if !from_replay && !self.has_queued_follow_up_messages() {
             self.maybe_prompt_plan_implementation();
@@ -256,6 +257,7 @@ impl ChatWidget {
         self.request_status_line_branch_refresh();
         self.refresh_status_line();
         self.maybe_show_pending_rate_limit_prompt();
+        self.request_pending_usage_output_insertion();
     }
 
     pub(super) fn on_model_cap_error(&mut self, model: String, reset_after_seconds: Option<u64>) {

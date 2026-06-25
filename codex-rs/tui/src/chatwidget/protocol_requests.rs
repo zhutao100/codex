@@ -245,6 +245,7 @@ impl ChatWidget {
                 // transcript cells, but we do not maintain rollback-aware raw-markdown history yet,
                 // so keeping the previous cache can return content that was just removed.
                 self.last_copyable_output = None;
+                self.clear_pending_token_activity_refreshes();
             }
             EventMsg::RawResponseItem(_)
             | EventMsg::ItemStarted(_)

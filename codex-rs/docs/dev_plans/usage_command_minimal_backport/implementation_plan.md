@@ -1,8 +1,10 @@
 # `/usage` Minimal Backport Implementation Plan
 
-Status: Proposed
+Status: Completed
 
 ## Phase 1: Planning
+
+Status: Completed
 
 - Inspect upstream from `c884536d8` and follow-up `/usage` commits.
 - Compare the old branch architecture:
@@ -16,6 +18,8 @@ Validation:
 - `git diff --check -- docs/dev_plans/usage_command_minimal_backport`
 
 ## Phase 2: Minimal Feature Port
+
+Status: Completed
 
 Backend client:
 
@@ -52,6 +56,26 @@ Validation:
 
 ## Phase 3: Completion
 
+Status: Completed
+
 - Update this plan status to Completed.
 - Record any intentional limitations that remain.
 - Commit implementation with a Conventional Commit message.
+
+Completed limitations:
+
+- `/usage` opens token activity directly; it does not expose the newer upstream reset-credit menu.
+- The old branch still lacks app-server `account/usage/read` protocol and generated schema fixtures by design.
+- Slash-command completion remains static; typed `/usage` reports the ChatGPT login requirement when auth is unavailable.
+
+Completed validation:
+
+- `just fmt`
+- `CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-backend-client`
+- `CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-tui usage`
+- `CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-tui token_activity`
+- `CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-tui daily_values`
+- `CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-tui`
+- `CODEX_SANDBOX_NETWORK_DISABLED=1 just fix -p codex-backend-client`
+- `CODEX_SANDBOX_NETWORK_DISABLED=1 just fix -p codex-tui`
+- `scripts/cargo-local insta pending-snapshots --manifest-path tui/Cargo.toml`

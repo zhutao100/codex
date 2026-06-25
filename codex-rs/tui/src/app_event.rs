@@ -10,6 +10,7 @@
 
 use std::path::PathBuf;
 
+use codex_backend_client::TokenUsageProfile;
 use codex_chatgpt::connectors::AppInfo;
 use codex_common::approval_presets::ApprovalPreset;
 use codex_core::protocol::Event;
@@ -145,6 +146,15 @@ pub(crate) enum AppEvent {
 
     /// Result of refreshing rate limits
     RateLimitSnapshotFetched(RateLimitSnapshot),
+
+    /// Result of fetching account-wide token activity for `/usage`.
+    TokenActivityLoaded {
+        request_id: u64,
+        result: Result<TokenUsageProfile, String>,
+    },
+
+    /// Commit settled asynchronous usage output after active output clears.
+    CommitPendingUsageOutput,
 
     /// Result of prefetching connectors.
     ConnectorsLoaded(Result<ConnectorsSnapshot, String>),

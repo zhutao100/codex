@@ -1,6 +1,6 @@
 # `/usage` Upstream Audit
 
-Status: Proposed
+Status: Completed
 
 ## Reference Commits
 

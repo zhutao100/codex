@@ -1935,6 +1935,23 @@ impl App {
             AppEvent::RateLimitSnapshotFetched(snapshot) => {
                 self.chat_widget.on_rate_limit_snapshot(Some(snapshot));
             }
+            AppEvent::TokenActivityLoaded { request_id, result } => {
+                if self
+                    .chat_widget
+                    .finish_token_activity_refresh(request_id, result)
+                    && !self.chat_widget.usage_history_insertion_blocked()
+                {
+                    self.chat_widget.request_pending_usage_output_insertion();
+                }
+            }
+            AppEvent::CommitPendingUsageOutput => {
+                if !self.chat_widget.usage_history_insertion_blocked()
+                    && let Some(cell) = self.chat_widget.take_completed_token_activity_output()
+                {
+                    self.chat_widget.add_to_history(cell);
+                    tui.frame_requester().schedule_frame();
+                }
+            }
             AppEvent::ConnectorsLoaded(result) => {
                 self.chat_widget.on_connectors_loaded(result);
             }

@@ -982,6 +982,9 @@ async fn make_chatwidget_manual(
         rate_limit_warnings: RateLimitWarningState::default(),
         rate_limit_switch_prompt: RateLimitSwitchPromptState::default(),
         rate_limit_poller: None,
+        refreshing_token_activity_output: None,
+        completed_token_activity_output: None,
+        next_token_activity_request_id: 1,
         adaptive_chunking: crate::streaming::chunking::AdaptiveChunkingPolicy::default(),
         stream_controller: None,
         plan_stream_controller: None,
@@ -1127,6 +1130,35 @@ fn lines_to_single_string(lines: &[ratatui::text::Line<'static>]) -> String {
         s.push('\n');
     }
     s
+}
+
+#[tokio::test]
+async fn signed_out_usage_command_reports_chatgpt_login_requirement() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.dispatch_command(SlashCommand::Usage);
+
+    let rendered = drain_insert_history(&mut rx)
+        .into_iter()
+        .map(|lines| lines_to_single_string(&lines))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("Sign in with ChatGPT to use /usage."));
+}
+
+#[tokio::test]
+async fn usage_command_with_invalid_view_reports_usage() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    set_chatgpt_auth(&mut chat);
+
+    chat.dispatch_command_with_args(SlashCommand::Usage, "monthly".to_string(), Vec::new());
+
+    let rendered = drain_insert_history(&mut rx)
+        .into_iter()
+        .map(|lines| lines_to_single_string(&lines))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("Usage: /usage [daily|weekly|cumulative]"));
 }
 
 fn make_token_info(total_tokens: i64, context_window: i64) -> TokenUsageInfo {

@@ -575,6 +575,11 @@ impl ChatWidget {
             SlashCommand::Status => {
                 self.add_status_output();
             }
+            SlashCommand::Usage => {
+                if self.ensure_usage_command_available() {
+                    self.add_token_activity_output(TokenActivityView::Daily);
+                }
+            }
             SlashCommand::DebugConfig => {
                 self.add_debug_config_output();
             }
@@ -768,6 +773,16 @@ impl ChatWidget {
                     tx.send(AppEvent::DiffResult(result));
                 });
             }
+            SlashCommand::Usage => {
+                if self.ensure_usage_command_available() {
+                    match TokenActivityView::parse(trimmed) {
+                        Some(view) => self.add_token_activity_output(view),
+                        None => self.add_error_message(
+                            "Usage: /usage [daily|weekly|cumulative]".to_string(),
+                        ),
+                    }
+                }
+            }
             SlashCommand::LegendMode => match parse_progress_legend_mode(trimmed) {
                 Ok(mode) => {
                     self.app_event_tx
@@ -923,6 +938,17 @@ impl ChatWidget {
                 });
                 QueueDrain::Continue
             }
+            SlashCommand::Usage => {
+                if self.ensure_usage_command_available() {
+                    match TokenActivityView::parse(&trimmed_rest) {
+                        Some(view) => self.add_token_activity_output(view),
+                        None => self.add_error_message(
+                            "Usage: /usage [daily|weekly|cumulative]".to_string(),
+                        ),
+                    }
+                }
+                QueueDrain::Continue
+            }
             SlashCommand::LegendMode => match parse_progress_legend_mode(&trimmed_rest) {
                 Ok(mode) => {
                     self.app_event_tx
@@ -1006,6 +1032,7 @@ impl ChatWidget {
 
         match cmd {
             SlashCommand::Status
+            | SlashCommand::Usage
             | SlashCommand::DebugConfig
             | SlashCommand::LegendMode
             | SlashCommand::Ps

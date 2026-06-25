@@ -204,6 +204,7 @@ use crate::get_git_diff::GitDiffResult;
 use crate::get_git_diff::get_git_diff;
 use crate::history_cell;
 use crate::history_cell::AgentMessageCell;
+use crate::history_cell::CompositeHistoryCell;
 use crate::history_cell::HistoryCell;
 use crate::history_cell::McpToolCallCell;
 use crate::history_cell::PlainHistoryCell;
@@ -243,6 +244,8 @@ mod protocol_requests;
 mod rate_limits;
 pub(crate) use self::rate_limits::get_limits_duration;
 use self::rate_limits::*;
+mod tokens;
+pub(crate) use self::tokens::TokenActivityView;
 mod rendering;
 mod replay;
 mod review_popups;
@@ -380,6 +383,9 @@ pub(crate) struct ChatWidget {
     rate_limit_warnings: RateLimitWarningState,
     rate_limit_switch_prompt: RateLimitSwitchPromptState,
     rate_limit_poller: Option<JoinHandle<()>>,
+    refreshing_token_activity_output: Option<tokens::PendingTokenActivityOutput>,
+    completed_token_activity_output: Option<CompositeHistoryCell>,
+    next_token_activity_request_id: u64,
     adaptive_chunking: AdaptiveChunkingPolicy,
     // Stream lifecycle controller
     stream_controller: Option<StreamController>,
@@ -618,6 +624,7 @@ impl ChatWidget {
         if let Some(active) = self.active_cell.take() {
             self.needs_final_message_separator = true;
             self.app_event_tx.send(AppEvent::InsertHistoryCell(active));
+            self.request_pending_usage_output_insertion();
         }
     }
 
