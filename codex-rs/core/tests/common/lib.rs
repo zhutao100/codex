@@ -192,8 +192,8 @@ pub fn sandbox_network_env_var() -> &'static str {
     codex_core::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR
 }
 
-/// Set by `scripts/cargo-local` when its network-disabled profile permits
-/// localhost sockets.
+/// Set by `cargo-local` when its network-disabled profile permits localhost
+/// sockets.
 pub fn localhost_network_env_var() -> &'static str {
     "CODEX_RS_LOCALHOST_NETWORK_ALLOWED"
 }

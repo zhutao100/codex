@@ -58,41 +58,41 @@ Recommended developer command:
 
 ```bash
 CODEX_SANDBOX_NETWORK_DISABLED=1 \
-  scripts/cargo-local build -p codex-cli --bin codex --profile release-fast --timings
+  cargo-local build -p codex-cli --bin codex --profile release-fast --timings
 ```
 
 Production release remains:
 
 ```bash
 CODEX_SANDBOX_NETWORK_DISABLED=1 \
-  scripts/cargo-local build -p codex-cli --bin codex --release --timings
+  cargo-local build -p codex-cli --bin codex --release --timings
 ```
 
 ## Phase 1: Standardize Measurements
 
-Create a small repeatable measurement note or script under this proposal before further structural changes. In this branch, use `measure.sh` so local runs go through `scripts/cargo-local` and keep machine-specific captures outside the repository.
+Create a small repeatable measurement note or script under this proposal before further structural changes. In this branch, use `measure.sh` so local runs go through `cargo-local` and keep machine-specific captures outside the repository.
 
 Minimum commands:
 
 ```bash
 # Dependency graph and feature fanout.
-scripts/cargo-local tree -p codex-cli -e normal > /tmp/codex-cli-tree-normal.txt
-scripts/cargo-local tree -p codex-cli -e features > /tmp/codex-cli-tree-features.txt
-scripts/cargo-local tree -p codex-cli --duplicates > /tmp/codex-cli-tree-duplicates.txt
+cargo-local tree -p codex-cli -e normal > /tmp/codex-cli-tree-normal.txt
+cargo-local tree -p codex-cli -e features > /tmp/codex-cli-tree-features.txt
+cargo-local tree -p codex-cli --duplicates > /tmp/codex-cli-tree-duplicates.txt
 
 # Production release timing.
-scripts/cargo-local clean -p codex-cli --release >/dev/null
+cargo-local clean -p codex-cli --release >/dev/null
 RUSTC_WRAPPER= CODEX_SANDBOX_NETWORK_DISABLED=1 \
   /usr/bin/time -p \
-  scripts/cargo-local build -p codex-cli --bin codex --release --timings \
+  cargo-local build -p codex-cli --bin codex --release --timings \
   >/tmp/codex-release.stdout \
   2>/tmp/codex-release.stderr
 
 # Fast release-like timing.
-scripts/cargo-local clean -p codex-cli --profile release-fast >/dev/null
+cargo-local clean -p codex-cli --profile release-fast >/dev/null
 RUSTC_WRAPPER= CODEX_SANDBOX_NETWORK_DISABLED=1 \
   /usr/bin/time -p \
-  scripts/cargo-local build -p codex-cli --bin codex --profile release-fast --timings \
+  cargo-local build -p codex-cli --bin codex --profile release-fast --timings \
   >/tmp/codex-release-fast.stdout \
   2>/tmp/codex-release-fast.stderr
 ```
@@ -117,8 +117,8 @@ Document the intended split:
 Recommended checks:
 
 ```bash
-CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local build -p codex-cli --bin codex --profile release-fast
-release_fast_bin="$(scripts/cargo-local --print-target-dir)/release-fast/codex"
+CODEX_SANDBOX_NETWORK_DISABLED=1 cargo-local build -p codex-cli --bin codex --profile release-fast
+release_fast_bin="$(cargo-local --print-target-dir)/release-fast/codex"
 "${release_fast_bin}" --help
 "${release_fast_bin}" exec --help
 "${release_fast_bin}" features list --help
@@ -169,14 +169,14 @@ For each split:
 After each candidate split:
 
 ```bash
-scripts/cargo-local tree -p codex-cli -e normal > /tmp/codex-cli-tree-normal.after.txt
-CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local build -p codex-cli --bin codex --profile release-fast --timings
-CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local build -p codex-cli --bin codex --release --timings
+cargo-local tree -p codex-cli -e normal > /tmp/codex-cli-tree-normal.after.txt
+CODEX_SANDBOX_NETWORK_DISABLED=1 cargo-local build -p codex-cli --bin codex --profile release-fast --timings
+CODEX_SANDBOX_NETWORK_DISABLED=1 cargo-local build -p codex-cli --bin codex --release --timings
 ```
 
 Acceptance:
 
-- removed crate no longer appears in `scripts/cargo-local tree -p codex-cli -e normal`, unless still reachable through another primary path;
+- removed crate no longer appears in `cargo-local tree -p codex-cli -e normal`, unless still reachable through another primary path;
 - primary `codex` smoke tests pass;
 - sidecar command smoke tests pass;
 - production packaging still includes required sidecars.
@@ -203,7 +203,7 @@ Acceptance:
 
 - local provider flows for LM Studio and Ollama remain unchanged;
 - non-local default provider flows do not require local-provider crates unless the selected command path needs them;
-- `scripts/cargo-local tree -p codex-cli -e normal` proves whether `codex-lmstudio` and `codex-ollama` remain in the primary closure.
+- `cargo-local tree -p codex-cli -e normal` proves whether `codex-lmstudio` and `codex-ollama` remain in the primary closure.
 
 ## Phase 5: Measured Core Follow-Ups
 

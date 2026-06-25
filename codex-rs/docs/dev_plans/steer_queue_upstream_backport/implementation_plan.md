@@ -314,13 +314,13 @@ Run at minimum:
 
 ```bash
 just fmt
-CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-core --test all pending_input
-CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-core session::tests::task_finish
-CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-core session::tests::abort
-CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-tui chat_composer
-CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-tui chatwidget::tests
+CODEX_SANDBOX_NETWORK_DISABLED=1 cargo-local test -p codex-core --test all pending_input
+CODEX_SANDBOX_NETWORK_DISABLED=1 cargo-local test -p codex-core session::tests::task_finish
+CODEX_SANDBOX_NETWORK_DISABLED=1 cargo-local test -p codex-core session::tests::abort
+CODEX_SANDBOX_NETWORK_DISABLED=1 cargo-local test -p codex-tui chat_composer
+CODEX_SANDBOX_NETWORK_DISABLED=1 cargo-local test -p codex-tui chatwidget::tests
 just write-app-server-schema
-CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-app-server-protocol
+CODEX_SANDBOX_NETWORK_DISABLED=1 cargo-local test -p codex-app-server-protocol
 CODEX_SANDBOX_NETWORK_DISABLED=1 just fix -p codex-core
 CODEX_SANDBOX_NETWORK_DISABLED=1 just fix -p codex-tui
 ```

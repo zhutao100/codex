@@ -47,9 +47,9 @@ Out of scope for this minimal pass:
 Validation:
 
 - `just fmt`
-- `CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-backend-client`
-- `CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-tui usage`
-- `CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-tui token_activity`
+- `CODEX_SANDBOX_NETWORK_DISABLED=1 cargo-local test -p codex-backend-client`
+- `CODEX_SANDBOX_NETWORK_DISABLED=1 cargo-local test -p codex-tui usage`
+- `CODEX_SANDBOX_NETWORK_DISABLED=1 cargo-local test -p codex-tui token_activity`
 - `just fix -p codex-backend-client`
 - `just fix -p codex-tui`
 - `cargo insta pending-snapshots -p codex-tui` if snapshot tests generate `*.snap.new`
@@ -71,11 +71,11 @@ Completed limitations:
 Completed validation:
 
 - `just fmt`
-- `CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-backend-client`
-- `CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-tui usage`
-- `CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-tui token_activity`
-- `CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-tui daily_values`
-- `CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-tui`
+- `CODEX_SANDBOX_NETWORK_DISABLED=1 cargo-local test -p codex-backend-client`
+- `CODEX_SANDBOX_NETWORK_DISABLED=1 cargo-local test -p codex-tui usage`
+- `CODEX_SANDBOX_NETWORK_DISABLED=1 cargo-local test -p codex-tui token_activity`
+- `CODEX_SANDBOX_NETWORK_DISABLED=1 cargo-local test -p codex-tui daily_values`
+- `CODEX_SANDBOX_NETWORK_DISABLED=1 cargo-local test -p codex-tui`
 - `CODEX_SANDBOX_NETWORK_DISABLED=1 just fix -p codex-backend-client`
 - `CODEX_SANDBOX_NETWORK_DISABLED=1 just fix -p codex-tui`
-- `scripts/cargo-local insta pending-snapshots --manifest-path tui/Cargo.toml`
+- `cargo-local insta pending-snapshots --manifest-path tui/Cargo.toml`

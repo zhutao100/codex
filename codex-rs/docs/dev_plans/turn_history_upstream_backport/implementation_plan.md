@@ -171,11 +171,11 @@ Run the focused tests in `test_matrix.md`, then the surrounding suites. At minim
 
 ```bash
 just fmt
-CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-core rollout_reconstruction
-CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-core thread_rollback
-CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-core history_needs_continuation
-CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-core prompt_caching
-CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-core compact
+CODEX_SANDBOX_NETWORK_DISABLED=1 cargo-local test -p codex-core rollout_reconstruction
+CODEX_SANDBOX_NETWORK_DISABLED=1 cargo-local test -p codex-core thread_rollback
+CODEX_SANDBOX_NETWORK_DISABLED=1 cargo-local test -p codex-core history_needs_continuation
+CODEX_SANDBOX_NETWORK_DISABLED=1 cargo-local test -p codex-core prompt_caching
+CODEX_SANDBOX_NETWORK_DISABLED=1 cargo-local test -p codex-core compact
 ```
 
 Test filters may need adjustment to match the workspace harness. Also run the full `codex-core` test target used by this branch before merge.

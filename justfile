@@ -1,7 +1,7 @@
 set working-directory := "codex-rs"
 set positional-arguments
 
-cargo_cmd := "scripts/cargo-local"
+cargo_cmd := "cargo-local"
 
 # Display help
 help:
