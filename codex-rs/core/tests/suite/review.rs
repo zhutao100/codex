@@ -1243,6 +1243,8 @@ fn rollout_event_count(lines: &[RolloutLine], predicate: impl Fn(&EventMsg) -> b
             | RolloutItem::ResponseItem(_)
             | RolloutItem::Compacted(_)
             | RolloutItem::InterAgentCommunication(_)
+            | RolloutItem::InterAgentCommunicationMetadata { .. }
+            | RolloutItem::WorldState(_)
             | RolloutItem::TurnContext(_) => false,
         })
         .count()
