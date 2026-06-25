@@ -3,7 +3,7 @@ set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 repo_root="$(cd -- "${script_dir}/../../.." && pwd -P)"
-cargo_cmd="${CARGO_CMD:-${repo_root}/scripts/cargo-local}"
+cargo_cmd="${CARGO_CMD:-cargo-local}"
 out_dir="${CODEX_BUILD_OPT_OUT_DIR:-/tmp/codex-build-optimization}"
 skip_builds=0
 
@@ -16,7 +16,7 @@ Outputs are written outside the repository because Cargo tree output contains
 absolute local paths.
 
 Environment:
-  CARGO_CMD                 Cargo wrapper to use (default: scripts/cargo-local).
+  CARGO_CMD                 Cargo wrapper to use (default: cargo-local).
   CODEX_BUILD_OPT_OUT_DIR   Output directory (default: /tmp/codex-build-optimization).
 EOF
 }

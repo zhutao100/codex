@@ -3,7 +3,7 @@
     "rust-analyzer.check.command": "clippy",
     "rust-analyzer.check.extraArgs": ["--all-features", "--tests"],
     "rust-analyzer.check.overrideCommand": [
-        "./scripts/cargo-local",
+        "cargo-local",
         "clippy",
         "--quiet",
         "--workspace",
@@ -14,7 +14,7 @@
         "--tests",
     ],
     "rust-analyzer.cargo.buildScripts.overrideCommand": [
-        "./scripts/cargo-local",
+        "cargo-local",
         "check",
         "--quiet",
         "--workspace",
@@ -24,7 +24,7 @@
         "--all-features",
         "--tests",
     ],
-    "rust-analyzer.runnables.command": "./scripts/cargo-local",
+    "rust-analyzer.runnables.command": "cargo-local",
     "rust-analyzer.rustfmt.extraArgs": ["--config", "imports_granularity=Item"],
     "rust-analyzer.cargo.targetDir": true,
     "[rust]": {

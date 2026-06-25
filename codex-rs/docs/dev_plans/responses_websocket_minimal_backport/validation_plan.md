@@ -209,10 +209,10 @@ Run formatting and the focused crates first:
 
 ```shell
 just fmt
-CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-api
-CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-core --test all client_websockets
-CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-core --test all websocket_fallback
-CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-core --test all abort_tasks
+CODEX_SANDBOX_NETWORK_DISABLED=1 cargo-local test -p codex-api
+CODEX_SANDBOX_NETWORK_DISABLED=1 cargo-local test -p codex-core --test all client_websockets
+CODEX_SANDBOX_NETWORK_DISABLED=1 cargo-local test -p codex-core --test all websocket_fallback
+CODEX_SANDBOX_NETWORK_DISABLED=1 cargo-local test -p codex-core --test all abort_tasks
 ```
 
 Then run the broader affected workspace tests required by the branch's normal validation policy. Regenerate `core/config.schema.json` through the project's schema command when feature or provider configuration changes.

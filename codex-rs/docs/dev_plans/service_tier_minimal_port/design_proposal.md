@@ -168,13 +168,13 @@ Minimum targeted verification for this backport:
 just write-config-schema
 just write-app-server-schema
 just fmt
-CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-protocol
-CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-core service_tier
-CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-core --lib
-CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-app-server-protocol schema_fixtures
-CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-app-server service_tier
-CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-app-server thread_start_creates_thread_and_emits_started
-CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-tui service_tier
-CODEX_SANDBOX_NETWORK_DISABLED=1 scripts/cargo-local test -p codex-exec
+CODEX_SANDBOX_NETWORK_DISABLED=1 cargo-local test -p codex-protocol
+CODEX_SANDBOX_NETWORK_DISABLED=1 cargo-local test -p codex-core service_tier
+CODEX_SANDBOX_NETWORK_DISABLED=1 cargo-local test -p codex-core --lib
+CODEX_SANDBOX_NETWORK_DISABLED=1 cargo-local test -p codex-app-server-protocol schema_fixtures
+CODEX_SANDBOX_NETWORK_DISABLED=1 cargo-local test -p codex-app-server service_tier
+CODEX_SANDBOX_NETWORK_DISABLED=1 cargo-local test -p codex-app-server thread_start_creates_thread_and_emits_started
+CODEX_SANDBOX_NETWORK_DISABLED=1 cargo-local test -p codex-tui service_tier
+CODEX_SANDBOX_NETWORK_DISABLED=1 cargo-local test -p codex-exec
 CODEX_SANDBOX_NETWORK_DISABLED=1 just fix -p codex-protocol -p codex-core -p codex-app-server-protocol -p codex-app-server -p codex-tui -p codex-exec
 ```
