@@ -8,7 +8,7 @@ set windows-shell := ["python", "-c", 'import os, runpy; runpy.run_path(os.envir
 
 rust_min_stack := "8388608"
 python := if os_family() == "windows" { "python" } else { "python3" }
-cargo_cmd := if os_family() == "windows" { "cargo" } else { "scripts/cargo-local" }
+cargo_cmd := if os_family() == "windows" { "cargo" } else { "cargo-local" }
 
 # Display help
 help:

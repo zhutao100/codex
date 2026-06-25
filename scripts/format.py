@@ -41,7 +41,7 @@ def just_formatter_group(*, check: bool) -> FormatterGroup:
 
 
 def rust_formatter_group(*, check: bool) -> FormatterGroup:
-    cargo_bin = "cargo" if os.name == "nt" else "scripts/cargo-local"
+    cargo_bin = "cargo" if os.name == "nt" else "cargo-local"
     args = [cargo_bin, "fmt", "--", "--config", "imports_granularity=Item"]
     if check:
         args.append("--check")
