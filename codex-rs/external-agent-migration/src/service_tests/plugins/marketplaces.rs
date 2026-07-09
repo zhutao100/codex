@@ -479,7 +479,7 @@ async fn import_plugins_supports_relative_external_agent_plugin_marketplace_path
 }
 
 #[test]
-fn import_plugins_infers_external_official_marketplace_when_missing_from_settings() {
+fn marketplace_import_sources_infers_external_official_marketplace_when_missing_from_settings() {
     let (_root, external_agent_home, _codex_home) = fixture_paths();
     fs::create_dir_all(&external_agent_home).expect("create external agent home");
 
