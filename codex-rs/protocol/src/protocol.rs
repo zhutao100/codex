@@ -1893,25 +1893,39 @@ where
     D: serde::Deserializer<'de>,
 {
     let value = Value::deserialize(deserializer)?;
-    if let Some(review_output) = value.get("review_output") {
-        return Ok(ExitedReviewModeEvent {
-            review_output: deserialize_optional_review_output(review_output)?,
-        });
+    if value.get("review_output").is_some() {
+        return serde_json::from_value(value).map_err(serde::de::Error::custom);
     }
     if let Some(review_output) = value
         .get("payload")
         .and_then(|payload| payload.get("review_output"))
     {
         return Ok(ExitedReviewModeEvent {
+            turn_id: deserialize_optional_string_field(&value, "turn_id")?,
+            item_id: deserialize_optional_string_field(&value, "item_id")?,
             review_output: deserialize_optional_review_output(review_output)?,
         });
     }
     if value.get("findings").is_some() || value.get("overall_confidence_score").is_some() {
         return Ok(ExitedReviewModeEvent {
+            turn_id: None,
+            item_id: None,
             review_output: Some(serde_json::from_value(value).map_err(serde::de::Error::custom)?),
         });
     }
     serde_json::from_value(value).map_err(serde::de::Error::custom)
+}
+
+fn deserialize_optional_string_field<E>(value: &Value, field: &str) -> Result<Option<String>, E>
+where
+    E: serde::de::Error,
+{
+    match value.get(field) {
+        Some(field_value) if !field_value.is_null() => serde_json::from_value(field_value.clone())
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+        Some(_) | None => Ok(None),
+    }
 }
 
 fn deserialize_optional_review_output<E>(value: &Value) -> Result<Option<ReviewOutputEvent>, E>
@@ -5852,6 +5866,8 @@ mod tests {
     fn exited_review_mode_deserializes_nested_review_output() -> Result<()> {
         let event: EventMsg = serde_json::from_value(json!({
             "type": "exited_review_mode",
+            "turn_id": "turn-1",
+            "item_id": "item-1",
             "review_output": {
                 "findings": [],
                 "overall_correctness": "",
@@ -5862,8 +5878,12 @@ mod tests {
 
         match event {
             EventMsg::ExitedReviewMode(ExitedReviewModeEvent {
+                turn_id: Some(turn_id),
+                item_id: Some(item_id),
                 review_output: Some(review_output),
             }) => {
+                assert_eq!(turn_id, "turn-1");
+                assert_eq!(item_id, "item-1");
                 assert_eq!(
                     review_output.overall_explanation,
                     "final review assistant output"
@@ -5925,6 +5945,8 @@ mod tests {
             "type": "event_msg",
             "payload": {
                 "type": "exited_review_mode",
+                "turn_id": "turn-1",
+                "item_id": "item-1",
                 "review_output": {
                     "findings": [],
                     "overall_correctness": "",
@@ -5936,8 +5958,12 @@ mod tests {
 
         match line.item {
             RolloutItem::EventMsg(EventMsg::ExitedReviewMode(ExitedReviewModeEvent {
+                turn_id: Some(turn_id),
+                item_id: Some(item_id),
                 review_output: Some(review_output),
             })) => {
+                assert_eq!(turn_id, "turn-1");
+                assert_eq!(item_id, "item-1");
                 assert_eq!(
                     review_output.overall_explanation,
                     "final review assistant output"

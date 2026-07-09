@@ -11,3 +11,4 @@ file_system_
 suite::seatbelt::
 suite::user_shell_cmd::
 suite::unified_exec::
+suite::workspace_roots::

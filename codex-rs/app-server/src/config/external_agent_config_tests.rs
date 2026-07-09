@@ -2736,7 +2736,7 @@ async fn import_plugins_supports_relative_external_agent_plugin_marketplace_path
 
 #[tokio::test]
 async fn import_plugins_infers_external_official_marketplace_when_missing_from_settings() {
-    let (_root, external_agent_home, _codex_home) = fixture_paths();
+    let (_root, external_agent_home, codex_home) = fixture_paths();
     fs::create_dir_all(&external_agent_home).expect("create external agent home");
 
     let settings_path = external_agent_home.join("settings.json");
@@ -2755,7 +2755,8 @@ async fn import_plugins_infers_external_official_marketplace_when_missing_from_s
     let settings = effective_external_settings(&settings_path)
         .expect("read settings")
         .expect("settings should exist");
-    let import_sources = collect_marketplace_import_sources(&settings, &external_agent_home);
+    let import_sources = service_for_paths(external_agent_home.clone(), codex_home)
+        .marketplace_import_sources(&settings, &external_agent_home);
     assert_eq!(
         import_sources.get(EXTERNAL_OFFICIAL_MARKETPLACE_NAME),
         Some(&MarketplaceImportSource {
