@@ -10,6 +10,7 @@ use crate::app_event::ExitMode;
 use crate::app_event_sender::AppEventSender;
 use crate::bottom_pane::FeedbackAudience;
 use crate::bottom_pane::LocalImageAttachment;
+use crate::history_cell::ReasoningSummaryCell;
 use crate::history_cell::UserHistoryCell;
 use crate::test_backend::VT100Backend;
 use crate::tui::FrameRequester;
@@ -199,6 +200,41 @@ async fn resumed_initial_messages_render_history() {
     assert!(
         text_blob.contains("assistant reply"),
         "expected replayed agent message",
+    );
+}
+
+#[tokio::test]
+async fn replayed_reasoning_summary_drops_empty_parts_without_losing_content() {
+    let (mut chat, mut rx, _ops) = make_chatwidget_manual(None).await;
+
+    // Rollouts persist one final AgentReasoning event per summary part, without deltas or explicit
+    // section breaks.
+    chat.replay_initial_messages(vec![
+        EventMsg::AgentReasoning(AgentReasoningEvent {
+            text: "**Plan**\n\ndone".to_string(),
+        }),
+        EventMsg::AgentReasoning(AgentReasoningEvent {
+            text: "**Checking tests**\n\n<!-- -->".to_string(),
+        }),
+    ]);
+
+    let mut reasoning_cell = None;
+    while let Ok(event) = rx.try_recv() {
+        if let AppEvent::InsertHistoryCell(cell) = event
+            && cell.as_any().is::<ReasoningSummaryCell>()
+        {
+            reasoning_cell = Some(cell);
+            break;
+        }
+    }
+    let cell = reasoning_cell.expect("expected a replayed reasoning summary cell");
+
+    assert_eq!(
+        (
+            lines_to_single_string(&cell.display_lines(80)),
+            lines_to_single_string(&cell.transcript_lines(80)),
+        ),
+        ("• done\n".to_string(), "• done\n".to_string()),
     );
 }
 
@@ -1002,7 +1038,7 @@ async fn make_chatwidget_manual(
         connectors_cache: ConnectorsCacheState::default(),
         interrupts: InterruptManager::new(),
         reasoning_buffer: String::new(),
-        full_reasoning_buffer: String::new(),
+        reasoning_summary_parts: Vec::new(),
         current_status_header: String::from("Working"),
         retry_status_header: None,
         active_runtime_context: None,
