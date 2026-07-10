@@ -46,6 +46,8 @@ pub enum ReasoningEffort {
     Medium,
     High,
     XHigh,
+    Max,
+    Ultra,
 }
 
 /// Canonical user-input modality tags advertised by a model.
@@ -471,6 +473,8 @@ fn effort_rank(effort: ReasoningEffort) -> i32 {
         ReasoningEffort::Medium => 3,
         ReasoningEffort::High => 4,
         ReasoningEffort::XHigh => 5,
+        ReasoningEffort::Max => 6,
+        ReasoningEffort::Ultra => 7,
     }
 }
 
@@ -523,6 +527,31 @@ mod tests {
             personality_friendly: Some("friendly".to_string()),
             personality_pragmatic: Some("pragmatic".to_string()),
         }
+    }
+
+    #[test]
+    fn reasoning_effort_supports_max_and_ultra() {
+        let efforts = vec![ReasoningEffort::Max, ReasoningEffort::Ultra];
+        let serialized =
+            serde_json::to_value(&efforts).expect("reasoning efforts should serialize");
+        let deserialized = serde_json::from_value::<Vec<ReasoningEffort>>(serialized.clone())
+            .expect("reasoning efforts should deserialize");
+
+        assert_eq!(serialized, serde_json::json!(["max", "ultra"]));
+        assert_eq!(deserialized, efforts);
+        assert_eq!(
+            ReasoningEffort::iter().collect::<Vec<_>>(),
+            vec![
+                ReasoningEffort::None,
+                ReasoningEffort::Minimal,
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::High,
+                ReasoningEffort::XHigh,
+                ReasoningEffort::Max,
+                ReasoningEffort::Ultra,
+            ]
+        );
     }
 
     #[test]

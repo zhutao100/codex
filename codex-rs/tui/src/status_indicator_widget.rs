@@ -380,6 +380,8 @@ fn thinking_label(effort: ReasoningEffort) -> &'static str {
         ReasoningEffort::Medium => "medium",
         ReasoningEffort::High => "high",
         ReasoningEffort::XHigh => "xhigh",
+        ReasoningEffort::Max => "max",
+        ReasoningEffort::Ultra => "ultra",
         ReasoningEffort::None => "none",
     }
 }
