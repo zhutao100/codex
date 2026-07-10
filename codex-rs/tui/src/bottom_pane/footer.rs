@@ -889,6 +889,8 @@ fn thinking_label_for(model: &str, effort: Option<ReasoningEffort>) -> Option<&'
         Some(ReasoningEffort::Medium) => Some("medium"),
         Some(ReasoningEffort::High) => Some("high"),
         Some(ReasoningEffort::XHigh) => Some("extra-high"),
+        Some(ReasoningEffort::Max) => Some("max"),
+        Some(ReasoningEffort::Ultra) => Some("ultra"),
         None => None,
     }
 }

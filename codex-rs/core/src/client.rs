@@ -194,6 +194,13 @@ enum WebsocketStreamOutcome {
     FallbackToHttp,
 }
 
+fn reasoning_effort_for_request(effort: ReasoningEffortConfig) -> ReasoningEffortConfig {
+    match effort {
+        ReasoningEffortConfig::Ultra => ReasoningEffortConfig::Max,
+        effort => effort,
+    }
+}
+
 impl ModelClient {
     #[allow(clippy::too_many_arguments)]
     /// Creates a new session-scoped `ModelClient`.
@@ -349,10 +356,12 @@ impl ModelClient {
         let payload = ApiMemoryTraceSummarizeInput {
             model: model_info.slug.clone(),
             traces,
-            reasoning: effort.map(|effort| Reasoning {
-                effort: Some(effort),
-                summary: None,
-            }),
+            reasoning: effort
+                .map(reasoning_effort_for_request)
+                .map(|effort| Reasoning {
+                    effort: Some(effort),
+                    summary: None,
+                }),
         };
 
         client
@@ -520,7 +529,9 @@ impl ModelClientSession {
         let default_reasoning_effort = model_info.default_reasoning_level;
         let reasoning = if model_info.supports_reasoning_summaries {
             Some(Reasoning {
-                effort: effort.or(default_reasoning_effort),
+                effort: effort
+                    .or(default_reasoning_effort)
+                    .map(reasoning_effort_for_request),
                 summary: if summary == ReasoningSummaryConfig::None {
                     None
                 } else {
@@ -1376,6 +1387,17 @@ mod tests {
     use tokio::sync::oneshot;
 
     type RequestMutation = fn(&mut ResponseCreateWsRequest);
+
+    #[test]
+    fn ultra_reasoning_uses_max_for_requests() {
+        assert_eq!(
+            (
+                reasoning_effort_for_request(ReasoningEffortConfig::Ultra),
+                reasoning_effort_for_request(ReasoningEffortConfig::High),
+            ),
+            (ReasoningEffortConfig::Max, ReasoningEffortConfig::High)
+        );
+    }
 
     #[test]
     fn service_tier_for_wire_maps_only_openai_provider() {

@@ -45,6 +45,7 @@ use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::sse_failed;
 use core_test_support::skip_if_no_network;
+use core_test_support::skip_if_no_network_unless_localhost;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
@@ -739,8 +740,8 @@ async fn skills_append_to_instructions() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn includes_configured_effort_in_request() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+async fn includes_configured_ultra_effort_as_max_in_request() -> anyhow::Result<()> {
+    skip_if_no_network_unless_localhost!(Ok(()));
     let server = MockServer::start().await;
 
     let resp_mock = mount_sse_once(
@@ -751,7 +752,7 @@ async fn includes_configured_effort_in_request() -> anyhow::Result<()> {
     let TestCodex { codex, .. } = test_codex()
         .with_model("gpt-5.1-codex")
         .with_config(|config| {
-            config.model_reasoning_effort = Some(ReasoningEffort::Medium);
+            config.model_reasoning_effort = Some(ReasoningEffort::Ultra);
         })
         .build(&server)
         .await?;
@@ -777,7 +778,7 @@ async fn includes_configured_effort_in_request() -> anyhow::Result<()> {
             .get("reasoning")
             .and_then(|t| t.get("effort"))
             .and_then(|v| v.as_str()),
-        Some("medium")
+        Some("max")
     );
 
     Ok(())

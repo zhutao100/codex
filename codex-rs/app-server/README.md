@@ -281,6 +281,8 @@ Turns attach user input (text or images) to a thread and trigger Codex generatio
 
 You can optionally specify config overrides on the new turn. If specified, these settings become the default for subsequent turns on the same thread. `serviceTier` accepts `"flex"` or `"fast"` and is sticky like model/reasoning settings. `outputSchema` applies only to the current turn.
 
+The `effort` override accepts `"none"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`, or `"ultra"`; clients should prefer values advertised by `model/list`. `ultra` remains the client-facing value and is translated to `max` at the inference request boundary.
+
 ```json
 { "method": "turn/start", "id": 30, "params": {
     "threadId": "thr_123",
