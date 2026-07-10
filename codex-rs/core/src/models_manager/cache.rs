@@ -28,6 +28,15 @@ impl ModelsCacheManager {
 
     /// Attempt to load a fresh cache entry. Returns `None` if the cache doesn't exist or is stale.
     pub(crate) async fn load_fresh(&self, expected_version: &str) -> Option<ModelsCache> {
+        let cache = self.load_compatible(expected_version).await?;
+        if !cache.is_fresh(self.cache_ttl) {
+            return None;
+        }
+        Some(cache)
+    }
+
+    /// Attempt to load a cache entry with a compatible client version, ignoring TTL staleness.
+    pub(crate) async fn load_compatible(&self, expected_version: &str) -> Option<ModelsCache> {
         let cache = match self.load().await {
             Ok(cache) => cache?,
             Err(err) => {
@@ -36,9 +45,6 @@ impl ModelsCacheManager {
             }
         };
         if cache.client_version.as_deref() != Some(expected_version) {
-            return None;
-        }
-        if !cache.is_fresh(self.cache_ttl) {
             return None;
         }
         Some(cache)

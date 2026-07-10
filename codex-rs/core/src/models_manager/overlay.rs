@@ -44,7 +44,7 @@ impl ModelOverlay {
                 entry
                     .patch
                     .apply_to(model, entry.final_instruction_override.is_some());
-            } else {
+            } else if entry.creates_model_candidate() {
                 let mut model = model_info::model_info_from_slug(&entry.slug);
                 self.cross_model
                     .apply_to(&mut model, self.final_instruction_override.is_some());
@@ -61,6 +61,7 @@ impl ModelOverlay {
     pub(crate) fn apply_mentioned_to_candidates(&self, candidates: &[ModelInfo]) -> Vec<ModelInfo> {
         self.models
             .iter()
+            .filter(|entry| entry.creates_model_candidate())
             .map(|entry| {
                 let mut model = candidates
                     .iter()
@@ -75,6 +76,16 @@ impl ModelOverlay {
                 model
             })
             .collect()
+    }
+
+    pub(crate) fn apply_to_fallback_model(&self, model: &mut ModelInfo) {
+        self.cross_model
+            .apply_to(model, self.final_instruction_override.is_some());
+        if let Some(entry) = self.models.iter().find(|entry| entry.slug == model.slug) {
+            entry
+                .patch
+                .apply_to(model, entry.final_instruction_override.is_some());
+        }
     }
 
     pub(crate) fn final_instruction_override_for_slug(&self, slug: &str) -> Option<String> {
@@ -99,6 +110,12 @@ pub struct ModelOverlayEntry {
     pub model_provider: Option<String>,
     pub patch: ModelInfoPatch,
     pub final_instruction_override: Option<String>,
+}
+
+impl ModelOverlayEntry {
+    fn creates_model_candidate(&self) -> bool {
+        self.model_provider.is_some() || self.patch.has_model_metadata()
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -129,6 +146,32 @@ pub struct ModelInfoPatch {
 }
 
 impl ModelInfoPatch {
+    fn has_model_metadata(&self) -> bool {
+        self.display_name.is_some()
+            || self.description.is_some()
+            || self.default_reasoning_level.is_some()
+            || self.supported_reasoning_levels.is_some()
+            || self.shell_type.is_some()
+            || self.visibility.is_some()
+            || self.supported_in_api.is_some()
+            || self.priority.is_some()
+            || self.upgrade.is_some()
+            || self.base_instructions.is_some()
+            || self.model_messages.is_some()
+            || self.clear_model_messages
+            || self.supports_reasoning_summaries.is_some()
+            || self.support_verbosity.is_some()
+            || self.default_verbosity.is_some()
+            || self.apply_patch_tool_type.is_some()
+            || self.truncation_policy.is_some()
+            || self.supports_parallel_tool_calls.is_some()
+            || self.context_window.is_some()
+            || self.auto_compact_token_limit.is_some()
+            || self.effective_context_window_percent.is_some()
+            || self.experimental_supported_tools.is_some()
+            || self.input_modalities.is_some()
+    }
+
     fn apply_to(&self, model: &mut ModelInfo, has_final_instruction_override: bool) {
         if let Some(display_name) = &self.display_name {
             model.display_name = display_name.clone();

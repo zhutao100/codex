@@ -84,6 +84,7 @@ async fn models_client_hits_models_endpoint() {
             truncation_policy: TruncationPolicyConfig::bytes(10_000),
             supports_parallel_tool_calls: false,
             context_window: Some(272_000),
+            max_context_window: None,
             auto_compact_token_limit: None,
             effective_context_window_percent: 95,
             experimental_supported_tools: Vec::new(),
