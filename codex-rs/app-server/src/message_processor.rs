@@ -42,6 +42,7 @@ use codex_core::default_client::USER_AGENT_SUFFIX;
 use codex_core::default_client::get_codex_user_agent;
 use codex_core::default_client::set_default_client_residency_requirement;
 use codex_core::default_client::set_default_originator;
+use codex_core::models_manager::refresh_worker::ModelsRefreshWorker;
 use codex_feedback::CodexFeedback;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::SessionSource;
@@ -107,6 +108,7 @@ impl ExternalAuthRefresher for ExternalAuthRefreshBridge {
 pub(crate) struct MessageProcessor {
     outgoing: Arc<OutgoingMessageSender>,
     codex_message_processor: CodexMessageProcessor,
+    models_refresh_worker: ModelsRefreshWorker,
     config_api: ConfigApi,
     config: Arc<Config>,
     config_warnings: Arc<Vec<ConfigWarningNotification>>,
@@ -165,6 +167,9 @@ impl MessageProcessor {
                 SessionSource::VSCode,
             ))
         });
+        let models_manager = thread_manager.get_models_manager();
+        let models_refresh_worker =
+            codex_core::models_manager::refresh_worker::spawn(&models_manager, Arc::clone(&config));
         let codex_message_processor = CodexMessageProcessor::new(CodexMessageProcessorArgs {
             auth_manager,
             thread_manager,
@@ -185,6 +190,7 @@ impl MessageProcessor {
         Self {
             outgoing,
             codex_message_processor,
+            models_refresh_worker,
             config_api,
             config,
             config_warnings: Arc::new(config_warnings),
@@ -442,5 +448,11 @@ impl MessageProcessor {
             Ok(response) => self.outgoing.send_response(request_id, response).await,
             Err(error) => self.outgoing.send_error(request_id, error).await,
         }
+    }
+}
+
+impl Drop for MessageProcessor {
+    fn drop(&mut self) {
+        self.models_refresh_worker.shutdown();
     }
 }
