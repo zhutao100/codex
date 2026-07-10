@@ -23,7 +23,13 @@ pub(crate) fn with_config_overrides(mut model: ModelInfo, config: &Config) -> Mo
         model.supports_reasoning_summaries = supports_reasoning_summaries;
     }
     if let Some(context_window) = config.model_context_window {
-        model.context_window = Some(context_window);
+        model.context_window = Some(
+            model
+                .max_context_window
+                .map_or(context_window, |max_context_window| {
+                    context_window.min(max_context_window)
+                }),
+        );
     }
     if let Some(auto_compact_token_limit) = config.model_auto_compact_token_limit {
         model.auto_compact_token_limit = Some(auto_compact_token_limit);
@@ -74,6 +80,7 @@ pub(crate) fn model_info_from_slug(slug: &str) -> ModelInfo {
         truncation_policy: TruncationPolicyConfig::bytes(10_000),
         supports_parallel_tool_calls: true,
         context_window: Some(CONTEXT_WINDOW_164K),
+        max_context_window: None,
         auto_compact_token_limit: Some(CONTEXT_WINDOW_164K * 2 / 3),
         effective_context_window_percent: 95,
         experimental_supported_tools: Vec::new(),

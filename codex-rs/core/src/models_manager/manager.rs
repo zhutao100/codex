@@ -27,6 +27,7 @@ use tokio::sync::RwLock;
 use tokio::sync::TryLockError;
 use tokio::time::timeout;
 use tracing::error;
+use tracing::warn;
 
 const MODEL_CACHE_FILE: &str = "models_cache.json";
 const DEFAULT_MODEL_CACHE_TTL: Duration = Duration::from_secs(300);
@@ -144,7 +145,20 @@ impl ModelsManager {
     /// Look up model metadata, applying remote overrides and config adjustments.
     pub async fn get_model_info(&self, model: &str, config: &Config) -> ModelInfo {
         let remote_models = self.remote_models.read().await;
-        Self::construct_model_info_from_candidates(model, remote_models.as_slice(), config)
+        if let Some(model_info) =
+            Self::find_model_info_from_candidates(model, remote_models.as_slice(), config)
+        {
+            return model_info;
+        }
+        drop(remote_models);
+
+        if config.features.enabled(Feature::RemoteModels)
+            && let Some(model_info) = self.get_model_info_from_cache(model, config).await
+        {
+            return model_info;
+        }
+
+        Self::construct_fallback_model_info(model, config)
     }
 
     pub async fn get_final_instruction_override(
@@ -220,6 +234,15 @@ impl ModelsManager {
         candidates: &[ModelInfo],
         config: &Config,
     ) -> ModelInfo {
+        Self::find_model_info_from_candidates(model, candidates, config)
+            .unwrap_or_else(|| Self::construct_fallback_model_info(model, config))
+    }
+
+    fn find_model_info_from_candidates(
+        model: &str,
+        candidates: &[ModelInfo],
+        config: &Config,
+    ) -> Option<ModelInfo> {
         // First use the normal longest-prefix match. If that misses, allow a narrowly scoped
         // retry for namespaced slugs like `custom/gpt-5.3-codex`.
         let overlaid_candidates;
@@ -230,15 +253,27 @@ impl ModelsManager {
             candidates
         };
         let remote = Self::find_model_match(model, candidates);
-        let model_info = if let Some(remote) = remote {
-            ModelInfo {
+        remote.map(|remote| {
+            let model_info = ModelInfo {
                 slug: model.to_string(),
                 ..remote
-            }
-        } else {
-            model_info::model_info_from_slug(model)
-        };
+            };
+            model_info::with_config_overrides(model_info, config)
+        })
+    }
+
+    fn construct_fallback_model_info(model: &str, config: &Config) -> ModelInfo {
+        let mut model_info = model_info::model_info_from_slug(model);
+        if let Some(overlay) = config.model_overlay.as_ref() {
+            overlay.apply_to_fallback_model(&mut model_info);
+        }
         model_info::with_config_overrides(model_info, config)
+    }
+
+    async fn get_model_info_from_cache(&self, model: &str, config: &Config) -> Option<ModelInfo> {
+        let client_version = crate::models_manager::client_version_to_whole();
+        let cache = self.cache_manager.load_compatible(&client_version).await?;
+        Self::find_model_info_from_candidates(model, &cache.models, config)
     }
 
     fn find_model_match(model: &str, candidates: &[ModelInfo]) -> Option<ModelInfo> {
@@ -271,27 +306,44 @@ impl ModelsManager {
         config: &Config,
         refresh_strategy: RefreshStrategy,
     ) -> CoreResult<()> {
-        if !config.features.enabled(Feature::RemoteModels)
-            || self.auth_manager.auth_mode() == Some(AuthMode::ApiKey)
-        {
+        if !config.features.enabled(Feature::RemoteModels) {
+            return Ok(());
+        }
+        if self.auth_manager.auth_mode() == Some(AuthMode::ApiKey) {
+            if matches!(
+                refresh_strategy,
+                RefreshStrategy::Offline | RefreshStrategy::OnlineIfUncached
+            ) {
+                self.try_load_cache(true).await;
+            }
             return Ok(());
         }
 
         match refresh_strategy {
             RefreshStrategy::Offline => {
-                // Only try to load from cache, never fetch
-                self.try_load_cache().await;
+                // Only try to load from cache, never fetch.
+                self.try_load_cache(true).await;
                 Ok(())
             }
             RefreshStrategy::OnlineIfUncached => {
-                // Try cache first, fall back to online if unavailable
-                if self.try_load_cache().await {
+                // Try a fresh cache first, fall back to online, then stale cache if offline.
+                if self.try_load_cache(false).await {
                     return Ok(());
                 }
-                self.fetch_and_update_models().await
+                match self.fetch_and_update_models().await {
+                    Ok(()) => Ok(()),
+                    Err(err) => {
+                        if self.try_load_cache(true).await {
+                            warn!("failed to fetch models; using stale models cache: {err}");
+                            Ok(())
+                        } else {
+                            Err(err)
+                        }
+                    }
+                }
             }
             RefreshStrategy::Online => {
-                // Always fetch from network
+                // Always fetch from network.
                 self.fetch_and_update_models().await
             }
         }
@@ -350,12 +402,17 @@ impl ModelsManager {
         Ok(response.models)
     }
 
-    /// Attempt to satisfy the refresh from the cache when it matches the provider and TTL.
-    async fn try_load_cache(&self) -> bool {
+    /// Attempt to satisfy the refresh from the cache when it matches the provider.
+    async fn try_load_cache(&self, allow_stale: bool) -> bool {
         let _timer =
             codex_otel::start_global_timer("codex.remote_models.load_cache.duration_ms", &[]);
         let client_version = crate::models_manager::client_version_to_whole();
-        let cache = match self.cache_manager.load_fresh(&client_version).await {
+        let cache = if allow_stale {
+            self.cache_manager.load_compatible(&client_version).await
+        } else {
+            self.cache_manager.load_fresh(&client_version).await
+        };
+        let cache = match cache {
             Some(cache) => cache,
             None => return false,
         };
@@ -733,6 +790,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_model_info_uses_stale_cache_before_overlay_only_fallback() {
+        let codex_home = tempdir().expect("temp dir");
+        let auth_manager =
+            AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
+        let provider = provider_for("http://example.test".to_string());
+        let manager =
+            ModelsManager::with_provider(codex_home.path().to_path_buf(), auth_manager, provider);
+        let mut config = test_config();
+        config.features.enable(Feature::RemoteModels);
+        config.model_overlay = Some(ModelOverlay {
+            cross_model: ModelInfoPatch {
+                effective_context_window_percent: Some(98),
+                ..Default::default()
+            },
+            models: vec![ModelOverlayEntry {
+                slug: "gpt-5.5".to_string(),
+                model_provider: None,
+                patch: ModelInfoPatch::default(),
+                final_instruction_override: Some("custom instructions".to_string()),
+            }],
+            ..Default::default()
+        });
+        let cached_model = remote_model("gpt-5.5", "GPT-5.5", 0);
+        manager
+            .cache_manager
+            .persist_cache(
+                std::slice::from_ref(&cached_model),
+                None,
+                crate::models_manager::client_version_to_whole(),
+            )
+            .await;
+        manager
+            .cache_manager
+            .manipulate_cache_for_test(|fetched_at| {
+                *fetched_at = Utc::now() - chrono::Duration::hours(1);
+            })
+            .await
+            .expect("cache manipulation succeeds");
+
+        let model_info = manager.get_model_info("gpt-5.5", &config).await;
+        let mut expected = cached_model;
+        expected.effective_context_window_percent = 98;
+
+        assert_eq!(model_info, expected);
+    }
+
+    #[tokio::test]
     async fn refresh_available_models_refetches_when_version_mismatch() {
         let server = MockServer::start().await;
         let initial_models = vec![remote_model("old", "Old", 1)];
@@ -993,6 +1097,25 @@ mod tests {
         let model = ModelsManager::construct_model_info_offline("gpt-5.4", &config);
 
         assert_eq!(model.context_window, Some(256_000));
+    }
+
+    #[test]
+    fn config_context_window_override_clamps_to_max_context_window() {
+        let mut config = test_config();
+        config.model_context_window = Some(500_000);
+        let mut candidate = remote_model("wide-model", "Wide", 1);
+        candidate.context_window = Some(272_000);
+        candidate.max_context_window = Some(400_000);
+
+        let model = ModelsManager::construct_model_info_from_candidates(
+            "wide-model",
+            &[candidate.clone()],
+            &config,
+        );
+        let mut expected = candidate;
+        expected.context_window = Some(400_000);
+
+        assert_eq!(model, expected);
     }
 
     #[tokio::test]
