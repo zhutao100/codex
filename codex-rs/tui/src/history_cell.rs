@@ -2153,30 +2153,65 @@ pub(crate) fn new_view_image_tool_call(path: PathBuf, cwd: &Path) -> PlainHistor
     PlainHistoryCell { lines }
 }
 
-pub(crate) fn new_reasoning_summary_block(full_reasoning_buffer: String) -> Box<dyn HistoryCell> {
-    let full_reasoning_buffer = full_reasoning_buffer.trim();
-    if let Some(open) = full_reasoning_buffer.find("**") {
-        let after_open = &full_reasoning_buffer[(open + 2)..];
-        if let Some(close) = after_open.find("**") {
-            let after_close_idx = open + 2 + close + 2;
-            // if we don't have anything beyond `after_close_idx`
-            // then we don't have a summary to inject into history
-            if after_close_idx < full_reasoning_buffer.len() {
-                let header_buffer = full_reasoning_buffer[..after_close_idx].to_string();
-                let summary_buffer = full_reasoning_buffer[after_close_idx..].to_string();
-                return Box::new(ReasoningSummaryCell::new(
-                    header_buffer,
-                    summary_buffer,
-                    false,
-                ));
+/// Create the reasoning history cell emitted at the end of a reasoning block.
+///
+/// Part boundaries are preserved so standalone empty placeholders can be removed without changing
+/// literal HTML comments or bold-only summary content.
+pub(crate) fn new_reasoning_summary_block(reasoning_parts: Vec<String>) -> Box<dyn HistoryCell> {
+    let (header, content) = split_reasoning_summary_parts(&reasoning_parts);
+    let transcript_only = header.is_empty();
+    Box::new(ReasoningSummaryCell::new(header, content, transcript_only))
+}
+
+/// Split structured reasoning-summary parts into the status header and renderable content.
+pub(crate) fn split_reasoning_summary_parts(reasoning_parts: &[String]) -> (String, String) {
+    let mut leading_empty_part_header = None;
+    let mut content_parts = Vec::with_capacity(reasoning_parts.len());
+
+    for part in reasoning_parts {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+
+        let header_end = part.strip_prefix("**").and_then(|after_open| {
+            after_open
+                .find("**")
+                .and_then(|close| (close > 0).then_some(close + 4))
+        });
+        let body = header_end.map_or(part, |header_end| &part[header_end..]);
+        if body.trim() == "<!-- -->" {
+            if content_parts.is_empty()
+                && leading_empty_part_header.is_none()
+                && let Some(header_end) = header_end
+            {
+                leading_empty_part_header = Some(part[..header_end].to_string());
             }
+            continue;
+        }
+
+        content_parts.push(part);
+    }
+
+    let content = content_parts.join("\n\n");
+    if content.is_empty() {
+        return (leading_empty_part_header.unwrap_or_default(), content);
+    }
+
+    if let Some(after_open) = content.strip_prefix("**")
+        && let Some(close) = after_open.find("**")
+    {
+        let after_close_idx = 2 + close + 2;
+        let after_close = &content[after_close_idx..];
+        if after_close.starts_with('\n') || after_close.starts_with('\r') {
+            return (
+                content[..after_close_idx].to_string(),
+                after_close.to_string(),
+            );
         }
     }
-    Box::new(ReasoningSummaryCell::new(
-        "".to_string(),
-        full_reasoning_buffer.to_string(),
-        true,
-    ))
+
+    (leading_empty_part_header.unwrap_or_default(), content)
 }
 
 #[derive(Debug)]
@@ -3494,9 +3529,9 @@ mod tests {
     }
     #[test]
     fn reasoning_summary_block() {
-        let cell = new_reasoning_summary_block(
+        let cell = new_reasoning_summary_block(vec![
             "**High level reasoning**\n\nDetailed reasoning goes here.".to_string(),
-        );
+        ]);
 
         let rendered_display = render_lines(&cell.display_lines(80));
         assert_eq!(rendered_display, vec!["• Detailed reasoning goes here."]);
@@ -3507,7 +3542,7 @@ mod tests {
 
     #[test]
     fn reasoning_summary_block_returns_reasoning_cell_when_feature_disabled() {
-        let cell = new_reasoning_summary_block("Detailed reasoning goes here.".to_string());
+        let cell = new_reasoning_summary_block(vec!["Detailed reasoning goes here.".to_string()]);
 
         let rendered = render_transcript(cell.as_ref());
         assert_eq!(rendered, vec!["• Detailed reasoning goes here."]);
@@ -3518,9 +3553,9 @@ mod tests {
         let mut config = test_config().await;
         config.model = Some("gpt-3.5-turbo".to_string());
         config.model_supports_reasoning_summaries = Some(true);
-        let cell = new_reasoning_summary_block(
+        let cell = new_reasoning_summary_block(vec![
             "**High level reasoning**\n\nDetailed reasoning goes here.".to_string(),
-        );
+        ]);
 
         let rendered_display = render_lines(&cell.display_lines(80));
         assert_eq!(rendered_display, vec!["• Detailed reasoning goes here."]);
@@ -3529,7 +3564,7 @@ mod tests {
     #[test]
     fn reasoning_summary_block_falls_back_when_header_is_missing() {
         let cell =
-            new_reasoning_summary_block("**High level reasoning without closing".to_string());
+            new_reasoning_summary_block(vec!["**High level reasoning without closing".to_string()]);
 
         let rendered = render_transcript(cell.as_ref());
         assert_eq!(rendered, vec!["• **High level reasoning without closing"]);
@@ -3537,15 +3572,16 @@ mod tests {
 
     #[test]
     fn reasoning_summary_block_falls_back_when_summary_is_missing() {
-        let cell =
-            new_reasoning_summary_block("**High level reasoning without closing**".to_string());
+        let cell = new_reasoning_summary_block(vec![
+            "**High level reasoning without closing**".to_string(),
+        ]);
 
         let rendered = render_transcript(cell.as_ref());
         assert_eq!(rendered, vec!["• High level reasoning without closing"]);
 
-        let cell = new_reasoning_summary_block(
+        let cell = new_reasoning_summary_block(vec![
             "**High level reasoning without closing**\n\n  ".to_string(),
-        );
+        ]);
 
         let rendered = render_transcript(cell.as_ref());
         assert_eq!(rendered, vec!["• High level reasoning without closing"]);
@@ -3553,15 +3589,113 @@ mod tests {
 
     #[test]
     fn reasoning_summary_block_splits_header_and_summary_when_present() {
-        let cell = new_reasoning_summary_block(
+        let cell = new_reasoning_summary_block(vec![
             "**High level plan**\n\nWe should fix the bug next.".to_string(),
-        );
+        ]);
 
         let rendered_display = render_lines(&cell.display_lines(80));
         assert_eq!(rendered_display, vec!["• We should fix the bug next."]);
 
         let rendered_transcript = render_transcript(cell.as_ref());
         assert_eq!(rendered_transcript, vec!["• We should fix the bug next."]);
+    }
+
+    #[test]
+    fn reasoning_summary_block_hides_empty_html_comment_parts() {
+        let cell = new_reasoning_summary_block(vec![
+            "**Checking the first thing**\n\n<!-- -->".to_string(),
+            "**Checking the second thing**\n\n<!-- -->".to_string(),
+        ]);
+
+        assert_eq!(
+            (
+                render_lines(&cell.display_lines(80)),
+                render_transcript(cell.as_ref()),
+            ),
+            (Vec::<String>::new(), Vec::<String>::new()),
+        );
+    }
+
+    #[test]
+    fn reasoning_summary_block_preserves_bold_content_after_empty_html_comment_part() {
+        let cell = new_reasoning_summary_block(vec![
+            "**Status**\n\n<!-- -->".to_string(),
+            "**Important conclusion**".to_string(),
+            "<!-- -->".to_string(),
+        ]);
+
+        assert_eq!(
+            (
+                render_lines(&cell.display_lines(80)),
+                render_transcript(cell.as_ref()),
+            ),
+            (
+                vec!["• Important conclusion".to_string()],
+                vec!["• Important conclusion".to_string()],
+            ),
+        );
+
+        let cell = new_reasoning_summary_block(vec![
+            "**Status**\n\n<!-- -->".to_string(),
+            "**Result:** keep **this**".to_string(),
+        ]);
+
+        assert_eq!(
+            render_transcript(cell.as_ref()),
+            vec!["• Result: keep this"],
+        );
+    }
+
+    #[test]
+    fn reasoning_summary_block_strips_header_after_leading_empty_part() {
+        let cell = new_reasoning_summary_block(vec![
+            "**Status**\n\n<!-- -->".to_string(),
+            "**Checking tests**\n\nTests passed".to_string(),
+        ]);
+
+        assert_eq!(
+            (
+                render_lines(&cell.display_lines(80)),
+                render_transcript(cell.as_ref()),
+            ),
+            (
+                vec!["• Tests passed".to_string()],
+                vec!["• Tests passed".to_string()],
+            ),
+        );
+    }
+
+    #[test]
+    fn reasoning_summary_block_drops_empty_part_after_real_content() {
+        let cell = new_reasoning_summary_block(vec![
+            "**Plan**\n\ndone".to_string(),
+            "**Checking tests**\n\n<!-- -->".to_string(),
+        ]);
+
+        assert_eq!(
+            (
+                render_lines(&cell.display_lines(80)),
+                render_transcript(cell.as_ref()),
+            ),
+            (vec!["• done".to_string()], vec!["• done".to_string()],),
+        );
+    }
+
+    #[test]
+    fn reasoning_summary_block_preserves_literal_html_comment() {
+        let cell =
+            new_reasoning_summary_block(vec!["**Plan**\n\nUse `<!-- -->` in JSX.".to_string()]);
+
+        assert_eq!(
+            (
+                render_lines(&cell.display_lines(80)),
+                render_transcript(cell.as_ref()),
+            ),
+            (
+                vec!["• Use <!-- --> in JSX.".to_string()],
+                vec!["• Use <!-- --> in JSX.".to_string()],
+            ),
+        );
     }
 
     #[test]

@@ -66,7 +66,7 @@ impl ChatWidget {
         self.turn_progress_trace.clear();
         self.pending_separator_progress_trace = None;
         self.set_status_header(String::from("Working"));
-        self.full_reasoning_buffer.clear();
+        self.reasoning_summary_parts.clear();
         self.reasoning_buffer.clear();
         self.refresh_status_line();
         self.request_redraw();

@@ -417,8 +417,8 @@ pub(crate) struct ChatWidget {
     interrupts: InterruptManager,
     // Accumulates the current reasoning block text to extract a header
     reasoning_buffer: String,
-    // Accumulates full reasoning content for transcript-only recording
-    full_reasoning_buffer: String,
+    // Preserves reasoning-summary part boundaries for transcript-only recording.
+    reasoning_summary_parts: Vec<String>,
     // Current status header shown in the status indicator.
     current_status_header: String,
     // Previous status header to restore after a transient stream retry.

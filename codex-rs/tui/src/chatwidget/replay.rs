@@ -22,16 +22,48 @@ impl ChatWidget {
     /// avoid triggering side effects. Event ids are passed as `None` to
     /// distinguish replayed events from live ones.
     pub(super) fn replay_initial_messages(&mut self, events: Vec<EventMsg>) {
+        let mut reasoning_parts = Vec::new();
+
         for msg in events {
-            if matches!(
-                msg,
-                EventMsg::SessionConfigured(_) | EventMsg::ThreadNameUpdated(_)
-            ) {
-                continue;
+            match msg {
+                EventMsg::AgentReasoning(AgentReasoningEvent { text })
+                | EventMsg::AgentReasoningRawContent(AgentReasoningRawContentEvent { text })
+                    if self.reasoning_buffer.is_empty()
+                        && self.reasoning_summary_parts.is_empty() =>
+                {
+                    reasoning_parts.push(text);
+                    continue;
+                }
+                msg => {
+                    self.flush_replayed_reasoning_parts(&mut reasoning_parts);
+                    if matches!(
+                        msg,
+                        EventMsg::SessionConfigured(_) | EventMsg::ThreadNameUpdated(_)
+                    ) {
+                        continue;
+                    }
+                    // `id: None` indicates a synthetic/fake id coming from replay.
+                    self.dispatch_event_msg(None, msg, true);
+                }
             }
-            // `id: None` indicates a synthetic/fake id coming from replay.
-            self.dispatch_event_msg(None, msg, true);
         }
+
+        self.flush_replayed_reasoning_parts(&mut reasoning_parts);
+    }
+
+    fn flush_replayed_reasoning_parts(&mut self, reasoning_parts: &mut Vec<String>) {
+        let reasoning_parts = std::mem::take(reasoning_parts);
+        if reasoning_parts.is_empty() {
+            return;
+        }
+
+        for (index, part) in reasoning_parts.into_iter().enumerate() {
+            if index > 0 {
+                self.on_reasoning_section_break();
+            }
+            self.on_agent_reasoning_delta(part);
+        }
+        self.on_agent_reasoning_final();
     }
 
     pub(crate) fn handle_codex_event_replay(&mut self, event: Event) {
