@@ -4,6 +4,7 @@ pub mod manager;
 pub mod model_info;
 pub mod model_presets;
 pub mod overlay;
+pub mod refresh_worker;
 
 #[cfg(any(test, feature = "test-support"))]
 pub use collaboration_mode_presets::test_builtin_collaboration_mode_presets;

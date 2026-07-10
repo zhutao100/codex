@@ -51,6 +51,7 @@ use codex_core::features::Feature;
 use codex_core::models_manager::manager::RefreshStrategy;
 use codex_core::models_manager::model_presets::HIDE_GPT_5_1_CODEX_MAX_MIGRATION_PROMPT_CONFIG;
 use codex_core::models_manager::model_presets::HIDE_GPT5_1_MIGRATION_PROMPT_CONFIG;
+use codex_core::models_manager::refresh_worker;
 use codex_core::protocol::AskForApproval;
 use codex_core::protocol::Event;
 use codex_core::protocol::EventMsg;
@@ -1160,12 +1161,13 @@ impl App {
             auth_manager.clone(),
             SessionSource::Cli,
         ));
-        let mut model = thread_manager
-            .get_models_manager()
+        let models_manager = thread_manager.get_models_manager();
+        let models_refresh_worker =
+            refresh_worker::spawn(&models_manager, Arc::new(config.clone()));
+        let mut model = models_manager
             .get_default_model(&config.model, &config, RefreshStrategy::Offline)
             .await;
-        let available_models = thread_manager
-            .get_models_manager()
+        let available_models = models_manager
             .list_models(&config, RefreshStrategy::Offline)
             .await;
         let exit_info = handle_model_migration_prompt_if_needed(
@@ -1456,6 +1458,7 @@ impl App {
                 AppRunControl::Exit(reason) => break reason,
             }
         };
+        drop(models_refresh_worker);
         if let Some(menubar_bridge) = app.menubar_bridge.take() {
             menubar_bridge.shutdown().await;
         }
