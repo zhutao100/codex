@@ -236,8 +236,8 @@ impl ChatWidget {
     /// This does not clear MCP startup tracking, because MCP startup can overlap with turn cleanup
     /// and should continue to drive the bottom-pane running indicator while it is in progress.
     pub(super) fn finalize_turn(&mut self) {
-        // Ensure any spinner is replaced by a red ✗ and flushed into history.
-        self.finalize_active_cell_as_failed();
+        // Ensure every started command is finalized even if cancellation prevented an end event.
+        self.finalize_turn_cells_as_failed();
         // Reset running state and clear streaming buffers.
         self.user_turn_pending_start = false;
         self.agent_turn_running = false;
@@ -246,8 +246,6 @@ impl ChatWidget {
         self.running_turn_reasoning_effort = None;
         self.update_task_running_state();
         self.bottom_pane.clear_progress_trace();
-        self.running_commands.clear();
-        self.suppressed_exec_calls.clear();
         self.last_unified_wait = None;
         self.unified_exec_wait_streak = None;
         self.clear_unified_exec_processes();

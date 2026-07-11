@@ -38,7 +38,9 @@ use codex_core::protocol::EventMsg;
 use codex_core::protocol::ExecApprovalRequestEvent;
 use codex_core::protocol::ExecCommandBeginEvent;
 use codex_core::protocol::ExecCommandEndEvent;
+use codex_core::protocol::ExecCommandOutputDeltaEvent;
 use codex_core::protocol::ExecCommandSource;
+use codex_core::protocol::ExecOutputStream;
 use codex_core::protocol::ExecPolicyAmendment;
 use codex_core::protocol::ExitedReviewModeEvent;
 use codex_core::protocol::FileChange;
@@ -1944,6 +1946,17 @@ fn begin_exec(chat: &mut ChatWidget, call_id: &str, raw_cmd: &str) -> ExecComman
     begin_exec_with_source(chat, call_id, raw_cmd, ExecCommandSource::Agent)
 }
 
+fn exec_output_delta(chat: &mut ChatWidget, call_id: &str, chunk: &str) {
+    chat.handle_codex_event(Event {
+        id: call_id.to_string(),
+        msg: EventMsg::ExecCommandOutputDelta(ExecCommandOutputDeltaEvent {
+            call_id: call_id.to_string(),
+            stream: ExecOutputStream::Stdout,
+            chunk: chunk.as_bytes().to_vec(),
+        }),
+    });
+}
+
 fn end_exec(
     chat: &mut ChatWidget,
     begin_event: ExecCommandBeginEvent,
@@ -2619,6 +2632,233 @@ async fn exec_end_without_begin_uses_event_command() {
     assert!(
         !blob.contains("call-orphan"),
         "call id should not be rendered when event has the command: {blob:?}"
+    );
+}
+
+#[tokio::test]
+async fn exec_end_without_begin_keeps_unrelated_running_exploring_cell() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.on_task_started(Some("turn-1".to_string()));
+
+    begin_exec(&mut chat, "call-exploring", "cat /dev/null");
+    assert!(drain_insert_history(&mut rx).is_empty());
+
+    let orphan =
+        begin_unified_exec_startup(&mut chat, "call-orphan", "proc-1", "echo repro-marker");
+    assert!(drain_insert_history(&mut rx).is_empty());
+    end_exec(&mut chat, orphan, "repro-marker\n", "", 0);
+
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(cells.len(), 1, "only the orphan end should be inserted");
+    let orphan_rendered = lines_to_single_string(&cells[0]);
+    assert!(
+        orphan_rendered.contains("Ran echo repro-marker"),
+        "{orphan_rendered}"
+    );
+    let active = active_blob(&chat);
+    assert!(active.contains("Exploring"), "{active}");
+    assert!(active.contains("Read null"), "{active}");
+    assert!(!active.contains("echo repro-marker"), "{active}");
+}
+
+#[tokio::test]
+async fn exec_end_without_begin_flushes_completed_exploring_cell_first() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.on_task_started(Some("turn-1".to_string()));
+
+    let list = begin_exec(&mut chat, "call-list", "ls -la");
+    end_exec(&mut chat, list, "", "", 0);
+    assert!(drain_insert_history(&mut rx).is_empty());
+
+    let orphan = begin_unified_exec_startup(&mut chat, "call-after", "proc-1", "echo after");
+    end_exec(&mut chat, orphan, "after\n", "", 0);
+
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(cells.len(), 2);
+    assert!(lines_to_single_string(&cells[0]).contains("Explored"));
+    assert!(lines_to_single_string(&cells[0]).contains("List ls -la"));
+    assert!(lines_to_single_string(&cells[1]).contains("Ran echo after"));
+    assert!(chat.active_cell.is_none());
+}
+
+#[tokio::test]
+async fn overlapping_exploring_exec_end_stays_in_active_group() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    let list = begin_exec(&mut chat, "call-list", "ls -la");
+    let read = begin_exec(&mut chat, "call-read", "cat foo.txt");
+    assert!(drain_insert_history(&mut rx).is_empty());
+
+    end_exec(&mut chat, list, "foo.txt\n", "", 0);
+
+    assert!(drain_insert_history(&mut rx).is_empty());
+    let active = active_blob(&chat);
+    assert!(active.contains("List ls -la"), "{active}");
+    assert!(active.contains("Read foo.txt"), "{active}");
+    assert!(active.contains("Exploring"), "{active}");
+
+    end_exec(&mut chat, read, "hello\n", "", 0);
+}
+
+#[tokio::test]
+async fn post_turn_review_parallel_exec_cascade_renders_every_completed_command() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.handle_codex_event(Event {
+        id: "review-start".into(),
+        msg: EventMsg::EnteredReviewMode(ReviewRequest {
+            target: ReviewTarget::Custom {
+                instructions: "Review the last completed Codex turn.".to_string(),
+            },
+            user_facing_hint: Some("completed turn".to_string()),
+        }),
+    });
+    let mut runtime_context = make_delegate_runtime_context("review-delegate", None);
+    runtime_context.task_kind = Some("post_turn_completion_review".to_string());
+    let delegate_session_id = runtime_context.session_id;
+    chat.handle_codex_event(Event {
+        id: "runtime-active".into(),
+        msg: EventMsg::RuntimeContextActivated(RuntimeContextActivatedEvent {
+            snapshot: runtime_context,
+        }),
+    });
+    chat.handle_codex_event(Event {
+        id: "delegate-turn".into(),
+        msg: EventMsg::TurnStarted(TurnStartedEvent {
+            model_context_window: None,
+            collaboration_mode_kind: ModeKind::Default,
+        }),
+    });
+
+    let read_skill = begin_exec(&mut chat, "call-read-skill", "cat /tmp/SKILL.md");
+    let read_agents = begin_exec(
+        &mut chat,
+        "call-read-agents",
+        "cat /tmp/AGENTS_structured_search.md",
+    );
+    let status = begin_exec(&mut chat, "call-status", "git status --short --branch");
+    let log = begin_exec(&mut chat, "call-log", "git log --oneline -n 3");
+
+    end_exec(&mut chat, read_skill, "skill instructions\n", "", 0);
+    end_exec(&mut chat, read_agents, "search instructions\n", "", 0);
+    end_exec(&mut chat, status, "## main\n", "", 0);
+    end_exec(&mut chat, log, "abc123 test commit\n", "", 0);
+
+    chat.handle_codex_event(Event {
+        id: "runtime-done".into(),
+        msg: EventMsg::RuntimeContextDeactivated(RuntimeContextDeactivatedEvent {
+            scope_id: "review-delegate".to_string(),
+            session_id: delegate_session_id,
+        }),
+    });
+    chat.handle_codex_event(Event {
+        id: "review-end".into(),
+        msg: EventMsg::ExitedReviewMode(ExitedReviewModeEvent {
+            review_output: None,
+            post_turn_completion_review_output: Some(PostTurnCompletionReviewOutputEvent {
+                evaluation: "No follow-up needed.".to_string(),
+                fix_actions_advised: false,
+            }),
+        }),
+    });
+    chat.handle_codex_event(Event {
+        id: "review-turn".into(),
+        msg: EventMsg::TurnComplete(TurnCompleteEvent {
+            last_agent_message: None,
+        }),
+    });
+
+    let rendered_cells = drain_insert_history(&mut rx)
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .map(|cell| cell.trim_start_matches('\n').to_string())
+        .collect::<Vec<_>>();
+    let exec_cells = rendered_cells
+        .iter()
+        .filter(|cell| cell.starts_with("• Explored") || cell.starts_with("• Ran git"))
+        .cloned()
+        .collect::<Vec<_>>();
+    let rendered = rendered_cells.concat();
+
+    assert_eq!(
+        exec_cells,
+        vec![
+            "• Explored\n  └ Read SKILL.md, AGENTS_structured_search.md\n".to_string(),
+            "• Ran git status --short --branch\n  └ ## main\n".to_string(),
+            "• Ran git log --oneline -n 3\n  └ abc123 test commit\n".to_string(),
+        ]
+    );
+    assert!(rendered.contains("No follow-up needed."), "{rendered}");
+    assert!(
+        rendered.contains("<< Code review finished >>"),
+        "{rendered}"
+    );
+}
+
+#[tokio::test]
+async fn streamed_parallel_exec_completions_render_once_out_of_order() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    let status = begin_exec(&mut chat, "call-status", "git status --short --branch");
+    exec_output_delta(&mut chat, "call-status", "partial status\n");
+    assert_eq!(
+        active_blob(&chat),
+        "• Running git status --short --branch\n  └ partial status\n"
+    );
+    let log = begin_exec(&mut chat, "call-log", "git log --oneline -n 3");
+
+    end_exec(&mut chat, log, "abc123 test commit\n", "", 0);
+    end_exec(&mut chat, status, "## main\n", "", 0);
+
+    let exec_cells = drain_insert_history(&mut rx)
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .map(|cell| cell.trim_start_matches('\n').to_string())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        exec_cells,
+        vec![
+            "• Ran git log --oneline -n 3\n  └ abc123 test commit\n".to_string(),
+            "• Ran git status --short --branch\n  └ ## main\n".to_string(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn interrupt_parallel_exec_cascade_materializes_every_started_command() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    begin_exec(&mut chat, "call-status", "git status --short --branch");
+    exec_output_delta(&mut chat, "call-status", "partial status\n");
+    begin_exec(&mut chat, "call-log", "git log --oneline -n 3");
+    exec_output_delta(&mut chat, "call-log", "partial log\n");
+    begin_exec(&mut chat, "call-pwd", "pwd");
+
+    chat.handle_codex_event(Event {
+        id: "turn-1".into(),
+        msg: EventMsg::TurnAborted(codex_core::protocol::TurnAbortedEvent {
+            reason: TurnAbortReason::Interrupted,
+        }),
+    });
+
+    let command_cells = drain_insert_history(&mut rx)
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .map(|cell| cell.trim_start_matches('\n').to_string())
+        .filter(|cell| {
+            cell.contains("git status --short --branch")
+                || cell.contains("git log --oneline -n 3")
+                || cell.contains("pwd")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        command_cells,
+        vec![
+            "• Ran git status --short --branch\n  └ partial status\n".to_string(),
+            "• Ran git log --oneline -n 3\n  └ partial log\n".to_string(),
+            "• Ran pwd\n  └ (no output)\n".to_string(),
+        ]
     );
 }
 
@@ -5268,11 +5508,12 @@ async fn submitted_input_queues_while_only_user_shell_is_running() {
     chat.bottom_pane.set_task_running(true);
     chat.running_commands.insert(
         "shell-1".to_string(),
-        RunningCommand {
-            command: vec!["echo".to_string(), "hi".to_string()],
-            parsed_cmd: Vec::new(),
-            source: ExecCommandSource::UserShell,
-        },
+        RunningCommand::new(
+            vec!["echo".to_string(), "hi".to_string()],
+            Vec::new(),
+            ExecCommandSource::UserShell,
+            None,
+        ),
     );
     chat.bottom_pane
         .set_composer_text("follow up".to_string(), Vec::new(), Vec::new());
@@ -5298,11 +5539,12 @@ async fn user_shell_prompt_still_runs_while_user_shell_is_running() {
     chat.bottom_pane.set_task_running(true);
     chat.running_commands.insert(
         "shell-1".to_string(),
-        RunningCommand {
-            command: vec!["echo".to_string(), "hi".to_string()],
-            parsed_cmd: Vec::new(),
-            source: ExecCommandSource::UserShell,
-        },
+        RunningCommand::new(
+            vec!["echo".to_string(), "hi".to_string()],
+            Vec::new(),
+            ExecCommandSource::UserShell,
+            None,
+        ),
     );
     chat.bottom_pane
         .set_composer_text("!pwd".to_string(), Vec::new(), Vec::new());

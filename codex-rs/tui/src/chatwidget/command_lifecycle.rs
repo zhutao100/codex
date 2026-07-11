@@ -30,18 +30,18 @@ impl ChatWidget {
 
     pub(super) fn on_exec_command_output_delta(&mut self, ev: ExecCommandOutputDeltaEvent) {
         self.track_unified_exec_output_chunk(&ev.call_id, &ev.chunk);
+        let chunk = std::str::from_utf8(&ev.chunk).unwrap_or("");
 
-        let Some(cell) = self
+        let appended_to_active = self
             .active_cell
             .as_mut()
             .and_then(|c| c.as_any_mut().downcast_mut::<ExecCell>())
-        else {
-            return;
-        };
-
-        if cell.append_output(&ev.call_id, std::str::from_utf8(&ev.chunk).unwrap_or("")) {
+            .is_some_and(|cell| cell.append_output(&ev.call_id, chunk));
+        if appended_to_active {
             self.bump_active_cell_revision();
             self.request_redraw();
+        } else if let Some(command) = self.running_commands.get_mut(&ev.call_id) {
+            command.append_output(chunk);
         }
     }
 
@@ -193,59 +193,151 @@ impl ChatWidget {
         self.sync_unified_exec_footer();
     }
 
+    pub(super) fn finalize_turn_cells_as_failed(&mut self) {
+        let active_call_ids = self
+            .active_cell
+            .as_ref()
+            .and_then(|cell| cell.as_any().downcast_ref::<ExecCell>())
+            .map(|cell| {
+                cell.iter_calls()
+                    .map(|call| call.call_id.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for call_id in active_call_ids {
+            self.running_commands.remove(&call_id);
+        }
+        for call_id in std::mem::take(&mut self.suppressed_exec_calls) {
+            self.running_commands.remove(&call_id);
+        }
+
+        self.finalize_active_cell_as_failed();
+
+        let mut pending_commands = std::mem::take(&mut self.running_commands)
+            .into_iter()
+            .collect::<Vec<_>>();
+        pending_commands.sort_by(|(left_id, left), (right_id, right)| {
+            left.started_at
+                .cmp(&right.started_at)
+                .then_with(|| left_id.cmp(right_id))
+        });
+        for (call_id, command) in pending_commands {
+            let mut cell = new_active_exec_command(
+                call_id.clone(),
+                command.command,
+                command.parsed_cmd,
+                command.source,
+                command.interaction_input,
+                self.config.animations,
+            );
+            cell.append_output(&call_id, &command.aggregated_output);
+            cell.mark_failed();
+            self.add_to_history(cell);
+        }
+    }
+
+    /// Finalizes an exec call without attaching its output to an unrelated active exec cell.
     pub(crate) fn handle_exec_end_now(&mut self, ev: ExecCommandEndEvent) {
+        enum ExecEndTarget {
+            ActiveTracked,
+            OrphanHistoryWhileActiveExec,
+            NewCell,
+        }
+
+        let call_id = ev.call_id.clone();
         let running = self.running_commands.remove(&ev.call_id);
         if self.suppressed_exec_calls.remove(&ev.call_id) {
             return;
         }
-        let (command, parsed, source) = match running {
-            Some(rc) => (rc.command, rc.parsed_cmd, rc.source),
-            None => (ev.command.clone(), ev.parsed_cmd.clone(), ev.source),
+        let (command, parsed, source, interaction_input) = match running {
+            Some(rc) => (rc.command, rc.parsed_cmd, rc.source, rc.interaction_input),
+            None => (
+                ev.command.clone(),
+                ev.parsed_cmd.clone(),
+                ev.source,
+                ev.interaction_input.clone(),
+            ),
         };
         let is_unified_exec_interaction =
             matches!(source, ExecCommandSource::UnifiedExecInteraction);
-
-        let needs_new = self
-            .active_cell
-            .as_ref()
-            .map(|cell| cell.as_any().downcast_ref::<ExecCell>().is_none())
-            .unwrap_or(true);
-        if needs_new {
-            self.flush_active_cell();
-            self.active_cell = Some(Box::new(new_active_exec_command(
-                ev.call_id.clone(),
-                command,
-                parsed,
-                source,
-                ev.interaction_input.clone(),
-                self.config.animations,
-            )));
-        }
-
-        if let Some(cell) = self
-            .active_cell
-            .as_mut()
-            .and_then(|c| c.as_any_mut().downcast_mut::<ExecCell>())
-        {
-            let output = if is_unified_exec_interaction {
-                CommandOutput {
-                    exit_code: ev.exit_code,
-                    formatted_output: String::new(),
-                    aggregated_output: String::new(),
+        let end_target = match self.active_cell.as_ref() {
+            Some(cell) => match cell.as_any().downcast_ref::<ExecCell>() {
+                Some(exec_cell) if exec_cell.iter_calls().any(|call| call.call_id == call_id) => {
+                    ExecEndTarget::ActiveTracked
                 }
-            } else {
-                CommandOutput {
-                    exit_code: ev.exit_code,
-                    formatted_output: ev.formatted_output.clone(),
-                    aggregated_output: ev.aggregated_output.clone(),
+                Some(exec_cell) if exec_cell.is_active() => {
+                    ExecEndTarget::OrphanHistoryWhileActiveExec
                 }
-            };
-            cell.complete_call(&ev.call_id, output, ev.duration);
-            if cell.should_flush() {
-                self.flush_active_cell();
-            } else {
-                self.bump_active_cell_revision();
+                Some(_) | None => ExecEndTarget::NewCell,
+            },
+            None => ExecEndTarget::NewCell,
+        };
+        let output = if is_unified_exec_interaction {
+            CommandOutput {
+                exit_code: ev.exit_code,
+                formatted_output: String::new(),
+                aggregated_output: String::new(),
+            }
+        } else {
+            CommandOutput {
+                exit_code: ev.exit_code,
+                formatted_output: ev.formatted_output.clone(),
+                aggregated_output: ev.aggregated_output.clone(),
+            }
+        };
+
+        match end_target {
+            ExecEndTarget::ActiveTracked => {
+                if let Some(cell) = self
+                    .active_cell
+                    .as_mut()
+                    .and_then(|c| c.as_any_mut().downcast_mut::<ExecCell>())
+                {
+                    let completed = cell.complete_call(&call_id, output, ev.duration);
+                    debug_assert!(completed, "active exec cell should contain {call_id}");
+                    if cell.should_flush() {
+                        self.flush_active_cell();
+                    } else {
+                        self.bump_active_cell_revision();
+                        self.request_redraw();
+                    }
+                }
+            }
+            ExecEndTarget::OrphanHistoryWhileActiveExec => {
+                let mut orphan = new_active_exec_command(
+                    call_id.clone(),
+                    command,
+                    parsed,
+                    source,
+                    interaction_input,
+                    self.config.animations,
+                );
+                let completed = orphan.complete_call(&call_id, output, ev.duration);
+                debug_assert!(completed, "new orphan exec cell should contain {call_id}");
+                self.needs_final_message_separator = true;
+                self.app_event_tx
+                    .send(AppEvent::InsertHistoryCell(Box::new(orphan)));
                 self.request_redraw();
+            }
+            ExecEndTarget::NewCell => {
+                self.flush_active_cell();
+                let mut cell = new_active_exec_command(
+                    call_id.clone(),
+                    command,
+                    parsed,
+                    source,
+                    interaction_input,
+                    self.config.animations,
+                );
+                let completed = cell.complete_call(&call_id, output, ev.duration);
+                debug_assert!(completed, "new exec cell should contain {call_id}");
+                if cell.should_flush() {
+                    self.add_to_history(cell);
+                } else {
+                    self.active_cell = Some(Box::new(cell));
+                    self.bump_active_cell_revision();
+                    self.request_redraw();
+                }
             }
         }
         // Mark that actual work was done (command executed)
@@ -257,11 +349,12 @@ impl ChatWidget {
         self.bottom_pane.ensure_status_indicator();
         self.running_commands.insert(
             ev.call_id.clone(),
-            RunningCommand {
-                command: ev.command.clone(),
-                parsed_cmd: ev.parsed_cmd.clone(),
-                source: ev.source,
-            },
+            RunningCommand::new(
+                ev.command.clone(),
+                ev.parsed_cmd.clone(),
+                ev.source,
+                ev.interaction_input.clone(),
+            ),
         );
         let is_wait_interaction = matches!(ev.source, ExecCommandSource::UnifiedExecInteraction)
             && ev
@@ -285,6 +378,13 @@ impl ChatWidget {
             return;
         }
         let interaction_input = ev.interaction_input.clone();
+        // Keep an incompatible running cell mutable. The parallel call remains in
+        // `running_commands` and renders as a standalone cell when it completes.
+        let active_exec_is_running = self
+            .active_cell
+            .as_ref()
+            .and_then(|cell| cell.as_any().downcast_ref::<ExecCell>())
+            .is_some_and(ExecCell::is_active);
         if let Some(cell) = self
             .active_cell
             .as_mut()
@@ -299,7 +399,7 @@ impl ChatWidget {
         {
             *cell = new_exec;
             self.bump_active_cell_revision();
-        } else {
+        } else if !active_exec_is_running {
             self.flush_active_cell();
 
             self.active_cell = Some(Box::new(new_active_exec_command(
