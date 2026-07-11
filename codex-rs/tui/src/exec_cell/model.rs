@@ -185,6 +185,8 @@ impl ExecCell {
         self.group.calls.iter().all(Self::is_exploring_call)
     }
 
+    // Output deltas populate `output` before completion; `duration` is set only when a call
+    // finishes or is failed during cleanup.
     pub(crate) fn is_active(&self) -> bool {
         self.group.calls.iter().any(|c| c.duration.is_none())
     }
