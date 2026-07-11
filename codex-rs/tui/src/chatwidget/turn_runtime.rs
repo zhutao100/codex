@@ -356,8 +356,8 @@ impl ChatWidget {
         // Drop preview-only stream tail content on any termination path before
         // failed-cell finalization, so transient tail cells are never persisted.
         self.clear_active_stream_tail();
-        // Ensure any spinner is replaced by a red ✗ and flushed into history.
-        self.finalize_active_cell_as_failed();
+        // Ensure every started command is finalized even if cancellation prevented an end event.
+        self.finalize_turn_cells_as_failed();
         // Turn-scoped hook rows are transient live state; once the turn is over,
         // do not leave an orphaned running row behind if no matching completion
         // event arrived before cancellation.
@@ -373,8 +373,6 @@ impl ChatWidget {
             crate::terminal_program_status::ProgramStatus::Error
         };
         self.update_task_running_state();
-        self.running_commands.clear();
-        self.suppressed_exec_calls.clear();
         self.last_unified_wait = None;
         self.unified_exec_wait_streak = None;
         self.adaptive_chunking.reset();
