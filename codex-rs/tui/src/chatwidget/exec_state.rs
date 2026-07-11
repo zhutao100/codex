@@ -1,11 +1,38 @@
 //! Execution state shared by command lifecycle handlers.
 
+use std::time::Instant;
+
 use super::*;
 
 pub(super) struct RunningCommand {
     pub(super) command: Vec<String>,
     pub(super) parsed_cmd: Vec<ParsedCommand>,
     pub(super) source: ExecCommandSource,
+    pub(super) interaction_input: Option<String>,
+    pub(super) started_at: Instant,
+    pub(super) aggregated_output: String,
+}
+
+impl RunningCommand {
+    pub(super) fn new(
+        command: Vec<String>,
+        parsed_cmd: Vec<ParsedCommand>,
+        source: ExecCommandSource,
+        interaction_input: Option<String>,
+    ) -> Self {
+        Self {
+            command,
+            parsed_cmd,
+            source,
+            interaction_input,
+            started_at: Instant::now(),
+            aggregated_output: String::new(),
+        }
+    }
+
+    pub(super) fn append_output(&mut self, chunk: &str) {
+        self.aggregated_output.push_str(chunk);
+    }
 }
 
 pub(super) struct UnifiedExecProcessSummary {

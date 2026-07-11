@@ -231,20 +231,22 @@ impl HistoryCell for ExecCell {
                         push_owned_lines(&wrapped, &mut lines);
                     }
                 }
-                let duration = call
-                    .duration
-                    .map(format_duration)
-                    .unwrap_or_else(|| "unknown".to_string());
-                let mut result: Line = if output.exit_code == 0 {
-                    Line::from("✓".green().bold())
-                } else {
-                    Line::from(vec![
-                        "✗".red().bold(),
-                        format!(" ({})", output.exit_code).into(),
-                    ])
-                };
-                result.push_span(format!(" • {duration}").dim());
-                lines.push(result);
+                if call.start_time.is_none() {
+                    let duration = call
+                        .duration
+                        .map(format_duration)
+                        .unwrap_or_else(|| "unknown".to_string());
+                    let mut result: Line = if output.exit_code == 0 {
+                        Line::from("✓".green().bold())
+                    } else {
+                        Line::from(vec![
+                            "✗".red().bold(),
+                            format!(" ({})", output.exit_code).into(),
+                        ])
+                    };
+                    result.push_span(format!(" • {duration}").dim());
+                    lines.push(result);
+                }
             }
         }
         lines
@@ -360,7 +362,11 @@ impl ExecCell {
             panic!("Expected exactly one call in a command display cell");
         };
         let layout = EXEC_DISPLAY_LAYOUT;
-        let success = call.output.as_ref().map(|o| o.exit_code == 0);
+        let success = if call.start_time.is_some() {
+            None
+        } else {
+            call.output.as_ref().map(|output| output.exit_code == 0)
+        };
         let bullet = match success {
             Some(true) => "•".green().bold(),
             Some(false) => "•".red().bold(),
@@ -612,6 +618,41 @@ const EXEC_DISPLAY_LAYOUT: ExecDisplayLayout = ExecDisplayLayout::new(
 mod tests {
     use super::*;
     use codex_core::protocol::ExecCommandSource;
+    use pretty_assertions::assert_eq;
+
+    fn render_line_text(line: &Line<'static>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
+    }
+
+    #[test]
+    fn streamed_output_keeps_active_indicators() {
+        let call = ExecCall {
+            call_id: "call-id".to_string(),
+            command: vec!["bash".into(), "-lc".into(), "echo partial".into()],
+            parsed: Vec::new(),
+            output: None,
+            source: ExecCommandSource::Agent,
+            start_time: Some(Instant::now()),
+            duration: None,
+            interaction_input: None,
+        };
+        let mut cell = ExecCell::new(call, false);
+        assert!(cell.append_output("call-id", "partial\n"));
+
+        let display = cell.command_display_lines(80);
+        assert_eq!(render_line_text(&display[0]), "• Running echo partial");
+        assert_eq!(display[0].spans[0], "•".dim());
+        assert_eq!(
+            cell.transcript_lines(80)
+                .iter()
+                .map(render_line_text)
+                .collect::<Vec<_>>(),
+            vec!["$ echo partial".to_string()]
+        );
+    }
 
     #[test]
     fn user_shell_output_is_limited_by_screen_lines() {
