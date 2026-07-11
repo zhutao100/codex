@@ -6,8 +6,8 @@
 //! The UI has both committed transcript cells (finalized `HistoryCell`s) and an in-flight active
 //! cell (`ChatWidget.active_cell`) that can mutate in place while streaming (often representing a
 //! coalesced exec/tool group). The transcript overlay (`Ctrl+T`) renders committed cells plus a
-//! cached, render-only live tail derived from the current active cell so in-flight tool calls are
-//! visible immediately.
+//! cached, render-only live tail derived from active and transient cells so in-flight tool calls and
+//! pending account activity are visible immediately.
 //!
 //! The transcript overlay is kept in sync by `App::overlay_forward_event`, which syncs a live tail
 //! during draws using `active_cell_transcript_key()` and `active_cell_transcript_lines()`. The
@@ -204,6 +204,7 @@ use crate::get_git_diff::GitDiffResult;
 use crate::get_git_diff::get_git_diff;
 use crate::history_cell;
 use crate::history_cell::AgentMessageCell;
+use crate::history_cell::CompositeHistoryCell;
 use crate::history_cell::HistoryCell;
 use crate::history_cell::McpToolCallCell;
 use crate::history_cell::PlainHistoryCell;
@@ -243,6 +244,8 @@ mod protocol_requests;
 mod rate_limits;
 pub(crate) use self::rate_limits::get_limits_duration;
 use self::rate_limits::*;
+mod tokens;
+pub(crate) use self::tokens::TokenActivityView;
 mod rendering;
 mod replay;
 mod review_popups;
@@ -380,6 +383,9 @@ pub(crate) struct ChatWidget {
     rate_limit_warnings: RateLimitWarningState,
     rate_limit_switch_prompt: RateLimitSwitchPromptState,
     rate_limit_poller: Option<JoinHandle<()>>,
+    refreshing_token_activity_output: Option<tokens::PendingTokenActivityOutput>,
+    completed_token_activity_output: Option<CompositeHistoryCell>,
+    pending_usage_history_barriers: HashSet<u64>,
     adaptive_chunking: AdaptiveChunkingPolicy,
     // Stream lifecycle controller
     stream_controller: Option<StreamController>,
@@ -617,7 +623,7 @@ impl ChatWidget {
     fn flush_active_cell(&mut self) {
         if let Some(active) = self.active_cell.take() {
             self.needs_final_message_separator = true;
-            self.app_event_tx.send(AppEvent::InsertHistoryCell(active));
+            self.queue_history_cell_with_usage_barrier(active);
         }
     }
 
@@ -626,6 +632,14 @@ impl ChatWidget {
     }
 
     fn add_boxed_history(&mut self, cell: Box<dyn HistoryCell>) {
+        self.add_boxed_history_inner(cell, false);
+    }
+
+    fn add_boxed_history_with_usage_barrier(&mut self, cell: Box<dyn HistoryCell>) {
+        self.add_boxed_history_inner(cell, true);
+    }
+
+    fn add_boxed_history_inner(&mut self, cell: Box<dyn HistoryCell>, usage_barrier: bool) {
         // Keep the placeholder session header as the active cell until real session info arrives,
         // so we can merge headers instead of committing a duplicate box to history.
         let keep_placeholder_header_active = !self.is_session_configured()
@@ -639,7 +653,11 @@ impl ChatWidget {
             self.flush_active_cell();
             self.needs_final_message_separator = true;
         }
-        self.app_event_tx.send(AppEvent::InsertHistoryCell(cell));
+        if usage_barrier || !self.pending_usage_history_barriers.is_empty() {
+            self.queue_history_cell_with_usage_barrier(cell);
+        } else {
+            self.app_event_tx.send(AppEvent::InsertHistoryCell(cell));
+        }
     }
 
     fn on_committed_user_message(&mut self, event: UserMessageEvent, from_replay: bool) {
@@ -926,34 +944,46 @@ impl ChatWidget {
         self.current_rollout_path.clone()
     }
 
-    /// Returns a cache key describing the current in-flight active cell for the transcript overlay.
+    /// Returns a cache key describing the current in-flight cells for the transcript overlay.
     ///
     /// `Ctrl+T` renders committed transcript cells plus a render-only live tail derived from the
-    /// current active cell, and the overlay caches that tail; this key is what it uses to decide
-    /// whether it must recompute. When there is no active cell, this returns `None` so the overlay
-    /// can drop the tail entirely.
+    /// current active and token-activity cells, and the overlay caches that tail; this key is what
+    /// it uses to decide whether it must recompute. When there are no live cells, this returns
+    /// `None` so the overlay can drop the tail entirely.
     ///
-    /// If callers mutate the active cell's transcript output without bumping the revision (or
-    /// providing an appropriate animation tick), the overlay will keep showing a stale tail while
-    /// the main viewport updates.
+    /// If callers mutate a live cell's transcript output without bumping the revision (or providing
+    /// an appropriate animation tick), the overlay will keep showing a stale tail while the main
+    /// viewport updates.
     pub(crate) fn active_cell_transcript_key(&self) -> Option<ActiveCellTranscriptKey> {
-        let cell = self.active_cell.as_ref()?;
+        let cell = self.active_cell.as_ref();
+        if cell.is_none() && self.pending_token_activity_output().is_none() {
+            return None;
+        }
         Some(ActiveCellTranscriptKey {
             revision: self.active_cell_revision,
-            is_stream_continuation: cell.is_stream_continuation(),
-            animation_tick: cell.transcript_animation_tick(),
+            is_stream_continuation: cell.is_some_and(|cell| cell.is_stream_continuation()),
+            animation_tick: cell.and_then(|cell| cell.transcript_animation_tick()),
         })
     }
 
-    /// Returns the active cell's transcript lines for a given terminal width.
+    /// Returns the active and token-activity cells' transcript lines for a terminal width.
     ///
     /// This is a convenience for the transcript overlay live-tail path, and it intentionally
     /// filters out empty results so the overlay can treat "nothing to render" as "no tail". Callers
     /// should pass the same width the overlay uses; using a different width will cause wrapping
     /// mismatches between the main viewport and the transcript overlay.
     pub(crate) fn active_cell_transcript_lines(&self, width: u16) -> Option<Vec<Line<'static>>> {
-        let cell = self.active_cell.as_ref()?;
-        let lines = cell.transcript_lines(width);
+        let mut lines = Vec::new();
+        if let Some(cell) = self.active_cell.as_ref() {
+            lines.extend(cell.transcript_lines(width));
+        }
+        if let Some(cell) = self.pending_token_activity_output() {
+            let token_activity_lines = cell.transcript_lines(width);
+            if !token_activity_lines.is_empty() && !lines.is_empty() {
+                lines.push(Line::default());
+            }
+            lines.extend(token_activity_lines);
+        }
         (!lines.is_empty()).then_some(lines)
     }
 

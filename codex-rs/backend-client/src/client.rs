@@ -4,6 +4,7 @@ use crate::types::CreditStatusDetails;
 use crate::types::PaginatedListTaskListItem;
 use crate::types::RateLimitStatusPayload;
 use crate::types::RateLimitWindowSnapshot;
+use crate::types::TokenUsageProfile;
 use crate::types::TurnAttemptsSiblingTurnsResponse;
 use anyhow::Result;
 use codex_core::auth::CodexAuth;
@@ -168,6 +169,20 @@ impl Client {
         let (body, ct) = self.exec_request(req, "GET", &url).await?;
         let payload: RateLimitStatusPayload = self.decode_json(&url, &ct, &body)?;
         Ok(Self::rate_limit_snapshot_from_payload(payload))
+    }
+
+    pub async fn get_token_usage_profile(&self) -> Result<TokenUsageProfile> {
+        let url = self.token_usage_profile_url();
+        let req = self.http.get(&url).headers(self.headers());
+        let (body, ct) = self.exec_request(req, "GET", &url).await?;
+        self.decode_json(&url, &ct, &body)
+    }
+
+    fn token_usage_profile_url(&self) -> String {
+        match self.path_style {
+            PathStyle::CodexApi => format!("{}/api/codex/profiles/me", self.base_url),
+            PathStyle::ChatGptApi => format!("{}/wham/profiles/me", self.base_url),
+        }
     }
 
     pub async fn list_tasks(
@@ -380,8 +395,15 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::Client;
+    use super::PathStyle;
     use codex_protocol::account::PlanType as AccountPlanType;
     use pretty_assertions::assert_eq;
+
+    fn test_client(base_url: &str, path_style: PathStyle) -> Client {
+        Client::new(base_url)
+            .expect("test client")
+            .with_path_style(path_style)
+    }
 
     #[test]
     fn map_plan_type_supports_prolite_and_unknown() {
@@ -392,6 +414,21 @@ mod tests {
         assert_eq!(
             Client::map_plan_type(crate::types::PlanType::Unknown),
             AccountPlanType::Unknown
+        );
+    }
+
+    #[test]
+    fn token_usage_profile_uses_expected_paths() {
+        let codex_client = test_client("https://example.test", PathStyle::CodexApi);
+        assert_eq!(
+            codex_client.token_usage_profile_url(),
+            "https://example.test/api/codex/profiles/me"
+        );
+
+        let chatgpt_client = test_client("https://chatgpt.com/backend-api", PathStyle::ChatGptApi);
+        assert_eq!(
+            chatgpt_client.token_usage_profile_url(),
+            "https://chatgpt.com/backend-api/wham/profiles/me"
         );
     }
 }

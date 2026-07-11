@@ -15,7 +15,7 @@ impl ChatWidget {
         if let Some(mut controller) = self.stream_controller.take()
             && let Some(cell) = controller.finalize()
         {
-            self.add_boxed_history(cell);
+            self.add_boxed_history_with_usage_barrier(cell);
         }
         self.adaptive_chunking.reset();
     }
@@ -86,7 +86,7 @@ impl ChatWidget {
         if let Some(mut controller) = self.plan_stream_controller.take()
             && let Some(cell) = controller.finalize()
         {
-            self.add_boxed_history(cell);
+            self.add_boxed_history_with_usage_barrier(cell);
             // TODO: Replace streamed output with the final plan item text if plan streaming is
             // removed or if we need to reconcile mismatches between streamed and final content.
             return;
@@ -196,6 +196,7 @@ impl ChatWidget {
         let mut mgr = std::mem::take(&mut self.interrupts);
         mgr.flush_all(self);
         self.interrupts = mgr;
+        self.request_pending_usage_output_insertion();
     }
 
     #[inline]

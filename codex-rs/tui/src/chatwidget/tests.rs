@@ -14,6 +14,9 @@ use crate::history_cell::UserHistoryCell;
 use crate::test_backend::VT100Backend;
 use crate::tui::FrameRequester;
 use assert_matches::assert_matches;
+use codex_backend_client::TokenUsageProfile;
+use codex_backend_client::TokenUsageProfileDailyBucket;
+use codex_backend_client::TokenUsageProfileStats;
 use codex_common::approval_presets::builtin_approval_presets;
 use codex_core::AuthManager;
 use codex_core::CodexAuth;
@@ -108,6 +111,12 @@ use tempfile::tempdir;
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::unbounded_channel;
 use toml::Value as TomlValue;
+use wiremock::Mock;
+use wiremock::MockServer;
+use wiremock::ResponseTemplate;
+use wiremock::matchers::header;
+use wiremock::matchers::method;
+use wiremock::matchers::path;
 
 async fn test_config() -> Config {
     // Use base defaults to avoid depending on host state.
@@ -982,6 +991,9 @@ async fn make_chatwidget_manual(
         rate_limit_warnings: RateLimitWarningState::default(),
         rate_limit_switch_prompt: RateLimitSwitchPromptState::default(),
         rate_limit_poller: None,
+        refreshing_token_activity_output: None,
+        completed_token_activity_output: None,
+        pending_usage_history_barriers: HashSet::new(),
         adaptive_chunking: crate::streaming::chunking::AdaptiveChunkingPolicy::default(),
         stream_controller: None,
         plan_stream_controller: None,
@@ -1127,6 +1139,407 @@ fn lines_to_single_string(lines: &[ratatui::text::Line<'static>]) -> String {
         s.push('\n');
     }
     s
+}
+
+async fn recv_token_activity_request_id(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+) -> u64 {
+    recv_token_activity_result(rx).await.0
+}
+
+async fn recv_token_activity_result(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+) -> (u64, std::result::Result<TokenUsageProfile, String>) {
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            match rx.recv().await {
+                Some(AppEvent::TokenActivityLoaded { request_id, result }) => {
+                    break (request_id, result);
+                }
+                Some(_) => {}
+                None => panic!("app event channel closed before token activity completed"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for token activity result")
+}
+
+#[tokio::test]
+async fn signed_out_usage_command_reports_chatgpt_login_requirement() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.dispatch_command(SlashCommand::Usage);
+
+    let rendered = drain_insert_history(&mut rx)
+        .into_iter()
+        .map(|lines| lines_to_single_string(&lines))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("Sign in with ChatGPT to use /usage."));
+}
+
+#[tokio::test]
+async fn usage_command_with_invalid_view_reports_usage() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    set_chatgpt_auth(&mut chat);
+
+    chat.dispatch_command_with_args(SlashCommand::Usage, "monthly".to_string(), Vec::new());
+
+    let rendered = drain_insert_history(&mut rx)
+        .into_iter()
+        .map(|lines| lines_to_single_string(&lines))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("Usage: /usage [daily|weekly|cumulative]"));
+}
+
+#[tokio::test]
+async fn authenticated_usage_command_fetches_and_commits_profile() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/codex/profiles/me"))
+        .and(header("authorization", "Bearer Access Token"))
+        .and(header("chatgpt-account-id", "account_id"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "stats": {
+                "lifetime_tokens": 12_500,
+                "peak_daily_tokens": 3_000,
+                "longest_running_turn_sec": 7_260,
+                "current_streak_days": 2,
+                "longest_streak_days": 5,
+                "daily_usage_buckets": [{
+                    "start_date": "2026-06-24",
+                    "tokens": 10
+                }]
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    set_chatgpt_auth(&mut chat);
+    chat.config.chatgpt_base_url = server.uri();
+
+    chat.dispatch_command(SlashCommand::Usage);
+    let (request_id, result) = recv_token_activity_result(&mut rx).await;
+    assert_eq!(result.as_ref(), Ok(&token_usage_profile_for_tests()));
+    assert!(chat.finish_token_activity_refresh(request_id, result));
+    chat.request_pending_usage_output_insertion();
+    assert!(
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .any(|event| matches!(event, AppEvent::CommitPendingUsageOutput))
+    );
+
+    let output = chat
+        .take_completed_token_activity_output()
+        .expect("settled usage output");
+    let rendered = lines_to_single_string(&output.display_lines(80));
+    assert!(rendered.contains("/usage daily"));
+    assert!(rendered.contains("Lifetime 12.5K"));
+    assert!(rendered.contains("Peak 3K"));
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn token_activity_output_is_in_transcript_live_tail() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.add_token_activity_output(TokenActivityView::Daily);
+
+    assert!(chat.active_cell_transcript_key().is_some());
+    let loading = lines_to_single_string(
+        &chat
+            .active_cell_transcript_lines(80)
+            .expect("loading token activity live tail"),
+    );
+    assert!(loading.contains("/usage daily"));
+    assert!(loading.contains("Loading..."));
+
+    let request_id = recv_token_activity_request_id(&mut rx).await;
+    chat.active_cell = Some(Box::new(PlainHistoryCell::new(vec![
+        "active output".into(),
+    ])));
+    assert!(
+        chat.finish_token_activity_refresh(
+            request_id,
+            Err("test token activity failure".to_string()),
+        )
+    );
+    assert!(chat.usage_history_insertion_blocked());
+
+    let settled = lines_to_single_string(
+        &chat
+            .active_cell_transcript_lines(80)
+            .expect("blocked settled token activity live tail"),
+    );
+    assert!(settled.contains("active output"));
+    assert!(settled.contains("Token activity unavailable"));
+}
+
+#[tokio::test]
+async fn completed_usage_output_can_commit_while_task_runs_without_live_output() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.on_task_started(None);
+    chat.add_token_activity_output(TokenActivityView::Daily);
+    let request_id = recv_token_activity_request_id(&mut rx).await;
+
+    assert!(
+        chat.finish_token_activity_refresh(
+            request_id,
+            Err("test token activity failure".to_string()),
+        )
+    );
+    assert!(chat.bottom_pane.is_task_running());
+    assert!(!chat.usage_history_insertion_blocked());
+    assert!(chat.take_completed_token_activity_output().is_some());
+    assert!(chat.pending_token_activity_output().is_none());
+}
+
+fn set_completed_usage_output(chat: &mut ChatWidget) {
+    let (usage_cell, handle) = super::tokens::new_token_activity_output(TokenActivityView::Daily);
+    handle.finish(Err("test token activity failure".to_string()));
+    chat.completed_token_activity_output = Some(usage_cell);
+}
+
+fn assert_history_precedes_usage_commit(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+    expected_history: &str,
+) {
+    let mut history_index = None;
+    let mut commit_index = None;
+    for (index, event) in std::iter::from_fn(|| rx.try_recv().ok()).enumerate() {
+        match event {
+            AppEvent::InsertHistoryCell(cell)
+                if lines_to_single_string(&cell.display_lines(80)).contains(expected_history) =>
+            {
+                history_index.get_or_insert(index);
+            }
+            AppEvent::CommitPendingUsageOutput => {
+                commit_index.get_or_insert(index);
+            }
+            _ => {}
+        }
+    }
+
+    let history_index = history_index.expect("missing terminal history cell");
+    let commit_index = commit_index.expect("missing usage commit event");
+    assert!(
+        history_index < commit_index,
+        "usage commit preceded terminal history"
+    );
+}
+
+#[tokio::test]
+async fn usage_commit_follows_terminal_turn_history() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    set_completed_usage_output(&mut chat);
+    chat.on_error("terminal error".to_string());
+    assert_history_precedes_usage_commit(&mut rx, "terminal error");
+
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    set_completed_usage_output(&mut chat);
+    chat.on_interrupted_turn(TurnAbortReason::Interrupted);
+    assert_history_precedes_usage_commit(&mut rx, "Conversation interrupted");
+
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    set_completed_usage_output(&mut chat);
+    chat.on_paused_turn();
+    assert_history_precedes_usage_commit(&mut rx, "Conversation paused");
+}
+
+#[tokio::test]
+async fn active_cell_flush_holds_usage_until_queued_history_is_inserted() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    let (usage_cell, _handle) = super::tokens::new_token_activity_output(TokenActivityView::Daily);
+    chat.completed_token_activity_output = Some(usage_cell);
+    chat.active_cell = Some(Box::new(PlainHistoryCell::new(vec!["active".into()])));
+
+    chat.add_to_history(PlainHistoryCell::new(vec!["following".into()]));
+
+    assert!(chat.usage_history_insertion_blocked());
+    assert_matches!(rx.try_recv(), Ok(AppEvent::InsertHistoryCell(_)));
+    let first_barrier_id = match rx.try_recv() {
+        Ok(AppEvent::ReleasePendingUsageHistoryBarrier { barrier_id }) => barrier_id,
+        other => panic!("expected first usage history barrier release, got {other:?}"),
+    };
+    chat.release_pending_usage_history_barrier(first_barrier_id);
+    assert!(chat.usage_history_insertion_blocked());
+    assert_matches!(rx.try_recv(), Ok(AppEvent::InsertHistoryCell(_)));
+    let second_barrier_id = match rx.try_recv() {
+        Ok(AppEvent::ReleasePendingUsageHistoryBarrier { barrier_id }) => barrier_id,
+        other => panic!("expected second usage history barrier release, got {other:?}"),
+    };
+    chat.release_pending_usage_history_barrier(second_barrier_id);
+    assert!(!chat.usage_history_insertion_blocked());
+}
+
+#[tokio::test]
+async fn deferred_interrupts_hold_usage_until_their_history_is_queued() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.on_agent_message_delta("streamed answer\n".to_string());
+
+    let command = vec![
+        "bash".to_string(),
+        "-lc".to_string(),
+        "echo deferred".to_string(),
+    ];
+    chat.handle_codex_event(Event {
+        id: "deferred-exec".to_string(),
+        msg: EventMsg::ExecCommandEnd(ExecCommandEndEvent {
+            call_id: "deferred-exec".to_string(),
+            process_id: None,
+            turn_id: "turn-1".to_string(),
+            parsed_cmd: codex_core::parse_command::parse_command(&command),
+            command,
+            cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            source: ExecCommandSource::Agent,
+            interaction_input: None,
+            stdout: "deferred\n".to_string(),
+            stderr: String::new(),
+            aggregated_output: "deferred\n".to_string(),
+            exit_code: 0,
+            duration: std::time::Duration::from_millis(5),
+            formatted_output: "deferred\n".to_string(),
+        }),
+    });
+    assert!(!chat.interrupts.is_empty());
+
+    set_completed_usage_output(&mut chat);
+    begin_exec(&mut chat, "next-exec", "echo next");
+    assert!(chat.stream_controller.is_none());
+    assert!(!chat.interrupts.is_empty());
+
+    let mut saw_stream_history = false;
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            AppEvent::InsertHistoryCell(_) => saw_stream_history = true,
+            AppEvent::ReleasePendingUsageHistoryBarrier { barrier_id } => {
+                chat.release_pending_usage_history_barrier(barrier_id);
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_stream_history);
+    assert!(chat.usage_history_insertion_blocked());
+
+    chat.handle_stream_finished();
+    assert!(chat.interrupts.is_empty());
+    assert!(chat.active_cell.is_some());
+    assert!(chat.usage_history_insertion_blocked());
+
+    let mut exec_history_index = None;
+    let mut usage_commit_index = None;
+    for (index, event) in std::iter::from_fn(|| rx.try_recv().ok()).enumerate() {
+        match event {
+            AppEvent::InsertHistoryCell(cell)
+                if lines_to_single_string(&cell.display_lines(80)).contains("echo deferred") =>
+            {
+                exec_history_index = Some(index);
+            }
+            AppEvent::CommitPendingUsageOutput => usage_commit_index = Some(index),
+            _ => {}
+        }
+    }
+    assert!(
+        exec_history_index.expect("deferred exec history")
+            < usage_commit_index.expect("usage commit retry")
+    );
+}
+
+fn token_usage_profile_for_tests() -> TokenUsageProfile {
+    TokenUsageProfile {
+        stats: TokenUsageProfileStats {
+            lifetime_tokens: Some(12_500),
+            peak_daily_tokens: Some(3_000),
+            longest_running_turn_sec: Some(7_260),
+            current_streak_days: Some(2),
+            longest_streak_days: Some(5),
+            daily_usage_buckets: Some(vec![TokenUsageProfileDailyBucket {
+                start_date: "2026-06-24".to_string(),
+                tokens: 10,
+            }]),
+        },
+    }
+}
+
+#[tokio::test]
+async fn token_activity_request_ids_do_not_repeat_across_widgets() {
+    let (mut old_chat, mut old_rx, _old_op_rx) = make_chatwidget_manual(None).await;
+    old_chat.add_token_activity_output(TokenActivityView::Daily);
+    let old_request_id = recv_token_activity_request_id(&mut old_rx).await;
+
+    let (mut new_chat, mut new_rx, _new_op_rx) = make_chatwidget_manual(None).await;
+    new_chat.add_token_activity_output(TokenActivityView::Daily);
+    let new_request_id = recv_token_activity_request_id(&mut new_rx).await;
+
+    assert_ne!(old_request_id, new_request_id);
+    assert!(!new_chat.finish_token_activity_refresh(
+        old_request_id,
+        Err("stale token activity result".to_string()),
+    ));
+    assert!(new_chat.pending_token_activity_output().is_some());
+    assert!(new_chat.finish_token_activity_refresh(
+        new_request_id,
+        Err("current token activity result".to_string()),
+    ));
+}
+
+#[tokio::test]
+async fn stale_usage_history_barrier_does_not_unblock_new_widget() {
+    let (mut old_chat, mut old_rx, _old_op_rx) = make_chatwidget_manual(None).await;
+    old_chat.queue_history_cell_with_usage_barrier(Box::new(PlainHistoryCell::new(vec![
+        "old history".into(),
+    ])));
+    assert_matches!(old_rx.try_recv(), Ok(AppEvent::InsertHistoryCell(_)));
+    let old_barrier_id = match old_rx.try_recv() {
+        Ok(AppEvent::ReleasePendingUsageHistoryBarrier { barrier_id }) => barrier_id,
+        other => panic!("expected old usage history barrier release, got {other:?}"),
+    };
+
+    let (mut new_chat, mut new_rx, _new_op_rx) = make_chatwidget_manual(None).await;
+    new_chat.queue_history_cell_with_usage_barrier(Box::new(PlainHistoryCell::new(vec![
+        "new history".into(),
+    ])));
+    assert_matches!(new_rx.try_recv(), Ok(AppEvent::InsertHistoryCell(_)));
+    let new_barrier_id = match new_rx.try_recv() {
+        Ok(AppEvent::ReleasePendingUsageHistoryBarrier { barrier_id }) => barrier_id,
+        other => panic!("expected new usage history barrier release, got {other:?}"),
+    };
+
+    new_chat.release_pending_usage_history_barrier(old_barrier_id);
+    assert!(new_chat.usage_history_insertion_blocked());
+    new_chat.release_pending_usage_history_barrier(new_barrier_id);
+    assert!(!new_chat.usage_history_insertion_blocked());
+}
+
+#[tokio::test]
+async fn loaded_usage_keeps_composer_visible_in_short_viewport() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.active_cell = Some(Box::new(PlainHistoryCell::new(
+        std::iter::repeat_n(Line::from("active output"), 20).collect(),
+    )));
+    let (usage_cell, handle) = super::tokens::new_token_activity_output(TokenActivityView::Daily);
+    handle.finish(Ok(token_usage_profile_for_tests()));
+    chat.completed_token_activity_output = Some(usage_cell);
+
+    let width = 80;
+    let height = 8;
+    let backend = VT100Backend::new(width, height);
+    let mut terminal = crate::custom_terminal::Terminal::with_options(backend).expect("terminal");
+    terminal.set_viewport_area(Rect::new(0, 0, width, height));
+    terminal
+        .draw(|frame| chat.render(frame.area(), frame.buffer_mut()))
+        .expect("draw chat widget");
+
+    assert!(
+        terminal
+            .backend()
+            .vt100()
+            .screen()
+            .contents()
+            .contains("Ask Codex to do anything")
+    );
 }
 
 fn make_token_info(total_tokens: i64, context_window: i64) -> TokenUsageInfo {

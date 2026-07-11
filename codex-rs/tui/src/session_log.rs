@@ -170,11 +170,19 @@ pub(crate) fn log_inbound_app_event(event: &AppEvent) {
                 "ts": now_ts(),
                 "dir": "to_tui",
                 "kind": "app_event",
-                "variant": format!("{other:?}").split('(').next().unwrap_or("app_event"),
+                "variant": app_event_variant_name(other),
             });
             LOGGER.write_json_line(value);
         }
     }
+}
+
+fn app_event_variant_name(event: &AppEvent) -> String {
+    format!("{event:?}")
+        .split(['(', ' ', '{'])
+        .next()
+        .unwrap_or("app_event")
+        .to_string()
 }
 
 pub(crate) fn log_outbound_op(op: &Op) {
@@ -207,4 +215,34 @@ where
         "payload": obj,
     });
     LOGGER.write_json_line(value);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_backend_client::TokenUsageProfile;
+    use codex_backend_client::TokenUsageProfileStats;
+
+    #[test]
+    fn app_event_variant_name_drops_struct_payloads() {
+        let event = AppEvent::TokenActivityLoaded {
+            request_id: 7,
+            result: Ok(TokenUsageProfile {
+                stats: TokenUsageProfileStats {
+                    lifetime_tokens: Some(123),
+                    peak_daily_tokens: Some(45),
+                    longest_running_turn_sec: None,
+                    current_streak_days: None,
+                    longest_streak_days: None,
+                    daily_usage_buckets: None,
+                },
+            }),
+        };
+
+        assert_eq!(app_event_variant_name(&event), "TokenActivityLoaded");
+        assert_eq!(
+            app_event_variant_name(&AppEvent::FatalExitRequest("stop".to_string())),
+            "FatalExitRequest"
+        );
+    }
 }

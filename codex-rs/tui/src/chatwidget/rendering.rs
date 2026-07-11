@@ -2,6 +2,20 @@
 
 use super::*;
 
+struct BorrowedHistoryCellRenderable<'a> {
+    cell: &'a dyn HistoryCell,
+}
+
+impl Renderable for BorrowedHistoryCellRenderable<'_> {
+    fn render(&self, area: Rect, buf: &mut Buffer) {
+        self.cell.render(area, buf);
+    }
+
+    fn desired_height(&self, width: u16) -> u16 {
+        HistoryCell::desired_height(self.cell, width)
+    }
+}
+
 impl Drop for ChatWidget {
     fn drop(&mut self) {
         self.stop_rate_limit_poller();
@@ -31,6 +45,13 @@ impl ChatWidget {
         };
         let mut flex = FlexRenderable::new();
         flex.push(1, active_cell_renderable);
+        if let Some(cell) = self.pending_token_activity_output() {
+            flex.push(
+                1,
+                RenderableItem::Owned(Box::new(BorrowedHistoryCellRenderable { cell }))
+                    .inset(Insets::tlbr(1, 0, 0, 0)),
+            );
+        }
         flex.push(
             0,
             RenderableItem::Borrowed(&self.bottom_pane).inset(Insets::tlbr(1, 0, 0, 0)),

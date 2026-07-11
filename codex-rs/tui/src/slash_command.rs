@@ -46,6 +46,7 @@ pub enum SlashCommand {
     #[strum(serialize = "copy-messages")]
     CopyMessage,
     Status,
+    Usage,
     DebugConfig,
     Statusline,
     Legend,
@@ -94,6 +95,7 @@ impl SlashCommand {
             SlashCommand::CopyMessage => "copy a previous message from this chat",
             SlashCommand::Skills => "use skills to improve how Codex performs specific tasks",
             SlashCommand::Status => "show current session configuration and token usage",
+            SlashCommand::Usage => "view account token activity",
             SlashCommand::DebugConfig => "show config layers and requirement sources for debugging",
             SlashCommand::Statusline => "configure which items appear in the status line",
             SlashCommand::Legend => "show progress timeline legend",
@@ -133,6 +135,7 @@ impl SlashCommand {
                 | SlashCommand::Export
                 | SlashCommand::Diff
                 | SlashCommand::LegendMode
+                | SlashCommand::Usage
         )
     }
 
@@ -167,6 +170,7 @@ impl SlashCommand {
             | SlashCommand::CopyMessage
             | SlashCommand::Skills
             | SlashCommand::Status
+            | SlashCommand::Usage
             | SlashCommand::DebugConfig
             | SlashCommand::Legend
             | SlashCommand::LegendMode
@@ -221,5 +225,16 @@ mod tests {
         );
         assert!(!SlashCommand::ReviewCompletedTurn.supports_inline_args());
         assert!(!SlashCommand::ReviewCompletedTurn.available_during_task());
+    }
+
+    #[test]
+    fn usage_command_shape() {
+        assert_eq!(SlashCommand::Usage.command(), "usage");
+        assert_eq!(
+            SlashCommand::Usage.description(),
+            "view account token activity"
+        );
+        assert!(SlashCommand::Usage.supports_inline_args());
+        assert!(SlashCommand::Usage.available_during_task());
     }
 }

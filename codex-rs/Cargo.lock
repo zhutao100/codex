@@ -2189,6 +2189,7 @@ dependencies = [
  "which",
  "windows-sys 0.52.0",
  "winsplit",
+ "wiremock",
 ]
 
 [[package]]

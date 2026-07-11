@@ -139,6 +139,16 @@ pub(crate) trait HistoryCell: std::fmt::Debug + Send + Sync + Any {
 
 impl Renderable for Box<dyn HistoryCell> {
     fn render(&self, area: Rect, buf: &mut Buffer) {
+        self.as_ref().render(area, buf);
+    }
+
+    fn desired_height(&self, width: u16) -> u16 {
+        HistoryCell::desired_height(self.as_ref(), width)
+    }
+}
+
+impl Renderable for dyn HistoryCell + '_ {
+    fn render(&self, area: Rect, buf: &mut Buffer) {
         let lines = self.display_lines(area.width);
         let y = if area.height == 0 {
             0
@@ -150,8 +160,9 @@ impl Renderable for Box<dyn HistoryCell> {
             .scroll((y, 0))
             .render(area, buf);
     }
+
     fn desired_height(&self, width: u16) -> u16 {
-        HistoryCell::desired_height(self.as_ref(), width)
+        HistoryCell::desired_height(self, width)
     }
 }
 

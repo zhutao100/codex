@@ -20,6 +20,7 @@ use crate::external_editor;
 use crate::file_search::FileSearchManager;
 use crate::get_git_diff::GitDiffResult;
 use crate::history_cell;
+use crate::history_cell::CompositeHistoryCell;
 use crate::history_cell::HistoryCell;
 #[cfg(not(debug_assertions))]
 use crate::history_cell::UpdateAvailableHistoryCell;
@@ -38,6 +39,7 @@ use crate::tui::TuiEvent;
 use crate::update_action::UpdateAction;
 use chrono::Utc;
 use codex_app_server_protocol::ConfigLayerSource;
+use codex_backend_client::TokenUsageProfile;
 use codex_core::AuthManager;
 use codex_core::CodexAuth;
 use codex_core::ThreadManager;
@@ -582,6 +584,30 @@ pub(crate) struct App {
     pending_primary_events: VecDeque<Event>,
 }
 
+enum PendingUsageAppEvent {
+    Loaded {
+        request_id: u64,
+        result: std::result::Result<TokenUsageProfile, String>,
+    },
+    Commit,
+    ReleaseHistoryBarrier {
+        barrier_id: u64,
+    },
+}
+
+#[derive(Default)]
+struct AppUiUpdate {
+    history_lines: Vec<Line<'static>>,
+    schedule_frame: bool,
+}
+
+impl AppUiUpdate {
+    fn merge(&mut self, mut other: Self) {
+        self.history_lines.append(&mut other.history_lines);
+        self.schedule_frame |= other.schedule_frame;
+    }
+}
+
 #[derive(Default)]
 struct WindowsSandboxState {
     setup_started_at: Option<Instant>,
@@ -1092,15 +1118,15 @@ impl App {
         self.pending_primary_events.clear();
     }
 
-    async fn drain_active_thread_events(&mut self, tui: &mut tui::Tui) -> Result<()> {
+    fn drain_ready_active_thread_events(&mut self) -> bool {
         let Some(mut rx) = self.active_thread_rx.take() else {
-            return Ok(());
+            return false;
         };
 
         let mut disconnected = false;
         loop {
             match rx.try_recv() {
-                Ok(event) => self.handle_codex_event_now(event),
+                Ok(event) => self.handle_active_thread_event_now(event),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     disconnected = true;
@@ -1111,11 +1137,19 @@ impl App {
 
         if !disconnected {
             self.active_thread_rx = Some(rx);
-        } else {
+        }
+        disconnected
+    }
+
+    async fn drain_active_thread_events_state(&mut self) -> bool {
+        if self.drain_ready_active_thread_events() {
             self.clear_active_thread().await;
         }
+        self.backtrack_render_pending
+    }
 
-        if self.backtrack_render_pending {
+    async fn drain_active_thread_events(&mut self, tui: &mut tui::Tui) -> Result<()> {
+        if self.drain_active_thread_events_state().await {
             tui.frame_requester().schedule_frame();
         }
         Ok(())
@@ -1528,6 +1562,103 @@ impl App {
         Ok(AppRunControl::Continue)
     }
 
+    fn record_history_cell(&mut self, cell: Box<dyn HistoryCell>, width: u16) -> AppUiUpdate {
+        let mut update = AppUiUpdate::default();
+        let cell: Arc<dyn HistoryCell> = cell.into();
+        if let Some(Overlay::Transcript(t)) = &mut self.overlay {
+            t.insert_cell(cell.clone());
+            update.schedule_frame = true;
+        }
+        self.transcript_cells.push(cell.clone());
+        let mut display = cell.display_lines(width);
+        if !display.is_empty() {
+            // Only insert a separating blank line for new cells that are not
+            // part of an ongoing stream. Streaming continuations should not
+            // accrue extra blank lines between chunks.
+            if !cell.is_stream_continuation() {
+                if self.has_emitted_history_lines {
+                    display.insert(0, Line::from(""));
+                } else {
+                    self.has_emitted_history_lines = true;
+                }
+            }
+            if self.overlay.is_some() {
+                self.deferred_history_lines.extend(display);
+            } else {
+                update.history_lines = display;
+            }
+        }
+        self.chat_widget.request_pending_usage_output_insertion();
+        update
+    }
+
+    fn apply_ui_update(tui: &mut tui::Tui, update: AppUiUpdate) {
+        if update.schedule_frame {
+            tui.frame_requester().schedule_frame();
+        }
+        if !update.history_lines.is_empty() {
+            tui.insert_history_lines(update.history_lines);
+        }
+    }
+
+    fn insert_history_cell(&mut self, tui: &mut tui::Tui, cell: Box<dyn HistoryCell>) {
+        let width = tui.terminal.last_known_screen_size.width;
+        let update = self.record_history_cell(cell, width);
+        Self::apply_ui_update(tui, update);
+    }
+
+    fn record_pending_usage_output_if_ready(&mut self, width: u16) -> AppUiUpdate {
+        if let Some(cell) = self.take_pending_usage_output_if_ready() {
+            self.record_history_cell(Box::new(cell), width)
+        } else {
+            AppUiUpdate::default()
+        }
+    }
+
+    fn take_pending_usage_output_if_ready(&mut self) -> Option<CompositeHistoryCell> {
+        if self.chat_widget.usage_history_insertion_blocked() {
+            return None;
+        }
+        self.chat_widget.take_completed_token_activity_output()
+    }
+
+    async fn apply_pending_usage_app_event(
+        &mut self,
+        event: PendingUsageAppEvent,
+        width: u16,
+    ) -> AppUiUpdate {
+        let mut update = AppUiUpdate::default();
+        let should_insert = match event {
+            PendingUsageAppEvent::Loaded { request_id, result } => {
+                update.schedule_frame |= self.drain_active_thread_events_state().await;
+                let error = result.as_ref().err().cloned();
+                let finished = self
+                    .chat_widget
+                    .finish_token_activity_refresh(request_id, result);
+                if finished && let Some(err) = error {
+                    tracing::warn!("token usage profile fetch failed during TUI refresh: {err}");
+                }
+                finished
+            }
+            PendingUsageAppEvent::Commit => {
+                update.schedule_frame |= self.drain_active_thread_events_state().await;
+                true
+            }
+            PendingUsageAppEvent::ReleaseHistoryBarrier { barrier_id } => {
+                self.chat_widget
+                    .release_pending_usage_history_barrier(barrier_id);
+                update.schedule_frame |= self.drain_active_thread_events_state().await;
+                true
+            }
+        };
+        if should_insert {
+            // Commit directly so later app events cannot overtake a settled card. Avoid
+            // ChatWidget::add_to_history because it can flush an in-progress active cell.
+            update.merge(self.record_pending_usage_output_if_ready(width));
+        }
+        update
+    }
+
     async fn handle_event(&mut self, tui: &mut tui::Tui, event: AppEvent) -> Result<AppRunControl> {
         match event {
             AppEvent::NewSession => {
@@ -1804,32 +1935,7 @@ impl App {
 
                 tui.frame_requester().schedule_frame();
             }
-            AppEvent::InsertHistoryCell(cell) => {
-                let cell: Arc<dyn HistoryCell> = cell.into();
-                if let Some(Overlay::Transcript(t)) = &mut self.overlay {
-                    t.insert_cell(cell.clone());
-                    tui.frame_requester().schedule_frame();
-                }
-                self.transcript_cells.push(cell.clone());
-                let mut display = cell.display_lines(tui.terminal.last_known_screen_size.width);
-                if !display.is_empty() {
-                    // Only insert a separating blank line for new cells that are not
-                    // part of an ongoing stream. Streaming continuations should not
-                    // accrue extra blank lines between chunks.
-                    if !cell.is_stream_continuation() {
-                        if self.has_emitted_history_lines {
-                            display.insert(0, Line::from(""));
-                        } else {
-                            self.has_emitted_history_lines = true;
-                        }
-                    }
-                    if self.overlay.is_some() {
-                        self.deferred_history_lines.extend(display);
-                    } else {
-                        tui.insert_history_lines(display);
-                    }
-                }
-            }
+            AppEvent::InsertHistoryCell(cell) => self.insert_history_cell(tui, cell),
             AppEvent::StartCommitAnimation => {
                 if self
                     .commit_anim_running
@@ -1934,6 +2040,33 @@ impl App {
             }
             AppEvent::RateLimitSnapshotFetched(snapshot) => {
                 self.chat_widget.on_rate_limit_snapshot(Some(snapshot));
+            }
+            AppEvent::TokenActivityLoaded { request_id, result } => {
+                let width = tui.terminal.last_known_screen_size.width;
+                let update = self
+                    .apply_pending_usage_app_event(
+                        PendingUsageAppEvent::Loaded { request_id, result },
+                        width,
+                    )
+                    .await;
+                Self::apply_ui_update(tui, update);
+            }
+            AppEvent::CommitPendingUsageOutput => {
+                let width = tui.terminal.last_known_screen_size.width;
+                let update = self
+                    .apply_pending_usage_app_event(PendingUsageAppEvent::Commit, width)
+                    .await;
+                Self::apply_ui_update(tui, update);
+            }
+            AppEvent::ReleasePendingUsageHistoryBarrier { barrier_id } => {
+                let width = tui.terminal.last_known_screen_size.width;
+                let update = self
+                    .apply_pending_usage_app_event(
+                        PendingUsageAppEvent::ReleaseHistoryBarrier { barrier_id },
+                        width,
+                    )
+                    .await;
+                Self::apply_ui_update(tui, update);
             }
             AppEvent::ConnectorsLoaded(result) => {
                 self.chat_widget.on_connectors_loaded(result);
@@ -2740,8 +2873,19 @@ impl App {
         self.chat_widget.handle_codex_event_replay(event);
     }
 
-    fn handle_active_thread_event(&mut self, tui: &mut tui::Tui, event: Event) -> Result<()> {
+    fn handle_active_thread_event_now(&mut self, event: Event) {
+        // Core and app events use separate channels. Hold completed usage output until app events
+        // emitted while handling this core event have been consumed.
+        let usage_barrier_id = self.chat_widget.begin_pending_usage_history_barrier();
         self.handle_codex_event_now(event);
+        if let Some(barrier_id) = usage_barrier_id {
+            self.chat_widget
+                .request_usage_history_barrier_release(barrier_id);
+        }
+    }
+
+    fn handle_active_thread_event(&mut self, tui: &mut tui::Tui, event: Event) -> Result<()> {
+        self.handle_active_thread_event_now(event);
         if self.backtrack_render_pending {
             tui.frame_requester().schedule_frame();
         }
@@ -3041,6 +3185,7 @@ mod tests {
     use super::*;
     use crate::app_backtrack::BacktrackState;
     use crate::app_backtrack::user_count;
+    use crate::chatwidget::TokenActivityView;
     use crate::chatwidget::tests::make_chatwidget_manual_with_sender;
     use crate::file_search::FileSearchManager;
     use crate::history_cell::AgentMessageCell;
@@ -3059,8 +3204,11 @@ mod tests {
     use codex_core::protocol::SandboxPolicy;
     use codex_core::protocol::SessionConfiguredEvent;
     use codex_core::protocol::SessionSource;
+    use codex_core::protocol::WebSearchBeginEvent;
+    use codex_core::protocol::WebSearchEndEvent;
     use codex_otel::OtelManager;
     use codex_protocol::ThreadId;
+    use codex_protocol::models::WebSearchAction;
     use codex_protocol::user_input::TextElement;
     use insta::assert_snapshot;
     use pretty_assertions::assert_eq;
@@ -3296,6 +3444,132 @@ mod tests {
             "test".to_string(),
             SessionSource::Cli,
         )
+    }
+
+    #[tokio::test]
+    async fn token_activity_app_event_commits_after_queued_active_thread_history() {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        app.chat_widget
+            .add_token_activity_output(TokenActivityView::Daily);
+
+        let (active_thread_tx, active_thread_rx) = tokio::sync::mpsc::channel(2);
+        app.active_thread_rx = Some(active_thread_rx);
+        active_thread_tx
+            .send(Event {
+                id: "search".to_string(),
+                msg: EventMsg::WebSearchBegin(WebSearchBeginEvent {
+                    call_id: "search".to_string(),
+                }),
+            })
+            .await
+            .expect("queue web search begin");
+        active_thread_tx
+            .send(Event {
+                id: "search".to_string(),
+                msg: EventMsg::WebSearchEnd(WebSearchEndEvent {
+                    call_id: "search".to_string(),
+                    query: "usage ordering".to_string(),
+                    action: WebSearchAction::Other,
+                }),
+            })
+            .await
+            .expect("queue web search end");
+
+        let loaded_event = time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                match app_event_rx.recv().await {
+                    Some(AppEvent::TokenActivityLoaded { request_id, result }) => {
+                        break PendingUsageAppEvent::Loaded { request_id, result };
+                    }
+                    Some(_) => {}
+                    None => panic!("app event channel closed before token activity completed"),
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for token activity result");
+
+        assert!(
+            app.chat_widget
+                .active_cell_transcript_lines(80)
+                .is_some_and(|lines| {
+                    lines
+                        .iter()
+                        .flat_map(|line| &line.spans)
+                        .any(|span| span.content.contains("Loading..."))
+                })
+        );
+        app.apply_pending_usage_app_event(loaded_event, 80).await;
+        assert!(app.chat_widget.usage_history_insertion_blocked());
+        assert!(app.transcript_cells.is_empty());
+
+        time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let usage_committed = app.transcript_cells.iter().any(|cell| {
+                    cell.display_lines(80)
+                        .iter()
+                        .flat_map(|line| &line.spans)
+                        .any(|span| span.content.contains("Token activity"))
+                });
+                if usage_committed {
+                    break;
+                }
+                match app_event_rx.recv().await {
+                    Some(AppEvent::InsertHistoryCell(cell)) => {
+                        app.record_history_cell(cell, 80);
+                    }
+                    Some(AppEvent::CommitPendingUsageOutput) => {
+                        app.apply_pending_usage_app_event(PendingUsageAppEvent::Commit, 80)
+                            .await;
+                    }
+                    Some(AppEvent::ReleasePendingUsageHistoryBarrier { barrier_id }) => {
+                        app.apply_pending_usage_app_event(
+                            PendingUsageAppEvent::ReleaseHistoryBarrier { barrier_id },
+                            80,
+                        )
+                        .await;
+                    }
+                    Some(_) => {}
+                    None => panic!("app event channel closed before usage committed"),
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for usage history commit");
+
+        assert!(app.chat_widget.active_cell_transcript_lines(80).is_none());
+        app.record_history_cell(
+            Box::new(AgentMessageCell::new(
+                vec![Line::from("later event")],
+                /*is_first_line*/ false,
+            )),
+            80,
+        );
+
+        let transcript = app
+            .transcript_cells
+            .iter()
+            .map(|cell| {
+                cell.display_lines(80)
+                    .into_iter()
+                    .flat_map(|line| line.spans.into_iter().map(|span| span.content.into_owned()))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        let search_index = transcript
+            .iter()
+            .position(|cell| cell.contains("usage ordering"))
+            .expect("web search history");
+        let usage_index = transcript
+            .iter()
+            .position(|cell| cell.contains("Token activity"))
+            .expect("usage history");
+        let later_index = transcript
+            .iter()
+            .position(|cell| cell.contains("later event"))
+            .expect("later history");
+        assert!(search_index < usage_index);
+        assert!(usage_index < later_index);
     }
 
     fn all_model_presets() -> Vec<ModelPreset> {

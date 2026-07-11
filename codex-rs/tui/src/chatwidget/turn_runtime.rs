@@ -91,7 +91,7 @@ impl ChatWidget {
         if let Some(mut controller) = self.plan_stream_controller.take()
             && let Some(cell) = controller.finalize()
         {
-            self.add_boxed_history(cell);
+            self.add_boxed_history_with_usage_barrier(cell);
         }
         self.flush_unified_exec_wait_streak();
         if !from_replay {
@@ -137,6 +137,7 @@ impl ChatWidget {
         if !from_replay {
             self.move_pending_steers_to_rejected_queue();
         }
+        self.request_pending_usage_output_insertion();
 
         if !from_replay && !self.has_queued_follow_up_messages() {
             self.maybe_prompt_plan_implementation();
@@ -234,6 +235,7 @@ impl ChatWidget {
     ///
     /// This does not clear MCP startup tracking, because MCP startup can overlap with turn cleanup
     /// and should continue to drive the bottom-pane running indicator while it is in progress.
+    /// Callers must request pending usage output insertion after queueing any terminal history cell.
     pub(super) fn finalize_turn(&mut self) {
         // Ensure any spinner is replaced by a red ✗ and flushed into history.
         self.finalize_active_cell_as_failed();
@@ -275,6 +277,7 @@ impl ChatWidget {
             }
 
             this.add_to_history(history_cell::new_warning_event(message));
+            this.request_pending_usage_output_insertion();
             this.request_redraw();
         });
         self.maybe_send_next_queued_input();
@@ -285,6 +288,7 @@ impl ChatWidget {
             this.finalize_turn();
             this.move_pending_steers_to_rejected_queue();
             this.add_to_history(history_cell::new_error_event(message));
+            this.request_pending_usage_output_insertion();
             this.request_redraw();
         });
 
@@ -297,6 +301,7 @@ impl ChatWidget {
             this.finalize_turn();
             this.move_pending_steers_to_rejected_queue();
             this.add_to_history(history_cell::new_cyber_policy_error_event());
+            this.request_pending_usage_output_insertion();
             this.request_redraw();
         });
 
@@ -327,6 +332,7 @@ impl ChatWidget {
                 "Conversation paused.".to_string(),
                 Some("Use `/continue` to resume this turn.".to_string()),
             );
+            this.request_pending_usage_output_insertion();
             this.request_redraw();
         });
     }

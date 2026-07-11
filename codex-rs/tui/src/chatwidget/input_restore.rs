@@ -15,7 +15,9 @@ impl ChatWidget {
             CodexErrorInfo::NoActiveTurnToSteer => {
                 self.active_turn_id = None;
                 self.finalize_turn();
-                self.enqueue_pending_steer_as_queued(client_user_message_id)
+                let handled = self.enqueue_pending_steer_as_queued(client_user_message_id);
+                self.request_pending_usage_output_insertion();
+                handled
             }
             CodexErrorInfo::ExpectedTurnMismatch { actual, .. } => {
                 self.active_turn_id = Some(actual.clone());
@@ -151,6 +153,7 @@ impl ChatWidget {
             ));
             }
 
+            this.request_pending_usage_output_insertion();
             this.request_redraw();
         });
     }

@@ -9,8 +9,7 @@ impl ChatWidget {
         };
         self.needs_final_message_separator = true;
         let cell = history_cell::new_unified_exec_interaction(wait.command_display, String::new());
-        self.app_event_tx
-            .send(AppEvent::InsertHistoryCell(Box::new(cell)));
+        self.queue_history_cell_with_usage_barrier(Box::new(cell));
         self.restore_reasoning_status_header();
     }
 
