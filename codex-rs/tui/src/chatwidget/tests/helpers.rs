@@ -871,6 +871,24 @@ pub(super) fn handle_exec_begin(chat: &mut ChatWidget, item: AppServerThreadItem
     );
 }
 
+pub(super) fn exec_output_delta(chat: &mut ChatWidget, call_id: &str, delta: &str) {
+    chat.handle_server_notification(
+        ServerNotification::CommandExecutionOutputDelta(
+            codex_app_server_protocol::CommandExecutionOutputDeltaNotification {
+                thread_id: thread_id(chat),
+                turn_id: chat
+                    .turn_lifecycle
+                    .last_turn_id
+                    .clone()
+                    .unwrap_or_else(|| "turn-1".to_string()),
+                item_id: call_id.to_string(),
+                delta: delta.to_string(),
+            },
+        ),
+        /*replay_kind*/ None,
+    );
+}
+
 pub(super) fn terminal_interaction(
     chat: &mut ChatWidget,
     call_id: &str,

@@ -95,24 +95,16 @@ impl ExecCell {
     }
 
     pub(crate) fn should_flush(&self) -> bool {
-        !self.is_exploring_cell() && self.calls.iter().all(|c| c.output.is_some())
+        !self.is_exploring_cell() && !self.is_active()
     }
 
     pub(crate) fn mark_failed(&mut self) {
         for call in self.calls.iter_mut() {
-            if call.output.is_none() {
-                let elapsed = call
-                    .start_time
-                    .map(|st| st.elapsed())
-                    .unwrap_or_else(|| Duration::from_millis(0));
-                call.start_time = None;
-                call.duration = Some(elapsed);
-                call.output = Some(CommandOutput {
-                    exit_code: 1,
-                    formatted_output: String::new(),
-                    aggregated_output: String::new(),
-                });
-            }
+            let Some(start_time) = call.start_time.take() else {
+                continue;
+            };
+            call.duration = Some(start_time.elapsed());
+            call.output.get_or_insert_default().exit_code = 1;
         }
     }
 
@@ -120,15 +112,14 @@ impl ExecCell {
         self.calls.iter().all(Self::is_exploring_call)
     }
 
+    // Output deltas populate `output` before completion; `start_time` is cleared only when a call
+    // finishes or is failed during cleanup.
     pub(crate) fn is_active(&self) -> bool {
-        self.calls.iter().any(|c| c.output.is_none())
+        self.calls.iter().any(|call| call.start_time.is_some())
     }
 
     pub(crate) fn active_start_time(&self) -> Option<Instant> {
-        self.calls
-            .iter()
-            .find(|c| c.output.is_none())
-            .and_then(|c| c.start_time)
+        self.calls.iter().find_map(|call| call.start_time)
     }
 
     pub(crate) fn animations_enabled(&self) -> bool {

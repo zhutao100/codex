@@ -388,6 +388,103 @@ async fn exec_end_without_begin_uses_event_command() {
 }
 
 #[tokio::test]
+async fn parallel_exec_cascade_renders_every_completed_command() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.on_task_started();
+
+    let read_skill = begin_exec(&mut chat, "call-read-skill", "cat /tmp/SKILL.md");
+    let read_agents = begin_exec(
+        &mut chat,
+        "call-read-agents",
+        "cat /tmp/AGENTS_structured_search.md",
+    );
+    let status = begin_exec(&mut chat, "call-status", "git status --short --branch");
+    let log = begin_exec(&mut chat, "call-log", "git log --oneline -n 3");
+
+    end_exec(&mut chat, read_skill, "skill instructions\n", "", 0);
+    end_exec(&mut chat, read_agents, "search instructions\n", "", 0);
+    end_exec(&mut chat, status, "## main\n", "", 0);
+    end_exec(&mut chat, log, "abc123 test commit\n", "", 0);
+
+    chat.flush_active_cell();
+    let exec_cells = drain_insert_history(&mut rx)
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .map(|cell| cell.trim_start_matches('\n').to_string())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        exec_cells,
+        vec![
+            "• Explored\n  └ Read SKILL.md, AGENTS_structured_search.md\n".to_string(),
+            "• Ran git status --short --branch\n  └ ## main\n".to_string(),
+            "• Ran git log --oneline -n 3\n  └ abc123 test commit\n".to_string(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn streamed_parallel_exec_completions_render_once_out_of_order() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.on_task_started();
+
+    let status = begin_exec(&mut chat, "call-status", "git status --short --branch");
+    exec_output_delta(&mut chat, "call-status", "partial status\n");
+    let log = begin_exec(&mut chat, "call-log", "git log --oneline -n 3");
+
+    end_exec(&mut chat, log, "abc123 test commit\n", "", 0);
+    end_exec(&mut chat, status, "## main\n", "", 0);
+
+    let exec_cells = drain_insert_history(&mut rx)
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .map(|cell| cell.trim_start_matches('\n').to_string())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        exec_cells,
+        vec![
+            "• Ran git log --oneline -n 3\n  └ abc123 test commit\n".to_string(),
+            "• Ran git status --short --branch\n  └ ## main\n".to_string(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn interrupt_parallel_exec_cascade_materializes_every_started_command() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.on_task_started();
+
+    begin_exec(&mut chat, "call-status", "git status --short --branch");
+    exec_output_delta(&mut chat, "call-status", "partial status\n");
+    begin_exec(&mut chat, "call-log", "git log --oneline -n 3");
+    exec_output_delta(&mut chat, "call-log", "partial log\n");
+    begin_exec(&mut chat, "call-pwd", "pwd");
+
+    handle_turn_interrupted(&mut chat, "turn-1");
+
+    let command_cells = drain_insert_history(&mut rx)
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .map(|cell| cell.trim_start_matches('\n').to_string())
+        .filter(|cell| {
+            cell.contains("git status --short --branch")
+                || cell.contains("git log --oneline -n 3")
+                || cell.contains("pwd")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        command_cells,
+        vec![
+            "• Ran git status --short --branch\n  └ partial status\n".to_string(),
+            "• Ran git log --oneline -n 3\n  └ partial log\n".to_string(),
+            "• Ran pwd\n  └ (no output)\n".to_string(),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn exec_end_without_begin_does_not_flush_unrelated_running_exploring_cell() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.on_task_started();

@@ -57,18 +57,17 @@ impl ChatWidget {
             return;
         }
 
-        let Some(cell) = self
+        let appended_to_active = self
             .transcript
             .active_cell
             .as_mut()
             .and_then(|c| c.as_any_mut().downcast_mut::<ExecCell>())
-        else {
-            return;
-        };
-
-        if cell.append_output(call_id, delta) {
+            .is_some_and(|cell| cell.append_output(call_id, delta));
+        if appended_to_active {
             self.bump_active_cell_revision();
             self.request_redraw();
+        } else if let Some(command) = self.running_commands.get_mut(call_id) {
+            command.append_output(delta);
         }
     }
 
@@ -239,6 +238,50 @@ impl ChatWidget {
         }
     }
 
+    pub(super) fn finalize_turn_cells_as_failed(&mut self) {
+        let active_call_ids = self
+            .transcript
+            .active_cell
+            .as_ref()
+            .and_then(|cell| cell.as_any().downcast_ref::<ExecCell>())
+            .map(|cell| {
+                cell.iter_calls()
+                    .map(|call| call.call_id.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for call_id in active_call_ids {
+            self.running_commands.remove(&call_id);
+        }
+        for call_id in std::mem::take(&mut self.suppressed_exec_calls) {
+            self.running_commands.remove(&call_id);
+        }
+
+        self.finalize_active_cell_as_failed();
+
+        let mut pending_commands = std::mem::take(&mut self.running_commands)
+            .into_iter()
+            .collect::<Vec<_>>();
+        pending_commands.sort_by(|(left_id, left), (right_id, right)| {
+            left.started_at
+                .cmp(&right.started_at)
+                .then_with(|| left_id.cmp(right_id))
+        });
+        for (call_id, command) in pending_commands {
+            let mut cell = new_active_exec_command(
+                call_id.clone(),
+                command.command,
+                command.parsed_cmd,
+                command.source,
+                /*interaction_input*/ None,
+                self.config.animations,
+            );
+            cell.append_output(&call_id, &command.aggregated_output);
+            cell.mark_failed();
+            self.add_to_history(cell);
+        }
+    }
+
     pub(crate) fn handle_command_execution_started_now(&mut self, item: ThreadItem) {
         self.record_visible_turn_activity();
         let ThreadItem::CommandExecution {
@@ -258,11 +301,7 @@ impl ChatWidget {
         let parsed_cmd = self.annotate_skill_reads_in_parsed_cmd(parsed_cmd);
         self.running_commands.insert(
             id.clone(),
-            RunningCommand {
-                command: command.clone(),
-                parsed_cmd: parsed_cmd.clone(),
-                source,
-            },
+            RunningCommand::new(command.clone(), parsed_cmd.clone(), source),
         );
         let is_wait_interaction = matches!(source, ExecCommandSource::UnifiedExecInteraction);
         let command_display = command.join(" ");
@@ -280,6 +319,14 @@ impl ChatWidget {
             self.suppressed_exec_calls.insert(id);
             return;
         }
+        // Keep an incompatible running cell mutable. The parallel call remains in
+        // `running_commands` and renders as a standalone cell when it completes.
+        let active_exec_is_running = self
+            .transcript
+            .active_cell
+            .as_ref()
+            .and_then(|cell| cell.as_any().downcast_ref::<ExecCell>())
+            .is_some_and(ExecCell::is_active);
         if let Some(cell) = self
             .transcript
             .active_cell
@@ -295,7 +342,7 @@ impl ChatWidget {
         {
             *cell = new_exec;
             self.bump_active_cell_revision();
-        } else {
+        } else if !active_exec_is_running {
             self.flush_active_cell();
 
             self.transcript.active_cell = Some(Box::new(new_active_exec_command(
