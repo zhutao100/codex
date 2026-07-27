@@ -3,6 +3,7 @@
 # network sandbox. These tests exercise Codex's own process sandboxing and
 # shell execution paths, which cannot run under an already-sandboxed parent.
 suite::abort_tasks::
+suite::multi_exec_server_sandbox::
 suite::v2::command_exec::
 suite::v2::executor_mcp::selected_executor_plugin_exposes_its_mcps_only_to_that_thread
 suite::v2::imagegen_extension::standalone_image_edit_uses_attached_model_visible_image
@@ -12,3 +13,10 @@ suite::seatbelt::
 suite::user_shell_cmd::
 suite::unified_exec::
 suite::workspace_roots::
+# Restricted filesystem and profile prewarm tests also require nested Seatbelt.
+suite::v2::executor_skills::restricted_executor_skill_
+session::tests::guardian_tests::exec_command_allows_sticky_turn_permissions_without_inline_request_permissions_feature
+tools::handlers::multi_agents::tests::spawn_agent_reapplies_runtime_sandbox_after_role_config
+suite::cloud_config::managed_deny_read_requirements_follow_thread_permission_updates
+suite::remote_env::environment_permissions_follow_configuration_ownership
+suite::shell_snapshot::shell_snapshot_v2_prewarm_preserves_the_sandbox

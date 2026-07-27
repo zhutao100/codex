@@ -31,3 +31,7 @@ Thus, the design of the changes target to minimize the potentials of future reba
 - The `cargo build` commands can produce giant console output, even with
   `--quiet`. Redirect broad/noisy build output to tmp files and parse only
   necessary information.
+- Keep `just-local test -p <crate>` scoped to the selected tests. Run `just-local bench-smoke` separately when benchmark validation is needed.
+- During upstream rebases, port custom behavior to its current owner instead of restoring deleted crates or old APIs. Preserve upstream history envelopes, instruction provenance, atomic settings updates, and sanitized Git URLs.
+- Model switches use upstream's incremental developer instructions and retain the original request instruction prefix; do not restore the retired session-wide base-instruction rewrite.
+- See [customization maintenance](docs/rebase_customizations.md) for upstream replacement decisions and invariants to preserve.
