@@ -666,6 +666,39 @@ async fn interrupt_parallel_exec_cascade_materializes_every_started_command() {
 }
 
 #[tokio::test]
+async fn deferred_parallel_exec_bounds_streamed_output() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.on_task_started();
+
+    begin_exec(&mut chat, "call-status", "git status --short --branch");
+    begin_exec(&mut chat, "call-log", "git log --oneline -n 3");
+    let oversized_output = (0..100_000)
+        .map(|line| format!("line {line}\n"))
+        .collect::<String>();
+    assert!(oversized_output.len() > 1024 * 1024);
+
+    exec_output_delta(&mut chat, "call-log", &oversized_output);
+
+    assert_eq!(
+        chat.running_commands
+            .get("call-log")
+            .expect("deferred command")
+            .output
+            .line_counts(),
+        (100_000, 100)
+    );
+
+    handle_turn_interrupted(&mut chat, "turn-1");
+
+    let log_cell = drain_insert_history(&mut rx)
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .find(|cell| cell.contains("git log --oneline -n 3"))
+        .expect("deferred command cell");
+    assert_chatwidget_snapshot!("deferred_parallel_exec_bounded_output", log_cell);
+}
+
+#[tokio::test]
 async fn exec_end_without_begin_does_not_flush_unrelated_running_exploring_cell() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.on_task_started();

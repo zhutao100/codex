@@ -5,6 +5,7 @@ use std::time::Instant;
 use codex_app_server_protocol::CommandExecutionSource as ExecCommandSource;
 use codex_protocol::parse_command::ParsedCommand;
 
+use crate::exec_cell::CommandOutput;
 use crate::exec_command::split_command_string;
 
 pub(super) struct RunningCommand {
@@ -12,7 +13,7 @@ pub(super) struct RunningCommand {
     pub(super) parsed_cmd: Vec<ParsedCommand>,
     pub(super) source: ExecCommandSource,
     pub(super) started_at: Instant,
-    pub(super) aggregated_output: String,
+    pub(super) output: CommandOutput,
 }
 
 impl RunningCommand {
@@ -26,12 +27,12 @@ impl RunningCommand {
             parsed_cmd,
             source,
             started_at: Instant::now(),
-            aggregated_output: String::new(),
+            output: CommandOutput::default(),
         }
     }
 
     pub(super) fn append_output(&mut self, chunk: &str) {
-        self.aggregated_output.push_str(chunk);
+        self.output.append_live_output(chunk);
     }
 }
 

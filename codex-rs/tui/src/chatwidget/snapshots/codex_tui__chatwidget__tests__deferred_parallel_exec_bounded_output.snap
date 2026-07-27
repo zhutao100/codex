@@ -1,0 +1,11 @@
+---
+source: tui/src/chatwidget/tests/exec_flow.rs
+expression: log_cell
+---
+
+• Ran git log --oneline -n 3
+  └ line 0
+    line 1
+    … +99996 lines (ctrl + t to view transcript)
+    line 99998
+    line 99999

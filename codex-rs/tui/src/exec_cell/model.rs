@@ -36,7 +36,7 @@ impl CommandOutput {
     }
 
     /// Returns the total number of logical lines and the number retained for rendering.
-    pub(super) fn line_counts(&self) -> (usize, usize) {
+    pub(crate) fn line_counts(&self) -> (usize, usize) {
         match self.live_output.as_ref() {
             Some(output) => (output.total_lines(), output.retained_lines()),
             None => {
@@ -44,6 +44,12 @@ impl CommandOutput {
                 (total, total)
             }
         }
+    }
+
+    pub(crate) fn append_live_output(&mut self, chunk: &str) {
+        self.live_output
+            .get_or_insert_with(LiveCommandOutput::default)
+            .push_str(chunk);
     }
 
     /// Returns retained preview lines with reverse traversal for efficient tail rendering.
@@ -225,10 +231,7 @@ impl ExecCell {
             return false;
         };
         let output = call.output.get_or_insert_with(CommandOutput::default);
-        output
-            .live_output
-            .get_or_insert_with(LiveCommandOutput::default)
-            .push_str(chunk);
+        output.append_live_output(chunk);
         true
     }
 

@@ -269,16 +269,27 @@ impl ChatWidget {
                 .then_with(|| left_id.cmp(right_id))
         });
         for (call_id, command) in pending_commands {
+            let RunningCommand {
+                command,
+                parsed_cmd,
+                source,
+                started_at,
+                mut output,
+            } = command;
             let mut cell = new_active_exec_command(
                 call_id.clone(),
-                command.command,
-                command.parsed_cmd,
-                command.source,
+                command,
+                parsed_cmd,
+                source,
                 /*interaction_input*/ None,
                 self.config.animations,
             );
-            cell.append_output(&call_id, &command.aggregated_output);
-            cell.mark_failed();
+            output.exit_code = 1;
+            let completed = cell.complete_call(&call_id, output, started_at.elapsed());
+            debug_assert!(
+                completed,
+                "new interrupted exec cell should contain {call_id}"
+            );
             self.add_to_history(cell);
         }
     }
