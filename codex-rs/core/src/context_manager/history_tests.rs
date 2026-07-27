@@ -1069,15 +1069,16 @@ async fn for_prompt_preserves_inter_agent_assistant_messages() {
 }
 
 #[test]
-fn cloned_history_shares_items_until_mutated() {
+fn cloned_history_shares_items_and_token_cache_until_mutated() {
     let first = assistant_msg(&"first ".repeat(1_024));
     let second = assistant_msg("second");
     let history = create_history_with_items(vec![first.clone()]);
     let mut snapshot = history.clone();
 
-    assert!(std::ptr::eq(
-        history.annotated_items().as_ptr(),
-        snapshot.annotated_items().as_ptr()
+    assert!(Arc::ptr_eq(&history.items, &snapshot.items));
+    assert!(Arc::ptr_eq(
+        &history.item_token_estimates,
+        &snapshot.item_token_estimates
     ));
 
     snapshot.record_items(
@@ -1085,12 +1086,15 @@ fn cloned_history_shares_items_until_mutated() {
         TruncationPolicy::Tokens(10_000),
     );
 
-    assert!(!std::ptr::eq(
-        history.annotated_items().as_ptr(),
-        snapshot.annotated_items().as_ptr()
+    assert!(!Arc::ptr_eq(&history.items, &snapshot.items));
+    assert!(!Arc::ptr_eq(
+        &history.item_token_estimates,
+        &snapshot.item_token_estimates
     ));
     assert_eq!(raw_items(&history), std::slice::from_ref(&first));
     assert_eq!(raw_items(&snapshot), &[first, second]);
+    assert_token_cache_matches(&history);
+    assert_token_cache_matches(&snapshot);
 }
 
 #[test]

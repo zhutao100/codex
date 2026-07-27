@@ -1621,8 +1621,8 @@ impl Session {
         &self,
         turn_context: &TurnContext,
     ) -> Option<i64> {
-        let history = self.clone_history().await;
-        history.estimate_token_count(turn_context)
+        let state = self.state.lock().await;
+        state.history.estimate_token_count(turn_context)
     }
 
     pub(crate) async fn get_base_instructions(&self) -> BaseInstructions {
