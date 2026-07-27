@@ -1,5 +1,6 @@
 set working-directory := "codex-rs"
-set positional-arguments
+set positional-arguments := true
+
 export CODEX_REPO_ROOT := justfile_directory()
 export JUST_SHELL := justfile_directory() / "scripts/just-shell.py"
 
@@ -49,7 +50,7 @@ assemble-codex-package *args:
 [unix]
 app-server-test-client *args:
     {{ cargo_cmd }} build -p codex-cli
-    {{ cargo_cmd }} run -p codex-app-server-test-client -- --codex-bin "$$({{ cargo_cmd }} --print-target-dir)/debug/codex" "$@"
+    {{ cargo_cmd }} run -p codex-app-server-test-client -- --codex-bin "$({{ cargo_cmd }} --print-target-dir)/debug/codex" "$@"
 
 [windows]
 app-server-test-client *args:
@@ -97,7 +98,6 @@ install:
 [unix]
 test *args:
     RUST_MIN_STACK={{ rust_min_stack }} NEXTEST_PROFILE=local {{ cargo_cmd }} nextest run --no-fail-fast "$@"
-    just bench-smoke
 
 [windows]
 test *args:
