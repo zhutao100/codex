@@ -48,11 +48,34 @@ pub(crate) enum InitialContextInjection {
     BeforeLastUserMessage,
 }
 
-pub(crate) fn should_use_remote_compact_task(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompactionImplementation {
+    Local,
+    Remote,
+    RemoteV2,
+}
+
+impl CompactionImplementation {
+    pub(crate) fn metric_label(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Remote => "remote",
+            Self::RemoteV2 => "remote_v2",
+        }
+    }
+}
+
+pub(crate) fn compaction_implementation(
     session: &Session,
     provider: &ModelProviderInfo,
-) -> bool {
-    provider.is_openai() && session.enabled(Feature::RemoteCompaction)
+) -> CompactionImplementation {
+    if !provider.is_openai() || !session.enabled(Feature::RemoteCompaction) {
+        CompactionImplementation::Local
+    } else if session.enabled(Feature::RemoteCompactionV2) {
+        CompactionImplementation::RemoteV2
+    } else {
+        CompactionImplementation::Remote
+    }
 }
 
 pub(crate) async fn run_inline_auto_compact_task(
@@ -114,7 +137,7 @@ async fn run_compact_task_inner(
     let PreparedCompactionInput {
         source_history,
         preserved_work_notes,
-    } = prepare_history_for_compaction(sess.clone_history().await, preserved_work_notes);
+    } = prepare_history_for_compaction(sess.clone_history().await, preserved_work_notes)?;
     let mut history = source_history;
     history.record_items(
         &[initial_input_for_turn.into()],
@@ -235,7 +258,7 @@ async fn run_compact_task_inner(
         .collect();
     new_history.extend(ghost_snapshots);
     let replacement_history = Some(new_history.clone());
-    client_session.clear_websocket_continuation();
+    client_session.reset_after_compaction();
 
     let compacted_item = CompactedItem {
         message: summary_text.clone(),
@@ -358,7 +381,18 @@ pub(crate) fn insert_initial_context_before_last_real_user_message(
     let insert_idx = history
         .iter()
         .rposition(is_real_user_message_for_compaction)
-        .unwrap_or(0);
+        .or_else(|| {
+            history.iter().rposition(|item| {
+                matches!(item, ResponseItem::Message { role, content, .. }
+                    if role == "user" && content_items_to_text(content).is_some_and(|text| is_summary_message(&text)))
+            })
+        })
+        .or_else(|| {
+            history
+                .iter()
+                .rposition(|item| matches!(item, ResponseItem::Compaction { .. }))
+        })
+        .unwrap_or(history.len());
     history.splice(insert_idx..insert_idx, initial_context);
 }
 
@@ -369,10 +403,8 @@ fn is_real_user_message_for_compaction(item: &ResponseItem) -> bool {
     if role != "user" {
         return false;
     }
-    let Some(text) = content_items_to_text(content) else {
-        return false;
-    };
-    !is_summary_message(&text) && !is_preserved_work_notes_message(&text)
+    !crate::event_mapping::is_contextual_user_message_content(content)
+        && !content_items_to_text(content).is_some_and(|text| is_summary_message(&text))
 }
 
 fn build_compacted_history_with_limit(
@@ -433,12 +465,18 @@ fn build_compacted_history_with_limit(
 pub(crate) fn prepare_history_for_compaction(
     mut history: ContextManager,
     preserved_work_notes: Option<String>,
-) -> PreparedCompactionInput {
+) -> CodexResult<PreparedCompactionInput> {
     let mut items = history.raw_items().to_vec();
 
-    // Drop the transient work-notes request suffix if it was injected.
-    if let Some(idx) = items.iter().rposition(is_work_notes_request_item) {
-        items.truncate(idx);
+    // Only remove a verified capture suffix. An abandoned marker must never
+    // cause later user input or actual tool work to be silently discarded.
+    let pending_notes = pending_work_notes(&items)?;
+    if let Some(pending) = &pending_notes {
+        let snapshots = items
+            .drain(pending.request_index..)
+            .filter(|item| matches!(item, ResponseItem::GhostSnapshot { .. }))
+            .collect::<Vec<_>>();
+        items.extend(snapshots);
     }
 
     let extracted_work_notes = extract_existing_preserved_work_notes(&items);
@@ -447,15 +485,73 @@ pub(crate) fn prepare_history_for_compaction(
 
     let preserved_work_notes = preserved_work_notes
         .and_then(|notes| (!notes.trim().is_empty()).then_some(notes))
+        .or_else(|| pending_notes.and_then(|pending| pending.notes))
         .or(extracted_work_notes);
 
-    PreparedCompactionInput {
+    Ok(PreparedCompactionInput {
         source_history: history,
         preserved_work_notes,
-    }
+    })
 }
 
-fn is_work_notes_request_item(item: &ResponseItem) -> bool {
+pub(crate) const WORK_NOTES_CAPTURE_MAX_ATTEMPTS: u8 = 2;
+pub(crate) const WORK_NOTES_TOOL_REJECT_REASON: &str =
+    "tool use disabled during auto-compact work-notes capture";
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct PendingWorkNotes {
+    pub(crate) request_index: usize,
+    pub(crate) notes: Option<String>,
+    pub(crate) attempts: u8,
+}
+
+pub(crate) fn pending_work_notes(items: &[ResponseItem]) -> CodexResult<Option<PendingWorkNotes>> {
+    let Some(request_index) = items.iter().rposition(is_work_notes_request_item) else {
+        return Ok(None);
+    };
+    let mut pending = PendingWorkNotes {
+        request_index,
+        notes: None,
+        attempts: 0,
+    };
+    for item in &items[request_index + 1..] {
+        if matches!(item, ResponseItem::GhostSnapshot { .. }) {
+            continue;
+        }
+        if pending.notes.is_some() {
+            return Err(CodexErr::Fatal(
+                "Work followed a completed compaction-notes capture; preserving history instead of discarding that work".into(),
+            ));
+        }
+        let is_capture_item = match item {
+            ResponseItem::Message { role, content, .. } if role == "assistant" => {
+                pending.attempts = pending.attempts.saturating_add(1);
+                pending.notes = content_items_to_text(content)
+                    .filter(|text| text.trim_start().starts_with(AUTO_COMPACT_WORK_NOTES_TAG));
+                pending.attempts <= WORK_NOTES_CAPTURE_MAX_ATTEMPTS
+            }
+            ResponseItem::Reasoning { .. }
+            | ResponseItem::FunctionCall { .. }
+            | ResponseItem::CustomToolCall { .. }
+            | ResponseItem::LocalShellCall { .. } => true,
+            ResponseItem::FunctionCallOutput { output, .. } => output
+                .text_content()
+                .is_some_and(|text| text.contains(WORK_NOTES_TOOL_REJECT_REASON)),
+            ResponseItem::CustomToolCallOutput { output, .. } => {
+                output.contains(WORK_NOTES_TOOL_REJECT_REASON)
+            }
+            _ => false,
+        };
+        if !is_capture_item {
+            return Err(CodexErr::Fatal(
+                "Unrecognized work after a compaction-notes request; preserving history instead of truncating the suffix".into(),
+            ));
+        }
+    }
+    Ok(Some(pending))
+}
+
+pub(crate) fn is_work_notes_request_item(item: &ResponseItem) -> bool {
     let ResponseItem::Message { role, content, .. } = item else {
         return false;
     };
@@ -467,7 +563,8 @@ fn is_work_notes_request_item(item: &ResponseItem) -> bool {
         return false;
     };
 
-    text.contains(AUTO_COMPACT_WORK_NOTES_REQUEST_TAG)
+    text.trim_start()
+        .starts_with(AUTO_COMPACT_WORK_NOTES_REQUEST_TAG)
 }
 
 fn is_preserved_work_notes_item(item: &ResponseItem) -> bool {
@@ -871,7 +968,7 @@ mod tests {
             },
         ]);
 
-        let prepared = prepare_history_for_compaction(history, None);
+        let prepared = prepare_history_for_compaction(history, None).unwrap();
 
         assert_eq!(
             prepared.preserved_work_notes,

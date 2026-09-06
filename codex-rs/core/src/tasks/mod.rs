@@ -620,6 +620,9 @@ impl Session {
         }
 
         task.handle.abort();
+        // A validated streaming compact may already be installing its exact
+        // replacement. Join that short boundary before constructing pause state.
+        let _compaction_installation = self.compaction_installation.lock().await;
 
         let session_ctx = Arc::new(SessionTaskContext::new(Arc::clone(self)));
         session_task

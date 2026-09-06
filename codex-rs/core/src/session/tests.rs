@@ -49,6 +49,9 @@ use tokio::time::sleep;
 
 use codex_protocol::mcp::CallToolResult as McpCallToolResult;
 use pretty_assertions::assert_eq;
+
+#[path = "compaction_tests.rs"]
+mod compaction;
 use serde::Deserialize;
 use serde_json::json;
 use std::path::PathBuf;
@@ -1840,6 +1843,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         features: config.features.clone(),
         pending_mcp_server_refresh_config: Mutex::new(None),
         active_turn: Mutex::new(None),
+        compaction_installation: Arc::new(Mutex::new(())),
         services,
         next_internal_sub_id: AtomicU64::new(0),
     };
@@ -1979,6 +1983,7 @@ pub(crate) async fn make_session_and_context_with_rx() -> (
         features: config.features.clone(),
         pending_mcp_server_refresh_config: Mutex::new(None),
         active_turn: Mutex::new(None),
+        compaction_installation: Arc::new(Mutex::new(())),
         services,
         next_internal_sub_id: AtomicU64::new(0),
     });

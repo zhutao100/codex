@@ -95,6 +95,7 @@ pub(crate) fn ensure_call_outputs_present(items: &mut Vec<ResponseItem>) {
                 | ResponseItem::WebSearchCall { .. }
                 | ResponseItem::Compaction { .. }
                 | ResponseItem::GhostSnapshot { .. }
+                | ResponseItem::CompactionTrigger {}
                 | ResponseItem::Other => {}
             }
         }
@@ -143,6 +144,7 @@ pub(crate) fn remove_orphan_outputs(items: &mut Vec<ResponseItem>) {
             | ResponseItem::WebSearchCall { .. }
             | ResponseItem::Compaction { .. }
             | ResponseItem::GhostSnapshot { .. }
+            | ResponseItem::CompactionTrigger {}
             | ResponseItem::Other => {}
         }
     }
@@ -232,6 +234,7 @@ pub(crate) fn strip_images_when_unsupported(
             | ResponseItem::WebSearchCall { .. }
             | ResponseItem::Compaction { .. }
             | ResponseItem::GhostSnapshot { .. }
+            | ResponseItem::CompactionTrigger {}
             | ResponseItem::Other => {}
         }
     }
@@ -260,6 +263,7 @@ pub(crate) fn corresponding_position_for(
         | ResponseItem::WebSearchCall { .. }
         | ResponseItem::Compaction { .. }
         | ResponseItem::GhostSnapshot { .. }
+        | ResponseItem::CompactionTrigger {}
         | ResponseItem::Other => None,
     }
 }

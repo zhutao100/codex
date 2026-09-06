@@ -442,6 +442,13 @@ async fn model_downshift_uses_previous_model_for_pre_sampling_compaction() -> Re
                 ev_completed_with_tokens("resp-1", 10_000),
             ]),
             sse(vec![
+                ev_assistant_message(
+                    "notes",
+                    "<AUTO_COMPACT_WORK_NOTES>\nPrevious-model findings",
+                ),
+                ev_completed_with_tokens("notes", 10),
+            ]),
+            sse(vec![
                 ev_assistant_message("msg-3", "small model reply"),
                 ev_completed_with_tokens("resp-3", 10),
             ]),
@@ -467,6 +474,9 @@ async fn model_downshift_uses_previous_model_for_pre_sampling_compaction() -> Re
     let mut builder = test_codex()
         .with_model(large_model)
         .with_config(move |config| {
+            config
+                .features
+                .disable(codex_core::features::Feature::RemoteCompactionV2);
             config.compact_prompt = Some(SUMMARIZATION_PROMPT.to_string());
             config.model_overlay = Some(ModelOverlay {
                 models: vec![
@@ -559,8 +569,8 @@ async fn model_downshift_uses_previous_model_for_pre_sampling_compaction() -> Re
     let requests = resp_mock.requests();
     assert_eq!(
         requests.len(),
-        2,
-        "expected requests before and after downshift compaction"
+        3,
+        "expected work, previous-model notes, and work after downshift compaction"
     );
     assert_eq!(
         requests[0]
@@ -588,14 +598,14 @@ async fn model_downshift_uses_previous_model_for_pre_sampling_compaction() -> Re
         "compaction should run before current-turn user input is recorded"
     );
     assert_eq!(
-        requests[1]
+        requests[2]
             .body_json()
             .get("model")
             .and_then(|v| v.as_str()),
         Some(small_model)
     );
     assert!(
-        requests[1]
+        requests[2]
             .message_input_texts("user")
             .iter()
             .any(|text| text == downshift_prompt),

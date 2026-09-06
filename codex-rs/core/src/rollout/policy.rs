@@ -29,7 +29,7 @@ pub(crate) fn should_persist_response_item(item: &ResponseItem) -> bool {
         | ResponseItem::WebSearchCall { .. }
         | ResponseItem::GhostSnapshot { .. }
         | ResponseItem::Compaction { .. } => true,
-        ResponseItem::Other => false,
+        ResponseItem::CompactionTrigger {} | ResponseItem::Other => false,
     }
 }
 

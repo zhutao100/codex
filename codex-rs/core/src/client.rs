@@ -155,6 +155,8 @@ pub struct ModelClientSession {
     connection_auth_mode: Option<Option<AuthMode>>,
     websocket_last_request: Option<ResponseCreateWsRequest>,
     websocket_last_response_rx: Option<oneshot::Receiver<LastResponse>>,
+    /// Actual sampling tools, captured before opening the stream for inline compaction.
+    pub(crate) sampling_tools: Option<(String, Vec<crate::client_common::tools::ToolSpec>)>,
     /// Turn state for sticky routing.
     ///
     /// This is an `OnceLock` that stores the turn state value received from the server
@@ -254,6 +256,7 @@ impl ModelClient {
             connection_auth_mode: None,
             websocket_last_request: None,
             websocket_last_response_rx: None,
+            sampling_tools: None,
             turn_state: Arc::new(OnceLock::new()),
         }
     }
@@ -463,6 +466,19 @@ impl ModelClient {
 }
 
 impl ModelClientSession {
+    pub(crate) fn reset_after_compaction(&mut self) {
+        if websocket_response_finished_for_cache(
+            self.websocket_last_request.as_ref(),
+            self.websocket_last_response_rx.as_mut(),
+        ) {
+            self.clear_websocket_continuation();
+        } else {
+            // Notes capture may have failed before a separate local/legacy
+            // compact succeeded. Do not make that unfinished socket cacheable.
+            self.drop_websocket_connection();
+        }
+    }
+
     pub(crate) fn clear_websocket_continuation(&mut self) {
         self.websocket_last_request = None;
         self.websocket_last_response_rx = None;
@@ -1614,6 +1630,41 @@ mod tests {
         );
 
         server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reset_after_compaction_caches_only_completed_connections() {
+        skip_if_no_network_unless_localhost!();
+
+        for completed in [false, true] {
+            let server = start_websocket_server(vec![Vec::new()]).await;
+            let provider = test_websocket_provider(&server);
+            let client = test_model_client(provider.clone());
+            {
+                let mut session = client.new_session();
+                session.connection = Some(connect_test_websocket(&provider).await);
+                session.connection_auth_mode = Some(Some(AuthMode::ApiKey));
+                session.websocket_last_request = Some(ws_request(vec![user_message_item("notes")]));
+                let (sender, receiver) = oneshot::channel();
+                if completed {
+                    sender
+                        .send(LastResponse {
+                            response_id: "complete".into(),
+                            items_added: vec![],
+                        })
+                        .unwrap();
+                }
+                session.websocket_last_response_rx = Some(receiver);
+                session.reset_after_compaction();
+            }
+            assert_eq!(
+                client
+                    .take_cached_websocket_connection(&provider, Some(AuthMode::ApiKey))
+                    .is_some(),
+                completed,
+            );
+            server.shutdown().await;
+        }
     }
 
     #[test]

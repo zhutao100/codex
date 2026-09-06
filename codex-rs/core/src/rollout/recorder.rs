@@ -538,7 +538,16 @@ impl RolloutRecorder {
         }
 
         if let Some(index) = first_dangling_tool_call_line_index(&kept_lines) {
-            kept_lines.truncate(index);
+            let snapshots = kept_lines
+                .drain(index..)
+                .filter(|(_, item)| {
+                    matches!(
+                        item,
+                        RolloutItem::ResponseItem(ResponseItem::GhostSnapshot { .. })
+                    )
+                })
+                .collect::<Vec<_>>();
+            kept_lines.extend(snapshots);
             changed = true;
         }
 
@@ -779,7 +788,8 @@ fn is_interrupted_abort_signal(item: &RolloutItem) -> bool {
 
 fn first_dangling_tool_call_line_index(lines: &[(String, RolloutItem)]) -> Option<usize> {
     let last_user_line_index = lines.iter().rposition(|(_line, item)| {
-        matches!(item, RolloutItem::ResponseItem(response_item) if is_user_turn_boundary(response_item))
+        matches!(item, RolloutItem::Compacted(_))
+            || matches!(item, RolloutItem::ResponseItem(response_item) if is_user_turn_boundary(response_item))
     })?;
 
     let mut open_calls: std::collections::HashMap<String, usize> = std::collections::HashMap::new();

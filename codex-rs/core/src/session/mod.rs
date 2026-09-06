@@ -17,8 +17,9 @@ use crate::analytics_client::build_track_events_context;
 use crate::compact;
 use crate::compact::AUTO_COMPACT_WORK_NOTES_REQUEST_TAG;
 use crate::compact::AUTO_COMPACT_WORK_NOTES_TAG;
+use crate::compact::CompactionImplementation;
+use crate::compact::compaction_implementation;
 use crate::compact::run_inline_auto_compact_task;
-use crate::compact::should_use_remote_compact_task;
 use crate::compact_remote::run_inline_remote_auto_compact_task;
 use crate::connectors;
 use crate::exec_policy::ExecPolicyManager;
@@ -647,7 +648,8 @@ impl Session {
         let beta_features_header = FEATURES
             .iter()
             .filter_map(|spec| {
-                if spec.stage.experimental_menu_description().is_some()
+                if (spec.stage.experimental_menu_description().is_some()
+                    || spec.id == Feature::RemoteCompactionV2)
                     && config.features.enabled(spec.id)
                 {
                     Some(spec.key)

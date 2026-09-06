@@ -7458,6 +7458,23 @@
           "type": "object"
         },
         {
+          "description": "Request-only control appended to a Responses compaction request.",
+          "properties": {
+            "type": {
+              "enum": [
+                "compaction_trigger"
+              ],
+              "title": "CompactionTriggerResponseItemType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "title": "CompactionTriggerResponseItem",
+          "type": "object"
+        },
+        {
           "properties": {
             "type": {
               "enum": [
@@ -13914,6 +13931,23 @@
               "type"
             ],
             "title": "CompactionResponseItem",
+            "type": "object"
+          },
+          {
+            "description": "Request-only control appended to a Responses compaction request.",
+            "properties": {
+              "type": {
+                "enum": [
+                  "compaction_trigger"
+                ],
+                "title": "CompactionTriggerResponseItemType",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "title": "CompactionTriggerResponseItem",
             "type": "object"
           },
           {

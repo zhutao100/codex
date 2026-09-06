@@ -55,7 +55,8 @@ The high-value gap was rollout replay. `core/src/session/rollout_reconstruction.
 |Compaction-aware continuation inference|Backported|Avoid treating a standalone compaction summary as an interrupted regular turn.|
 |Persisted lifecycle IDs and reverse replay|Defer|Upstream solution is broader than required and conflicts with branch-local task semantics unless ported as a coherent subsystem.|
 |`comp_hash` compatibility|Conditional|Useful only when this branch's model metadata source supplies a stable non-empty hash.|
-|History windows, body-after-prefix budgets, remote compaction v2|Defer|Large dependency surface; not required for the confirmed defects.|
+|History windows, body-after-prefix budgets|Defer|Large dependency surface; not required for the confirmed defects.|
+|Remote compaction v2|Implemented separately|See [streaming remote compaction](../../features/remote_compaction_v2/README.md); uses exact replacement epochs without a history-envelope migration.|
 
 No mandatory protocol, rollout-schema, or public event change is proposed.
 

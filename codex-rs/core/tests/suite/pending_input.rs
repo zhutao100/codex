@@ -398,6 +398,15 @@ async fn steered_user_input_preserves_previous_request_prefix_after_reasoning_it
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mid_turn_compaction_defers_pending_input_until_model_follow_up_finishes() {
+    assert_pending_input_after_compaction(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_v2_mid_turn_compaction_defers_pending_input_until_model_follow_up_finishes() {
+    assert_pending_input_after_compaction(true).await;
+}
+
+async fn assert_pending_input_after_compaction(remote_v2: bool) {
     let (work_notes_completed_tx, work_notes_completed_rx) = oneshot::channel();
     let pending_text = "queued during work-notes capture";
     let call_id = "call-pending-compact";
@@ -416,7 +425,10 @@ async fn mid_turn_compaction_defers_pending_input_until_model_follow_up_finishes
         },
         StreamingSseChunk {
             gate: None,
-            body: sse_event(ev_completed_with_tokens("resp-1", 96)),
+            body: sse_event(ev_completed_with_tokens(
+                "resp-1",
+                if remote_v2 { 100_000 } else { 96 },
+            )),
         },
     ];
     let work_notes_chunks = vec![
@@ -440,7 +452,11 @@ async fn mid_turn_compaction_defers_pending_input_until_model_follow_up_finishes
         },
         StreamingSseChunk {
             gate: None,
-            body: sse_event(ev_assistant_message("msg-summary", "COMPACTED SUMMARY")),
+            body: sse_event(if remote_v2 {
+                serde_json::json!({"type":"response.output_item.done", "item": {"type":"compaction","encrypted_content":"COMPACTED SUMMARY"}})
+            } else {
+                ev_assistant_message("msg-summary", "COMPACTED SUMMARY")
+            }),
         },
         StreamingSseChunk {
             gate: None,
@@ -482,11 +498,15 @@ async fn mid_turn_compaction_defers_pending_input_until_model_follow_up_finishes
 
     let codex = test_codex()
         .with_model("gpt-5.1")
-        .with_config(|config| {
+        .with_config(move |config| {
             config.compact_prompt = Some(SUMMARIZATION_PROMPT.to_string());
-            config.model_context_window = Some(100);
-            config.model_auto_compact_token_limit = Some(90);
-            config.features.disable(Feature::RemoteCompaction);
+            config.model_context_window = Some(if remote_v2 { 200_000 } else { 100 });
+            config.model_auto_compact_token_limit = Some(if remote_v2 { 90_000 } else { 90 });
+            if remote_v2 {
+                config.features.enable(Feature::RemoteCompaction);
+            } else {
+                config.features.disable(Feature::RemoteCompaction);
+            }
         })
         .build_with_streaming_server(&server)
         .await
@@ -529,12 +549,19 @@ async fn mid_turn_compaction_defers_pending_input_until_model_follow_up_finishes
     let bodies = (0..requests.len())
         .map(|index| request_body(&requests, index))
         .collect::<Vec<_>>();
-    assert!(
-        message_input_texts(&bodies[2], "user")
-            .iter()
-            .any(|text| text == SUMMARIZATION_PROMPT),
-        "expected third request to be compaction"
-    );
+    if remote_v2 {
+        assert_eq!(
+            bodies[2]["input"].as_array().unwrap().last(),
+            Some(&serde_json::json!({"type":"compaction_trigger"}))
+        );
+    } else {
+        assert!(
+            message_input_texts(&bodies[2], "user")
+                .iter()
+                .any(|text| text == SUMMARIZATION_PROMPT),
+            "expected third request to be compaction"
+        );
+    }
 
     for (index, body) in bodies.iter().take(4).enumerate() {
         let user_texts = message_input_texts(body, "user");

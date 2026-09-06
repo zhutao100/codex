@@ -1,5 +1,7 @@
 # Design Proposal
 
+Compaction integration: [streaming remote compaction](../../features/remote_compaction_v2/README.md) adds recoverable notes phases, coherent installation during task-stop, and encrypted-only inline continuation/replay. Existing pause task eligibility and pending-steer restoration remain the governing contracts.
+
 ## Target Base
 
 This proposal targets the `15a9f932c49d78c8b5db4625bd542165b30e3c9b` code shape.

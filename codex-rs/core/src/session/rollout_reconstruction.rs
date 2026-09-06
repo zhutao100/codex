@@ -180,8 +180,17 @@ impl Session {
         let history = history.raw_items().to_vec();
         let suppress_compaction_continuation = latest_compaction_tail_kind
             == CompactionTailKind::StandaloneOrPreTurn
-            && !checkpoint_after_latest_compaction;
-        let pending_continuation = (history_needs_continuation(&history)
+            && !checkpoint_after_latest_compaction
+            && !compact::pending_work_notes(&history).is_ok_and(|pending| pending.is_some());
+        let encrypted_only_continuation = latest_compaction_tail_kind
+            == CompactionTailKind::MidTurnWithInjectedContext
+            && !history.iter().any(is_user_turn_boundary_response_item)
+            && history
+                .iter()
+                .rposition(|item| matches!(item, ResponseItem::Compaction { .. }))
+                .is_some_and(|index| turn::tail_needs_continuation(&history[index + 1..]));
+        let pending_continuation = ((history_needs_continuation(&history)
+            || encrypted_only_continuation)
             && !suppress_compaction_continuation)
             .then(|| PendingContinuation {
                 source: TurnContinuationSource::Interrupted,

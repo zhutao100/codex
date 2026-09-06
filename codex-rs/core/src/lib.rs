@@ -16,6 +16,7 @@ mod client;
 mod client_common;
 mod codex_thread;
 mod compact_remote;
+mod compact_remote_v2;
 pub(crate) mod session;
 mod thread_name;
 pub use codex_thread::CodexThread;

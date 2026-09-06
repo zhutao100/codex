@@ -22,8 +22,7 @@ build-script/proc-macro loading, and runnables.
 Cargo with quiet short diagnostics, then filters successful libtest progress,
 passing-test subprocess chatter, doctest timing chatter, and legacy snapshot
 notices into compact summaries while preserving warnings, errors, failure
-details, and sanitized local paths. Set `CODEX_RS_CARGO_LOCAL_TEST_OUTPUT=raw`
-when exact Cargo/libtest output is needed.
+details, and sanitized local paths. Prefer `-- --show-output` for diagnostics while retaining repository test exclusions. The shared wrapper's `CODEX_RS_CARGO_LOCAL_TEST_OUTPUT=raw` mode currently bypasses those exclusions; keep raw mode limited to explicitly scoped safe tests.
 
 Target-dir selection:
 

@@ -4,6 +4,8 @@
 
 Implemented with rollout learnings incorporated into the design: pre-turn auto-compaction must also capture notes, and pending input must be deferred until after compaction so notes capture is not short-circuited.
 
+The [streaming compaction backport](../../features/remote_compaction_v2/README.md) additionally recovers abandoned notes capture before sampling/new input, shares capture with previous-model downshift, propagates cancellation, preserves late snapshots and reserves exact notes in the context budget.
+
 ## Target Base
 
 This proposal targets the `fe8b474acd43cb8894d661944c6b5c8db0ef0ad1` code shape.

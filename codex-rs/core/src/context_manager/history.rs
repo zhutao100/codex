@@ -112,7 +112,12 @@ impl ContextManager {
     ) -> Vec<ResponseItem> {
         normalize::normalize_history(&mut items);
         normalize::strip_images_when_unsupported(input_modalities, &mut items);
-        items.retain(|item| !matches!(item, ResponseItem::GhostSnapshot { .. }));
+        items.retain(|item| {
+            !matches!(
+                item,
+                ResponseItem::GhostSnapshot { .. } | ResponseItem::CompactionTrigger {}
+            )
+        });
         items
     }
 
@@ -152,6 +157,7 @@ impl ContextManager {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn remove_last_item(&mut self) -> bool {
         if let Some(removed) = self.pop_item() {
             self.remove_corresponding_for(&removed);
@@ -334,6 +340,7 @@ impl ContextManager {
         self.items.push(item);
     }
 
+    #[cfg(test)]
     fn pop_item(&mut self) -> Option<ResponseItem> {
         let index = self.items.len().checked_sub(1)?;
         let token_estimate = self.item_token_estimates.remove(index);
@@ -427,6 +434,7 @@ impl ContextManager {
             | ResponseItem::CustomToolCall { .. }
             | ResponseItem::Compaction { .. }
             | ResponseItem::GhostSnapshot { .. }
+            | ResponseItem::CompactionTrigger {}
             | ResponseItem::Other => item.clone(),
         }
     }
@@ -446,7 +454,7 @@ fn is_api_message(message: &ResponseItem) -> bool {
         | ResponseItem::WebSearchCall { .. }
         | ResponseItem::Compaction { .. } => true,
         ResponseItem::GhostSnapshot { .. } => false,
-        ResponseItem::Other => false,
+        ResponseItem::CompactionTrigger {} | ResponseItem::Other => false,
     }
 }
 
@@ -470,6 +478,13 @@ pub(crate) fn estimate_item_token_count(item: &ResponseItem) -> i64 {
 /// base64 image payload with a fixed image estimate while preserving the data
 /// URL prefix and JSON wrapper bytes already counted in the serialized item.
 const RESIZED_IMAGE_BYTES_ESTIMATE: i64 = 7373;
+
+pub(crate) fn estimate_image_token_count() -> usize {
+    usize::try_from(approx_tokens_from_byte_count(
+        RESIZED_IMAGE_BYTES_ESTIMATE as usize,
+    ))
+    .unwrap_or(usize::MAX)
+}
 
 fn estimate_response_item_model_visible_bytes(item: &ResponseItem) -> i64 {
     match item {
@@ -566,6 +581,7 @@ fn image_data_url_estimate_adjustment(item: &ResponseItem) -> (i64, i64) {
         | ResponseItem::WebSearchCall { .. }
         | ResponseItem::CustomToolCall { .. }
         | ResponseItem::Compaction { .. }
+        | ResponseItem::CompactionTrigger {}
         | ResponseItem::Other => {}
     }
 
@@ -585,13 +601,6 @@ fn is_model_generated_item(item: &ResponseItem) -> bool {
             | ResponseItem::CustomToolCall { .. }
             | ResponseItem::Compaction { .. }
     )
-}
-
-pub(crate) fn is_codex_generated_item(item: &ResponseItem) -> bool {
-    matches!(
-        item,
-        ResponseItem::FunctionCallOutput { .. } | ResponseItem::CustomToolCallOutput { .. }
-    ) || matches!(item, ResponseItem::Message { role, .. } if role == "developer")
 }
 
 pub(crate) fn is_user_turn_boundary(item: &ResponseItem) -> bool {

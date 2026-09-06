@@ -145,6 +145,7 @@ async fn auto_compaction_remote_emits_started_and_completed_items() -> Result<()
     let codex_home = TempDir::new()?;
     let mut features = BTreeMap::default();
     features.insert(Feature::RemoteCompaction, true);
+    features.insert(Feature::RemoteCompactionV2, false);
     write_mock_responses_config_toml(
         codex_home.path(),
         &server.uri(),

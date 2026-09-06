@@ -158,9 +158,9 @@ A minimal port is not isolated because it touches:
 
 Do not add placeholder fields without consumers.
 
-## 8. Deferred: remote compaction v2 and expanded compaction phases
+## 8. Implemented separately: remote compaction v2
 
-The upstream branch has newer remote compaction behavior, reasons/phases, and model capabilities. Port only from a separate product requirement. The replay fix already treats `replacement_history` as an opaque exact base and therefore remains compatible with future replacement producers.
+The endpoint migration is implemented in [streaming remote compaction](../../features/remote_compaction_v2/README.md). It reuses exact `replacement_history` and extends continuation inference/cleanup for encrypted-only inline epochs. Broader upstream history and provider architecture remains deferred.
 
 ## 9. Deferred: expanded response items and inter-agent communication
 

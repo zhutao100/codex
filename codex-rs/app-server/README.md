@@ -2,6 +2,8 @@
 
 `codex app-server` is the interface Codex uses to power rich interfaces such as the [Codex VS Code extension](https://marketplace.visualstudio.com/items?itemName=openai.chatgpt).
 
+Expand `$HOME` in the path examples below before sending requests; wire payloads use absolute paths.
+
 ## Table of Contents
 
 - [Protocol](#protocol)
@@ -92,7 +94,7 @@ Example (from OpenAI's official VSCode extension):
 - `thread/archive` — move a thread’s rollout file into the archived directory; returns `{}` on success.
 - `thread/name/set` — set or update a thread’s user-facing name; returns `{}` on success. Thread names are not required to be unique; name lookups resolve to the most recently updated thread.
 - `thread/unarchive` — move an archived rollout file back into the sessions directory; returns the restored `thread` on success.
-- `thread/compact/start` — trigger conversation history compaction for a thread; returns `{}` immediately while progress streams through standard turn/item notifications.
+- `thread/compact/start` — trigger conversation history compaction for a thread; returns `{}` immediately while progress streams through standard turn/item notifications. Eligible OpenAI providers default to streaming remote compaction through Responses; see [selection, fallback and history guarantees](../docs/features/remote_compaction_v2/README.md).
 - `thread/rollback` — drop the last N turns from the agent’s in-memory context and persist a rollback marker in the rollout so future resumes see the pruned history; returns the updated `thread` (with `turns` populated) on success.
 - `turn/start` — add user input to a thread and begin Codex generation; responds with the initial `turn` object and streams `turn/started`, `item/*`, and `turn/completed` notifications.
 - `turn/interrupt` — request cancellation of an in-flight turn by `(thread_id, turn_id)`; success is an empty `{}` response and the turn finishes with `status: "interrupted"`.
@@ -127,7 +129,7 @@ Start a fresh thread when you need a new Codex conversation.
     // Optionally set config settings. If not specified, will use the user's
     // current config settings.
     "model": "gpt-5.1-codex",
-    "cwd": "/Users/me/project",
+    "cwd": "$HOME/project",
     "approvalPolicy": "never",
     "sandbox": "workspaceWrite",
     "personality": "friendly",
@@ -288,11 +290,11 @@ The `effort` override accepts `"none"`, `"minimal"`, `"low"`, `"medium"`, `"high
     "threadId": "thr_123",
     "input": [ { "type": "text", "text": "Run tests" } ],
     // Below are optional config overrides
-    "cwd": "/Users/me/project",
+    "cwd": "$HOME/project",
     "approvalPolicy": "unlessTrusted",
     "sandboxPolicy": {
         "type": "workspaceWrite",
-        "writableRoots": ["/Users/me/project"],
+        "writableRoots": ["$HOME/project"],
         "networkAccess": true
     },
     "model": "gpt-5.1-codex",
@@ -325,7 +327,7 @@ Invoke a skill explicitly by including `$<skill-name>` in the text input and add
     "threadId": "thr_123",
     "input": [
         { "type": "text", "text": "$skill-creator Add a new skill for triaging flaky CI and include step-by-step usage." },
-        { "type": "skill", "name": "skill-creator", "path": "/Users/me/.codex/skills/skill-creator/SKILL.md" }
+        { "type": "skill", "name": "skill-creator", "path": "$HOME/.codex/skills/skill-creator/SKILL.md" }
     ]
 } }
 { "id": 33, "result": { "turn": {
@@ -446,7 +448,7 @@ Run a standalone command (argv vector) in the server’s sandbox without creatin
 ```json
 { "method": "command/exec", "id": 32, "params": {
     "command": ["ls", "-la"],
-    "cwd": "/Users/me/project",                    // optional; defaults to server cwd
+    "cwd": "$HOME/project",                    // optional; defaults to server cwd
     "sandboxPolicy": { "type": "workspaceWrite" }, // optional; defaults to user config
     "timeoutMs": 10000                             // optional; ms timeout; defaults to server timeout
 } }
@@ -632,7 +634,7 @@ Invoke a skill by including `$<skill-name>` in the text input. Add a `skill` inp
       {
         "type": "skill",
         "name": "skill-creator",
-        "path": "/Users/me/.codex/skills/skill-creator/SKILL.md"
+        "path": "$HOME/.codex/skills/skill-creator/SKILL.md"
       }
     ]
   }
@@ -651,12 +653,12 @@ Use `skills/list` to fetch the available skills (optionally scoped by `cwds`, wi
 
 ```json
 { "method": "skills/list", "id": 25, "params": {
-    "cwds": ["/Users/me/project"],
+    "cwds": ["$HOME/project"],
     "forceReload": false
 } }
 { "id": 25, "result": {
     "data": [{
-        "cwd": "/Users/me/project",
+        "cwd": "$HOME/project",
         "skills": [
             {
               "name": "skill-creator",
@@ -684,7 +686,7 @@ To enable or disable a skill by path:
   "method": "skills/config/write",
   "id": 26,
   "params": {
-    "path": "/Users/me/.codex/skills/skill-creator/SKILL.md",
+    "path": "$HOME/.codex/skills/skill-creator/SKILL.md",
     "enabled": false
   }
 }

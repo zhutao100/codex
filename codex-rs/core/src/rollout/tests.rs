@@ -176,6 +176,53 @@ async fn load_rollout_items_ignores_custom_pause_continue_events() -> Result<()>
 }
 
 #[tokio::test]
+async fn clean_for_continue_uses_compaction_epoch_and_keeps_late_snapshots() -> Result<()> {
+    let temp = TempDir::new()?;
+    let path = temp.path().join("rollout.jsonl");
+    let call = |id: &str| {
+        RolloutItem::ResponseItem(ResponseItem::FunctionCall {
+            id: None,
+            name: "shell".into(),
+            arguments: "{}".into(),
+            call_id: id.into(),
+        })
+    };
+    let previous = call("superseded");
+    let checkpoint = RolloutItem::Compacted(codex_protocol::protocol::CompactedItem {
+        message: String::new(),
+        replacement_history: Some(vec![ResponseItem::Compaction {
+            encrypted_content: "summary".into(),
+        }]),
+    });
+    let snapshot = RolloutItem::ResponseItem(ResponseItem::GhostSnapshot {
+        ghost_commit: codex_git::GhostCommit::new("snapshot".into(), None, vec![], vec![]),
+    });
+    let items = [
+        previous.clone(),
+        checkpoint.clone(),
+        call("unfinished"),
+        snapshot.clone(),
+    ];
+    let text = items
+        .into_iter()
+        .map(rollout_json_line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&path, format!("{text}\n"))?;
+    assert!(RolloutRecorder::clean_for_continue(&path, false).await?);
+    let actual: Vec<_> = fs::read_to_string(&path)?
+        .lines()
+        .map(|line| serde_json::from_str::<RolloutLine>(line).unwrap().item)
+        .collect();
+    assert_eq!(
+        serde_json::to_value(actual)?,
+        serde_json::to_value(vec![previous, checkpoint, snapshot])?,
+    );
+    assert!(!RolloutRecorder::clean_for_continue(&path, false).await?);
+    Ok(())
+}
+
+#[tokio::test]
 async fn clean_for_continue_removes_abort_custom_and_dangling_records() -> Result<()> {
     let temp = TempDir::new().unwrap();
     let path = temp.path().join("rollout.jsonl");

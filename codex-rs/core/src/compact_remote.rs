@@ -7,16 +7,18 @@ use crate::compact::insert_initial_context_before_last_real_user_message;
 use crate::compact::prepare_history_for_compaction;
 use crate::compact::preserved_work_notes_message;
 use crate::context_manager::ContextManager;
-use crate::context_manager::is_codex_generated_item;
+use crate::context_manager::estimate_item_token_count;
 use crate::error::Result as CodexResult;
 use crate::protocol::CompactedItem;
 use crate::protocol::EventMsg;
 use crate::protocol::TurnStartedEvent;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
+use crate::truncate::approx_token_count;
 use codex_protocol::items::ContextCompactionItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::BaseInstructions;
+use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::ResponseItem;
 use tracing::info;
 
@@ -91,17 +93,19 @@ async fn run_remote_compact_task_inner_impl(
     let PreparedCompactionInput {
         mut source_history,
         preserved_work_notes,
-    } = prepare_history_for_compaction(sess.clone_history().await, preserved_work_notes);
-    let deleted_items = trim_function_call_history_to_fit_context_window(
-        &mut source_history,
-        turn_context.as_ref(),
-        &base_instructions,
-    );
-    if deleted_items > 0 {
+    } = prepare_history_for_compaction(sess.clone_history().await, preserved_work_notes)?;
+    let (rewritten_outputs, estimated_deleted_tokens) =
+        trim_function_call_history_to_fit_context_window(
+            &mut source_history,
+            turn_context.as_ref(),
+            &base_instructions,
+        );
+    if rewritten_outputs > 0 {
         info!(
             turn_id = %turn_context.sub_id,
-            deleted_items,
-            "trimmed history items before remote compaction"
+            rewritten_outputs,
+            estimated_deleted_tokens,
+            "rewrote history outputs before remote compaction"
         );
     }
 
@@ -164,31 +168,65 @@ async fn run_remote_compact_task_inner_impl(
     Ok(())
 }
 
-fn trim_function_call_history_to_fit_context_window(
+pub(crate) const TRUNCATED_OUTPUT: &str =
+    "Output exceeded the available model context and was truncated";
+
+pub(crate) fn trim_function_call_history_to_fit_context_window(
     history: &mut ContextManager,
     turn_context: &TurnContext,
     base_instructions: &BaseInstructions,
-) -> usize {
-    let mut deleted_items = 0usize;
+) -> (usize, i64) {
     let Some(context_window) = turn_context.model_context_window() else {
-        return deleted_items;
+        return (0, 0);
     };
-
-    while history
+    if history
         .estimate_token_count_with_base_instructions(base_instructions)
-        .is_some_and(|estimated_tokens| estimated_tokens > context_window)
+        .is_none_or(|estimated_tokens| estimated_tokens <= context_window)
     {
-        let Some(last_item) = history.raw_items().last() else {
-            break;
-        };
-        if !is_codex_generated_item(last_item) {
-            break;
-        }
-        if !history.remove_last_item() {
-            break;
-        }
-        deleted_items += 1;
+        return (0, 0);
     }
 
-    deleted_items
+    let mut items = history.raw_items().to_vec();
+    // Keep the accumulator unclamped while subtracting rewritten outputs.
+    let mut tokens = items
+        .iter()
+        .map(estimate_item_token_count)
+        .map(i128::from)
+        .sum::<i128>()
+        + approx_token_count(&base_instructions.text) as i128;
+    let original_tokens = tokens;
+    let mut rewritten_outputs = 0;
+    for item in items.iter_mut().rev() {
+        if tokens <= i128::from(context_window) {
+            break;
+        }
+        if matches!(item, ResponseItem::GhostSnapshot { .. }) {
+            continue;
+        }
+        let before = estimate_item_token_count(item);
+        let mut rewritten = item.clone();
+        match &mut rewritten {
+            ResponseItem::FunctionCallOutput { output, .. } => {
+                output.body = FunctionCallOutputBody::Text(TRUNCATED_OUTPUT.into());
+            }
+            ResponseItem::CustomToolCallOutput { output, .. } => {
+                *output = TRUNCATED_OUTPUT.into();
+            }
+            _ => break,
+        }
+        let after = estimate_item_token_count(&rewritten);
+        if after < before {
+            *item = rewritten;
+            tokens -= i128::from(before - after);
+            rewritten_outputs += 1;
+        }
+    }
+    if rewritten_outputs > 0 {
+        history.replace(items);
+    }
+
+    (
+        rewritten_outputs,
+        i64::try_from(original_tokens - tokens).unwrap_or(i64::MAX),
+    )
 }

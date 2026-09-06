@@ -18,7 +18,7 @@ use codex_protocol::user_input::UserInput;
 use core_test_support::responses;
 use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::sse;
-use core_test_support::skip_if_no_network;
+use core_test_support::skip_if_no_network_unless_localhost;
 use core_test_support::test_codex::TestCodexHarness;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
@@ -42,13 +42,14 @@ fn estimate_compact_payload_tokens(request: &responses::ResponsesRequest) -> i64
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_compact_replaces_history_for_followups() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    skip_if_no_network_unless_localhost!(Ok(()));
 
     let harness = TestCodexHarness::with_builder(
         test_codex()
             .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
             .with_config(|config| {
                 config.features.enable(Feature::RemoteCompaction);
+                config.features.disable(Feature::RemoteCompactionV2);
             }),
     )
     .await?;
@@ -168,13 +169,14 @@ async fn remote_compact_replaces_history_for_followups() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_compact_runs_automatically() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    skip_if_no_network_unless_localhost!(Ok(()));
 
     let harness = TestCodexHarness::with_builder(
         test_codex()
             .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
             .with_config(|config| {
                 config.features.enable(Feature::RemoteCompaction);
+                config.features.disable(Feature::RemoteCompactionV2);
             }),
     )
     .await?;
@@ -186,6 +188,14 @@ async fn remote_compact_runs_automatically() -> Result<()> {
         sse(vec![
             responses::ev_shell_command_call("m1", "echo 'hi'"),
             responses::ev_completed_with_tokens("resp-1", 100000000), // over token limit
+        ]),
+    )
+    .await;
+    mount_sse_once(
+        harness.server(),
+        sse(vec![
+            responses::ev_assistant_message("notes", "<AUTO_COMPACT_WORK_NOTES>\nKeep the task"),
+            responses::ev_completed("notes"),
         ]),
     )
     .await;
@@ -254,7 +264,7 @@ async fn remote_compact_runs_automatically() -> Result<()> {
 #[cfg_attr(target_os = "windows", ignore)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_compact_trims_function_call_history_to_fit_context_window() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    skip_if_no_network_unless_localhost!(Ok(()));
 
     let first_user_message = "turn with retained shell call";
     let second_user_message = "turn with trimmed shell call";
@@ -268,6 +278,7 @@ async fn remote_compact_trims_function_call_history_to_fit_context_window() -> R
             .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
             .with_config(|config| {
                 config.features.enable(Feature::RemoteCompaction);
+                config.features.disable(Feature::RemoteCompactionV2);
                 config.model_context_window = Some(2_000);
             }),
     )
@@ -359,22 +370,23 @@ async fn remote_compact_trims_function_call_history_to_fit_context_window() -> R
         "expected compact request to keep the older function call/result pair"
     );
     assert!(
-        !compact_request.has_function_call(trimmed_call_id)
+        compact_request.has_function_call(trimmed_call_id)
             && compact_request
                 .function_call_output_text(trimmed_call_id)
-                .is_none(),
-        "expected compact request to drop the trailing function call/result pair past the boundary"
+                .as_deref()
+                == Some("Output exceeded the available model context and was truncated"),
+        "expected compact request to preserve the trailing call with a truncated output"
     );
 
     assert_eq!(
         compact_request.inputs_of_type("function_call").len(),
-        1,
-        "expected exactly one function call after trimming"
+        2,
+        "expected both function calls after output rewriting"
     );
     assert_eq!(
         compact_request.inputs_of_type("function_call_output").len(),
-        1,
-        "expected exactly one function call output after trimming"
+        2,
+        "expected both paired outputs after output rewriting"
     );
 
     Ok(())
@@ -383,7 +395,7 @@ async fn remote_compact_trims_function_call_history_to_fit_context_window() -> R
 #[cfg_attr(target_os = "windows", ignore)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_compact_trim_estimate_uses_session_base_instructions() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    skip_if_no_network_unless_localhost!(Ok(()));
 
     let first_user_message = "turn with baseline shell call";
     let second_user_message = "turn with trailing shell call";
@@ -399,6 +411,7 @@ async fn remote_compact_trim_estimate_uses_session_base_instructions() -> Result
             .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
             .with_config(|config| {
                 config.features.enable(Feature::RemoteCompaction);
+                config.features.disable(Feature::RemoteCompactionV2);
                 config.model_context_window = Some(200_000);
             }),
     )
@@ -497,6 +510,7 @@ async fn remote_compact_trim_estimate_uses_session_base_instructions() -> Result
                 let override_base_instructions = override_base_instructions.clone();
                 move |config| {
                     config.features.enable(Feature::RemoteCompaction);
+                    config.features.disable(Feature::RemoteCompactionV2);
                     config.model_context_window = Some(override_context_window);
                     config.base_instructions = Some(override_base_instructions);
                 }
@@ -577,8 +591,14 @@ async fn remote_compact_trim_estimate_uses_session_base_instructions() -> Result
         "expected remote compact request to preserve older function call history"
     );
     assert!(
-        !override_compact_request.has_function_call(override_trailing_call_id),
-        "expected remote compact request to trim trailing function call history with override instructions"
+        override_compact_request.has_function_call(override_trailing_call_id),
+        "expected remote compact request to preserve trailing call identity"
+    );
+    assert_eq!(
+        override_compact_request
+            .function_call_output_text(override_trailing_call_id)
+            .as_deref(),
+        Some("Output exceeded the available model context and was truncated"),
     );
 
     Ok(())
@@ -586,13 +606,14 @@ async fn remote_compact_trim_estimate_uses_session_base_instructions() -> Result
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_manual_compact_emits_context_compaction_items() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    skip_if_no_network_unless_localhost!(Ok(()));
 
     let harness = TestCodexHarness::with_builder(
         test_codex()
             .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
             .with_config(|config| {
                 config.features.enable(Feature::RemoteCompaction);
+                config.features.disable(Feature::RemoteCompactionV2);
             }),
     )
     .await?;
@@ -682,13 +703,14 @@ async fn remote_manual_compact_emits_context_compaction_items() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_compact_persists_replacement_history_in_rollout() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    skip_if_no_network_unless_localhost!(Ok(()));
 
     let harness = TestCodexHarness::with_builder(
         test_codex()
             .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
             .with_config(|config| {
                 config.features.enable(Feature::RemoteCompaction);
+                config.features.disable(Feature::RemoteCompactionV2);
             }),
     )
     .await?;

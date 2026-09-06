@@ -181,6 +181,8 @@ pub enum ResponseItem {
     Compaction {
         encrypted_content: String,
     },
+    /// Request-only control appended to a Responses compaction request.
+    CompactionTrigger {},
     #[serde(other)]
     Other,
 }
@@ -1494,6 +1496,15 @@ mod tests {
             serde_json::to_string(&expected_items)?
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn roundtrips_compaction_trigger() -> Result<()> {
+        let item = ResponseItem::CompactionTrigger {};
+        let json = r#"{"type":"compaction_trigger"}"#;
+        assert_eq!(serde_json::to_string(&item)?, json);
+        assert_eq!(serde_json::from_str::<ResponseItem>(json)?, item);
         Ok(())
     }
 
