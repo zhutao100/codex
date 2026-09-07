@@ -12,6 +12,9 @@ use tokio::sync::oneshot;
 #[path = "compact_remote_v2_downshift.rs"]
 mod downshift;
 
+#[path = "compact_local_recovery.rs"]
+mod local_fallback;
+
 fn chunk(events: Vec<Value>) -> StreamingSseChunk {
     StreamingSseChunk {
         gate: None,
@@ -75,7 +78,9 @@ async fn plan_mode_compaction_preserves_literal_plan_tags_in_multipart_notes() -
     use codex_protocol::config_types::CollaborationMode;
     use codex_protocol::config_types::ModeKind;
     use codex_protocol::config_types::Settings;
-    let notes = format!("{NOTES}\n<proposed_plan>Keep this literal block.</proposed_plan>");
+    let notes = format!(
+        "{NOTES}\n<proposed_plan>\nKeep this literal block.\n</proposed_plan>\nNext action."
+    );
     let mut event = multipart_notes();
     event["item"]["content"][1]["text"] = json!(&notes[19..]);
     let mut streams = work_and_notes();
@@ -114,6 +119,58 @@ async fn plan_mode_compaction_preserves_literal_plan_tags_in_multipart_notes() -
     let followup: Value = serde_json::from_slice(&requests[3])?;
     assert_eq!(
         user_messages(&followup)
+            .iter()
+            .filter(|text| text.ends_with(&notes))
+            .count(),
+        1,
+    );
+    let path = test.session_configured.rollout_path.as_ref().unwrap();
+    let recorded_notes: Vec<_> = std::fs::read_to_string(path)?
+        .lines()
+        .map(|line| serde_json::from_str::<RolloutLine>(line).unwrap().item)
+        .filter_map(|item| match item {
+            RolloutItem::ResponseItem(ResponseItem::Message { role, content, .. })
+                if role == "assistant" =>
+            {
+                Some(
+                    content
+                        .into_iter()
+                        .filter_map(|part| match part {
+                            codex_protocol::models::ContentItem::OutputText { text } => Some(text),
+                            _ => None,
+                        })
+                        .collect::<String>(),
+                )
+            }
+            _ => None,
+        })
+        .filter(|text| text.starts_with("<AUTO_COMPACT_WORK_NOTES>"))
+        .collect();
+    assert_eq!(recorded_notes, vec![notes.clone()]);
+    test.codex.submit(Op::Shutdown).await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::ShutdownComplete)
+    })
+    .await;
+    let replay_server = responses::start_mock_server().await;
+    let replay = responses::mount_sse_once(
+        &replay_server,
+        responses::sse(vec![
+            responses::ev_assistant_message("resumed", "finished"),
+            responses::ev_completed("resumed"),
+        ]),
+    )
+    .await;
+    let resumed = test_codex()
+        .resume(&replay_server, test.home.clone(), path.clone())
+        .await?;
+    resumed
+        .codex
+        .submit(user_input("resume with the exact notes"))
+        .await?;
+    complete(&resumed.codex).await;
+    assert_eq!(
+        user_messages(&replay.single_request().body_json())
             .iter()
             .filter(|text| text.ends_with(&notes))
             .count(),

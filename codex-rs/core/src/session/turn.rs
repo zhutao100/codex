@@ -2334,6 +2334,7 @@ async fn try_run_sampling_request(
                     turn_context: turn_context.clone(),
                     tool_runtime: tool_runtime.clone(),
                     cancellation_token: cancellation_token.child_token(),
+                    plan_mode,
                 };
 
                 let output_result = handle_output_item_done(&mut ctx, item, previously_active_item)

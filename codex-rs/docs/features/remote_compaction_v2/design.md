@@ -24,6 +24,8 @@ Source references: upstream `core/src/compact_remote_v2.rs`, `compact_remote_v2_
 |Failed/paused downshift recovery lost the source model after notes lowered reported usage.|Persist the JSON-encoded source model in the notes request; use separate source request and destination replacement contexts during recovery.|
 |Replay selected the previous user-turn model for unfinished downshift work.|Pending captures keep the resume-selected destination; installed inline replacements continue with their adjacent reference context's model.|
 |Multipart capture recovery inserted newlines and could alter split sentinels or code.|Reuse live assistant output-text concatenation, and bypass plan-tag parsing during notes capture.|
+|An output helper independently re-enabled plan parsing during capture.|Pass sampling's parsing decision through output handling; verify standalone multiline plan tags in live and replayed notes.|
+|Failed local summarization appended uncommitted output after completed notes and blocked recovery.|Buffer output per attempt and construct the summary only from a completed attempt, without mutating live source history.|
 |64,000 retained tokens can exceed smaller windows once fixed context is added.|Use it as a ceiling; reserve all known fixed costs and apply the destination model's limits on downshift.|
 |Recomputed usage counted preserved notes twice.|Store a baseline at the last model item, excluding adjustments subsequently added by live/replayed context accounting.|
 |A valid encrypted-only replacement could not continue after restart.|Use the existing inline-compaction epoch and tail-completion semantics; fix dangling-call cleanup to respect the same epoch.|
@@ -74,7 +76,9 @@ An outstanding notes capture remains unfinished across errors, interruption and 
 
 Function, MCP and custom-tool rejection outputs may arrive after the assistant's notes because sampling drains tool futures after the stream. Accept exact known rejections only for matching capture calls. If interruption precedes output recording, live and durable continuation cleanup preserve the capture for notes recovery; ordinary dangling work after a later real user boundary is still trimmed.
 
-Live capture, recovery and the native acceptance checker concatenate only assistant output-text parts, without adding separators. This preserves split sentinels and code tokens. Capture disables ordinary plan-mode parsing so literal `<proposed_plan>` blocks survive unchanged.
+Live capture, recovery and the native acceptance checker concatenate only assistant output-text parts, without adding separators. This preserves split sentinels and code tokens. Capture disables ordinary plan-mode parsing so literal `<proposed_plan>` blocks survive unchanged. Output handlers must use the sampling loop's decision instead of deriving it again from collaboration mode. Tests use tags on separate lines because the parser deliberately ignores same-line tags.
+
+Local fallback buffers completed output items within each summarization attempt. EOF, stream errors and retries discard the buffer, leaving the live notes capture recoverable. Only a completed attempt supplies the local summary used by the replacement writer; raw summarizer output never enters live source history.
 
 When a failed regular turn finishes, pending steering keeps the existing acknowledgement/persistence behavior. It becomes later source history for the retry, and continuation remains available instead of treating notes as a final answer or running successful-completion hooks. Successful inline compaction still defers queued input until its first follow-up. These semantics use existing history and continuation records; no persisted queue format is added.
 

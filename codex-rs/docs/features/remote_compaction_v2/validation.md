@@ -27,17 +27,17 @@ The new transport fixtures use the loopback-aware guard; the wrapper supplies it
 |Collector|Complete singleton summary; unrelated tool output ignored; missing/multiple outputs; incomplete/failed stream; usage before validation; attempt-local retry state.|
 |HTTP|ChatGPT and API-key request construction; backend base path; ordinary tools/settings/cache parity; no legacy route; permanent 404 and configured retry budgets; manual and automatic follow-ups.|
 |Retention|Mixed stale context; old summaries; interruption markers; newest-first boundaries; escaped Unicode; image-only histories; atomic labels; no older backfill; base64 preservation; fixed-context limits.|
-|Notes|Exact multiline/multipart notes, including split sentinels/code and literal plan tags; bounded capture exclusion; matching function/MCP/custom rejections before or after notes; interrupted capture cleanup; pre-turn schema skip; source-model metadata and malformed metadata rejection; distinct previous/destination instructions and final overrides; missing-provider errors; preservation of later acknowledged input.|
+|Notes|Exact multiline/multipart notes, including split sentinels/code and standalone multiline plan tags; live notes versus recorded notes and replayed replacement; bounded capture exclusion; matching function/MCP/custom rejections before or after notes; interrupted capture cleanup; pre-turn schema skip; source-model metadata and malformed metadata rejection; distinct previous/destination instructions and final overrides; missing-provider errors; preservation of later acknowledged input.|
 |Lifecycle/accounting|Matching start/completion; failure/Continue/steering/restart; nine downshift recovery cases covering failure/pause, Continue/new input, restart and older captures; cancellation before installation; actual pause/interrupt handlers aborting a parent blocked on a real recorder; snapshots completing during the stream; healthy socket reuse; exact local token baselines; long notes below the limit do not trigger another pre-turn compaction after restart.|
 |Replay|Exact durable replacement and adjacent reference read without a test-side flush; live/replayed history equality; source/destination selection before and after installation; encrypted-only inline versus standalone provenance; completed and incomplete tails; rollback; compaction-relative durable dangling-call cleanup.|
-|Legacy|Explicit legacy selection; output placeholder rewrite retaining calls and success flags; base-instruction estimate; unchanged local selection.|
+|Local/legacy|Explicit legacy selection; output placeholder rewrite retaining calls and success flags; base-instruction estimate; local fallback with two failed summarizer attempts, Continue/new input and restart; failed output absent from recovery requests and durable replacement.|
 
 ## Results
 
 |Check|Result|
 |---|---|
-|Core package, final guarded run|1,893 reported passes across four suites; 15 ignored and 44 excluded by the nested-sandbox skip list. Existing sandbox/network early returns are included in these package totals.|
-|Focused compaction run|56 unit tests and 57 reported integration passes; two unchanged legacy resume/fork cases returned at their explicit network guard. The other 55 integration cases ran, including all v2 fixtures and the local compaction/model-downshift fixtures using the loopback-aware guard.|
+|Core package, final guarded run|1,897 reported passes across four suites; 15 ignored and 44 excluded by the nested-sandbox skip list. Existing sandbox/network early returns are included in these package totals.|
+|Focused compaction run|56 unit tests and 61 reported integration passes; two unchanged legacy resume/fork cases returned at their explicit network guard. The other 59 integration cases ran, including all v2 fixtures and the local compaction/model-downshift fixtures using the loopback-aware guard.|
 |Protocol, telemetry and app-server protocol packages|123 tests passed across nine suites.|
 |Schema generation|Config JSON and affected app-server JSON/TypeScript fixtures regenerated; schema tests passed.|
 |Formatting/lints/build|`just-local fmt`, scoped `just-local fix`, and `cargo-local build -p codex-cli --bin codex` completed. Existing lint warnings remain in unrelated task/util code and a pre-existing pending-input helper.|
@@ -46,6 +46,8 @@ The new transport fixtures use the loopback-aware guard; the wrapper supplies it
 Package totals include existing external-network and Seatbelt early returns and must not be reported as executed transport coverage. The dedicated v2 fixtures all executed past their guards.
 
 Executing the older localhost fixtures exposed stale assumptions about work-notes requests, JSON-escaped notes and canonical-context placement. Those fixtures now include the notes phase and compare actual retained history and notes rather than removing fixed-position context entries.
+
+Multiline plan-note and local-fallback regressions reproduced three failures before their fixes: standalone plan blocks were stripped, and unfinished local summary output blocked both Continue and new input. Restart cases already passed because the failed output was confined to live memory. Output handlers now share the capture parsing decision, and local attempts keep their output private until completion.
 
 The initial raw-output core run included seven failures in the pre-existing shell/Seatbelt exclusion categories because raw mode bypasses the wrapper's skip list. The subsequent normal-wrapper runs applied those exclusions and passed. The complete workspace `--all-features` test suite was not run; scoped Clippy used all features for the affected crates.
 

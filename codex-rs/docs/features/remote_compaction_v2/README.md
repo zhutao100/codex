@@ -39,8 +39,9 @@ Disabling only `remote_compaction_v2` selects the legacy endpoint and can reprod
 - Mid-turn compaction borrows the active client and preserves deferred-input ordering.
 - Recover an outstanding notes transaction before ordinary work or incoming user input is appended. Recognize completed notes and abort markers from durable history. A later real user message ends the capture segment; preserve it and subsequent work in the retry source. Reject ambiguous work inside the capture segment.
 - Failed compaction keeps continuation available immediately and after restart. Queued steering acknowledged when the failed turn finishes is persisted outside the capture segment; notes are never treated as the final user answer.
+- Local fallback keeps summarizer output private until the attempt completes. Failed attempts cannot append uncommitted summaries after a notes capture and block recovery.
 - Matching tool rejections can follow completed notes because tool futures drain after the stream. Continuation cleanup preserves notes captures whose rejected outputs were not recorded before interruption.
-- Concatenate assistant output-text parts exactly for both live capture and recovery, including split sentinels and literal plan tags. Capture bypasses ordinary plan rendering.
+- Concatenate assistant output-text parts exactly for both live capture and recovery, including split sentinels and multiline plan blocks. Output handlers share sampling's capture-specific decision to bypass plan rendering.
 - Preserve undo snapshots, including snapshots arriving during notes capture, the compaction stream or interrupted tool work. Snapshot recording and replacement installation share a guard. Snapshots remain absent from model requests.
 - Install canonical context before the last real user, then the last plaintext summary, then the encrypted summary, or append it if none exists. Image-only input is a real user anchor.
 - Append notes after the encrypted summary and snapshots after notes. Persist exactly this vector plus the appropriate adjacent reference context.

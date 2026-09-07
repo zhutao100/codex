@@ -179,7 +179,7 @@ async fn run_compact_task_inner(
     let rollout_item = RolloutItem::TurnContext(turn_context.to_turn_context_item());
     sess.persist_rollout_items(&[rollout_item]).await;
 
-    loop {
+    let completed_output = loop {
         // Clone is required because of the loop
         let turn_input = history
             .clone()
@@ -201,7 +201,7 @@ async fn run_compact_task_inner(
         .await;
 
         match attempt_result {
-            Ok(()) => {
+            Ok(output) => {
                 if truncated_count > 0 {
                     sess.notify_background_event(
                         turn_context.as_ref(),
@@ -211,7 +211,7 @@ async fn run_compact_task_inner(
                     )
                     .await;
                 }
-                break;
+                break output;
             }
             Err(CodexErr::Interrupted) => {
                 return Err(CodexErr::Interrupted);
@@ -251,11 +251,12 @@ async fn run_compact_task_inner(
                 }
             }
         }
-    }
+    };
 
     let history_snapshot = sess.clone_history().await;
     let history_items = history_snapshot.raw_items();
-    let summary_suffix = get_last_assistant_message_from_turn(history_items).unwrap_or_default();
+    let summary_suffix =
+        get_last_assistant_message_from_turn(&completed_output).unwrap_or_default();
     let summary_text = format!("{SUMMARY_PREFIX}\n{summary_suffix}");
     let user_messages = collect_user_messages(history_items);
 
@@ -668,7 +669,7 @@ async fn drain_to_completed(
     client_session: &mut ModelClientSession,
     turn_metadata_header: Option<&str>,
     prompt: &Prompt,
-) -> CodexResult<()> {
+) -> CodexResult<Vec<ResponseItem>> {
     let mut stream = client_session
         .stream(
             prompt,
@@ -680,6 +681,9 @@ async fn drain_to_completed(
             turn_metadata_header,
         )
         .await?;
+    // Keep uncommitted summarizer output out of the live notes capture. Each
+    // retry gets a fresh buffer; only a completed attempt supplies the summary.
+    let mut output = Vec::new();
     loop {
         let maybe_event = stream.next().await;
         let Some(event) = maybe_event else {
@@ -690,8 +694,7 @@ async fn drain_to_completed(
         };
         match event {
             Ok(ResponseEvent::OutputItemDone(item)) => {
-                sess.record_into_history(std::slice::from_ref(&item), turn_context)
-                    .await;
+                output.push(item);
             }
             Ok(ResponseEvent::ServerReasoningIncluded(included)) => {
                 sess.set_server_reasoning_included(included).await;
@@ -702,7 +705,7 @@ async fn drain_to_completed(
             Ok(ResponseEvent::Completed { token_usage, .. }) => {
                 sess.update_token_usage_info(turn_context, token_usage.as_ref())
                     .await;
-                return Ok(());
+                return Ok(output);
             }
             Ok(_) => continue,
             Err(e) => return Err(e),

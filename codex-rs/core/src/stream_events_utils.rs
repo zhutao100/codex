@@ -1,7 +1,6 @@
 use std::pin::Pin;
 use std::sync::Arc;
 
-use codex_protocol::config_types::ModeKind;
 use codex_protocol::items::TurnItem;
 use tokio_util::sync::CancellationToken;
 
@@ -40,6 +39,7 @@ pub(crate) struct HandleOutputCtx {
     pub turn_context: Arc<TurnContext>,
     pub tool_runtime: ToolCallRuntime,
     pub cancellation_token: CancellationToken,
+    pub plan_mode: bool,
 }
 
 #[instrument(level = "trace", skip_all)]
@@ -49,7 +49,7 @@ pub(crate) async fn handle_output_item_done(
     previously_active_item: Option<TurnItem>,
 ) -> Result<OutputItemResult> {
     let mut output = OutputItemResult::default();
-    let plan_mode = ctx.turn_context.collaboration_mode.mode == ModeKind::Plan;
+    let plan_mode = ctx.plan_mode;
 
     match ToolRouter::build_tool_call(ctx.sess.as_ref(), item.clone()).await {
         // The model emitted a tool call; log it, persist the item immediately, and queue the tool execution.
