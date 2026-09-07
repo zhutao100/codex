@@ -4,6 +4,7 @@ use crate::compact::WORK_NOTES_TOOL_REJECT_REASON;
 use crate::compact::pending_work_notes;
 use crate::compact_remote_v2::CompactionReason;
 use crate::context_manager::estimate_item_token_count;
+use crate::session_prefix::is_turn_aborted_marker;
 use crate::truncate::approx_token_count;
 use crate::truncate::truncate_function_output_items_with_policy;
 use crate::truncate::truncate_text;
@@ -326,7 +327,7 @@ async fn run_turn_inner(
     };
     if pending_notes {
         // Finish the recorded notes transaction before ordinary sampling or new
-        // user input can get appended beyond its transient suffix.
+        // user input can get appended beyond its capture segment.
         let injection = if continuation.is_some() {
             InitialContextInjection::BeforeLastUserMessage
         } else {
@@ -790,9 +791,17 @@ async fn maybe_run_previous_model_inline_compact(
         return Ok(false);
     }
 
-    let previous_context = sess
+    let previous_context = match sess
         .turn_context_with_model(turn_context.as_ref(), &previous_turn_settings.model)
-        .await;
+        .await
+    {
+        Ok(context) => context,
+        Err(error) => {
+            sess.send_event(turn_context, EventMsg::Error(error.to_error_event(None)))
+                .await;
+            return Err(error);
+        }
+    };
     let previous_model = previous_context.model_info.slug.as_str();
     let previous_context_window = previous_context.model_context_window();
     let current_context_window = turn_context.model_context_window();
@@ -920,7 +929,14 @@ async fn run_pre_turn_compact(
     if cancellation_token.is_cancelled() {
         return Err(CodexErr::TurnAborted);
     }
-    let pending = pending_work_notes(sess.clone_history().await.raw_items())?;
+    let (pending, has_following_input) = {
+        let history = sess.clone_history().await;
+        let pending = pending_work_notes(history.raw_items())?;
+        let has_following_input = pending
+            .as_ref()
+            .is_some_and(|pending| pending.capture_end < history.raw_items().len());
+        (pending, has_following_input)
+    };
     let mut attempts = pending.as_ref().map_or(0, |pending| pending.attempts);
     let mut notes = pending.as_ref().and_then(|pending| pending.notes.clone());
     let mut client_session = sess
@@ -930,6 +946,7 @@ async fn run_pre_turn_compact(
     if notes.is_none()
         && turn_context.final_output_json_schema.is_none()
         && attempts < WORK_NOTES_CAPTURE_MAX_ATTEMPTS
+        && !has_following_input
     {
         if pending.is_none() {
             inject_pre_compact_work_notes_request(sess, turn_context).await;
@@ -989,7 +1006,7 @@ async fn run_pre_turn_compact(
 }
 
 pub(super) fn history_needs_continuation(history: &[ResponseItem]) -> bool {
-    if pending_work_notes(history).is_ok_and(|pending| pending.is_some()) {
+    if !matches!(pending_work_notes(history), Ok(None)) {
         return true;
     }
     let Some(last_user_index) = history
@@ -1222,7 +1239,7 @@ pub(super) fn is_user_turn_boundary_response_item(item: &ResponseItem) -> bool {
 }
 
 pub(super) fn remove_trailing_turn_aborted_marker(items: &mut Vec<ResponseItem>) -> bool {
-    if items.last().is_some_and(is_turn_aborted_interrupted_marker) {
+    if items.last().is_some_and(is_turn_aborted_marker) {
         items.pop();
         true
     } else {
@@ -1279,20 +1296,6 @@ fn first_dangling_tool_call_index(items: &[ResponseItem]) -> Option<usize> {
         .copied()
         .chain(first_incomplete_local_shell)
         .min()
-}
-
-fn is_turn_aborted_interrupted_marker(item: &ResponseItem) -> bool {
-    let ResponseItem::Message { role, content, .. } = item else {
-        return false;
-    };
-
-    role == "user"
-        && content.iter().any(|content_item| {
-            matches!(
-                content_item,
-                ContentItem::InputText { text } if text.starts_with(TURN_ABORTED_OPEN_TAG)
-            )
-        })
 }
 
 pub(super) fn filter_connectors_for_input(

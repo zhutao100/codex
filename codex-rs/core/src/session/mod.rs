@@ -189,7 +189,6 @@ use crate::rollout::RolloutRecorder;
 use crate::rollout::RolloutRecorderParams;
 use crate::rollout::map_session_init_error;
 use crate::rollout::metadata;
-use crate::session_prefix::TURN_ABORTED_OPEN_TAG;
 use crate::shell;
 use crate::shell_snapshot::ShellSnapshot;
 use crate::skills::SkillError;
@@ -1604,6 +1603,21 @@ impl Session {
         self.record_into_history(items, turn_context).await;
         self.persist_rollout_response_items(items).await;
         self.send_raw_response_items(turn_context, items).await;
+    }
+
+    pub(crate) async fn record_ghost_snapshot(
+        &self,
+        turn_context: &TurnContext,
+        ghost_commit: &codex_git::GhostCommit,
+    ) {
+        let _installation = self.compaction_installation.lock().await;
+        self.record_conversation_items(
+            turn_context,
+            &[ResponseItem::GhostSnapshot {
+                ghost_commit: ghost_commit.clone(),
+            }],
+        )
+        .await;
     }
 
     /// Append ResponseItems to the in-memory conversation history only.

@@ -324,3 +324,80 @@ fn work_notes_preparation_keeps_snapshots_that_arrive_during_capture() {
     assert_eq!(prepared.source_history.for_prompt(), vec![]);
     assert_eq!(prepared.preserved_work_notes, Some("notes".into()));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snapshot_completed_during_the_compaction_stream_survives_installation() {
+    core_test_support::skip_if_no_network_unless_localhost!();
+    use core_test_support::responses;
+    use core_test_support::streaming_sse::StreamingSseChunk;
+    use core_test_support::streaming_sse::start_streaming_sse_server;
+    let (release, gate) = tokio::sync::oneshot::channel();
+    let (server, _) = start_streaming_sse_server(vec![vec![StreamingSseChunk {
+        gate: Some(gate),
+        body: responses::sse(vec![
+            json!({"type":"response.output_item.done", "item":{"type":"compaction","encrypted_content":"summary"}}),
+            responses::ev_completed("complete"),
+        ]),
+    }]]).await;
+    let (session, mut context) = make_session_and_context().await;
+    context.provider.base_url = Some(format!("{}/v1", server.uri()));
+    let session = Arc::new(session);
+    let context = Arc::new(context);
+    let user = ResponseItem::Message {
+        id: None,
+        role: "user".into(),
+        content: vec![ContentItem::InputText {
+            text: "task".into(),
+        }],
+        end_turn: None,
+        phase: None,
+    };
+    session
+        .record_conversation_items(&context, std::slice::from_ref(&user))
+        .await;
+    let before = codex_git::GhostCommit::new("before-request".into(), None, vec![], vec![]);
+    let during = codex_git::GhostCommit::new("during-request".into(), None, vec![], vec![]);
+    session.record_ghost_snapshot(&context, &before).await;
+    let task_session = Arc::clone(&session);
+    let task_context = Arc::clone(&context);
+    let task = tokio::spawn(async move {
+        run_remote_compact_task(
+            &task_session,
+            &task_context,
+            None,
+            None,
+            InitialContextInjection::DoNotInject,
+            CompactionReason::TokenLimit,
+            &CancellationToken::new(),
+        )
+        .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while server.requests().await.is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    session.record_ghost_snapshot(&context, &during).await;
+    release.send(()).unwrap();
+    assert!(task.await.unwrap().unwrap());
+    assert_eq!(
+        session.clone_history().await.raw_items(),
+        &[
+            user.clone(),
+            compaction("summary"),
+            ResponseItem::GhostSnapshot {
+                ghost_commit: before
+            },
+            ResponseItem::GhostSnapshot {
+                ghost_commit: during
+            },
+        ]
+    );
+    assert_eq!(
+        session.clone_history().await.for_prompt(),
+        vec![user, compaction("summary")]
+    );
+    server.shutdown().await;
+}

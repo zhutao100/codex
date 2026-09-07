@@ -16,13 +16,15 @@ Source references: upstream `core/src/compact_remote_v2.rs`, `compact_remote_v2_
 |Gap in the original plan|Implemented resolution|
 |---|---|
 |Abandoned notes state disappears on pause/restart.|Infer the bounded capture phase and exact completed notes from existing history before sampling or recording new user input.|
-|A stale request marker could delete all later history.|Validate the suffix; reject later user/work records without mutation. Preserve late ghost snapshots.|
+|A stale request marker could delete later history or block retry after interruption.|Bound the capture at the next real user message. Preserve known abort controls, snapshots and subsequent user/work records; reject unidentified work inside the capture segment.|
+|Failed compaction finalized notes as a completed turn and cleared continuation.|Keep continuation and skip completion hooks while a notes transaction remains. Persist acknowledged steering after the bounded segment so retry and restart retain it.|
 |Pre-turn capture errors included cancellation.|Propagate cancellation before no-notes fallback.|
-|Previous-model compaction bypassed fresh notes.|Share pre-turn capture under the previous provider/model.|
+|Previous-model compaction bypassed fresh notes and could retain the destination provider.|Share pre-turn capture and explicitly resolve the previous model's provider from configuration; report provider-resolution errors.|
 |64,000 retained tokens can exceed smaller windows once fixed context is added.|Use it as a ceiling; reserve all known fixed costs and apply the destination model's limits on downshift.|
 |A valid encrypted-only replacement could not continue after restart.|Use the existing inline-compaction epoch and tail-completion semantics; fix dangling-call cleanup to respect the same epoch.|
 |Clearing unfinished WebSocket tracking could make a bad socket cacheable.|Reset after successful installation; discard an unfinished notes socket when local/legacy compaction completed through a different request. Preserve completed physical connections.|
 |The replacement writer alone was not cancellation-safe.|Shield installation in a short child task and join its guard from task-stop before pause/abort state is built.|
+|Snapshots completing during the stream were absent from the prepared source.|Gather current snapshots under the installation guard and use that guard for background snapshot recording.|
 |Legacy trim tests and mock guards could conceal behavior.|Select legacy explicitly, update call-preserving assertions, and execute localhost fixtures through the existing guard.|
 
 ## Stream and retry semantics
@@ -47,7 +49,13 @@ Output fitting rewrites only a contiguous supported trailing output suffix, igno
 
 `replace_compacted_history` remains the single replacement writer and recomputes token usage once. The shielded installation orders the exact replacement, adjacent reference context and completion event before task-stop constructs its pause/abort result. This prevents cancellation from splitting the existing operation; it does not introduce power-loss atomicity or a new disk format.
 
+The installer gathers current undo snapshots while holding the same guard as the background snapshot writer. A snapshot recorded during the remote request enters the replacement; a writer acquiring the guard after installation appends after that checkpoint.
+
 Standalone/pre-turn replacements clear the reference baseline. Inline replacements retain a matching reference context. Replay infers unfinished encrypted-only work only from inline provenance, applies ordinary completion semantics to the subsequent tail, and respects rollback across the compaction epoch.
+
+An outstanding notes capture remains unfinished across errors, interruption and restart. Its bounded segment accepts known abort controls and ends at the next real user message. Preparation removes only verified capture items, preserving controls and all later source history. Unidentified work within the segment fails without mutation and retains continuation. If incomplete capture already has following input, recovery uses existing notes or the no-notes fallback instead of requesting notes across that boundary.
+
+When a failed regular turn finishes, pending steering keeps the existing acknowledgement/persistence behavior. It becomes later source history for the retry, and continuation remains available instead of treating notes as a final answer or running successful-completion hooks. Successful inline compaction still defers queued input until its first follow-up. These semantics use existing history and continuation records; no persisted queue format is added.
 
 Notes intentionally follow the encrypted summary. This preserves the branch's established carryover contract, whereas upstream normally keeps the summary last. The deployment check must therefore cover an automatic notes-bearing compaction and its follow-up.
 

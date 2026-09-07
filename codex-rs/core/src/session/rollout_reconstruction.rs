@@ -181,7 +181,7 @@ impl Session {
         let suppress_compaction_continuation = latest_compaction_tail_kind
             == CompactionTailKind::StandaloneOrPreTurn
             && !checkpoint_after_latest_compaction
-            && !compact::pending_work_notes(&history).is_ok_and(|pending| pending.is_some());
+            && matches!(compact::pending_work_notes(&history), Ok(None));
         let encrypted_only_continuation = latest_compaction_tail_kind
             == CompactionTailKind::MidTurnWithInjectedContext
             && !history.iter().any(is_user_turn_boundary_response_item)

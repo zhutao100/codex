@@ -1,5 +1,8 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+#[path = "compact_remote_v2_recovery.rs"]
+mod recovery;
+
 use anyhow::Result;
 use codex_core::CodexAuth;
 use codex_core::features::Feature;

@@ -389,6 +389,33 @@ impl Session {
             .await;
             return;
         }
+        if task_kind == TaskKind::Regular
+            && !matches!(
+                crate::compact::pending_work_notes(self.clone_history().await.raw_items()),
+                Ok(None)
+            )
+        {
+            // A failed compact leaves its capture transaction in history.
+            // Pending input was acknowledged above and remains outside that
+            // segment. Preserve continuation instead of treating notes as the
+            // user's final answer or running completion-review hooks.
+            self.set_pending_continuation(Some(PendingContinuation {
+                source: TurnContinuationSource::Interrupted,
+                continued_from_turn_id: Some(turn_context.sub_id.clone()),
+                model: Some(turn_context.model_info.slug.clone()),
+                pause_reason: None,
+                target: PendingContinuationTarget::Regular,
+            }))
+            .await;
+            self.send_event(
+                turn_context.as_ref(),
+                EventMsg::TurnComplete(TurnCompleteEvent {
+                    last_agent_message: None,
+                }),
+            )
+            .await;
+            return;
+        }
         self.clear_pending_continuation().await;
         if task_kind == TaskKind::Regular {
             self.capture_completed_regular_turn_for_review(

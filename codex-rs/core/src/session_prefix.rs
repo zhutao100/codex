@@ -1,3 +1,6 @@
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::ResponseItem;
+
 /// Helpers for identifying model-visible "session prefix" messages.
 ///
 /// A session prefix is a user-role message that carries configuration or state needed by
@@ -12,4 +15,18 @@ pub(crate) fn is_session_prefix(text: &str) -> bool {
     let trimmed = text.trim_start();
     let lowered = trimmed.to_ascii_lowercase();
     lowered.starts_with(ENVIRONMENT_CONTEXT_OPEN_TAG) || lowered.starts_with(TURN_ABORTED_OPEN_TAG)
+}
+
+pub(crate) fn is_turn_aborted_marker(item: &ResponseItem) -> bool {
+    let ResponseItem::Message { role, content, .. } = item else {
+        return false;
+    };
+
+    role == "user"
+        && content.iter().any(|content_item| {
+            matches!(
+                content_item,
+                ContentItem::InputText { text } if text.starts_with(TURN_ABORTED_OPEN_TAG)
+            )
+        })
 }

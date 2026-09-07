@@ -397,16 +397,18 @@ async fn steered_user_input_preserves_previous_request_prefix_after_reasoning_it
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mid_turn_compaction_defers_pending_input_until_model_follow_up_finishes() {
-    assert_pending_input_after_compaction(false).await;
+async fn mid_turn_compaction_defers_pending_input_until_model_follow_up_finishes()
+-> anyhow::Result<()> {
+    assert_pending_input_after_compaction(false).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn remote_v2_mid_turn_compaction_defers_pending_input_until_model_follow_up_finishes() {
-    assert_pending_input_after_compaction(true).await;
+async fn remote_v2_mid_turn_compaction_defers_pending_input_until_model_follow_up_finishes()
+-> anyhow::Result<()> {
+    assert_pending_input_after_compaction(true).await
 }
 
-async fn assert_pending_input_after_compaction(remote_v2: bool) {
+async fn assert_pending_input_after_compaction(remote_v2: bool) -> anyhow::Result<()> {
     let (work_notes_completed_tx, work_notes_completed_rx) = oneshot::channel();
     let pending_text = "queued during work-notes capture";
     let call_id = "call-pending-compact";
@@ -509,8 +511,7 @@ async fn assert_pending_input_after_compaction(remote_v2: bool) {
             }
         })
         .build_with_streaming_server(&server)
-        .await
-        .unwrap()
+        .await?
         .codex;
 
     codex
@@ -521,8 +522,7 @@ async fn assert_pending_input_after_compaction(remote_v2: bool) {
             }],
             final_output_json_schema: None,
         })
-        .await
-        .unwrap();
+        .await?;
 
     wait_for_event(&codex, |event| {
         matches!(event, EventMsg::AgentMessage(message) if message.message == work_notes_text)
@@ -537,8 +537,7 @@ async fn assert_pending_input_after_compaction(remote_v2: bool) {
             }],
             final_output_json_schema: None,
         })
-        .await
-        .unwrap();
+        .await?;
 
     let _ = work_notes_completed_tx.send(());
     wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
@@ -551,7 +550,7 @@ async fn assert_pending_input_after_compaction(remote_v2: bool) {
         .collect::<Vec<_>>();
     if remote_v2 {
         assert_eq!(
-            bodies[2]["input"].as_array().unwrap().last(),
+            request_input_items(&bodies[2]).last(),
             Some(&serde_json::json!({"type":"compaction_trigger"}))
         );
     } else {
@@ -580,4 +579,5 @@ async fn assert_pending_input_after_compaction(remote_v2: bool) {
     );
 
     server.shutdown().await;
+    Ok(())
 }

@@ -119,12 +119,6 @@ async fn run_compact(
             turn_context,
             &base_instructions,
         );
-    let snapshots: Vec<_> = source
-        .raw_items()
-        .iter()
-        .filter(|item| matches!(item, ResponseItem::GhostSnapshot { .. }))
-        .cloned()
-        .collect();
     let mut input = source.for_prompt_with_modalities(&turn_context.model_info.input_modalities);
     let tools = match &client_session.sampling_tools {
         Some((model, tools)) if model == &turn_context.model_info.slug => tools.clone(),
@@ -205,7 +199,6 @@ async fn run_compact(
         }
     };
     replacement.extend(notes_item);
-    replacement.extend(snapshots);
     check_cancelled(cancellation_token)?;
 
     install_compacted_history(
@@ -235,7 +228,7 @@ async fn run_compact(
 async fn install_compacted_history(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
-    replacement: Vec<ResponseItem>,
+    mut replacement: Vec<ResponseItem>,
     reference: Option<crate::protocol::TurnContextItem>,
     lifecycle_item: TurnItem,
     cancellation_token: &CancellationToken,
@@ -248,6 +241,18 @@ async fn install_compacted_history(
     let install_context = Arc::clone(turn_context);
     let install = tokio::spawn(async move {
         let _guard = guard;
+        // Snapshot capture shares this guard. A snapshot that completed while
+        // the model was compacting must be included in the exact checkpoint;
+        // one completing later appends after that checkpoint.
+        replacement.extend(
+            install_session
+                .clone_history()
+                .await
+                .raw_items()
+                .iter()
+                .filter(|item| matches!(item, ResponseItem::GhostSnapshot { .. }))
+                .cloned(),
+        );
         let compacted = CompactedItem {
             message: String::new(),
             replacement_history: Some(replacement.clone()),

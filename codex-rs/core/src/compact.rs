@@ -17,6 +17,7 @@ use crate::session::session::Session;
 use crate::session::turn::get_last_assistant_message_from_turn;
 use crate::session::turn_context::TurnContext;
 use crate::session_prefix::TURN_ABORTED_OPEN_TAG;
+use crate::session_prefix::is_turn_aborted_marker;
 use crate::truncate::TruncationPolicy;
 use crate::truncate::approx_token_count;
 use crate::truncate::truncate_text;
@@ -468,15 +469,18 @@ pub(crate) fn prepare_history_for_compaction(
 ) -> CodexResult<PreparedCompactionInput> {
     let mut items = history.raw_items().to_vec();
 
-    // Only remove a verified capture suffix. An abandoned marker must never
-    // cause later user input or actual tool work to be silently discarded.
+    // Remove only the identified capture segment. Input acknowledged after a
+    // failed attempt belongs to the next attempt's source, not to notes capture.
     let pending_notes = pending_work_notes(&items)?;
     if let Some(pending) = &pending_notes {
-        let snapshots = items
-            .drain(pending.request_index..)
-            .filter(|item| matches!(item, ResponseItem::GhostSnapshot { .. }))
+        let controls = items[pending.request_index..pending.capture_end]
+            .iter()
+            .filter(|item| {
+                matches!(item, ResponseItem::GhostSnapshot { .. }) || is_turn_aborted_marker(item)
+            })
+            .cloned()
             .collect::<Vec<_>>();
-        items.extend(snapshots);
+        items.splice(pending.request_index..pending.capture_end, controls);
     }
 
     let extracted_work_notes = extract_existing_preserved_work_notes(&items);
@@ -501,6 +505,7 @@ pub(crate) const WORK_NOTES_TOOL_REJECT_REASON: &str =
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct PendingWorkNotes {
     pub(crate) request_index: usize,
+    pub(crate) capture_end: usize,
     pub(crate) notes: Option<String>,
     pub(crate) attempts: u8,
 }
@@ -511,12 +516,17 @@ pub(crate) fn pending_work_notes(items: &[ResponseItem]) -> CodexResult<Option<P
     };
     let mut pending = PendingWorkNotes {
         request_index,
+        capture_end: items.len(),
         notes: None,
         attempts: 0,
     };
-    for item in &items[request_index + 1..] {
-        if matches!(item, ResponseItem::GhostSnapshot { .. }) {
+    for (index, item) in items.iter().enumerate().skip(request_index + 1) {
+        if matches!(item, ResponseItem::GhostSnapshot { .. }) || is_turn_aborted_marker(item) {
             continue;
+        }
+        if crate::context_manager::is_user_turn_boundary(item) {
+            pending.capture_end = index;
+            break;
         }
         if pending.notes.is_some() {
             return Err(CodexErr::Fatal(

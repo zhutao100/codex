@@ -138,6 +138,7 @@ async fn completed_work_notes_remain_pending_work_after_restart() {
         pending,
         compact::PendingWorkNotes {
             request_index: 1,
+            capture_end: 3,
             notes: Some(notes.into()),
             attempts: 1
         }
@@ -147,12 +148,148 @@ async fn completed_work_notes_remain_pending_work_after_restart() {
     let prepared = compact::prepare_history_for_compaction(source, None).unwrap();
     assert_eq!(prepared.source_history.raw_items(), &history[..1]);
     assert_eq!(prepared.preserved_work_notes, Some(notes.into()));
-    let mut abandoned = history;
-    abandoned.push(user_message("later genuine work"));
+    let mut abandoned = history.clone();
+    let later = user_message("later genuine work");
+    abandoned.push(later.clone());
     let mut source = ContextManager::new();
     source.replace(abandoned.clone());
-    assert!(compact::prepare_history_for_compaction(source.clone(), None).is_err());
+    let prepared = compact::prepare_history_for_compaction(source.clone(), None).unwrap();
+    assert_eq!(
+        prepared.source_history.raw_items(),
+        &[history[0].clone(), later]
+    );
+    assert_eq!(prepared.preserved_work_notes, Some(notes.into()));
     assert_eq!(source.raw_items(), abandoned);
+
+    let mut ambiguous = ContextManager::new();
+    let mut items = history;
+    items.push(assistant_message("unidentified later work"));
+    ambiguous.replace(items);
+    assert!(compact::prepare_history_for_compaction(ambiguous, None).is_err());
+}
+
+#[tokio::test]
+async fn interrupted_notes_replay_and_preparation_preserve_the_known_abort_marker() {
+    let (session, context) = make_session_and_context().await;
+    let request: ResponseItem =
+        DeveloperInstructions::new(compact::AUTO_COMPACT_WORK_NOTES_REQUEST_TAG).into();
+    let notes = "<AUTO_COMPACT_WORK_NOTES>\nExact captured notes";
+    let marker = user_message("<turn_aborted>\ninterrupted\n</turn_aborted>");
+    for completed_notes in [false, true] {
+        let mut history = vec![user_message("original task"), request.clone()];
+        if completed_notes {
+            history.push(assistant_message(notes));
+        }
+        history.push(marker.clone());
+        let rollout: Vec<_> = history
+            .iter()
+            .cloned()
+            .map(RolloutItem::ResponseItem)
+            .collect();
+        let reconstructed = session
+            .reconstruct_history_from_rollout(&context, &rollout)
+            .await;
+        assert!(reconstructed.pending_continuation.is_some());
+        assert_eq!(reconstructed.history, history);
+        let mut source = ContextManager::new();
+        source.replace(history);
+        let prepared = compact::prepare_history_for_compaction(source, None).unwrap();
+        assert_eq!(
+            prepared.source_history.raw_items(),
+            &[user_message("original task"), marker.clone()]
+        );
+        assert_eq!(
+            prepared.preserved_work_notes,
+            completed_notes.then(|| notes.to_string())
+        );
+    }
+}
+
+#[tokio::test]
+async fn ambiguous_compaction_notes_remain_recoverable_after_standalone_replay() {
+    let (session, context) = make_session_and_context().await;
+    let history = vec![
+        ResponseItem::Compaction {
+            encrypted_content: "earlier summary".into(),
+        },
+        DeveloperInstructions::new(compact::AUTO_COMPACT_WORK_NOTES_REQUEST_TAG).into(),
+        assistant_message("<AUTO_COMPACT_WORK_NOTES>\nnotes"),
+        assistant_message("unidentified later work"),
+    ];
+    let rollout = vec![
+        RolloutItem::Compacted(CompactedItem {
+            message: String::new(),
+            replacement_history: Some(history[..1].to_vec()),
+        }),
+        RolloutItem::ResponseItem(history[1].clone()),
+        RolloutItem::ResponseItem(history[2].clone()),
+        RolloutItem::ResponseItem(history[3].clone()),
+    ];
+    let reconstructed = session
+        .reconstruct_history_from_rollout(&context, &rollout)
+        .await;
+    assert_eq!(reconstructed.history, history);
+    assert!(reconstructed.pending_continuation.is_some());
+    assert!(compact::pending_work_notes(&reconstructed.history).is_err());
+}
+
+#[tokio::test]
+async fn previous_model_compaction_reports_a_missing_provider() {
+    use crate::models_manager::overlay::ModelInfoPatch;
+    use crate::models_manager::overlay::ModelOverlay;
+    use crate::models_manager::overlay::ModelOverlayEntry;
+
+    let (session, mut context, events) = make_session_and_context_with_rx().await;
+    Arc::get_mut(&mut context)
+        .unwrap()
+        .model_info
+        .auto_compact_token_limit = Some(100);
+    {
+        let mut state = session.state.lock().await;
+        let config = Arc::make_mut(&mut state.session_configuration.original_config_do_not_use);
+        config.model_overlay = Some(ModelOverlay {
+            models: vec![ModelOverlayEntry {
+                slug: "previous-model".into(),
+                model_provider: Some("missing-provider".into()),
+                patch: ModelInfoPatch::default(),
+                final_instruction_override: None,
+            }],
+            ..Default::default()
+        });
+        state.set_token_usage_full(1_000);
+    }
+    session
+        .set_previous_turn_settings(Some(PreviousTurnSettings {
+            model: "previous-model".into(),
+        }))
+        .await;
+    assert_eq!(
+        turn::run_turn(
+            session,
+            context,
+            vec![UserInput::Text {
+                text: "next task".into(),
+                text_elements: vec![],
+            }],
+            CancellationToken::new(),
+        )
+        .await,
+        None
+    );
+    let mut errors = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let EventMsg::Error(error) = event.msg {
+            errors.push(error);
+        }
+    }
+    assert_eq!(
+        serde_json::to_value(errors).unwrap(),
+        serde_json::to_value(vec![
+            CodexErr::Fatal("Model provider `missing-provider` not found".into())
+                .to_error_event(None)
+        ])
+        .unwrap()
+    );
 }
 
 #[test]

@@ -328,7 +328,7 @@ impl Session {
         &self,
         source: &TurnContext,
         model: &str,
-    ) -> Arc<TurnContext> {
+    ) -> CodexResult<Arc<TurnContext>> {
         let mut session_configuration = {
             let state = self.state.lock().await;
             state.session_configuration.clone()
@@ -336,12 +336,18 @@ impl Session {
         session_configuration.collaboration_mode = session_configuration
             .collaboration_mode
             .with_updates(Some(model.to_string()), None, None);
-        self.new_turn_from_configuration(
-            source.sub_id.clone(),
-            session_configuration,
-            Some(source.final_output_json_schema.clone()),
-            false,
-        )
-        .await
+        let (provider_id, provider) = session_configuration
+            .original_config_do_not_use
+            .resolve_model_provider_for_model(model)?;
+        session_configuration.provider_id = provider_id;
+        session_configuration.provider = provider;
+        Ok(self
+            .new_turn_from_configuration(
+                source.sub_id.clone(),
+                session_configuration,
+                Some(source.final_output_json_schema.clone()),
+                false,
+            )
+            .await)
     }
 }

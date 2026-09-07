@@ -41,10 +41,9 @@ use crate::default_client::originator;
 use crate::git_info::collect_git_info;
 use crate::path_utils;
 use crate::protocol::EventMsg;
-use crate::session_prefix::TURN_ABORTED_OPEN_TAG;
+use crate::session_prefix::is_turn_aborted_marker;
 use crate::state_db;
 use crate::state_db::StateDbHandle;
-use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::ResumedHistory;
@@ -781,7 +780,7 @@ fn is_interrupted_abort_signal(item: &RolloutItem) -> bool {
         RolloutItem::EventMsg(EventMsg::TurnAborted(ev)) => {
             ev.reason == TurnAbortReason::Interrupted
         }
-        RolloutItem::ResponseItem(item) => is_turn_aborted_interrupted_marker(item),
+        RolloutItem::ResponseItem(item) => is_turn_aborted_marker(item),
         _ => false,
     }
 }
@@ -821,20 +820,6 @@ fn first_dangling_tool_call_line_index(lines: &[(String, RolloutItem)]) -> Optio
         .copied()
         .chain(first_incomplete_local_shell)
         .min()
-}
-
-fn is_turn_aborted_interrupted_marker(item: &ResponseItem) -> bool {
-    let ResponseItem::Message { role, content, .. } = item else {
-        return false;
-    };
-
-    role == "user"
-        && content.iter().any(|content_item| {
-            matches!(
-                content_item,
-                ContentItem::InputText { text } if text.starts_with(TURN_ABORTED_OPEN_TAG)
-            )
-        })
 }
 
 impl From<codex_state::ThreadsPage> for ThreadsPage {
