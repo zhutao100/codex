@@ -23,10 +23,122 @@ fn work_and_notes() -> Vec<Vec<StreamingSseChunk>> {
             responses::ev_completed_with_tokens("work", 1_000_000),
         ])],
         vec![chunk(vec![
+            responses::ev_function_call("notes-tool", "update_plan", r#"{"plan":[]}"#),
             responses::ev_assistant_message("notes", NOTES),
             responses::ev_completed("notes"),
         ])],
     ]
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn notes_with_rejected_tools_complete_compaction_without_retry() -> Result<()> {
+    skip_if_no_network_unless_localhost!(Ok(()));
+    let mut streams = work_and_notes();
+    streams.extend(successful_recovery());
+    let (server, _) = start_streaming_sse_server(streams).await;
+    let test = test_codex().build_with_streaming_server(&server).await?;
+    test.codex.submit(user_input("task with notes")).await?;
+    complete(&test.codex).await;
+    let requests = server.requests().await;
+    assert_eq!(requests.len(), 4);
+    let compact: Value = serde_json::from_slice(&requests[2])?;
+    assert_compact_request(&compact);
+    assert!(!compact.to_string().contains("notes-tool"));
+    assert!(!compact.to_string().contains("AUTO_COMPACT_WORK_NOTES"));
+    let followup: Value = serde_json::from_slice(&requests[3])?;
+    assert_eq!(
+        user_messages(&followup)
+            .iter()
+            .filter(|text| text.ends_with(NOTES))
+            .count(),
+        1
+    );
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn long_notes_do_not_trigger_another_pre_turn_compaction_after_restart() -> Result<()> {
+    skip_if_no_network_unless_localhost!(Ok(()));
+    let notes = format!("{NOTES}\n{}", "n ".repeat(40_000));
+    let (_release, gate) = oneshot::channel();
+    let mut streams = work_and_notes();
+    streams[1] = vec![chunk(vec![
+        responses::ev_assistant_message("long-notes", &notes),
+        responses::ev_completed("notes"),
+    ])];
+    streams.push(vec![chunk(vec![
+        ev_compaction("summary"),
+        responses::ev_completed("compact"),
+    ])]);
+    streams.push(vec![
+        chunk(vec![responses::ev_response_created("blocked-followup")]),
+        StreamingSseChunk {
+            gate: Some(gate),
+            body: responses::sse(vec![responses::ev_completed("blocked-followup")]),
+        },
+    ]);
+    let (server, _) = start_streaming_sse_server(streams).await;
+    let configure = |config: &mut codex_core::config::Config| {
+        config.base_instructions = Some("Answer concisely.".into());
+        config.model_context_window = Some(100_000);
+        config.model_auto_compact_token_limit = Some(35_000);
+    };
+    let test = test_codex()
+        .with_config(configure)
+        .build_with_streaming_server(&server)
+        .await?;
+    test.codex.submit(user_input("original task")).await?;
+    wait_for_requests(&server, 4).await;
+    test.codex.submit(Op::Interrupt).await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnAborted(_))
+    })
+    .await;
+    test.codex.submit(Op::Shutdown).await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::ShutdownComplete)
+    })
+    .await;
+
+    let resumed_server = responses::start_mock_server().await;
+    let mock = responses::mount_sse_once(
+        &resumed_server,
+        responses::sse(vec![
+            responses::ev_assistant_message("done", "finished"),
+            responses::ev_completed("done"),
+        ]),
+    )
+    .await;
+    let resumed = test_codex()
+        .with_config(configure)
+        .resume(
+            &resumed_server,
+            test.home.clone(),
+            test.session_configured
+                .rollout_path
+                .as_ref()
+                .unwrap()
+                .clone(),
+        )
+        .await?;
+    resumed
+        .codex
+        .submit(user_input("fresh input after restart"))
+        .await?;
+    complete(&resumed.codex).await;
+    let body = mock.single_request().body_json();
+    assert!(!body.to_string().contains("AUTO_COMPACT_WORK_NOTES_REQUEST"));
+    assert!(!body.to_string().contains("compaction_trigger"));
+    assert_eq!(
+        user_messages(&body)
+            .iter()
+            .filter(|text| text.ends_with(&notes))
+            .count(),
+        1
+    );
+    server.shutdown().await;
+    Ok(())
 }
 
 fn successful_recovery() -> Vec<Vec<StreamingSseChunk>> {
@@ -286,6 +398,15 @@ async fn assert_interrupted_notes_recover(restart: bool) -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn model_downshift_v2_uses_the_previous_provider_for_notes_and_compaction() -> Result<()> {
+    assert_previous_model_instructions(false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn model_downshift_v2_respects_each_models_final_instruction_override() -> Result<()> {
+    assert_previous_model_instructions(true).await
+}
+
+async fn assert_previous_model_instructions(final_override: bool) -> Result<()> {
     skip_if_no_network_unless_localhost!(Ok(()));
     let old_server = responses::start_mock_server().await;
     let new_server = responses::start_mock_server().await;
@@ -316,7 +437,7 @@ async fn model_downshift_v2_uses_the_previous_provider_for_notes_and_compaction(
     let test = test_codex()
         .with_model("previous-provider-model")
         .with_config(move |config| {
-            config.base_instructions = Some("Preserve the user's task and findings.".into());
+            config.base_instructions = None;
             config
                 .model_providers
                 .insert("previous".into(), config.model_provider.clone());
@@ -331,21 +452,25 @@ async fn model_downshift_v2_uses_the_previous_provider_for_notes_and_compaction(
                         slug: "previous-provider-model".into(),
                         model_provider: Some("previous".into()),
                         patch: ModelInfoPatch {
+                            base_instructions: Some("Previous model base instructions.".into()),
                             context_window: Some(Some(200_000)),
                             auto_compact_token_limit: Some(Some(180_000)),
                             ..Default::default()
                         },
-                        final_instruction_override: None,
+                        final_instruction_override: final_override
+                            .then(|| "Previous model final override.".into()),
                     },
                     ModelOverlayEntry {
                         slug: "destination-provider-model".into(),
                         model_provider: Some("destination".into()),
                         patch: ModelInfoPatch {
+                            base_instructions: Some("Destination model base instructions.".into()),
                             context_window: Some(Some(100_000)),
                             auto_compact_token_limit: Some(Some(40_000)),
                             ..Default::default()
                         },
-                        final_instruction_override: None,
+                        final_instruction_override: final_override
+                            .then(|| "Destination model final override.".into()),
                     },
                 ],
                 ..Default::default()
@@ -375,6 +500,14 @@ async fn model_downshift_v2_uses_the_previous_provider_for_notes_and_compaction(
     assert_eq!(old.len(), 3);
     for request in &old {
         assert_eq!(request.body_json()["model"], "previous-provider-model");
+        assert_eq!(
+            request.body_json()["instructions"],
+            if final_override {
+                "Previous model final override."
+            } else {
+                "Previous model base instructions."
+            }
+        );
     }
     assert_compact_request(&old[2].body_json());
     assert!(
@@ -392,6 +525,14 @@ async fn model_downshift_v2_uses_the_previous_provider_for_notes_and_compaction(
     assert_eq!(metadata["compaction"]["reason"], "model_downshift");
     let new = new_request.single_request().body_json();
     assert_eq!(new["model"], "destination-provider-model");
+    assert_eq!(
+        new["instructions"],
+        if final_override {
+            "Destination model final override."
+        } else {
+            "Destination model base instructions."
+        }
+    );
     assert!(new.to_string().contains("previous-provider-summary"));
     assert_eq!(
         user_messages(&new)

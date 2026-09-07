@@ -285,6 +285,10 @@ impl ContextManager {
             .as_ref()
             .map(|info| info.last_token_usage.total_tokens)
             .unwrap_or(0);
+        last_tokens.saturating_add(self.get_unreported_token_usage(server_reasoning_included))
+    }
+
+    pub(crate) fn get_unreported_token_usage(&self, server_reasoning_included: bool) -> i64 {
         let after_last_model_generated_start =
             self.items.len() - self.items_after_last_model_generated_item().len();
         let items_after_last_model_generated_tokens = self.item_token_estimates
@@ -292,10 +296,9 @@ impl ContextManager {
             .iter()
             .fold(0i64, |acc, estimate| acc.saturating_add(*estimate));
         if server_reasoning_included {
-            last_tokens.saturating_add(items_after_last_model_generated_tokens)
+            items_after_last_model_generated_tokens
         } else {
-            last_tokens
-                .saturating_add(self.get_non_last_reasoning_items_tokens())
+            self.get_non_last_reasoning_items_tokens()
                 .saturating_add(items_after_last_model_generated_tokens)
         }
     }

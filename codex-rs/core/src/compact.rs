@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::ModelProviderInfo;
@@ -168,7 +169,7 @@ async fn run_compact_task_inner(
         let turn_input_len = turn_input.len();
         let prompt = Prompt {
             input: turn_input,
-            base_instructions: sess.get_base_instructions().await,
+            base_instructions: sess.get_base_instructions_for_turn(&turn_context).await,
             personality: turn_context.personality,
             ..Default::default()
         };
@@ -520,6 +521,9 @@ pub(crate) fn pending_work_notes(items: &[ResponseItem]) -> CodexResult<Option<P
         notes: None,
         attempts: 0,
     };
+    let mut function_calls = HashSet::new();
+    let mut custom_calls = HashSet::new();
+    let mcp_rejection = format!("err: {WORK_NOTES_TOOL_REJECT_REASON:?}");
     for (index, item) in items.iter().enumerate().skip(request_index + 1) {
         if matches!(item, ResponseItem::GhostSnapshot { .. }) || is_turn_aborted_marker(item) {
             continue;
@@ -527,6 +531,24 @@ pub(crate) fn pending_work_notes(items: &[ResponseItem]) -> CodexResult<Option<P
         if crate::context_manager::is_user_turn_boundary(item) {
             pending.capture_end = index;
             break;
+        }
+        // Tool futures are drained after assistant notes are recorded. Only
+        // accept exact rejections for calls in this capture, in either order.
+        let rejected_capture_output = match item {
+            ResponseItem::FunctionCallOutput {
+                call_id, output, ..
+            } => {
+                output.text_content().is_some_and(|text| {
+                    text == WORK_NOTES_TOOL_REJECT_REASON || text == mcp_rejection
+                }) && function_calls.remove(call_id)
+            }
+            ResponseItem::CustomToolCallOutput {
+                call_id, output, ..
+            } => output == WORK_NOTES_TOOL_REJECT_REASON && custom_calls.remove(call_id),
+            _ => false,
+        };
+        if rejected_capture_output {
+            continue;
         }
         if pending.notes.is_some() {
             return Err(CodexErr::Fatal(
@@ -540,16 +562,15 @@ pub(crate) fn pending_work_notes(items: &[ResponseItem]) -> CodexResult<Option<P
                     .filter(|text| text.trim_start().starts_with(AUTO_COMPACT_WORK_NOTES_TAG));
                 pending.attempts <= WORK_NOTES_CAPTURE_MAX_ATTEMPTS
             }
-            ResponseItem::Reasoning { .. }
-            | ResponseItem::FunctionCall { .. }
-            | ResponseItem::CustomToolCall { .. }
-            | ResponseItem::LocalShellCall { .. } => true,
-            ResponseItem::FunctionCallOutput { output, .. } => output
-                .text_content()
-                .is_some_and(|text| text.contains(WORK_NOTES_TOOL_REJECT_REASON)),
-            ResponseItem::CustomToolCallOutput { output, .. } => {
-                output.contains(WORK_NOTES_TOOL_REJECT_REASON)
+            ResponseItem::FunctionCall { call_id, .. } => function_calls.insert(call_id),
+            ResponseItem::CustomToolCall { call_id, .. } => custom_calls.insert(call_id),
+            ResponseItem::LocalShellCall { id, call_id, .. } => {
+                if let Some(call_id) = call_id.as_ref().or(id.as_ref()) {
+                    function_calls.insert(call_id);
+                }
+                true
             }
+            ResponseItem::Reasoning { .. } => true,
             _ => false,
         };
         if !is_capture_item {

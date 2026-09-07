@@ -65,7 +65,7 @@ async fn sampling_input_for_pre_compact_work_notes(
     turn_context: &TurnContext,
 ) -> Vec<ResponseItem> {
     let mut input = sess.prompt_history(turn_context).await;
-    let base_instructions = sess.get_base_instructions().await;
+    let base_instructions = sess.get_base_instructions_for_turn(turn_context).await;
     if let Some(stats) = trim_pre_compact_work_notes_input_to_headroom(
         &mut input,
         &base_instructions,
@@ -1255,6 +1255,11 @@ pub(super) fn trim_incomplete_continuation_tail(items: &mut Vec<ResponseItem>) -
     };
 
     let tail = &items[last_user_index + 1..];
+    // Capture calls are rejected without execution; their outputs may not yet
+    // be recorded. Notes recovery owns this segment and must keep exact notes.
+    if tail.iter().any(compact::is_work_notes_request_item) {
+        return false;
+    }
     let Some(relative_index) = first_dangling_tool_call_index(tail) else {
         return false;
     };
@@ -1430,7 +1435,7 @@ async fn run_sampling_request(
 
     let model_supports_parallel = turn_context.model_info.supports_parallel_tool_calls;
 
-    let base_instructions = sess.get_base_instructions().await;
+    let base_instructions = sess.get_base_instructions_for_turn(&turn_context).await;
 
     let prompt = Prompt {
         input,

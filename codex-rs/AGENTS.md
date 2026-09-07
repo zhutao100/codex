@@ -10,7 +10,7 @@ Thus, the design of the changes target to minimize the potentials of future reba
 
 # Agents operation tips
 
-- Always use the shared `cargo-local` wrapper instead of direct `cargo` for local build/check/test/run commands. It uses an external target dir when an agent-created `/Volumes/*/.codex-rs-build-root` marker directory is mounted, and otherwise falls back to the workspace `target/`.
+- Always use the shared `cargo-local` wrapper instead of direct `cargo` for local build/check/test/run commands. It uses an external target dir when an agent-created `/Volumes/*/.codex-rs-build-root` marker directory is mounted, and otherwise falls back to the workspace `target/`. Keep its per-worktree target separation when building comparison baselines.
 - Use `just-local` instead of direct `just` in Rust projects whose recipes call `cargo` directly; it adds a per-invocation `cargo` shim that delegates to `cargo-local`.
 - always use `CODEX_SANDBOX_NETWORK_DISABLED=1` for test runs to avoid tampering the host.
 - With `CODEX_SANDBOX_NETWORK_DISABLED=1` on macOS, `cargo-local` wraps Cargo in a Seatbelt profile that allows localhost sockets only and filters tests listed in `scripts/cargo-local-network-sandbox-skips.txt` because they exercise nested sandbox/shell behavior.
@@ -18,4 +18,4 @@ Thus, the design of the changes target to minimize the potentials of future reba
 - The `cargo build` commands can produce giant console output, even with `--quiet`. Redirect broad/noisy build output to tmp files and parse only necessary information.
 - For mock-only HTTP/WebSocket tests, use the existing `skip_if_no_network_unless_localhost!` guard. Let the wrapper declare localhost capability; never forge its flag or count an early-return network test as executed transport coverage.
 - See [streaming remote compaction](docs/features/remote_compaction_v2/README.md) before changing compaction, work notes, replay or client continuation. Keep triggers request-only, notes/snapshots exact, and installation coherent with task cancellation. Explicit unary fixtures must disable `RemoteCompactionV2`.
-- Compaction recovery must preserve acknowledged input beyond a bounded notes capture and remain consistent in task finalization and rollout replay. Background snapshot writes share the installation guard; previous-model compaction must resolve that model's provider.
+- Compaction recovery must preserve acknowledged input beyond a bounded notes capture and remain consistent in task finalization and rollout replay. Accept matching rejected tool outputs after notes, and leave capture cleanup to recovery. Background snapshot writes share the installation guard; previous-model compaction must resolve that model's provider and effective instructions.

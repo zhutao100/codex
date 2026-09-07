@@ -20,7 +20,7 @@ use codex_protocol::items::TurnItem;
 use codex_protocol::user_input::UserInput;
 use core_test_support::responses::ev_local_shell_call;
 use core_test_support::responses::ev_reasoning_item;
-use core_test_support::skip_if_no_network;
+use core_test_support::skip_if_no_network_unless_localhost as skip_if_no_network;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use core_test_support::wait_for_event_match;
@@ -623,12 +623,21 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
     ]);
 
     // mount the mock responses from the model
+    let notes_response = |id: &str| {
+        sse(vec![
+            ev_assistant_message(id, WORK_NOTES_TEXT),
+            ev_completed_with_tokens(id, 10),
+        ])
+    };
     let bodies = vec![
         model_reasoning_response_1_sse,
+        notes_response("notes-1"),
         model_compact_response_1_sse,
         model_reasoning_response_2_sse,
+        notes_response("notes-2"),
         model_compact_response_2_sse,
         model_reasoning_response_3_sse,
+        notes_response("notes-3"),
         model_compact_response_3_sse,
         model_final_response_sse,
     ];
@@ -648,7 +657,18 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     // collect the requests payloads from the model
-    let requests_payloads = request_log.requests();
+    let requests = request_log.requests();
+    assert_eq!(requests.len(), 10);
+    let requests_payloads = requests
+        .into_iter()
+        .filter(|request| {
+            !request
+                .body_json()
+                .to_string()
+                .contains("<AUTO_COMPACT_WORK_NOTES_REQUEST>")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(requests_payloads.len(), 7);
     let body = requests_payloads[0].body_json();
     let input = body.get("input").and_then(|v| v.as_array()).unwrap();
 
@@ -675,11 +695,14 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
                 // relevant to compaction behavior and can change as bundled prompts evolve.
                 let role = value.get("role").and_then(|role| role.as_str());
                 if role == Some("developer")
-                    && text.is_some_and(|text| text.contains("`sandbox_mode`"))
+                    && text.is_some_and(|text| text.starts_with("<permissions instructions>"))
                 {
                     return false;
                 }
-                !text.is_some_and(|text| text.starts_with("# AGENTS.md instructions for "))
+                !text.is_some_and(|text| {
+                    text.starts_with("# AGENTS.md instructions for ")
+                        || text.starts_with("Immediately before compaction,")
+                })
             })
             .cloned()
             .collect()
@@ -698,12 +721,17 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
     for (i, expected_summary) in compaction_indices.into_iter().zip(expected_summaries) {
         let body = requests_payloads.clone()[i].body_json();
         let input = body.get("input").and_then(|v| v.as_array()).unwrap();
+        assert!(input.iter().any(|item| {
+            item["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.ends_with(WORK_NOTES_TEXT))
+        }));
         let input = normalize_inputs(input);
         assert_eq!(input.len(), 3);
-        let environment_message = input[0]["content"][0]["text"].as_str().unwrap();
+        let received_environment = input[0]["content"][0]["text"].as_str().unwrap();
         let user_message_received = input[1]["content"][0]["text"].as_str().unwrap();
         let summary_message = input[2]["content"][0]["text"].as_str().unwrap();
-        assert_eq!(environment_message, environment_message);
+        assert_eq!(received_environment, environment_message);
         assert_eq!(user_message_received, user_message);
         assert_eq!(
             summary_message, expected_summary,
@@ -1723,7 +1751,7 @@ async fn auto_compact_persists_rollout_entries() {
                 if let Some(replacement_history) = compacted.replacement_history.as_ref() {
                     let replacement_text = serde_json::to_string(replacement_history)
                         .expect("serialize replacement history");
-                    if replacement_text.contains(WORK_NOTES_TEXT)
+                    if body_contains_text(&replacement_text, WORK_NOTES_TEXT)
                         && replacement_text.contains("preserved session work notes")
                     {
                         saw_preserved_work_notes = true;
@@ -2019,12 +2047,15 @@ async fn manual_compact_twice_preserves_latest_user_messages() {
         .into_iter()
         .collect::<VecDeque<_>>();
 
-    // Permissions developer message
-    final_output.pop_front();
-    // User instructions (project docs/skills)
-    final_output.pop_front();
-    // Environment context
-    final_output.pop_front();
+    // Context is seeded when the next turn starts, after the standalone
+    // replacement. Compare user history independently of that placement.
+    final_output.retain(|item| {
+        !item["content"][0]["text"].as_str().is_some_and(|text| {
+            text.starts_with("<permissions instructions>")
+                || text.starts_with("# AGENTS.md instructions for ")
+                || text.starts_with("<environment_context>")
+        })
+    });
 
     let _ = final_output
         .iter_mut()

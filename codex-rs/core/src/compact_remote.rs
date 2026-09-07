@@ -89,7 +89,7 @@ async fn run_remote_compact_task_inner_impl(
     let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
     sess.emit_turn_item_started(turn_context, &compaction_item)
         .await;
-    let base_instructions = sess.get_base_instructions().await;
+    let base_instructions = sess.get_base_instructions_for_turn(turn_context).await;
     let PreparedCompactionInput {
         mut source_history,
         preserved_work_notes,

@@ -18,9 +18,11 @@ Source references: upstream `core/src/compact_remote_v2.rs`, `compact_remote_v2_
 |Abandoned notes state disappears on pause/restart.|Infer the bounded capture phase and exact completed notes from existing history before sampling or recording new user input.|
 |A stale request marker could delete later history or block retry after interruption.|Bound the capture at the next real user message. Preserve known abort controls, snapshots and subsequent user/work records; reject unidentified work inside the capture segment.|
 |Failed compaction finalized notes as a completed turn and cleared continuation.|Keep continuation and skip completion hooks while a notes transaction remains. Persist acknowledged steering after the bounded segment so retry and restart retain it.|
+|Rejected tool outputs can be recorded after completed notes.|Recognize exact rejections for matching capture call IDs before rejecting ambiguous later work. Preserve capture segments during live and durable dangling-call cleanup.|
 |Pre-turn capture errors included cancellation.|Propagate cancellation before no-notes fallback.|
-|Previous-model compaction bypassed fresh notes and could retain the destination provider.|Share pre-turn capture and explicitly resolve the previous model's provider from configuration; report provider-resolution errors.|
+|Previous-model compaction bypassed fresh notes and could retain destination provider/instructions.|Share pre-turn capture and resolve the previous model's provider and effective instructions; report provider-resolution errors and preserve the selected model.|
 |64,000 retained tokens can exceed smaller windows once fixed context is added.|Use it as a ceiling; reserve all known fixed costs and apply the destination model's limits on downshift.|
+|Recomputed usage counted preserved notes twice.|Store a baseline at the last model item, excluding adjustments subsequently added by live/replayed context accounting.|
 |A valid encrypted-only replacement could not continue after restart.|Use the existing inline-compaction epoch and tail-completion semantics; fix dangling-call cleanup to respect the same epoch.|
 |Clearing unfinished WebSocket tracking could make a bad socket cacheable.|Reset after successful installation; discard an unfinished notes socket when local/legacy compaction completed through a different request. Preserve completed physical connections.|
 |The replacement writer alone was not cancellation-safe.|Shield installation in a short child task and join its guard from task-stop before pause/abort state is built.|
@@ -34,6 +36,10 @@ The collector counts completed compaction items, not all output items. It accoun
 The outer retry allowance is `min(provider.stream_max_retries(), 2)` per transport. Existing WebSocket-to-HTTP fallback resets that allowance once. HTTP opening retries and authentication recovery remain owned by the normal client. Permanent 4xx errors, except 408/429, stop the outer loop. No completed protocol-validation failure triggers transport or semantic fallback.
 
 Request-local `x-codex-turn-metadata` preserves existing workspace fields and adds `request_kind = compaction`, trigger, reason, phase, implementation `responses_compaction_v2` and strategy `memento`. Missing workspace metadata is supported; sampling's cached metadata is unchanged.
+
+## Previous-model instructions
+
+Requests for the selected model/personality keep the session's instructions, including resumed-session instructions. A temporary previous-model context resolves explicit config instructions, then the model's final instruction override, then effective model instructions, without mutating the selected session model. Notes headroom, sampling and compaction use this request context; replacement retention reserves the selected destination model's instructions.
 
 ## Retention and estimates
 
@@ -49,11 +55,15 @@ Output fitting rewrites only a contiguous supported trailing output suffix, igno
 
 `replace_compacted_history` remains the single replacement writer and recomputes token usage once. The shielded installation orders the exact replacement, adjacent reference context and completion event before task-stop constructs its pause/abort result. This prevents cancellation from splitting the existing operation; it does not introduce power-loss atomicity or a new disk format.
 
+Recomputation stores the estimated baseline at the last model-generated item, subtracting the local-tail and reasoning adjustments already handled by `get_total_token_usage`. Preserved notes after the encrypted summary are therefore added once. Existing `TokenCount` records restore the same baseline after restart, and newly appended input adds its cost once; no new token-info format is needed.
+
 The installer gathers current undo snapshots while holding the same guard as the background snapshot writer. A snapshot recorded during the remote request enters the replacement; a writer acquiring the guard after installation appends after that checkpoint.
 
 Standalone/pre-turn replacements clear the reference baseline. Inline replacements retain a matching reference context. Replay infers unfinished encrypted-only work only from inline provenance, applies ordinary completion semantics to the subsequent tail, and respects rollback across the compaction epoch.
 
 An outstanding notes capture remains unfinished across errors, interruption and restart. Its bounded segment accepts known abort controls and ends at the next real user message. Preparation removes only verified capture items, preserving controls and all later source history. Unidentified work within the segment fails without mutation and retains continuation. If incomplete capture already has following input, recovery uses existing notes or the no-notes fallback instead of requesting notes across that boundary.
+
+Function, MCP and custom-tool rejection outputs may arrive after the assistant's notes because sampling drains tool futures after the stream. Accept exact known rejections only for matching capture calls. If interruption precedes output recording, live and durable continuation cleanup preserve the capture for notes recovery; ordinary dangling work after a later real user boundary is still trimmed.
 
 When a failed regular turn finishes, pending steering keeps the existing acknowledgement/persistence behavior. It becomes later source history for the retry, and continuation remains available instead of treating notes as a final answer or running successful-completion hooks. Successful inline compaction still defers queued input until its first follow-up. These semantics use existing history and continuation records; no persisted queue format is added.
 

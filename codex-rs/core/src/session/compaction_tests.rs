@@ -3,6 +3,197 @@ use crate::compact::CompactionImplementation;
 use crate::compact::compaction_implementation;
 use pretty_assertions::assert_eq;
 
+#[test]
+fn compaction_notes_accept_only_matching_rejected_capture_outputs() {
+    let notes = "<AUTO_COMPACT_WORK_NOTES>\nexact notes";
+    let request: ResponseItem =
+        DeveloperInstructions::new(compact::AUTO_COMPACT_WORK_NOTES_REQUEST_TAG).into();
+    let reason = compact::WORK_NOTES_TOOL_REJECT_REASON;
+    for (call, output) in [
+        (
+            ResponseItem::FunctionCall {
+                id: None,
+                call_id: "capture".into(),
+                name: "update_plan".into(),
+                arguments: r#"{"plan":[]}"#.into(),
+            },
+            ResponseItem::FunctionCallOutput {
+                call_id: "capture".into(),
+                output: FunctionCallOutputPayload {
+                    body: FunctionCallOutputBody::Text(reason.into()),
+                    success: Some(false),
+                },
+            },
+        ),
+        (
+            ResponseItem::FunctionCall {
+                id: None,
+                call_id: "capture".into(),
+                name: "mcp__server__tool".into(),
+                arguments: "{}".into(),
+            },
+            ResponseInputItem::McpToolCallOutput {
+                call_id: "capture".into(),
+                result: Err(reason.into()),
+            }
+            .into(),
+        ),
+        (
+            ResponseItem::CustomToolCall {
+                id: None,
+                call_id: "capture".into(),
+                name: "apply_patch".into(),
+                input: "unexecuted patch".into(),
+                status: None,
+            },
+            ResponseItem::CustomToolCallOutput {
+                call_id: "capture".into(),
+                output: reason.into(),
+            },
+        ),
+    ] {
+        for output_after_notes in [false, true] {
+            let mut items = vec![user_message("task"), request.clone(), call.clone()];
+            let tail = if output_after_notes {
+                vec![assistant_message(notes), output.clone()]
+            } else {
+                vec![output.clone(), assistant_message(notes)]
+            };
+            items.extend(tail);
+            let mut history = ContextManager::new();
+            history.replace(items.clone());
+            let prepared = compact::prepare_history_for_compaction(history, None).unwrap();
+            assert_eq!(prepared.source_history.raw_items(), &[user_message("task")]);
+            assert_eq!(prepared.preserved_work_notes, Some(notes.into()));
+            // The same rejection without its matching capture call is
+            // unrecognized work and must not be silently discarded.
+            items.remove(2);
+            assert!(compact::pending_work_notes(&items).is_err());
+        }
+    }
+}
+
+#[tokio::test]
+async fn continuation_cleanup_preserves_notes_before_rejected_outputs_are_recorded() {
+    let call = ResponseItem::FunctionCall {
+        id: None,
+        call_id: "capture".into(),
+        name: "update_plan".into(),
+        arguments: "{}".into(),
+    };
+    let capture = vec![
+        user_message("task"),
+        DeveloperInstructions::new(compact::AUTO_COMPACT_WORK_NOTES_REQUEST_TAG).into(),
+        call,
+        assistant_message("<AUTO_COMPACT_WORK_NOTES>\nexact notes"),
+    ];
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("rollout.jsonl");
+    for later_work in [false, true] {
+        let mut items = capture.clone();
+        if later_work {
+            items.extend([
+                user_message("later task"),
+                ResponseItem::FunctionCall {
+                    id: None,
+                    call_id: "actual-work".into(),
+                    name: "shell".into(),
+                    arguments: "{}".into(),
+                },
+            ]);
+        }
+        let lines = items
+            .iter()
+            .map(|item| {
+                serde_json::to_string(&codex_protocol::protocol::RolloutLine {
+                    timestamp: "2026-09-07T00:00:00Z".into(),
+                    item: RolloutItem::ResponseItem(item.clone()),
+                })
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        tokio::fs::write(&path, format!("{}\n", lines.join("\n")))
+            .await
+            .unwrap();
+        assert_eq!(trim_incomplete_continuation_tail(&mut items), later_work);
+        let mut expected = capture.clone();
+        if later_work {
+            expected.push(user_message("later task"));
+        }
+        assert_eq!(items, expected);
+        assert_eq!(
+            RolloutRecorder::clean_for_continue(&path, false)
+                .await
+                .unwrap(),
+            later_work
+        );
+        let remaining = tokio::fs::read_to_string(&path).await.unwrap();
+        assert_eq!(remaining, format!("{}\n", lines[..items.len()].join("\n")));
+        assert_eq!(
+            compact::pending_work_notes(&items).unwrap().unwrap().notes,
+            Some("<AUTO_COMPACT_WORK_NOTES>\nexact notes".into())
+        );
+    }
+}
+
+#[tokio::test]
+async fn compaction_usage_counts_preserved_notes_once_after_installation_and_restart() {
+    let (session, context) = make_session_and_context().await;
+    let notes = compact::preserved_work_notes_message(&"long exact notes\n".repeat(2_000));
+    let replacement = vec![
+        user_message("original task"),
+        ResponseItem::Compaction {
+            encrypted_content: "summary".into(),
+        },
+        notes,
+    ];
+    let compacted = CompactedItem {
+        message: String::new(),
+        replacement_history: Some(replacement.clone()),
+    };
+    let reference = context.to_turn_context_item();
+    session
+        .replace_compacted_history(
+            &context,
+            replacement.clone(),
+            Some(reference.clone()),
+            compacted.clone(),
+        )
+        .await;
+    let expected = session
+        .clone_history()
+        .await
+        .estimate_token_count_with_base_instructions(&session.get_base_instructions().await)
+        .unwrap();
+    assert_eq!(session.get_total_token_usage().await, expected);
+    let info = session.state.lock().await.token_info();
+    let (resumed, resumed_context) = make_session_and_context().await;
+    resumed
+        .record_initial_history(InitialHistory::Resumed(ResumedHistory {
+            conversation_id: ThreadId::default(),
+            rollout_path: PathBuf::from("/tmp/compaction-usage.jsonl"),
+            history: vec![
+                RolloutItem::Compacted(compacted),
+                RolloutItem::TurnContext(reference),
+                RolloutItem::EventMsg(EventMsg::TokenCount(TokenCountEvent {
+                    info,
+                    rate_limits: None,
+                })),
+            ],
+        }))
+        .await;
+    assert_eq!(resumed.clone_history().await.raw_items(), replacement);
+    assert_eq!(resumed.get_total_token_usage().await, expected);
+    let next = user_message("new input");
+    resumed
+        .record_into_history(std::slice::from_ref(&next), &resumed_context)
+        .await;
+    assert_eq!(
+        resumed.get_total_token_usage().await,
+        expected + crate::context_manager::estimate_item_token_count(&next)
+    );
+}
+
 #[tokio::test]
 async fn stable_compaction_feature_is_advertised_without_displacing_other_flags() {
     let home = tempfile::tempdir().unwrap();

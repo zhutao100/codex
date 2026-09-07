@@ -112,7 +112,7 @@ async fn run_compact(
         .await;
     let prepared = prepare_history_for_compaction(sess.clone_history().await, notes)?;
     let mut source = prepared.source_history;
-    let base_instructions = sess.get_base_instructions().await;
+    let base_instructions = sess.get_base_instructions_for_turn(turn_context).await;
     let (rewritten_outputs, estimated_deleted_tokens) =
         trim_function_call_history_to_fit_context_window(
             &mut source,
@@ -156,13 +156,16 @@ async fn run_compact(
         .preserved_work_notes
         .as_deref()
         .map(preserved_work_notes_message);
+    // Previous-model requests use that model's instructions, while the
+    // replacement must leave room for the selected destination model.
+    let replacement_instructions = sess.get_base_instructions().await;
     let fixed_tokens = initial_context
         .iter()
         .chain(std::iter::once(&output.item))
         .chain(notes_item.iter())
         .map(history::retained_tokens)
         .sum::<usize>()
-        .saturating_add(approx_token_count(&prompt.base_instructions.text))
+        .saturating_add(approx_token_count(&replacement_instructions.text))
         .saturating_add(approx_token_count(&serde_json::to_string(&prompt.tools)?));
     let (window, auto_limit) = match reason {
         CompactionReason::ModelDownshift {

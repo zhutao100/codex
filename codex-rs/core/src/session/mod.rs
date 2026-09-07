@@ -814,6 +814,26 @@ impl Session {
         }
     }
 
+    pub(crate) async fn get_base_instructions_for_turn(
+        &self,
+        turn_context: &TurnContext,
+    ) -> BaseInstructions {
+        let state = self.state.lock().await;
+        let selected = &state.session_configuration;
+        let text = if selected.collaboration_mode.model() == turn_context.collaboration_mode.model()
+            && selected.personality == turn_context.personality
+        {
+            selected.base_instructions.clone()
+        } else {
+            resolve_current_base_instructions(
+                &turn_context.config,
+                &turn_context.model_info,
+                turn_context.final_instruction_override.as_deref(),
+            )
+        };
+        BaseInstructions { text }
+    }
+
     async fn record_initial_history(&self, conversation_history: InitialHistory) {
         let turn_context = self.new_default_turn().await;
         match conversation_history {
@@ -1949,17 +1969,20 @@ impl Session {
 
     pub(crate) async fn recompute_token_usage(&self, turn_context: &TurnContext) {
         let base_instructions = self.get_base_instructions().await;
-        let estimated_total_tokens = {
-            let state = self.state.lock().await;
-            state
-                .history
-                .estimate_token_count_with_base_instructions(&base_instructions)
-        };
-        let Some(estimated_total_tokens) = estimated_total_tokens else {
-            return;
-        };
         {
             let mut state = self.state.lock().await;
+            let Some(estimated_total_tokens) = state
+                .history
+                .estimate_token_count_with_base_instructions(&base_instructions)
+            else {
+                return;
+            };
+            // Store a baseline at the last model item, just like server usage.
+            // Local notes/inputs after it are added by get_total_token_usage,
+            // including after restoring this TokenCount from a rollout.
+            let unreported_tokens = state
+                .history
+                .get_unreported_token_usage(state.server_reasoning_included());
             let mut info = state.token_info().unwrap_or(TokenUsageInfo {
                 total_token_usage: TokenUsage::default(),
                 last_token_usage: TokenUsage::default(),
@@ -1971,7 +1994,9 @@ impl Session {
                 cached_input_tokens: 0,
                 output_tokens: 0,
                 reasoning_output_tokens: 0,
-                total_tokens: estimated_total_tokens.max(0),
+                total_tokens: estimated_total_tokens
+                    .saturating_sub(unreported_tokens)
+                    .max(0),
             };
 
             if info.model_context_window.is_none() {

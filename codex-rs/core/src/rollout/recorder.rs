@@ -795,6 +795,11 @@ fn first_dangling_tool_call_line_index(lines: &[(String, RolloutItem)]) -> Optio
     let mut first_incomplete_local_shell: Option<usize> = None;
     for (line_index, (_line, item)) in lines.iter().enumerate().skip(last_user_line_index + 1) {
         match item {
+            RolloutItem::ResponseItem(item) if crate::compact::is_work_notes_request_item(item) => {
+                // Keep capture calls and notes for recovery even if their
+                // rejected outputs were not recorded before interruption.
+                return None;
+            }
             RolloutItem::ResponseItem(ResponseItem::FunctionCall { call_id, .. })
             | RolloutItem::ResponseItem(ResponseItem::CustomToolCall { call_id, .. }) => {
                 open_calls.entry(call_id.clone()).or_insert(line_index);
