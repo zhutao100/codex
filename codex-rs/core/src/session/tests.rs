@@ -479,14 +479,14 @@ async fn rollout_reconstruction_restores_reference_context_item_after_replacemen
         reconstructed,
         ReconstructedRollout {
             history: replacement_history,
-            reference_context_item: Some(compacted_context),
+            reference_context_item: Some(compacted_context.clone()),
             previous_turn_settings: Some(PreviousTurnSettings {
                 model: previous_context.model.clone()
             }),
             pending_continuation: Some(PendingContinuation {
                 source: TurnContinuationSource::Interrupted,
                 continued_from_turn_id: None,
-                model: Some(previous_context.model.clone()),
+                model: Some(compacted_context.model),
                 pause_reason: None,
                 target: PendingContinuationTarget::Regular,
             }),
@@ -699,6 +699,18 @@ async fn record_initial_history_reconstructs_resumed_transcript() {
 
     let history = session.state.lock().await.clone_history();
     assert_eq!(expected, history.raw_items());
+}
+
+pub(crate) async fn replay_rollout_history(history: Vec<RolloutItem>) -> ContextManager {
+    let (session, _) = make_session_and_context().await;
+    session
+        .record_initial_history(InitialHistory::Resumed(ResumedHistory {
+            conversation_id: session.conversation_id,
+            history,
+            rollout_path: PathBuf::from("/tmp/replay-test.jsonl"),
+        }))
+        .await;
+    session.clone_history().await
 }
 
 #[tokio::test]

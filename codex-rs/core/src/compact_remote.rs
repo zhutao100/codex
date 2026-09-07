@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use crate::Prompt;
+use crate::compact::CompactionContext;
 use crate::compact::InitialContextInjection;
 use crate::compact::PreparedCompactionInput;
 use crate::compact::insert_initial_context_before_last_real_user_message;
@@ -24,13 +25,13 @@ use tracing::info;
 
 pub(crate) async fn run_inline_remote_auto_compact_task(
     sess: Arc<Session>,
-    turn_context: Arc<TurnContext>,
+    context: CompactionContext<'_>,
     preserved_work_notes: Option<String>,
     initial_context_injection: InitialContextInjection,
 ) -> CodexResult<bool> {
     run_remote_compact_task_inner(
         &sess,
-        &turn_context,
+        context,
         preserved_work_notes,
         initial_context_injection,
     )
@@ -50,7 +51,7 @@ pub(crate) async fn run_remote_compact_task(
 
     run_remote_compact_task_inner(
         &sess,
-        &turn_context,
+        CompactionContext::new(&turn_context),
         None,
         InitialContextInjection::DoNotInject,
     )
@@ -59,13 +60,13 @@ pub(crate) async fn run_remote_compact_task(
 
 async fn run_remote_compact_task_inner(
     sess: &Arc<Session>,
-    turn_context: &Arc<TurnContext>,
+    context: CompactionContext<'_>,
     preserved_work_notes: Option<String>,
     initial_context_injection: InitialContextInjection,
 ) -> CodexResult<()> {
     if let Err(err) = run_remote_compact_task_inner_impl(
         sess,
-        turn_context,
+        context,
         preserved_work_notes,
         initial_context_injection,
     )
@@ -74,7 +75,7 @@ async fn run_remote_compact_task_inner(
         let event = EventMsg::Error(
             err.to_error_event(Some("Error running remote compact task".to_string())),
         );
-        sess.send_event(turn_context, event).await;
+        sess.send_event(context.request, event).await;
         return Err(err);
     }
     Ok(())
@@ -82,10 +83,11 @@ async fn run_remote_compact_task_inner(
 
 async fn run_remote_compact_task_inner_impl(
     sess: &Arc<Session>,
-    turn_context: &Arc<TurnContext>,
+    context: CompactionContext<'_>,
     preserved_work_notes: Option<String>,
     initial_context_injection: InitialContextInjection,
 ) -> CodexResult<()> {
+    let turn_context = context.request;
     let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
     sess.emit_turn_item_started(turn_context, &compaction_item)
         .await;
@@ -140,9 +142,9 @@ async fn run_remote_compact_task_inner_impl(
     let reference_context_item = match initial_context_injection {
         InitialContextInjection::DoNotInject => None,
         InitialContextInjection::BeforeLastUserMessage => {
-            let initial_context = sess.build_initial_context(turn_context.as_ref()).await;
+            let initial_context = sess.build_initial_context(context.replacement).await;
             insert_initial_context_before_last_real_user_message(&mut new_history, initial_context);
-            Some(turn_context.to_turn_context_item())
+            Some(context.replacement.to_turn_context_item())
         }
     };
     if let Some(notes) = preserved_work_notes.as_ref() {
@@ -156,7 +158,7 @@ async fn run_remote_compact_task_inner_impl(
         replacement_history: Some(new_history.clone()),
     };
     sess.replace_compacted_history(
-        turn_context.as_ref(),
+        context.replacement,
         new_history,
         reference_context_item,
         compacted_item,

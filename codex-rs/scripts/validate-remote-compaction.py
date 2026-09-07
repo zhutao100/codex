@@ -167,7 +167,10 @@ async def main():
                         entry = json.loads(line)
                         payload = entry.get("payload", {})
                         if entry.get("type") == "response_item" and payload.get("role") == "assistant":
-                            text = "\n".join(part["text"] for part in payload.get("content", []) if part.get("text"))
+                            text = "".join(
+                                part["text"] for part in payload.get("content", [])
+                                if part.get("type") == "output_text"
+                            )
                             if text.lstrip().startswith("<AUTO_COMPACT_WORK_NOTES>"):
                                 notes.append(text)
                         if entry.get("type") == "compacted":

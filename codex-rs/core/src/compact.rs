@@ -19,6 +19,7 @@ use crate::session::turn::get_last_assistant_message_from_turn;
 use crate::session::turn_context::TurnContext;
 use crate::session_prefix::TURN_ABORTED_OPEN_TAG;
 use crate::session_prefix::is_turn_aborted_marker;
+use crate::stream_events_utils::last_assistant_message_from_item;
 use crate::truncate::TruncationPolicy;
 use crate::truncate::approx_token_count;
 use crate::truncate::truncate_text;
@@ -37,6 +38,7 @@ pub const SUMMARIZATION_PROMPT: &str = include_str!("../templates/compact/prompt
 pub const SUMMARY_PREFIX: &str = include_str!("../templates/compact/summary_prefix.md");
 pub(crate) const AUTO_COMPACT_WORK_NOTES_REQUEST_TAG: &str = "<AUTO_COMPACT_WORK_NOTES_REQUEST>";
 pub(crate) const AUTO_COMPACT_WORK_NOTES_TAG: &str = "<AUTO_COMPACT_WORK_NOTES>";
+pub(crate) const WORK_NOTES_SOURCE_MODEL_PREFIX: &str = "Compaction source model: ";
 const COMPACT_USER_MESSAGE_MAX_TOKENS: usize = 20_000;
 
 pub(crate) struct PreparedCompactionInput {
@@ -48,6 +50,21 @@ pub(crate) struct PreparedCompactionInput {
 pub(crate) enum InitialContextInjection {
     DoNotInject,
     BeforeLastUserMessage,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CompactionContext<'a> {
+    pub(crate) request: &'a Arc<TurnContext>,
+    pub(crate) replacement: &'a Arc<TurnContext>,
+}
+
+impl<'a> CompactionContext<'a> {
+    pub(crate) fn new(context: &'a Arc<TurnContext>) -> Self {
+        Self {
+            request: context,
+            replacement: context,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,11 +99,11 @@ pub(crate) fn compaction_implementation(
 
 pub(crate) async fn run_inline_auto_compact_task(
     sess: Arc<Session>,
-    turn_context: Arc<TurnContext>,
+    context: CompactionContext<'_>,
     preserved_work_notes: Option<String>,
     initial_context_injection: InitialContextInjection,
 ) -> CodexResult<bool> {
-    let prompt = turn_context.compact_prompt().to_string();
+    let prompt = context.request.compact_prompt().to_string();
     let input = vec![UserInput::Text {
         text: prompt,
         // Compaction prompt is synthesized; no UI element ranges to preserve.
@@ -95,7 +112,7 @@ pub(crate) async fn run_inline_auto_compact_task(
 
     run_compact_task_inner(
         sess,
-        turn_context,
+        context,
         input,
         preserved_work_notes,
         initial_context_injection,
@@ -116,7 +133,7 @@ pub(crate) async fn run_compact_task(
     sess.send_event(&turn_context, start_event).await;
     run_compact_task_inner(
         sess.clone(),
-        turn_context,
+        CompactionContext::new(&turn_context),
         input,
         None,
         InitialContextInjection::DoNotInject,
@@ -126,13 +143,14 @@ pub(crate) async fn run_compact_task(
 
 async fn run_compact_task_inner(
     sess: Arc<Session>,
-    turn_context: Arc<TurnContext>,
+    context: CompactionContext<'_>,
     input: Vec<UserInput>,
     preserved_work_notes: Option<String>,
     initial_context_injection: InitialContextInjection,
 ) -> CodexResult<()> {
+    let turn_context = context.request;
     let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
-    sess.emit_turn_item_started(&turn_context, &compaction_item)
+    sess.emit_turn_item_started(turn_context, &compaction_item)
         .await;
     let initial_input_for_turn: ResponseInputItem = ResponseInputItem::from(input);
 
@@ -169,7 +187,7 @@ async fn run_compact_task_inner(
         let turn_input_len = turn_input.len();
         let prompt = Prompt {
             input: turn_input,
-            base_instructions: sess.get_base_instructions_for_turn(&turn_context).await,
+            base_instructions: sess.get_base_instructions_for_turn(turn_context).await,
             personality: turn_context.personality,
             ..Default::default()
         };
@@ -211,7 +229,7 @@ async fn run_compact_task_inner(
                 }
                 sess.set_total_tokens_full(turn_context.as_ref()).await;
                 let event = EventMsg::Error(e.to_error_event(None));
-                sess.send_event(&turn_context, event).await;
+                sess.send_event(turn_context, event).await;
                 return Err(e);
             }
             Err(e) => {
@@ -228,7 +246,7 @@ async fn run_compact_task_inner(
                     continue;
                 } else {
                     let event = EventMsg::Error(e.to_error_event(None));
-                    sess.send_event(&turn_context, event).await;
+                    sess.send_event(turn_context, event).await;
                     return Err(e);
                 }
             }
@@ -245,9 +263,9 @@ async fn run_compact_task_inner(
     let reference_context_item = match initial_context_injection {
         InitialContextInjection::DoNotInject => None,
         InitialContextInjection::BeforeLastUserMessage => {
-            let initial_context = sess.build_initial_context(turn_context.as_ref()).await;
+            let initial_context = sess.build_initial_context(context.replacement).await;
             insert_initial_context_before_last_real_user_message(&mut new_history, initial_context);
-            Some(turn_context.to_turn_context_item())
+            Some(context.replacement.to_turn_context_item())
         }
     };
     if let Some(notes) = preserved_work_notes.as_ref() {
@@ -267,19 +285,19 @@ async fn run_compact_task_inner(
         replacement_history,
     };
     sess.replace_compacted_history(
-        turn_context.as_ref(),
+        context.replacement,
         new_history,
         reference_context_item,
         compacted_item,
     )
     .await;
 
-    sess.emit_turn_item_completed(&turn_context, compaction_item)
+    sess.emit_turn_item_completed(turn_context, compaction_item)
         .await;
     let warning = EventMsg::Warning(WarningEvent {
         message: "Heads up: Long threads and multiple compactions can cause the model to be less accurate. Start a new thread when possible to keep threads small and targeted.".to_string(),
     });
-    sess.send_event(&turn_context, warning).await;
+    sess.send_event(turn_context, warning).await;
     Ok(())
 }
 
@@ -507,6 +525,7 @@ pub(crate) const WORK_NOTES_TOOL_REJECT_REASON: &str =
 pub(crate) struct PendingWorkNotes {
     pub(crate) request_index: usize,
     pub(crate) capture_end: usize,
+    pub(crate) source_model: Option<String>,
     pub(crate) notes: Option<String>,
     pub(crate) attempts: u8,
 }
@@ -518,6 +537,7 @@ pub(crate) fn pending_work_notes(items: &[ResponseItem]) -> CodexResult<Option<P
     let mut pending = PendingWorkNotes {
         request_index,
         capture_end: items.len(),
+        source_model: work_notes_source_model(&items[request_index])?,
         notes: None,
         attempts: 0,
     };
@@ -556,9 +576,9 @@ pub(crate) fn pending_work_notes(items: &[ResponseItem]) -> CodexResult<Option<P
             ));
         }
         let is_capture_item = match item {
-            ResponseItem::Message { role, content, .. } if role == "assistant" => {
+            ResponseItem::Message { role, .. } if role == "assistant" => {
                 pending.attempts = pending.attempts.saturating_add(1);
-                pending.notes = content_items_to_text(content)
+                pending.notes = last_assistant_message_from_item(item, false)
                     .filter(|text| text.trim_start().starts_with(AUTO_COMPACT_WORK_NOTES_TAG));
                 pending.attempts <= WORK_NOTES_CAPTURE_MAX_ATTEMPTS
             }
@@ -580,6 +600,20 @@ pub(crate) fn pending_work_notes(items: &[ResponseItem]) -> CodexResult<Option<P
         }
     }
     Ok(Some(pending))
+}
+
+fn work_notes_source_model(item: &ResponseItem) -> CodexResult<Option<String>> {
+    let ResponseItem::Message { content, .. } = item else {
+        return Ok(None);
+    };
+    let text = content_items_to_text(content).unwrap_or_default();
+    text.trim_start()
+        .lines()
+        .nth(1)
+        .and_then(|line| line.strip_prefix(WORK_NOTES_SOURCE_MODEL_PREFIX))
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(|error| CodexErr::Fatal(format!("Invalid compaction capture model: {error}")))
 }
 
 pub(crate) fn is_work_notes_request_item(item: &ResponseItem) -> bool {

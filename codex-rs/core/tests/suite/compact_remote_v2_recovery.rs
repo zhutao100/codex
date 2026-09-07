@@ -9,11 +9,23 @@ use core_test_support::test_codex::TestCodex;
 use pretty_assertions::assert_eq;
 use tokio::sync::oneshot;
 
+#[path = "compact_remote_v2_downshift.rs"]
+mod downshift;
+
 fn chunk(events: Vec<Value>) -> StreamingSseChunk {
     StreamingSseChunk {
         gate: None,
         body: responses::sse(events),
     }
+}
+
+fn multipart_notes() -> Value {
+    let mut event = responses::ev_assistant_message("notes", NOTES);
+    event["item"]["content"] = json!([
+        {"type": "output_text", "text": &NOTES[..19]},
+        {"type": "output_text", "text": &NOTES[19..]}
+    ]);
+    event
 }
 
 fn work_and_notes() -> Vec<Vec<StreamingSseChunk>> {
@@ -24,7 +36,7 @@ fn work_and_notes() -> Vec<Vec<StreamingSseChunk>> {
         ])],
         vec![chunk(vec![
             responses::ev_function_call("notes-tool", "update_plan", r#"{"plan":[]}"#),
-            responses::ev_assistant_message("notes", NOTES),
+            multipart_notes(),
             responses::ev_completed("notes"),
         ])],
     ]
@@ -52,6 +64,60 @@ async fn notes_with_rejected_tools_complete_compaction_without_retry() -> Result
             .filter(|text| text.ends_with(NOTES))
             .count(),
         1
+    );
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plan_mode_compaction_preserves_literal_plan_tags_in_multipart_notes() -> Result<()> {
+    skip_if_no_network_unless_localhost!(Ok(()));
+    use codex_protocol::config_types::CollaborationMode;
+    use codex_protocol::config_types::ModeKind;
+    use codex_protocol::config_types::Settings;
+    let notes = format!("{NOTES}\n<proposed_plan>Keep this literal block.</proposed_plan>");
+    let mut event = multipart_notes();
+    event["item"]["content"][1]["text"] = json!(&notes[19..]);
+    let mut streams = work_and_notes();
+    streams[1] = vec![chunk(vec![event, responses::ev_completed("notes")])];
+    streams.extend(successful_recovery());
+    let (server, _) = start_streaming_sse_server(streams).await;
+    let test = test_codex()
+        .with_model("gpt-5.1")
+        .build_with_streaming_server(&server)
+        .await?;
+    test.codex
+        .submit(Op::OverrideTurnContext {
+            cwd: None,
+            approval_policy: None,
+            sandbox_policy: None,
+            windows_sandbox_level: None,
+            model: None,
+            effort: None,
+            summary: None,
+            collaboration_mode: Some(CollaborationMode {
+                mode: ModeKind::Plan,
+                settings: Settings {
+                    model: "gpt-5.1".into(),
+                    reasoning_effort: None,
+                    developer_instructions: None,
+                },
+            }),
+            personality: None,
+            service_tier: None,
+        })
+        .await?;
+    test.codex.submit(user_input("plan this task")).await?;
+    complete(&test.codex).await;
+    let requests = server.requests().await;
+    assert_eq!(requests.len(), 4);
+    let followup: Value = serde_json::from_slice(&requests[3])?;
+    assert_eq!(
+        user_messages(&followup)
+            .iter()
+            .filter(|text| text.ends_with(&notes))
+            .count(),
+        1,
     );
     server.shutdown().await;
     Ok(())
@@ -433,48 +499,12 @@ async fn assert_previous_model_instructions(final_override: bool) -> Result<()> 
         ]),
     )
     .await;
+    let old_base = format!("{}/v1", old_server.uri());
     let new_base = format!("{}/v1", new_server.uri());
     let test = test_codex()
         .with_model("previous-provider-model")
         .with_config(move |config| {
-            config.base_instructions = None;
-            config
-                .model_providers
-                .insert("previous".into(), config.model_provider.clone());
-            let mut new_provider = config.model_provider.clone();
-            new_provider.base_url = Some(new_base);
-            config
-                .model_providers
-                .insert("destination".into(), new_provider);
-            config.model_overlay = Some(ModelOverlay {
-                models: vec![
-                    ModelOverlayEntry {
-                        slug: "previous-provider-model".into(),
-                        model_provider: Some("previous".into()),
-                        patch: ModelInfoPatch {
-                            base_instructions: Some("Previous model base instructions.".into()),
-                            context_window: Some(Some(200_000)),
-                            auto_compact_token_limit: Some(Some(180_000)),
-                            ..Default::default()
-                        },
-                        final_instruction_override: final_override
-                            .then(|| "Previous model final override.".into()),
-                    },
-                    ModelOverlayEntry {
-                        slug: "destination-provider-model".into(),
-                        model_provider: Some("destination".into()),
-                        patch: ModelInfoPatch {
-                            base_instructions: Some("Destination model base instructions.".into()),
-                            context_window: Some(Some(100_000)),
-                            auto_compact_token_limit: Some(Some(40_000)),
-                            ..Default::default()
-                        },
-                        final_instruction_override: final_override
-                            .then(|| "Destination model final override.".into()),
-                    },
-                ],
-                ..Default::default()
-            });
+            downshift::configure_providers(config, old_base, new_base, final_override);
         })
         .build(&old_server)
         .await?;

@@ -27,22 +27,23 @@ The new transport fixtures use the loopback-aware guard; the wrapper supplies it
 |Collector|Complete singleton summary; unrelated tool output ignored; missing/multiple outputs; incomplete/failed stream; usage before validation; attempt-local retry state.|
 |HTTP|ChatGPT and API-key request construction; backend base path; ordinary tools/settings/cache parity; no legacy route; permanent 404 and configured retry budgets; manual and automatic follow-ups.|
 |Retention|Mixed stale context; old summaries; interruption markers; newest-first boundaries; escaped Unicode; image-only histories; atomic labels; no older backfill; base64 preservation; fixed-context limits.|
-|Notes|Exact multiline notes; bounded capture exclusion; matching function/MCP/custom rejections before or after notes; interrupted capture cleanup; pre-turn schema skip; distinct previous/destination instructions and final overrides; missing-provider errors; preservation of later acknowledged input.|
-|Lifecycle/accounting|Matching start/completion; failure/Continue/steering/restart; cancellation before installation; forced parent abort during persistence; snapshots completing during the stream; healthy socket reuse; exact local token baselines; long notes below the limit do not trigger another pre-turn compaction after restart.|
-|Replay|Exact replacements; encrypted-only inline versus standalone provenance; completed and incomplete tails; rollback; compaction-relative durable dangling-call cleanup.|
+|Notes|Exact multiline/multipart notes, including split sentinels/code and literal plan tags; bounded capture exclusion; matching function/MCP/custom rejections before or after notes; interrupted capture cleanup; pre-turn schema skip; source-model metadata and malformed metadata rejection; distinct previous/destination instructions and final overrides; missing-provider errors; preservation of later acknowledged input.|
+|Lifecycle/accounting|Matching start/completion; failure/Continue/steering/restart; nine downshift recovery cases covering failure/pause, Continue/new input, restart and older captures; cancellation before installation; actual pause/interrupt handlers aborting a parent blocked on a real recorder; snapshots completing during the stream; healthy socket reuse; exact local token baselines; long notes below the limit do not trigger another pre-turn compaction after restart.|
+|Replay|Exact durable replacement and adjacent reference read without a test-side flush; live/replayed history equality; source/destination selection before and after installation; encrypted-only inline versus standalone provenance; completed and incomplete tails; rollback; compaction-relative durable dangling-call cleanup.|
 |Legacy|Explicit legacy selection; output placeholder rewrite retaining calls and success flags; base-instruction estimate; unchanged local selection.|
 
 ## Results
 
 |Check|Result|
 |---|---|
-|Core package, final guarded run|1,181 reported unit passes; 4 ignored. Integration: 694 reported passes, 11 ignored and 44 excluded by the nested-sandbox skip list. Five reported doctest passes. Existing sandbox/network early returns are included in these package totals.|
-|Focused compaction run|53 unit tests and 47 reported integration passes; two unchanged legacy resume/fork cases returned at their explicit network guard. The other 45 integration cases ran, including all v2 fixtures and the local compaction/model-downshift fixtures using the loopback-aware guard.|
+|Core package, final guarded run|1,893 reported passes across four suites; 15 ignored and 44 excluded by the nested-sandbox skip list. Existing sandbox/network early returns are included in these package totals.|
+|Focused compaction run|56 unit tests and 57 reported integration passes; two unchanged legacy resume/fork cases returned at their explicit network guard. The other 55 integration cases ran, including all v2 fixtures and the local compaction/model-downshift fixtures using the loopback-aware guard.|
 |Protocol, telemetry and app-server protocol packages|123 tests passed across nine suites.|
 |Schema generation|Config JSON and affected app-server JSON/TypeScript fixtures regenerated; schema tests passed.|
 |Formatting/lints/build|`just-local fmt`, scoped `just-local fix`, and `cargo-local build -p codex-cli --bin codex` completed. Existing lint warnings remain in unrelated task/util code and a pre-existing pending-input helper.|
+|Native checker|Python syntax and the actual multipart output-text extraction expression passed synthetic split-sentinel/code and input-text exclusion checks.|
 
-The final package log contains 520 standard external-network guard notices across unit tests, integration tests and doctests, plus two legacy resume/fork notices and ten Seatbelt notices. One test can emit multiple notices; these are not counts of distinct tests. Package totals therefore must not be reported as executed transport coverage. The dedicated v2 fixtures all executed past their guards.
+Package totals include existing external-network and Seatbelt early returns and must not be reported as executed transport coverage. The dedicated v2 fixtures all executed past their guards.
 
 Executing the older localhost fixtures exposed stale assumptions about work-notes requests, JSON-escaped notes and canonical-context placement. Those fixtures now include the notes phase and compare actual retained history and notes rather than removing fixed-position context entries.
 
@@ -59,9 +60,11 @@ Same fixture source/settings before and after compaction; all traffic used the n
 
 Byte counts describe decoded JSON request bodies, not compressed wire bytes. Image URLs are small on the wire but each consumes the retained-image budget. The three requests in each fixture were initial work, compaction and follow-up.
 
+The downshift recovery matrix sends 630,000 bytes of user text to a source model with a 200,000-token window, then selects a destination with a 100,000-token window and a 40,000-token automatic threshold. Notes report only ten tokens. All nine cases require recovery to use the source provider/model and ordinary follow-up to use the destination; each follow-up's approximate serialized input/instructions/tools cost remains below 40,000 tokens. Final overrides distinguish both models across resume without changing the existing session-instruction precedence.
+
 ## Authenticated deployment check
 
-The rebuilt CLI's app-server completed native HTTP acceptance against the reported ChatGPT deployment using `gpt-6-astra`, the built-in OpenAI provider and default request compression. The client ran in macOS 15.6.1 (24G90) with ordinary guest networking and no HTTP/TLS forwarder.
+The client recorded in `4daffadda2` completed native HTTP acceptance against the reported ChatGPT deployment using `gpt-6-astra`, the built-in OpenAI provider and default request compression. The client ran in macOS 15.6.1 (24G90) with ordinary guest networking and no HTTP/TLS forwarder. Subsequent recovery refinements were verified with the guarded core package, loopback recovery matrix and real-recorder tests; authenticated acceptance was not repeated for those refinements.
 
 |Scenario|Observed result|
 |---|---|

@@ -3,6 +3,88 @@ use crate::compact::CompactionImplementation;
 use crate::compact::compaction_implementation;
 use pretty_assertions::assert_eq;
 
+#[tokio::test]
+async fn compaction_notes_preserve_multipart_text_and_source_model_after_replay() {
+    let source_model = "source-\"model\\name";
+    let request: ResponseItem = DeveloperInstructions::new(format!(
+        "{}\n{}{}",
+        compact::AUTO_COMPACT_WORK_NOTES_REQUEST_TAG,
+        compact::WORK_NOTES_SOURCE_MODEL_PREFIX,
+        serde_json::to_string(source_model).unwrap()
+    ))
+    .into();
+    let mut message = assistant_message("");
+    let ResponseItem::Message { content, .. } = &mut message else {
+        unreachable!()
+    };
+    *content = vec![
+        ContentItem::OutputText {
+            text: "<AUTO_COMPACT_WORK_".into(),
+        },
+        ContentItem::InputText {
+            text: "not assistant output".into(),
+        },
+        ContentItem::OutputText {
+            text: "NOTES>\n`let val".into(),
+        },
+        ContentItem::OutputText {
+            text: "ue = 1;`\n<proposed_plan>literal notes</proposed_plan>".into(),
+        },
+    ];
+    let notes =
+        "<AUTO_COMPACT_WORK_NOTES>\n`let value = 1;`\n<proposed_plan>literal notes</proposed_plan>";
+    assert_eq!(
+        crate::stream_events_utils::last_assistant_message_from_item(&message, false),
+        Some(notes.into())
+    );
+    let items = vec![user_message("task"), request, message];
+    let expected = compact::PendingWorkNotes {
+        request_index: 1,
+        capture_end: 3,
+        source_model: Some(source_model.into()),
+        notes: Some(notes.into()),
+        attempts: 1,
+    };
+    let (session, _) = make_session_and_context().await;
+    let rollout: Vec<_> = items
+        .iter()
+        .cloned()
+        .map(RolloutItem::ResponseItem)
+        .collect();
+    session
+        .record_initial_history(InitialHistory::Resumed(ResumedHistory {
+            conversation_id: session.conversation_id,
+            rollout_path: PathBuf::from("/tmp/multipart-compaction.jsonl"),
+            history: serde_json::from_str(&serde_json::to_string(&rollout).unwrap()).unwrap(),
+        }))
+        .await;
+    assert_eq!(session.clone_history().await.raw_items(), items);
+    assert_eq!(
+        compact::pending_work_notes(session.clone_history().await.raw_items()).unwrap(),
+        Some(expected)
+    );
+    let prepared =
+        compact::prepare_history_for_compaction(session.clone_history().await, None).unwrap();
+    assert_eq!(prepared.source_history.raw_items(), &[user_message("task")]);
+    assert_eq!(prepared.preserved_work_notes, Some(notes.into()));
+}
+
+#[test]
+fn compaction_notes_reject_malformed_explicit_source_models() {
+    for model in ["unquoted", "null", "42", "\"unterminated"] {
+        let request = DeveloperInstructions::new(format!(
+            "{}\n{}{model}",
+            compact::AUTO_COMPACT_WORK_NOTES_REQUEST_TAG,
+            compact::WORK_NOTES_SOURCE_MODEL_PREFIX,
+        ))
+        .into();
+        assert!(matches!(
+            compact::pending_work_notes(&[request]),
+            Err(CodexErr::Fatal(_))
+        ));
+    }
+}
+
 #[test]
 fn compaction_notes_accept_only_matching_rejected_capture_outputs() {
     let notes = "<AUTO_COMPACT_WORK_NOTES>\nexact notes";
@@ -216,6 +298,8 @@ async fn stable_compaction_feature_is_advertised_without_displacing_other_flags(
 async fn encrypted_only_replay_uses_inline_provenance_and_completion_tail() {
     let (session, context) = make_session_and_context().await;
     let baseline = context.to_turn_context_item();
+    let mut source = baseline.clone();
+    source.model = "larger-source-model".into();
     for inline in [false, true] {
         for notes in [false, true] {
             for completed in [false, true] {
@@ -226,7 +310,7 @@ async fn encrypted_only_replay_uses_inline_provenance_and_completion_tail() {
                     history.push(compact::preserved_work_notes_message("exact notes"));
                 }
                 let mut rollout = vec![
-                    RolloutItem::TurnContext(baseline.clone()),
+                    RolloutItem::TurnContext(source.clone()),
                     RolloutItem::ResponseItem(user_message("original task")),
                     RolloutItem::Compacted(CompactedItem {
                         message: String::new(),
@@ -250,7 +334,7 @@ async fn encrypted_only_replay_uses_inline_provenance_and_completion_tail() {
                         history,
                         reference_context_item: inline.then(|| baseline.clone()),
                         previous_turn_settings: Some(PreviousTurnSettings {
-                            model: baseline.model.clone()
+                            model: source.model.clone()
                         }),
                         pending_continuation: (inline && !completed).then(|| PendingContinuation {
                             source: TurnContinuationSource::Interrupted,
@@ -330,6 +414,7 @@ async fn completed_work_notes_remain_pending_work_after_restart() {
         compact::PendingWorkNotes {
             request_index: 1,
             capture_end: 3,
+            source_model: None,
             notes: Some(notes.into()),
             attempts: 1
         }

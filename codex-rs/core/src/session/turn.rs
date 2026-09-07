@@ -1,5 +1,7 @@
 use super::*;
+use crate::compact::CompactionContext;
 use crate::compact::WORK_NOTES_CAPTURE_MAX_ATTEMPTS;
+use crate::compact::WORK_NOTES_SOURCE_MODEL_PREFIX;
 use crate::compact::WORK_NOTES_TOOL_REJECT_REASON;
 use crate::compact::pending_work_notes;
 use crate::compact_remote_v2::CompactionReason;
@@ -32,8 +34,10 @@ fn is_auto_compact_work_notes_message(message: &str) -> bool {
 }
 
 async fn inject_pre_compact_work_notes_request(sess: &Session, turn_context: &TurnContext) {
+    let source_model = serde_json::Value::String(turn_context.model_info.slug.clone());
     let request = format!(
         "{AUTO_COMPACT_WORK_NOTES_REQUEST_TAG}\n\
+{WORK_NOTES_SOURCE_MODEL_PREFIX}{source_model}\n\
 Token limit is approaching and follow-up work is still needed.\n\
 \n\
 Respond with exactly one assistant message and do not call tools.\n\
@@ -318,14 +322,14 @@ async fn run_turn_inner(
     }
     let mut recovered_notes = false;
     let pending_notes = match pending_work_notes(sess.clone_history().await.raw_items()) {
-        Ok(pending) => pending.is_some(),
+        Ok(pending) => pending,
         Err(error) => {
             sess.send_event(&turn_context, EventMsg::Error(error.to_error_event(None)))
                 .await;
             return None;
         }
     };
-    if pending_notes {
+    if let Some(pending_notes) = pending_notes {
         // Finish the recorded notes transaction before ordinary sampling or new
         // user input can get appended beyond its capture segment.
         let injection = if continuation.is_some() {
@@ -333,11 +337,37 @@ async fn run_turn_inner(
         } else {
             InitialContextInjection::DoNotInject
         };
-        if let Err(error) = run_pre_turn_compact(
+        let request_context = match work_notes_request_context(
             &sess,
             &turn_context,
+            pending_notes.source_model.as_deref(),
+        )
+        .await
+        {
+            Ok(context) => context,
+            Err(error) => {
+                sess.send_event(&turn_context, EventMsg::Error(error.to_error_event(None)))
+                    .await;
+                return None;
+            }
+        };
+        let reason = if request_context
+            .model_context_window()
+            .zip(turn_context.model_context_window())
+            .is_some_and(|(source, target)| source > target)
+        {
+            CompactionReason::ModelDownshift
+        } else {
+            CompactionReason::TokenLimit
+        };
+        if let Err(error) = run_pre_turn_compact(
+            &sess,
+            CompactionContext {
+                request: &request_context,
+                replacement: &turn_context,
+            },
             injection,
-            CompactionReason::TokenLimit,
+            reason,
             &cancellation_token,
         )
         .await
@@ -373,7 +403,7 @@ async fn run_turn_inner(
         if total_usage_tokens >= auto_compact_limit
             && let Err(e) = run_pre_turn_compact(
                 &sess,
-                &turn_context,
+                CompactionContext::new(&turn_context),
                 InitialContextInjection::DoNotInject,
                 CompactionReason::TokenLimit,
                 &cancellation_token,
@@ -593,7 +623,7 @@ async fn run_turn_inner(
                     {
                         match run_auto_compact(
                             &sess,
-                            &turn_context,
+                            CompactionContext::new(&turn_context),
                             Some(notes),
                             InitialContextInjection::BeforeLastUserMessage,
                             Some(&mut client_session),
@@ -621,7 +651,7 @@ async fn run_turn_inner(
                         );
                         match run_auto_compact(
                             &sess,
-                            &turn_context,
+                            CompactionContext::new(&turn_context),
                             None,
                             InitialContextInjection::BeforeLastUserMessage,
                             Some(&mut client_session),
@@ -656,7 +686,7 @@ async fn run_turn_inner(
                     if turn_context.final_output_json_schema.is_some() {
                         match run_auto_compact(
                             &sess,
-                            &turn_context,
+                            CompactionContext::new(&turn_context),
                             None,
                             InitialContextInjection::BeforeLastUserMessage,
                             Some(&mut client_session),
@@ -710,7 +740,7 @@ async fn run_turn_inner(
                 info!("Work-notes capture failed; compacting without notes: {e:#}");
                 match run_auto_compact(
                     &sess,
-                    &turn_context,
+                    CompactionContext::new(&turn_context),
                     None,
                     InitialContextInjection::BeforeLastUserMessage,
                     Some(&mut client_session),
@@ -760,6 +790,39 @@ async fn run_turn_inner(
     }
 
     last_agent_message
+}
+
+async fn work_notes_request_context(
+    sess: &Arc<Session>,
+    current: &Arc<TurnContext>,
+    source_model: Option<&str>,
+) -> CodexResult<Arc<TurnContext>> {
+    if let Some(model) = source_model {
+        return if model == current.model_info.slug {
+            Ok(Arc::clone(current))
+        } else {
+            sess.turn_context_with_model(current, model).await
+        };
+    }
+
+    // Older captures predate the source-model line. A downshift begins before
+    // recording the new user turn, so its previous-turn context still identifies
+    // the larger source model. Completed notes may have replaced the usage count.
+    if let Some(previous) = sess.previous_turn_settings().await
+        && previous.model != current.model_info.slug
+    {
+        let context = sess
+            .turn_context_with_model(current, &previous.model)
+            .await?;
+        if context
+            .model_context_window()
+            .zip(current.model_context_window())
+            .is_some_and(|(source, target)| source > target)
+        {
+            return Ok(context);
+        }
+    }
+    Ok(Arc::clone(current))
 }
 
 async fn maybe_run_previous_model_inline_compact(
@@ -832,12 +895,12 @@ async fn maybe_run_previous_model_inline_compact(
 
     run_pre_turn_compact(
         sess,
-        &previous_context,
-        InitialContextInjection::DoNotInject,
-        CompactionReason::ModelDownshift {
-            target_window: current_context_window,
-            target_auto_limit: Some(current_auto_compact_limit),
+        CompactionContext {
+            request: &previous_context,
+            replacement: turn_context,
         },
+        InitialContextInjection::DoNotInject,
+        CompactionReason::ModelDownshift,
         cancellation_token,
     )
     .await
@@ -863,13 +926,14 @@ fn should_compact_with_previous_model(
 
 async fn run_auto_compact(
     sess: &Arc<Session>,
-    turn_context: &Arc<TurnContext>,
+    context: CompactionContext<'_>,
     preserved_work_notes: Option<String>,
     initial_context_injection: InitialContextInjection,
     mut client_session: Option<&mut ModelClientSession>,
     reason: CompactionReason,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<bool> {
+    let turn_context = context.request;
     if cancellation_token.is_cancelled() {
         return Err(CodexErr::TurnAborted);
     }
@@ -883,7 +947,7 @@ async fn run_auto_compact(
         CompactionImplementation::RemoteV2 => {
             return crate::compact_remote_v2::run_remote_compact_task(
                 sess,
-                turn_context,
+                context,
                 client_session,
                 preserved_work_notes,
                 initial_context_injection,
@@ -895,7 +959,7 @@ async fn run_auto_compact(
         CompactionImplementation::Remote => {
             run_inline_remote_auto_compact_task(
                 Arc::clone(sess),
-                Arc::clone(turn_context),
+                context,
                 preserved_work_notes,
                 initial_context_injection,
             )
@@ -904,7 +968,7 @@ async fn run_auto_compact(
         CompactionImplementation::Local => {
             run_inline_auto_compact_task(
                 Arc::clone(sess),
-                Arc::clone(turn_context),
+                context,
                 preserved_work_notes,
                 initial_context_injection,
             )
@@ -921,11 +985,12 @@ async fn run_auto_compact(
 
 async fn run_pre_turn_compact(
     sess: &Arc<Session>,
-    turn_context: &Arc<TurnContext>,
+    context: CompactionContext<'_>,
     injection: InitialContextInjection,
     reason: CompactionReason,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<bool> {
+    let turn_context = context.request;
     if cancellation_token.is_cancelled() {
         return Err(CodexErr::TurnAborted);
     }
@@ -995,7 +1060,7 @@ async fn run_pre_turn_compact(
     }
     run_auto_compact(
         sess,
-        turn_context,
+        context,
         notes,
         injection,
         Some(&mut client_session),
@@ -2182,7 +2247,8 @@ async fn try_run_sampling_request(
     let mut last_agent_message: Option<String> = None;
     let mut active_item: Option<TurnItem> = None;
     let mut should_emit_turn_diff = false;
-    let plan_mode = turn_context.collaboration_mode.mode == ModeKind::Plan;
+    let plan_mode = turn_context.collaboration_mode.mode == ModeKind::Plan
+        && matches!(tool_execution_mode, ToolCallExecutionMode::Normal);
     let mut plan_mode_state = plan_mode.then(|| PlanModeStreamState::new(&turn_context.sub_id));
     let mut progress_trace_state = ProgressTraceStreamState::default();
     let receiving_span = trace_span!("receiving_stream");

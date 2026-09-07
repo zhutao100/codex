@@ -1,11 +1,22 @@
 use super::*;
 use crate::context_manager::ContextManager;
 use crate::rollout::policy::should_persist_response_item;
+use crate::rollout::recorder::RolloutRecorder;
+use crate::rollout::recorder::RolloutRecorderParams;
 use crate::session::tests::make_session_and_context;
+use crate::state::TaskKind;
+use crate::tasks::SessionTask;
+use crate::tasks::SessionTaskContext;
 use crate::truncate::TruncationPolicy;
 use codex_protocol::models::FunctionCallOutputPayload;
+use codex_protocol::protocol::RolloutItem;
+use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::TokenUsage;
+use codex_protocol::protocol::TurnAbortReason;
+use codex_protocol::protocol::TurnPauseReason;
+use codex_protocol::user_input::UserInput;
 use pretty_assertions::assert_eq;
+use tokio::sync::Notify;
 use tokio::sync::mpsc;
 
 fn compaction(value: &str) -> ResponseItem {
@@ -230,62 +241,224 @@ async fn tail_rewrite_preserves_calls_status_and_live_source() {
     );
 }
 
+struct InstallingTask {
+    started: Arc<Notify>,
+    install: Arc<Notify>,
+    dropped: Arc<Notify>,
+    replacement: Vec<ResponseItem>,
+}
+
+struct NotifyOnDrop(Arc<Notify>);
+
+impl Drop for NotifyOnDrop {
+    fn drop(&mut self) {
+        self.0.notify_one();
+    }
+}
+
+impl SessionTask for InstallingTask {
+    fn kind(&self) -> TaskKind {
+        TaskKind::Regular
+    }
+
+    async fn run(
+        self: Arc<Self>,
+        session: Arc<SessionTaskContext>,
+        context: Arc<TurnContext>,
+        _input: Vec<UserInput>,
+        cancellation_token: CancellationToken,
+    ) -> Option<String> {
+        let _dropped = NotifyOnDrop(Arc::clone(&self.dropped));
+        let session = session.clone_session();
+        let item = TurnItem::ContextCompaction(ContextCompactionItem::new());
+        session.emit_turn_item_started(&context, &item).await;
+        self.started.notify_one();
+        self.install.notified().await;
+        install_compacted_history(
+            &session,
+            &context,
+            self.replacement.clone(),
+            Some(context.to_turn_context_item()),
+            item,
+            &cancellation_token,
+        )
+        .await
+        .unwrap();
+        std::future::pending().await
+    }
+}
+
+#[test_case::test_case(true; "pause")]
+#[test_case::test_case(false; "interrupt")]
 #[tokio::test]
-async fn installation_finishes_coherently_when_the_parent_is_aborted_during_persistence() {
+async fn installation_persists_before_task_stop_and_replays_exactly(pause: bool) {
     let (session, context, events) =
         crate::session::tests::make_session_and_context_with_rx().await;
+    let home = tempfile::tempdir().unwrap();
+    let mut config = context.config.as_ref().clone();
+    config.codex_home = home.path().into();
+    let recorder = RolloutRecorder::new(
+        &config,
+        RolloutRecorderParams::Create {
+            conversation_id: session.conversation_id,
+            forked_from_id: None,
+            source: context.session_source.clone(),
+            model_provider_id: context.model_provider_id.clone(),
+            base_instructions: session.get_base_instructions().await,
+            dynamic_tools: vec![],
+        },
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let path = recorder.rollout_path.clone();
+    *session.services.rollout.lock().await = Some(recorder);
+    let user = ResponseItem::Message {
+        id: None,
+        role: "user".into(),
+        content: vec![ContentItem::InputText {
+            text: "task".into(),
+        }],
+        end_turn: None,
+        phase: None,
+    };
+    session.record_conversation_items(&context, &[user]).await;
+    let snapshot = codex_git::GhostCommit::new("snapshot".into(), None, vec![], vec![]);
+    session.record_ghost_snapshot(&context, &snapshot).await;
+    session.flush_rollout().await;
     let replacement = vec![
         compaction("installed"),
         preserved_work_notes_message("exact notes"),
     ];
-    let expected = replacement.clone();
-    let reference = context.to_turn_context_item();
-    let expected_reference = reference.clone();
-    // Hold the recorder lock at the real await between memory installation and
-    // persistence, then simulate task-stop's forced abort of the parent.
-    let recorder = session.services.rollout.lock().await;
-    let install_session = Arc::clone(&session);
-    let install_context = Arc::clone(&context);
-    let parent = tokio::spawn(async move {
-        install_compacted_history(
-            &install_session,
-            &install_context,
-            replacement,
-            Some(reference),
-            TurnItem::ContextCompaction(ContextCompactionItem::new()),
-            &CancellationToken::new(),
-        )
-        .await
+    let mut expected = replacement.clone();
+    expected.push(ResponseItem::GhostSnapshot {
+        ghost_commit: snapshot,
     });
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    let reference = context.to_turn_context_item();
+    let started = Arc::new(Notify::new());
+    let install = Arc::new(Notify::new());
+    let dropped = Arc::new(Notify::new());
+    session
+        .spawn_task(
+            Arc::clone(&context),
+            vec![],
+            InstallingTask {
+                started: Arc::clone(&started),
+                install: Arc::clone(&install),
+                dropped: Arc::clone(&dropped),
+                replacement,
+            },
+        )
+        .await;
+    let timeout = std::time::Duration::from_secs(10);
+    tokio::time::timeout(timeout, started.notified())
+        .await
+        .unwrap();
+    // Block the real recorder at the await after memory installation.
+    let recorder_gate = session.services.rollout.lock().await;
+    install.notify_one();
+    tokio::time::timeout(timeout, async {
         while session.clone_history().await.raw_items() != expected {
-            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
     })
     .await
     .unwrap();
-    parent.abort();
-    assert!(parent.await.unwrap_err().is_cancelled());
+    let stop_session = Arc::clone(&session);
+    let stopped = tokio::spawn(async move {
+        if pause {
+            stop_session
+                .pause_all_tasks(TurnPauseReason::UserRequested)
+                .await;
+        } else {
+            stop_session
+                .abort_all_tasks(TurnAbortReason::Interrupted)
+                .await;
+        }
+    });
+    // The actual task-stop grace timeout aborts the parent, leaving its child
+    // installer alive and holding the boundary until persistence completes.
+    tokio::time::timeout(timeout, dropped.notified())
+        .await
+        .unwrap();
+    assert!(!stopped.is_finished());
     assert!(session.compaction_installation.try_lock().is_err());
-    drop(recorder);
-    let _installed = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        session.compaction_installation.lock(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(session.clone_history().await.raw_items(), expected);
-    assert_eq!(
-        session.reference_context_item().await,
-        Some(expected_reference)
-    );
-    let mut completed = 0;
+    let mut lifecycle = Vec::new();
     while let Ok(event) = events.try_recv() {
-        if matches!(event.msg, EventMsg::ItemCompleted(_)) {
-            completed += 1;
+        assert!(!matches!(
+            event.msg,
+            EventMsg::TurnPaused(_) | EventMsg::TurnAborted(_)
+        ));
+        if matches!(event.msg, EventMsg::ItemStarted(_)) {
+            lifecycle.push("started");
         }
     }
-    assert_eq!(completed, 1);
+    drop(recorder_gate);
+    tokio::time::timeout(timeout, stopped)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // No test-side flush: task-stop must make the replacement and reference
+    // visible on disk before reporting that the turn stopped.
+    let rollout: Vec<_> = tokio::fs::read_to_string(&path)
+        .await
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<RolloutLine>(line).unwrap().item)
+        .collect();
+    let checkpoints: Vec<_> = rollout
+        .windows(2)
+        .filter_map(|items| {
+            if let [
+                RolloutItem::Compacted(item),
+                RolloutItem::TurnContext(reference),
+            ] = items
+            {
+                Some((item.clone(), reference.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(
+        serde_json::to_value(checkpoints).unwrap(),
+        serde_json::to_value(vec![(
+            CompactedItem {
+                message: String::new(),
+                replacement_history: Some(expected.clone()),
+            },
+            reference.clone()
+        )])
+        .unwrap(),
+    );
+    let live = session.clone_history().await;
+    assert_eq!(&live.raw_items()[..expected.len()], expected);
+    assert_eq!(live.raw_items().len(), expected.len() + usize::from(!pause));
+    assert_eq!(session.reference_context_item().await, Some(reference));
+    while let Ok(event) = events.try_recv() {
+        match event.msg {
+            EventMsg::ItemCompleted(_) => lifecycle.push("completed"),
+            EventMsg::TurnPaused(_) => lifecycle.push("paused"),
+            EventMsg::TurnAborted(_) => lifecycle.push("interrupted"),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        lifecycle,
+        vec![
+            "started",
+            "completed",
+            if pause { "paused" } else { "interrupted" }
+        ]
+    );
+    let replayed = crate::session::tests::replay_rollout_history(rollout).await;
+    assert_eq!(replayed.raw_items(), live.raw_items());
+    assert_eq!(
+        replayed.reference_context_item(),
+        live.reference_context_item()
+    );
 }
 
 #[tokio::test]
@@ -363,7 +536,7 @@ async fn snapshot_completed_during_the_compaction_stream_survives_installation()
     let task = tokio::spawn(async move {
         run_remote_compact_task(
             &task_session,
-            &task_context,
+            CompactionContext::new(&task_context),
             None,
             None,
             InitialContextInjection::DoNotInject,

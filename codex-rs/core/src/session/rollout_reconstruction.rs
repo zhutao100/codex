@@ -178,10 +178,11 @@ impl Session {
         }
 
         let history = history.raw_items().to_vec();
+        let pending_notes = !matches!(compact::pending_work_notes(&history), Ok(None));
         let suppress_compaction_continuation = latest_compaction_tail_kind
             == CompactionTailKind::StandaloneOrPreTurn
             && !checkpoint_after_latest_compaction
-            && matches!(compact::pending_work_notes(&history), Ok(None));
+            && !pending_notes;
         let encrypted_only_continuation = latest_compaction_tail_kind
             == CompactionTailKind::MidTurnWithInjectedContext
             && !history.iter().any(is_user_turn_boundary_response_item)
@@ -195,10 +196,25 @@ impl Session {
             .then(|| PendingContinuation {
                 source: TurnContinuationSource::Interrupted,
                 continued_from_turn_id: None,
-                model: current_metadata
-                    .previous_turn_settings
-                    .as_ref()
-                    .map(|settings| settings.model.clone()),
+                // Pre-turn capture may precede the destination's first user
+                // boundary. Keep the resume-selected destination for work;
+                // recovery resolves the capture's source model separately.
+                model: if pending_notes {
+                    Some(turn_context.model_info.slug.clone())
+                } else if latest_compaction_tail_kind
+                    == CompactionTailKind::MidTurnWithInjectedContext
+                    && !checkpoint_after_latest_compaction
+                {
+                    current_metadata
+                        .reference_context_item
+                        .as_ref()
+                        .map(|context| context.model.clone())
+                } else {
+                    current_metadata
+                        .previous_turn_settings
+                        .as_ref()
+                        .map(|settings| settings.model.clone())
+                },
                 pause_reason: None,
                 target: PendingContinuationTarget::Regular,
             });

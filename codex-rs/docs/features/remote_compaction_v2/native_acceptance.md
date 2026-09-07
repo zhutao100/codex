@@ -25,7 +25,7 @@ The script uses the built-in OpenAI provider and default request compression. It
 2. Manual compaction completes exactly once; follow-up recalls a synthetic codeword.
 3. A real tool round with 8,000 inert reference lines crosses a 30,000-token automatic threshold.
 4. Automatic compaction completes and its follow-up recalls a second codeword.
-5. Replacement history excludes triggers and preserves emitted work notes byte-for-byte.
+5. Replacement history excludes triggers and preserves emitted work notes byte-for-byte, concatenating assistant output-text parts without separators.
 6. A new app-server process resumes the persisted thread and recalls the codeword.
 
 An 8 MiB subprocess stdout limit accommodates large user-message notifications. Shutdown drains the app-server pipes. No real conversation history is used.
@@ -43,7 +43,7 @@ Verified on 2026-09-07 with `gpt-6-astra` in macOS 15.6.1 (24G90):
 |Executable/scenario|Result|
 |---|---|
 |Pre-backport `1c74f68455`, ordinary native generation|Passed in 2.39 seconds.|
-|Final rebuilt client, ordinary native generation|Passed in 2.71 seconds.|
+|Client recorded in `4daffadda2`, ordinary native generation|Passed in 2.71 seconds.|
 |Manual compaction and follow-up|Passed.|
 |Automatic compaction and follow-up|Passed with one compaction.|
 |Restart/resume and exact notes|Passed with one preserved notes item.|

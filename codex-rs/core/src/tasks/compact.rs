@@ -37,7 +37,7 @@ impl SessionTask for CompactTask {
             CompactionImplementation::RemoteV2 => {
                 let _ = crate::compact_remote_v2::run_remote_compact_task(
                     &session,
-                    &ctx,
+                    crate::compact::CompactionContext::new(&ctx),
                     None,
                     None,
                     InitialContextInjection::DoNotInject,

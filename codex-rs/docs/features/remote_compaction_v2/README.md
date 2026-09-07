@@ -35,18 +35,19 @@ Disabling only `remote_compaction_v2` selects the legacy endpoint and can reprod
 ## Branch lifecycle
 
 - Manual compaction preserves existing notes without requesting new notes.
-- Pre-turn and model-downshift compaction share bounded notes capture; the latter uses the previous model's provider and effective instructions while reserving the destination model's instructions and context limits.
+- Pre-turn and model-downshift compaction share bounded notes capture. Preserve the source model with the request so failed/paused capture retries use its provider and instructions even after notes report low usage. Replacement budgets, tools, canonical context and reference context use the destination model.
 - Mid-turn compaction borrows the active client and preserves deferred-input ordering.
 - Recover an outstanding notes transaction before ordinary work or incoming user input is appended. Recognize completed notes and abort markers from durable history. A later real user message ends the capture segment; preserve it and subsequent work in the retry source. Reject ambiguous work inside the capture segment.
 - Failed compaction keeps continuation available immediately and after restart. Queued steering acknowledged when the failed turn finishes is persisted outside the capture segment; notes are never treated as the final user answer.
 - Matching tool rejections can follow completed notes because tool futures drain after the stream. Continuation cleanup preserves notes captures whose rejected outputs were not recorded before interruption.
+- Concatenate assistant output-text parts exactly for both live capture and recovery, including split sentinels and literal plan tags. Capture bypasses ordinary plan rendering.
 - Preserve undo snapshots, including snapshots arriving during notes capture, the compaction stream or interrupted tool work. Snapshot recording and replacement installation share a guard. Snapshots remain absent from model requests.
 - Install canonical context before the last real user, then the last plaintext summary, then the encrypted summary, or append it if none exists. Image-only input is a real user anchor.
 - Append notes after the encrypted summary and snapshots after notes. Persist exactly this vector plus the appropriate adjacent reference context.
 - Recomputed usage stores the model-item baseline; local tail items, including notes, are added once during live accounting and replay.
 - Cancellation before installation preserves live history. Once installation starts, task-stop waits for its memory/persistence/completion boundary.
 - Clear logical WebSocket continuation after installation; reuse only healthy physical connections. Unfinished requests remain marked unfinished on failure or cancellation.
-- Replay uses inline-compaction provenance to infer pending work even when retention removes all real users. Later completion and rollback suppress that inference.
+- Replay uses inline-compaction provenance to infer pending work even when retention removes all real users. Pending captures keep the resume-selected destination; installed inline replacements use their persisted reference model. Later completion and rollback suppress continuation inference.
 
 ## Maintenance
 

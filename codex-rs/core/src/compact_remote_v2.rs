@@ -7,6 +7,7 @@ use crate::Prompt;
 use crate::client::ModelClientSession;
 use crate::client_common::ResponseEvent;
 use crate::client_common::ResponseStream;
+use crate::compact::CompactionContext;
 use crate::compact::InitialContextInjection;
 use crate::compact::insert_initial_context_before_last_real_user_message;
 use crate::compact::prepare_history_for_compaction;
@@ -38,21 +39,19 @@ mod history;
 pub(crate) enum CompactionReason {
     UserRequested,
     TokenLimit,
-    ModelDownshift {
-        target_window: Option<i64>,
-        target_auto_limit: Option<i64>,
-    },
+    ModelDownshift,
 }
 
 pub(crate) async fn run_remote_compact_task(
     sess: &Arc<Session>,
-    turn_context: &Arc<TurnContext>,
+    context: CompactionContext<'_>,
     client_session: Option<&mut ModelClientSession>,
     notes: Option<String>,
     injection: InitialContextInjection,
     reason: CompactionReason,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<bool> {
+    let turn_context = context.request;
     if reason == CompactionReason::UserRequested {
         sess.send_event(
             turn_context,
@@ -76,7 +75,7 @@ pub(crate) async fn run_remote_compact_task(
     };
     let result = run_compact(
         sess,
-        turn_context,
+        context,
         client_session,
         notes,
         injection,
@@ -98,13 +97,15 @@ pub(crate) async fn run_remote_compact_task(
 
 async fn run_compact(
     sess: &Arc<Session>,
-    turn_context: &Arc<TurnContext>,
+    context: CompactionContext<'_>,
     client_session: &mut ModelClientSession,
     notes: Option<String>,
     injection: InitialContextInjection,
     reason: CompactionReason,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<()> {
+    let turn_context = context.request;
+    let replacement_context = context.replacement;
     check_cancelled(cancellation_token)?;
     let started = Instant::now();
     let lifecycle_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
@@ -151,14 +152,21 @@ async fn run_compact(
 
     // Reserve canonical context even for standalone/pre-turn compaction: the
     // next normal request seeds it. Count notes and tools outside retention.
-    let initial_context = sess.build_initial_context(turn_context).await;
+    let initial_context = sess.build_initial_context(replacement_context).await;
     let notes_item = prepared
         .preserved_work_notes
         .as_deref()
         .map(preserved_work_notes_message);
     // Previous-model requests use that model's instructions, while the
     // replacement must leave room for the selected destination model.
-    let replacement_instructions = sess.get_base_instructions().await;
+    let replacement_instructions = sess
+        .get_base_instructions_for_turn(replacement_context)
+        .await;
+    let replacement_tools = if Arc::ptr_eq(turn_context, replacement_context) {
+        prompt.tools.clone()
+    } else {
+        compaction_tool_specs(sess, replacement_context, &prompt.input, cancellation_token).await?
+    };
     let fixed_tokens = initial_context
         .iter()
         .chain(std::iter::once(&output.item))
@@ -166,18 +174,14 @@ async fn run_compact(
         .map(history::retained_tokens)
         .sum::<usize>()
         .saturating_add(approx_token_count(&replacement_instructions.text))
-        .saturating_add(approx_token_count(&serde_json::to_string(&prompt.tools)?));
-    let (window, auto_limit) = match reason {
-        CompactionReason::ModelDownshift {
-            target_window,
-            target_auto_limit,
-        } => (target_window, target_auto_limit),
-        CompactionReason::UserRequested | CompactionReason::TokenLimit => (
-            turn_context.model_context_window(),
-            turn_context.model_info.auto_compact_token_limit(),
-        ),
-    };
-    let budget = retention_budget(fixed_tokens, window, auto_limit)?;
+        .saturating_add(approx_token_count(&serde_json::to_string(
+            &replacement_tools,
+        )?));
+    let budget = retention_budget(
+        fixed_tokens,
+        replacement_context.model_context_window(),
+        replacement_context.model_info.auto_compact_token_limit(),
+    )?;
     let mut replacement = history::retain_messages(&prompt.input, budget);
     let retained_tokens = replacement
         .iter()
@@ -198,7 +202,7 @@ async fn run_compact(
         InitialContextInjection::DoNotInject => None,
         InitialContextInjection::BeforeLastUserMessage => {
             insert_initial_context_before_last_real_user_message(&mut replacement, initial_context);
-            Some(turn_context.to_turn_context_item())
+            Some(replacement_context.to_turn_context_item())
         }
     };
     replacement.extend(notes_item);
@@ -206,7 +210,7 @@ async fn run_compact(
 
     install_compacted_history(
         sess,
-        turn_context,
+        replacement_context,
         replacement,
         reference,
         lifecycle_item,
@@ -320,7 +324,7 @@ fn compaction_metadata(
             "reason": match reason {
                 CompactionReason::UserRequested => "user_requested",
                 CompactionReason::TokenLimit => "context_limit",
-                CompactionReason::ModelDownshift { .. } => "model_downshift",
+                CompactionReason::ModelDownshift => "model_downshift",
             },
             "implementation": "responses_compaction_v2",
             "phase": if manual { "standalone_turn" } else {
