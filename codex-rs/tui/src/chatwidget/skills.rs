@@ -17,6 +17,7 @@ use codex_core::connectors::connector_mention_slug;
 use codex_core::protocol::ListSkillsResponseEvent;
 use codex_core::protocol::SkillMetadata as ProtocolSkillMetadata;
 use codex_core::protocol::SkillsListEntry;
+use codex_core::skills::injection::tool_mention_name_len;
 use codex_core::skills::model::SkillDependencies;
 use codex_core::skills::model::SkillInterface;
 use codex_core::skills::model::SkillMetadata;
@@ -333,12 +334,7 @@ fn extract_tool_mentions_from_text(text: &str) -> ToolMentions {
             continue;
         }
 
-        let mut name_end = name_start + 1;
-        while let Some(next_byte) = text_bytes.get(name_end)
-            && is_mention_name_char(*next_byte)
-        {
-            name_end += 1;
-        }
+        let name_end = name_start + tool_mention_name_len(&text_bytes[name_start..]);
 
         let name = &text[name_start..name_end];
         if !is_common_env_var(name) {
@@ -369,12 +365,7 @@ fn parse_linked_tool_mention<'a>(
         return None;
     }
 
-    let mut name_end = name_start + 1;
-    while let Some(next_byte) = text_bytes.get(name_end)
-        && is_mention_name_char(*next_byte)
-    {
-        name_end += 1;
-    }
+    let name_end = name_start + tool_mention_name_len(&text_bytes[name_start..]);
 
     if text_bytes.get(name_end) != Some(&b']') {
         return None;
@@ -446,4 +437,42 @@ fn app_id_from_path(path: &str) -> Option<&str> {
 
 fn is_app_or_mcp_path(path: &str) -> bool {
     path.starts_with("app://") || path.starts_with("mcp://")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn plugin_names_keep_selected_paths_through_submission_parsing() {
+        let skill = SkillMetadata {
+            name: "team.tools:fetch".into(),
+            description: "Fetch a page".into(),
+            short_description: None,
+            interface: None,
+            dependencies: None,
+            path: PathBuf::from("/plugins/skills/fetch/SKILL.md"),
+            scope: codex_core::protocol::SkillScope::User,
+        };
+        let paths = HashMap::from([(
+            skill.name.clone(),
+            skill.path.to_string_lossy().into_owned(),
+        )]);
+        for text in [
+            "Use $team.tools:fetch.",
+            "Use [$team.tools:fetch](/plugins/skills/fetch/SKILL.md)",
+        ] {
+            let mentions = collect_tool_mentions(text, &paths);
+            assert_eq!(mentions.linked_paths, paths);
+            assert_eq!(
+                find_skill_mentions_with_tool_mentions(&mentions, std::slice::from_ref(&skill)),
+                vec![skill.clone()]
+            );
+        }
+        assert_eq!(
+            collect_tool_mentions("$ordinary.suffix", &HashMap::new()).names,
+            HashSet::from(["ordinary".to_string()])
+        );
+    }
 }

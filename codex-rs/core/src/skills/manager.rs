@@ -51,6 +51,7 @@ impl SkillsManager {
         let roots =
             skill_roots_from_layer_stack_with_agents(&config.config_layer_stack, &config.cwd);
         let mut outcome = load_skills_from_roots(roots);
+        crate::plugins::append_skills(&mut outcome, &self.codex_home, &config.config_layer_stack);
         outcome.disabled_paths = disabled_paths_from_stack(&config.config_layer_stack);
         let mut cache = match self.cache_by_cwd.write() {
             Ok(cache) => cache,
@@ -106,6 +107,7 @@ impl SkillsManager {
 
         let roots = skill_roots_from_layer_stack_with_agents(&config_layer_stack, cwd);
         let mut outcome = load_skills_from_roots(roots);
+        crate::plugins::append_skills(&mut outcome, &self.codex_home, &config_layer_stack);
         outcome.disabled_paths = disabled_paths_from_stack(&config_layer_stack);
         let mut cache = match self.cache_by_cwd.write() {
             Ok(cache) => cache,

@@ -41,6 +41,7 @@ mod app_cmd;
 #[cfg(target_os = "macos")]
 mod desktop_app;
 mod mcp_cmd;
+mod plugin_cmd;
 #[cfg(not(windows))]
 mod wsl_paths;
 
@@ -100,6 +101,9 @@ enum Subcommand {
 
     /// [experimental] Run Codex as an MCP server and manage MCP servers.
     Mcp(McpCli),
+
+    /// Manage local plugin bundles and marketplaces.
+    Plugin(plugin_cmd::PluginCli),
 
     /// [experimental] Run the Codex MCP server (stdio transport).
     McpServer,
@@ -933,6 +937,13 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
             // Propagate any root-level config overrides (e.g. `-c key=value`).
             prepend_config_flags(&mut mcp_cli.config_overrides, root_config_overrides.clone());
             mcp_cli.run().await?;
+        }
+        Some(Subcommand::Plugin(plugin_cli)) => {
+            anyhow::ensure!(
+                root_config_overrides.raw_overrides.is_empty(),
+                "plugin management edits user config directly and does not accept -c/--enable/--disable overrides"
+            );
+            plugin_cli.run()?;
         }
         Some(Subcommand::AppServer(app_server_cli)) => match app_server_cli.subcommand {
             None => {

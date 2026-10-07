@@ -449,6 +449,28 @@
         }
       ]
     },
+    "MarketplaceConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "source": {
+          "type": "string"
+        },
+        "source_type": {
+          "$ref": "#/definitions/MarketplaceSourceType"
+        }
+      },
+      "required": [
+        "source",
+        "source_type"
+      ],
+      "type": "object"
+    },
+    "MarketplaceSourceType": {
+      "enum": [
+        "local"
+      ],
+      "type": "string"
+    },
     "ModeKind": {
       "description": "Initial collaboration mode to use when the TUI starts.",
       "enum": [
@@ -1083,6 +1105,16 @@
         "pragmatic"
       ],
       "type": "string"
+    },
+    "PluginConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "default": true,
+          "type": "boolean"
+        }
+      },
+      "type": "object"
     },
     "ProgressLegendMode": {
       "enum": [
@@ -1944,6 +1976,14 @@
       ],
       "description": "Directory where Codex writes log files, for example `codex-tui.log`. Defaults to `$CODEX_HOME/log`."
     },
+    "marketplaces": {
+      "additionalProperties": {
+        "$ref": "#/definitions/MarketplaceConfig"
+      },
+      "default": {},
+      "description": "Local plugin marketplaces registered with `codex plugin marketplace add`.",
+      "type": "object"
+    },
     "mcp_oauth_callback_port": {
       "description": "Optional fixed port for the local HTTP callback server used during MCP OAuth login. When unset, Codex will bind to an ephemeral port chosen by the OS.",
       "format": "uint16",
@@ -2062,6 +2102,14 @@
         }
       ],
       "description": "Optionally specify a personality for the model"
+    },
+    "plugins": {
+      "additionalProperties": {
+        "$ref": "#/definitions/PluginConfig"
+      },
+      "default": {},
+      "description": "Installed local plugin bundles, keyed by `plugin@marketplace`.",
+      "type": "object"
     },
     "post_turn_completion_review_agents_filename": {
       "description": "Post-turn-review-specific host-level AGENTS filename under the Codex home directory.",

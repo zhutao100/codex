@@ -39,6 +39,8 @@
 //! and attachment pruning, and clears pending paste state on success.
 //! Slash commands with arguments (like `/plan` and `/review`) reuse the same preparation path so
 //! pasted content and text elements are preserved when extracting args.
+//! Plugin skill selections retain their `plugin:skill` names (including dots in the plugin name)
+//! in the hidden mention-to-path map, just like ordinary skill selections.
 //!
 //! # Non-bracketed Paste Bursts
 //!
@@ -3302,7 +3304,7 @@ fn skill_description(skill: &SkillMetadata) -> Option<String> {
 }
 
 fn is_mention_name_char(byte: u8) -> bool {
-    matches!(byte, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-')
+    matches!(byte, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-' | b':' | b'.')
 }
 
 impl Renderable for ChatComposer {
@@ -3681,6 +3683,26 @@ mod tests {
     use crate::bottom_pane::prompt_args::extract_positional_args_for_prompt_line;
     use crate::bottom_pane::textarea::TextArea;
     use tokio::sync::mpsc::unbounded_channel;
+
+    #[test]
+    fn plugin_skill_selection_preserves_qualified_name_and_path() {
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let mut composer = ChatComposer::new(
+            true,
+            AppEventSender::new(tx),
+            false,
+            "Ask Codex to do anything".to_string(),
+            false,
+        );
+        composer.record_mention_path("$team.tools:fetch", "/plugins/skills/fetch/SKILL.md");
+        assert_eq!(
+            composer.take_mention_paths(),
+            HashMap::from([(
+                "team.tools:fetch".to_string(),
+                "/plugins/skills/fetch/SKILL.md".to_string(),
+            )])
+        );
+    }
 
     #[test]
     fn footer_hint_row_is_separated_from_composer() {

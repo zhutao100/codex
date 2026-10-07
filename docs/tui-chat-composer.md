@@ -260,6 +260,7 @@ Non-char input must not leak burst state across unrelated actions:
   `set_text_content` path intentionally clears linkage for fresh drafts; restore
   paths that rehydrate blocked/interrupted submissions must use the
   mention-preserving setter so retry keeps the originally selected target.
+- Plugin skill selections use `$plugin:skill`; the linkage key keeps the complete qualified name, including dots in the plugin namespace. Ordinary unqualified skill names are unchanged.
 
 ## Tests that pin behavior
 

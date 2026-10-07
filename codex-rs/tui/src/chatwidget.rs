@@ -274,6 +274,7 @@ use self::agent::spawn_agent_from_existing;
 pub(crate) use self::agent::spawn_op_forwarder;
 mod session_header;
 use self::session_header::SessionHeader;
+mod plugins;
 mod skills;
 use self::skills::collect_tool_mentions;
 use self::skills::find_app_mentions;

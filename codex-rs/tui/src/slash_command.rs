@@ -52,6 +52,7 @@ pub enum SlashCommand {
     Legend,
     LegendMode,
     Mcp,
+    Plugins,
     Apps,
     Queue,
     Logout,
@@ -111,6 +112,7 @@ impl SlashCommand {
             SlashCommand::ElevateSandbox => "set up elevated agent sandbox",
             SlashCommand::Experimental => "toggle experimental features",
             SlashCommand::Mcp => "list configured MCP tools",
+            SlashCommand::Plugins => "list installed plugins",
             SlashCommand::Apps => "manage apps",
             SlashCommand::Queue => "view and edit queued messages",
             SlashCommand::Logout => "log out of Codex",
@@ -176,6 +178,7 @@ impl SlashCommand {
             | SlashCommand::LegendMode
             | SlashCommand::Ps
             | SlashCommand::Mcp
+            | SlashCommand::Plugins
             | SlashCommand::Apps
             | SlashCommand::Queue
             | SlashCommand::Feedback

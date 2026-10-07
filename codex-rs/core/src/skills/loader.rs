@@ -123,7 +123,9 @@ impl fmt::Display for SkillParseError {
 impl Error for SkillParseError {}
 
 pub fn load_skills(config: &Config) -> SkillLoadOutcome {
-    load_skills_from_roots(skill_roots(config))
+    let mut outcome = load_skills_from_roots(skill_roots(config));
+    crate::plugins::append_skills(&mut outcome, &config.codex_home, &config.config_layer_stack);
+    outcome
 }
 
 pub(crate) struct SkillRoot {

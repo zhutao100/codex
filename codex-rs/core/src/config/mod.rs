@@ -1062,6 +1062,14 @@ pub struct ConfigToml {
     #[schemars(schema_with = "crate::config::schema::mcp_servers_schema")]
     pub mcp_servers: HashMap<String, McpServerConfig>,
 
+    /// Installed local plugin bundles, keyed by `plugin@marketplace`.
+    #[serde(default)]
+    pub plugins: BTreeMap<String, crate::plugins::PluginConfig>,
+
+    /// Local plugin marketplaces registered with `codex plugin marketplace add`.
+    #[serde(default)]
+    pub marketplaces: BTreeMap<String, crate::plugins::MarketplaceConfig>,
+
     /// Preferred backend for storing MCP OAuth credentials.
     /// keyring: Use an OS-specific keyring service.
     ///          https://github.com/openai/codex/blob/main/codex-rs/rmcp-client/src/oauth.rs#L2
@@ -1834,7 +1842,9 @@ impl Config {
             .set(sandbox_policy)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{e}")))?;
 
-        let mcp_servers = constrain_mcp_servers(cfg.mcp_servers.clone(), mcp_servers.as_ref())
+        let mut configured_mcp_servers = cfg.mcp_servers.clone();
+        crate::plugins::merge_mcp_servers(&mut configured_mcp_servers, &codex_home, &cfg.plugins);
+        let mcp_servers = constrain_mcp_servers(configured_mcp_servers, mcp_servers.as_ref())
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{e}")))?;
 
         let config = Self {

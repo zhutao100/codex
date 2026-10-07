@@ -3988,6 +3988,15 @@ async fn slash_copy_reports_when_no_copyable_output_exists() {
 }
 
 #[tokio::test]
+async fn slash_plugins_reports_empty_installations() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.dispatch_command(SlashCommand::Plugins);
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(cells.len(), 1);
+    assert!(lines_to_single_string(&cells[0]).contains("No plugins installed."));
+}
+
+#[tokio::test]
 async fn slash_copy_state_is_preserved_during_running_task() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
 

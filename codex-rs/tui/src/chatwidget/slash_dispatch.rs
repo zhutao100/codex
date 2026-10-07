@@ -572,6 +572,9 @@ impl ChatWidget {
             SlashCommand::Skills => {
                 self.open_skills_menu();
             }
+            SlashCommand::Plugins => {
+                self.add_plugins_output();
+            }
             SlashCommand::Status => {
                 self.add_status_output();
             }
@@ -993,6 +996,7 @@ impl ChatWidget {
             | SlashCommand::Statusline
             | SlashCommand::Legend
             | SlashCommand::Mcp
+            | SlashCommand::Plugins
             | SlashCommand::Apps
             | SlashCommand::Queue
             | SlashCommand::Logout
@@ -1037,6 +1041,7 @@ impl ChatWidget {
             | SlashCommand::LegendMode
             | SlashCommand::Ps
             | SlashCommand::Mcp
+            | SlashCommand::Plugins
             | SlashCommand::Apps
             | SlashCommand::Queue
             | SlashCommand::Rollout

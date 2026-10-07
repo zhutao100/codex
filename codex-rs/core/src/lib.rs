@@ -55,6 +55,7 @@ mod model_provider_info;
 pub mod parse_command;
 pub mod path_utils;
 pub mod personality_migration;
+pub mod plugins;
 pub mod powershell;
 mod preserved_work_notes;
 mod proposed_plan_parser;

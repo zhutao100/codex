@@ -229,13 +229,7 @@ pub(crate) fn extract_tool_mentions(text: &str) -> ToolMentions<'_> {
             continue;
         }
 
-        let mut name_end = name_start + 1;
-        while let Some(next_byte) = text_bytes.get(name_end)
-            && is_mention_name_char(*next_byte)
-        {
-            name_end += 1;
-        }
-
+        let name_end = name_start + tool_mention_name_len(&text_bytes[name_start..]);
         let name = &text[name_start..name_end];
         if !is_common_env_var(name) {
             mentioned_names.insert(name);
@@ -337,12 +331,7 @@ fn parse_linked_tool_mention<'a>(
         return None;
     }
 
-    let mut name_end = name_start + 1;
-    while let Some(next_byte) = text_bytes.get(name_end)
-        && is_mention_name_char(*next_byte)
-    {
-        name_end += 1;
-    }
+    let name_end = name_start + tool_mention_name_len(&text_bytes[name_start..]);
 
     if text_bytes.get(name_end) != Some(&b']') {
         return None;
@@ -397,38 +386,45 @@ fn is_common_env_var(name: &str) -> bool {
 
 #[cfg(test)]
 fn text_mentions_skill(text: &str, skill_name: &str) -> bool {
-    if skill_name.is_empty() {
-        return false;
-    }
-
-    let text_bytes = text.as_bytes();
-    let skill_bytes = skill_name.as_bytes();
-
-    for (index, byte) in text_bytes.iter().copied().enumerate() {
-        if byte != b'$' {
-            continue;
-        }
-
-        let name_start = index + 1;
-        let Some(rest) = text_bytes.get(name_start..) else {
-            continue;
-        };
-        if !rest.starts_with(skill_bytes) {
-            continue;
-        }
-
-        let after_index = name_start + skill_bytes.len();
-        let after = text_bytes.get(after_index).copied();
-        if after.is_none_or(|b| !is_mention_name_char(b)) {
-            return true;
-        }
-    }
-
-    false
+    extract_tool_mentions(text).plain_names.contains(skill_name)
 }
 
 fn is_mention_name_char(byte: u8) -> bool {
     matches!(byte, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-')
+}
+
+/// Length of an ordinary skill/app name or a `plugin:skill` name at the start of `bytes`.
+/// Shared with the direct-core TUI so selected paths and injected instructions agree.
+pub fn tool_mention_name_len(bytes: &[u8]) -> usize {
+    let simple_end = bytes
+        .iter()
+        .take_while(|byte| is_mention_name_char(**byte))
+        .count();
+    if simple_end == 0 {
+        return 0;
+    }
+    let mut prefix_end = simple_end;
+    while bytes
+        .get(prefix_end)
+        .is_some_and(|byte| is_mention_name_char(*byte) || *byte == b'.')
+    {
+        prefix_end += 1;
+    }
+    // Dots belong to plugin namespaces, not ordinary skill names or sentence punctuation.
+    if bytes.get(prefix_end) == Some(&b':')
+        && bytes
+            .get(prefix_end + 1)
+            .is_some_and(|byte| is_mention_name_char(*byte))
+    {
+        prefix_end
+            + 1
+            + bytes[prefix_end + 1..]
+                .iter()
+                .take_while(|byte| is_mention_name_char(**byte))
+                .count()
+    } else {
+        simple_end
+    }
 }
 
 #[cfg(test)]
@@ -458,6 +454,20 @@ mod tests {
         let mentions = extract_tool_mentions(text);
         assert_eq!(mentions.names, set(expected_names));
         assert_eq!(mentions.paths, set(expected_paths));
+    }
+
+    #[test]
+    fn plugin_qualified_mentions_preserve_namespace_and_sentence_punctuation() {
+        assert_mentions(
+            "Use $curl-safari:curl-safari, $team.tools:fetch. Then $ordinary:",
+            &["curl-safari:curl-safari", "team.tools:fetch", "ordinary"],
+            &[],
+        );
+        assert_mentions(
+            "Use [$team.tools:fetch](/plugins/skills/fetch/SKILL.md)",
+            &["team.tools:fetch"],
+            &["/plugins/skills/fetch/SKILL.md"],
+        );
     }
 
     fn build_skill_name_counts(
