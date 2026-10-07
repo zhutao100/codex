@@ -651,6 +651,8 @@ $skill-creator Add a new skill for triaging flaky CI and include step-by-step us
 
 Use `skills/list` to fetch the available skills (optionally scoped by `cwds`, with `forceReload`).
 
+Plugin skills use the server's effective startup configuration. `forceReload` refreshes skill discovery without discarding CLI plugin overrides.
+
 ```json
 { "method": "skills/list", "id": 25, "params": {
     "cwds": ["$HOME/project"],

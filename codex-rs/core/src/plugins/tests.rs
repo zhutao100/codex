@@ -67,8 +67,16 @@ impl Fixture {
     }
 
     async fn config(&self) -> Result<crate::config::Config> {
+        self.config_with_overrides(Vec::new()).await
+    }
+
+    async fn config_with_overrides(
+        &self,
+        cli_overrides: Vec<(String, toml::Value)>,
+    ) -> Result<crate::config::Config> {
         Ok(ConfigBuilder::default()
             .codex_home(self.home.path().to_path_buf())
+            .cli_overrides(cli_overrides)
             .harness_overrides(ConfigOverrides {
                 cwd: Some(self.cwd.path().to_path_buf()),
                 ..Default::default()
@@ -76,6 +84,64 @@ impl Fixture {
             .build()
             .await?)
     }
+}
+
+#[tokio::test]
+async fn plugin_choices_are_session_scoped_across_shared_cache_and_reload() -> Result<()> {
+    let fixture = Fixture::new()?;
+    fixture.install()?;
+    let mut configs = Vec::new();
+    for enabled in [false, true] {
+        configs.push(
+            fixture
+                .config_with_overrides(vec![(
+                    "plugins.sample@local-test.enabled".into(),
+                    toml::Value::Boolean(enabled),
+                )])
+                .await?,
+        );
+    }
+    let manager = SkillsManager::new(fixture.home.path().into());
+    for disk_enabled in [false, true] {
+        fixture
+            .store
+            .set_enabled("sample@local-test", disk_enabled)?;
+        for config in [&configs[0], &configs[1], &configs[0]] {
+            let expected = SkillsManager::new(fixture.home.path().into()).skills_for_config(config);
+            for actual in [
+                manager.skills_for_config(config),
+                manager
+                    .skills_for_cwd(fixture.cwd.path(), false, config)
+                    .await,
+                manager
+                    .skills_for_cwd(fixture.cwd.path(), true, config)
+                    .await,
+                manager
+                    .skills_for_cwd(fixture.cwd.path(), false, config)
+                    .await,
+            ] {
+                assert_eq!(
+                    (actual.skills, actual.errors, actual.disabled_paths),
+                    (
+                        expected.skills.clone(),
+                        expected.errors.clone(),
+                        expected.disabled_paths.clone(),
+                    )
+                );
+            }
+        }
+        manager.clear_cache();
+        let reloaded = manager
+            .skills_for_cwd(fixture.cwd.path(), false, &configs[0])
+            .await;
+        assert!(
+            !reloaded
+                .skills
+                .iter()
+                .any(|skill| skill.name == "sample:fetch")
+        );
+    }
+    Ok(())
 }
 
 #[tokio::test]
@@ -130,7 +196,9 @@ async fn local_bundle_lifecycle_preserves_config_and_namespaces_skills() -> Resu
         SkillsManager::new(fixture.home.path().into()).skills_for_config(&fixture.config().await?);
     assert!(!disabled.skills.iter().any(|s| s.name == "sample:fetch"));
     fixture.store.set_enabled("sample@local-test", true)?;
-    let mut reloaded = manager.skills_for_cwd(fixture.cwd.path(), true).await;
+    let mut reloaded = manager
+        .skills_for_cwd(fixture.cwd.path(), true, &fixture.config().await?)
+        .await;
     reloaded.skills.retain(|s| s.name == "sample:fetch");
     assert_eq!(
         reloaded.skills,
@@ -143,7 +211,9 @@ async fn local_bundle_lifecycle_preserves_config_and_namespaces_skills() -> Resu
             enabled: false,
         }])
         .apply_blocking()?;
-    let disabled_skill = manager.skills_for_cwd(fixture.cwd.path(), true).await;
+    let disabled_skill = manager
+        .skills_for_cwd(fixture.cwd.path(), true, &fixture.config().await?)
+        .await;
     assert!(
         !disabled_skill
             .enabled_skills()

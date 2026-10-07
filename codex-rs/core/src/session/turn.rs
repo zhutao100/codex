@@ -420,7 +420,7 @@ async fn run_turn_inner(
         let skills_outcome = Some(
             sess.services
                 .skills_manager
-                .skills_for_cwd(&turn_context.cwd, false)
+                .skills_for_cwd(&turn_context.cwd, false, &turn_context.config)
                 .await,
         );
 
@@ -1641,7 +1641,7 @@ pub(crate) async fn compaction_tool_specs(
     let skills = sess
         .services
         .skills_manager
-        .skills_for_cwd(&turn_context.cwd, false)
+        .skills_for_cwd(&turn_context.cwd, false, &turn_context.config)
         .await;
     let (_, skill_name_counts_lower) =
         build_skill_name_counts(&skills.skills, &skills.disabled_paths);

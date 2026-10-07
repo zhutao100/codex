@@ -2,14 +2,19 @@
 """VM-only release-binary check using Curl Safari and a deterministic Responses server."""
 
 import argparse
+import fcntl
 import json
 import os
 from pathlib import Path
+import pty
 import secrets
+import select
 import shlex
+import struct
 import subprocess
 import sys
 import tempfile
+import termios
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -116,6 +121,73 @@ class ProbeHandler(BaseHTTPRequestHandler):
             self.wfile.write(f"data: {json.dumps(event)}\n\n".encode())
 
 
+def verify_tui_override(
+    binary: Path, provider_args: list[str], server: ProbeServer,
+    env: dict[str, str], work: Path, artifacts: Path, *, enabled: bool,
+) -> None:
+    """The initial prompt follows the TUI's automatic forced ListSkills operation."""
+    server.requests.clear()
+    master, slave = pty.openpty()
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 140, 0, 0))
+    command = [
+        binary, "--no-alt-screen", "--dangerously-bypass-approvals-and-sandbox",
+        *provider_args,
+        "-c", "notice.hide_full_access_warning=true",
+        "-c", f'projects={{ {json.dumps(str(work))} = {{ trust_level = "trusted" }} }}',
+        "-c", f"plugins.curl-safari@curl-safari-local.enabled={str(enabled).lower()}",
+        "Use $curl-safari:curl-safari if it is available.",
+    ]
+    process = subprocess.Popen(
+        command, stdin=slave, stdout=slave, stderr=slave,
+        env=env | {"TERM": "xterm-256color"}, cwd=work, start_new_session=True,
+    )
+    os.close(slave)
+    output = bytearray()
+
+    def wait_for(marker: bytes) -> None:
+        deadline = time.monotonic() + 30
+        while marker not in output and time.monotonic() < deadline:
+            if not select.select([master], [], [], .1)[0]:
+                continue
+            try:
+                data = os.read(master, 65536)
+            except OSError:
+                break
+            if not data:
+                break
+            output.extend(data)
+            if b"\x1b[6n" in data:
+                os.write(master, b"\x1b[1;1R")
+            if b"\x1b]11;?" in data:
+                os.write(master, b"\x1b]11;rgb:0000/0000/0000\x1b\\")
+        assert marker in output, f"TUI did not render {marker!r}; exit={process.poll()}"
+
+    try:
+        wait_for(b"Plugin probe complete.")
+        os.write(master, b"\x1b[200~/plugins\x1b[201~\r")
+        state = "enabled" if enabled else "disabled"
+        wait_for(f"curl-safari@curl-safari-local ({state})".encode())
+        assert len(server.requests) == 1, len(server.requests)
+        first = json.dumps(server.requests[0]["input"])
+        observed = {
+            "catalog": "- curl-safari:curl-safari:" in first,
+            "injected": "<name>curl-safari:curl-safari</name>" in first,
+        }
+        assert observed == {"catalog": enabled, "injected": enabled}, observed
+        (artifacts / f"tui-override-{state}.json").write_text(json.dumps({
+            "requests": 1, "plugin_skill_present": enabled,
+            "session_listing_matches": True, "forced_reload_injection_matches": True,
+        }, indent=2) + "\n")
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+        os.close(master)
+
+
 MCP_SERVER = """import json, sys
 for line in sys.stdin:
     request = json.loads(line)
@@ -163,18 +235,22 @@ def main() -> None:
         def codex(*argv: str | Path) -> str:
             return run([binary, *argv], env=env, cwd=work)
 
+        provider_args = [
+            "-m", "gpt-5.2-codex",
+            "-c", 'model_provider="plugin-probe"',
+            "-c", 'model_providers.plugin-probe.name="Plugin Probe"',
+            "-c", f'model_providers.plugin-probe.base_url="{server.url}/v1"',
+            "-c", 'model_providers.plugin-probe.wire_api="responses"',
+            "-c", "model_providers.plugin-probe.requires_openai_auth=false",
+            "-c", "features.remote_compaction_v2=false",
+            "-c", "features.unified_exec=false",
+        ]
+
         def execute(label: str, prompt: str, *, skill: bool, mcp: bool = False) -> None:
             server.requests.clear()
             output = codex(
                 "exec", "--skip-git-repo-check", "--sandbox", "danger-full-access",
-                "-m", "gpt-5.2-codex",
-                "-c", 'model_provider="plugin-probe"',
-                "-c", 'model_providers.plugin-probe.name="Plugin Probe"',
-                "-c", f'model_providers.plugin-probe.base_url="{server.url}/v1"',
-                "-c", 'model_providers.plugin-probe.wire_api="responses"',
-                "-c", "model_providers.plugin-probe.requires_openai_auth=false",
-                "-c", "features.remote_compaction_v2=false",
-                "-c", "features.unified_exec=false",
+                *provider_args,
                 prompt,
             )
             assert "Plugin probe complete." in output, output
@@ -238,8 +314,10 @@ def main() -> None:
                 helper.wait(timeout=10)
 
         server.command = None
+        verify_tui_override(binary, provider_args, server, env, work, args.artifacts, enabled=False)
         codex("plugin", "disable", "curl-safari@curl-safari-local")
         execute("disabled", "Use $curl-safari:curl-safari if it is available.", skill=False)
+        verify_tui_override(binary, provider_args, server, env, work, args.artifacts, enabled=True)
         codex("plugin", "enable", "curl-safari@curl-safari-local")
         execute("reenabled", "Use $curl-safari:curl-safari.", skill=True)
         codex("plugin", "remove", "curl-safari@curl-safari-local")
@@ -273,7 +351,7 @@ def main() -> None:
         codex("plugin", "marketplace", "remove", "probe-local")
     server.shutdown()
     thread.join(timeout=5)
-    print("Plugin VM verification passed: Safari authenticated shell flow, skill lifecycle, MCP lifecycle.")
+    print("Plugin VM verification passed: Safari fetch, skill/MCP lifecycle, TUI session overrides.")
 
 
 if __name__ == "__main__":

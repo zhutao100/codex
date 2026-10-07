@@ -21,6 +21,7 @@ use crate::skills::system::install_system_skills;
 
 pub struct SkillsManager {
     codex_home: PathBuf,
+    // Plugin choices belong to the requesting session, not to a shared cwd cache.
     cache_by_cwd: RwLock<HashMap<PathBuf, SkillLoadOutcome>>,
 }
 
@@ -37,8 +38,14 @@ impl SkillsManager {
     }
 
     /// Load skills for an already-constructed [`Config`], avoiding any additional config-layer
-    /// loading. This also seeds the per-cwd cache for subsequent lookups.
+    /// loading. Only non-plugin skills seed the per-cwd cache for subsequent lookups.
     pub fn skills_for_config(&self, config: &Config) -> SkillLoadOutcome {
+        let mut outcome = self.local_skills_for_config(config);
+        crate::plugins::append_skills(&mut outcome, &self.codex_home, &config.config_layer_stack);
+        outcome
+    }
+
+    fn local_skills_for_config(&self, config: &Config) -> SkillLoadOutcome {
         let cwd = &config.cwd;
         let cached = match self.cache_by_cwd.read() {
             Ok(cache) => cache.get(cwd).cloned(),
@@ -51,7 +58,6 @@ impl SkillsManager {
         let roots =
             skill_roots_from_layer_stack_with_agents(&config.config_layer_stack, &config.cwd);
         let mut outcome = load_skills_from_roots(roots);
-        crate::plugins::append_skills(&mut outcome, &self.codex_home, &config.config_layer_stack);
         outcome.disabled_paths = disabled_paths_from_stack(&config.config_layer_stack);
         let mut cache = match self.cache_by_cwd.write() {
             Ok(cache) => cache,
@@ -61,7 +67,19 @@ impl SkillsManager {
         outcome
     }
 
-    pub async fn skills_for_cwd(&self, cwd: &Path, force_reload: bool) -> SkillLoadOutcome {
+    /// Refresh local discovery without changing the requesting session's plugin activation.
+    pub async fn skills_for_cwd(
+        &self,
+        cwd: &Path,
+        force_reload: bool,
+        config: &Config,
+    ) -> SkillLoadOutcome {
+        let mut outcome = self.local_skills_for_cwd(cwd, force_reload).await;
+        crate::plugins::append_skills(&mut outcome, &self.codex_home, &config.config_layer_stack);
+        outcome
+    }
+
+    async fn local_skills_for_cwd(&self, cwd: &Path, force_reload: bool) -> SkillLoadOutcome {
         let cached = match self.cache_by_cwd.read() {
             Ok(cache) => cache.get(cwd).cloned(),
             Err(err) => err.into_inner().get(cwd).cloned(),
@@ -107,7 +125,6 @@ impl SkillsManager {
 
         let roots = skill_roots_from_layer_stack_with_agents(&config_layer_stack, cwd);
         let mut outcome = load_skills_from_roots(roots);
-        crate::plugins::append_skills(&mut outcome, &self.codex_home, &config_layer_stack);
         outcome.disabled_paths = disabled_paths_from_stack(&config_layer_stack);
         let mut cache = match self.cache_by_cwd.write() {
             Ok(cache) => cache,

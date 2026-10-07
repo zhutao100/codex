@@ -107,7 +107,7 @@ pub(super) async fn submission_loop(
                 list_custom_prompts(&sess, sub.id.clone()).await;
             }
             Op::ListSkills { cwds, force_reload } => {
-                list_skills(&sess, sub.id.clone(), cwds, force_reload).await;
+                list_skills(&sess, &config, sub.id.clone(), cwds, force_reload).await;
             }
             Op::ListRemoteSkills => {
                 list_remote_skills(&sess, &config, sub.id.clone()).await;
@@ -629,7 +629,13 @@ pub async fn list_custom_prompts(sess: &Session, sub_id: String) {
     sess.send_event_raw(event).await;
 }
 
-pub async fn list_skills(sess: &Session, sub_id: String, cwds: Vec<PathBuf>, force_reload: bool) {
+pub async fn list_skills(
+    sess: &Session,
+    config: &Config,
+    sub_id: String,
+    cwds: Vec<PathBuf>,
+    force_reload: bool,
+) {
     let cwds = if cwds.is_empty() {
         let state = sess.state.lock().await;
         vec![state.session_configuration.cwd.clone()]
@@ -640,7 +646,9 @@ pub async fn list_skills(sess: &Session, sub_id: String, cwds: Vec<PathBuf>, for
     let skills_manager = &sess.services.skills_manager;
     let mut skills = Vec::new();
     for cwd in cwds {
-        let outcome = skills_manager.skills_for_cwd(&cwd, force_reload).await;
+        let outcome = skills_manager
+            .skills_for_cwd(&cwd, force_reload, config)
+            .await;
         let errors = super::errors_to_info(&outcome.errors);
         let skills_metadata = super::skills_to_info(&outcome.skills, &outcome.disabled_paths);
         skills.push(SkillsListEntry {

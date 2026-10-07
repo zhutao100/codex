@@ -29,9 +29,10 @@ codex plugin remove curl-safari@curl-safari-local
 codex plugin marketplace remove curl-safari-local
 ```
 
+- A session-only override does not change the stored installation: `codex -c 'plugins.curl-safari@curl-safari-local.enabled=false'`. Startup's forced skill listing and later turns retain this choice.
 - `add`, `remove`, `enable`, and `disable` also accept `PLUGIN --marketplace MARKETPLACE` and `--json`.
 - Marketplace registration stores a canonical local directory. Installation reads its current manifest and copies the complete bundle, excluding `.git` and root build caches `.build`/`target`; it does not build or execute package code.
-- Repeating `add` replaces the installed copy, including rebuilt binaries with unchanged manifest versions. Build/package before adding, and restart Codex after all mutations. Running sessions and their established MCP connections are not hot-reloaded.
+- Repeating `add` replaces the installed copy, including rebuilt binaries with unchanged manifest versions. Build/package before adding, and restart Codex after bundle or activation mutations. Activation is session-scoped, and established MCP connections are not hot-reloaded.
 - Marketplace removal requires removing its installed plugins first. Package source directories are never removed.
 - Curl Safari still requires its local helper and macOS cookie-access permissions. Installation does not grant Full Disk Access or start the helper.
 
@@ -49,6 +50,7 @@ enabled = true
 - State lives under `CODEX_HOME`, including `$CODEX_HOME/plugins/cache/MARKETPLACE/PLUGIN/local`. This backport keeps one active local copy, not upstream's version-selection/migration logic. Manifest versions remain display metadata.
 - CLI mutations edit the user config with the existing atomic TOML writer and preserve unrelated settings/comments. A package-operation lock serializes concurrent plugin commands. A staged copy is validated before publication; publication/config failures restore the previous copy.
 - Runtime loading uses the effective trusted config stack. Missing or invalid bundles do not hide unrelated skills; skill-load errors and `/plugins` diagnostics identify invalid installations.
+- The cwd cache contains only non-plugin skills. Every lookup applies the requesting session's effective plugin configuration, including after forced listings or cache invalidation, so shared managers cannot mix activation choices between sessions. Refreshes still reload ordinary skill files and per-skill disable settings from disk.
 - Skills default to `./skills`, or use a manifest `skills` string/list of directories. The existing skill parser supplies metadata, instructions, dependencies, and per-path skill disabling. Plugin skills retain user scope; no protocol-enum change is needed.
 - Plugin skill names are `PLUGIN:SKILL`. Equal plugin names from different marketplaces remain ambiguous for plain-name selection; explicit `[$PLUGIN:SKILL](/installed/path/SKILL.md)` links disambiguate them. The old core's rule that structured skill inputs alone do not trigger injection is unchanged.
 - MCP configuration comes from inline `mcpServers`, a declared `./file.json`, or default `.mcp.json`. Both a server map and an `mcpServers` wrapper are accepted. `${CODEX_PLUGIN_ROOT}` and `${CLAUDE_PLUGIN_ROOT}` expand inside JSON string values; no arbitrary environment-variable expansion is added.
@@ -61,7 +63,7 @@ enabled = true
 Focused coverage:
 
 - `core::plugins`: lifecycle, config preservation, copied executables/symlinks, rejected inputs, replacement failure, skill namespacing/toggles, MCP config precedence and root expansion.
-- `core/tests/suite/plugins.rs`: installed skill catalog and explicit instruction injection into a captured Responses request.
+- `core/tests/suite/plugins.rs`: installed skill catalog and explicit instruction injection into a captured Responses request; forced and cached listing followed by injection with CLI overrides opposing the disk configuration.
 - `cli/tests/plugins.rs`: marketplace/install/list/toggle/remove command round trip and invalid selections.
 - TUI tests: qualified selection-to-path mapping and `/plugins` dispatch.
 
@@ -77,15 +79,15 @@ python3 scripts/verify-local-plugins.py \
 
 Prerequisites: disposable Apple Silicon macOS VM, Python 3.13+, Safari automation permissions, built Curl Safari app/client, and cookie access for the helper's execution context. Use the GhostVM safe-testing workflow with read-only host inputs and writable artifact export; stop the VM and restore its config afterward.
 
-The probe establishes a synthetic localhost login in guest Safari, runs the installed unmodified helper/client through a real Codex shell tool call, and checks the authenticated result in the next model request. It also verifies absence after disable/removal, re-enabling, and a separate bundled MCP tool call plus disable. Responses are deterministic fixtures, not a hosted-model decision-quality test. Only structural evidence is exported, not model request bodies or Safari cookie contents.
+The probe establishes a synthetic localhost login in guest Safari, runs the installed unmodified helper/client through a real Codex shell tool call, and checks the authenticated result in the next model request. It also verifies absence after disable/removal, re-enabling, and a separate bundled MCP tool call plus disable. TUI PTY cases override both enabled and disabled disk settings, exercise startup's forced skill listing before the first prompt, and check that `/plugins`, the catalog, and instruction injection agree. Responses are deterministic fixtures, not a hosted-model decision-quality test. Only structural evidence is exported, not model request bodies or Safari cookie contents.
 
 ### Verified Results
 
 Verified on October 7, 2026:
 
-- Production build: `cargo-local build --release --bin codex`, published to `target/release/codex`; SHA-256 `30314e2d8c6ae78347082b8ad51697ab4a214fa244843843d4177f29e233b81e` matched the guest copy.
-- macOS 15.6.1 GhostVM, reverted from `automation-ready`: built the unmodified Curl Safari Go client and Swift helper, then verified all six release-binary probe cases, including a fresh Safari cookie authenticated fetch and a real MCP call. Eight Responses requests were checked.
-- Release TUI PTY check: `/plugins` listed the installation; selecting the qualified skill and submitting a turn produced its catalog entry and full instructions in the captured request, then rendered the response.
-- Rust checks: 1,191 core unit tests and one focused core HTTP integration test passed; 927 TUI unit tests and nine TUI integration tests passed; all 58 CLI tests passed in the VM, with subprocess tests using the release binary. Seven existing tests remained ignored across these scopes.
-- `just-local fmt`, scoped Clippy fixes for core/TUI/CLI, and regenerated config-schema validation passed. The full workspace `--all-features` test suite was not run.
+- Production build: `cargo-local build --release --bin codex`, published to `target/release/codex`; SHA-256 `053385f6acab5ea909dfcc17133ff9cd9a5f9dc64ecb86b7401102c3d013c902` matched the guest copy.
+- macOS 15.6.1 GhostVM, reverted from `automation-ready`: built the unmodified Curl Safari Go client and Swift helper, then verified all eight release-binary probe cases, including a fresh Safari cookie authenticated fetch, a real MCP call, and two TUI override cases. Ten Responses requests were checked.
+- The original release reproduced the override regression: `/plugins` and the initial catalog reflected a CLI disable, but the startup forced listing re-enabled instruction injection. The corrected release preserves both disabling an enabled installation and enabling a disabled installation through forced listing, the catalog, `/plugins`, and the next model request.
+- Rust checks: 1,192 core unit tests, two focused core HTTP integration tests, and 42 app-server unit tests passed; 927 TUI unit tests and nine TUI integration tests passed; all 58 CLI tests passed in the VM, with subprocess tests using the release binary. Seven existing tests remained ignored across these scopes.
+- `just-local fmt`, scoped Clippy, and config-schema validation passed. The full workspace `--all-features` test suite was not run.
 - The helper ran under the guest's pre-authorized automation context. This verifies real Safari cookie access and the client/helper/curl chain, not fresh Full Disk Access onboarding or a hosted model's autonomous tool selection.

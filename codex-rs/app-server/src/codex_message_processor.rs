@@ -4417,7 +4417,9 @@ impl CodexMessageProcessor {
         let skills_manager = self.thread_manager.skills_manager();
         let mut data = Vec::new();
         for cwd in cwds {
-            let outcome = skills_manager.skills_for_cwd(&cwd, force_reload).await;
+            let outcome = skills_manager
+                .skills_for_cwd(&cwd, force_reload, &self.config)
+                .await;
             let errors = errors_to_info(&outcome.errors);
             let skills = skills_to_info(&outcome.skills, &outcome.disabled_paths);
             data.push(codex_app_server_protocol::SkillsListEntry {
