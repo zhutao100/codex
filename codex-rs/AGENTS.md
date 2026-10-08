@@ -16,6 +16,7 @@ Thus, the design of the changes target to minimize the potentials of future reba
 - Use `just-local` instead of direct `just` in Rust projects whose recipes call
   `cargo` directly; it adds a per-invocation `cargo` shim that delegates to
   `cargo-local`.
+- Put `$HOME/.cargo/bin` before Homebrew in `PATH` so both Cargo and rustc honor `rust-toolchain.toml`; selecting only the Cargo proxy can still leave Homebrew rustc in use.
 - always use `CODEX_SANDBOX_NETWORK_DISABLED=1` for test runs to avoid tampering the host.
 - With `CODEX_SANDBOX_NETWORK_DISABLED=1` on macOS, `cargo-local`
   wraps Cargo in a Seatbelt profile that allows localhost sockets only and
@@ -34,5 +35,8 @@ Thus, the design of the changes target to minimize the potentials of future reba
 - Keep `just-local test -p <crate>` scoped to the selected tests. Run `just-local bench-smoke` separately when benchmark validation is needed.
 - During upstream rebases, port custom behavior to its current owner instead of restoring deleted crates or old APIs. Preserve upstream history envelopes, instruction provenance, atomic settings updates, and sanitized Git URLs.
 - Model switches use upstream's incremental developer instructions and retain the original request instruction prefix; do not restore the retired session-wide base-instruction rewrite.
+- Use `codex-prompts` rendering and reviewer `ToolPolicy` restrictions; do not restore retired personality-template metadata or session-identity-based tool dispatch.
+- Preserve upstream's request history snapshots, async image resolution, and last usable server-usage boundary when updating token caches; do not restore the retired `prompt_history` helper.
+- Formatting uses upstream's Git-indexed, batched `rustfmt` driver in `../scripts/format.py`; it no longer invokes Cargo and needs no wrapper override.
 - See [customization maintenance](docs/rebase_customizations.md) for upstream replacement decisions and invariants to preserve.
 - Keep model discovery's compile-time version override, `/models` query, and cache identity aligned; see [model client version](docs/model_client_version.md). Strip both prerelease and build metadata; do not substitute runtime package provenance for the compile-time contract.

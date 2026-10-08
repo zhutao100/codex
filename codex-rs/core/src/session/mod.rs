@@ -249,6 +249,7 @@ mod config_refresh;
 pub(crate) mod context_window;
 mod daemon_recovery;
 mod environment;
+mod event_dispatch;
 mod extension_interruption;
 pub(crate) mod extension_metrics;
 mod guardian_checkpoint;
@@ -286,6 +287,7 @@ mod turn_suspension;
 mod world_state;
 use self::code_mode_warning::unsupported_code_mode_warning;
 pub(crate) use self::environment::ThreadEnvironmentDefaults;
+use self::event_dispatch::RealtimeMirrorEvent;
 #[cfg(test)]
 use self::handlers::submission_dispatch_span;
 use self::handlers::submission_loop;
@@ -301,11 +303,8 @@ use self::session::SessionSettingsCommit;
 pub(crate) use self::session::SessionSettingsUpdate;
 #[cfg(test)]
 use self::turn::AssistantMessageStreamParsers;
-use self::turn::RealtimeEventText;
-use self::turn::agent_message_text;
 #[cfg(test)]
 use self::turn::collect_explicit_app_ids_from_skill_items;
-use self::turn::realtime_text_for_event;
 use self::turn_context::TurnContext;
 #[cfg(test)]
 mod rollout_reconstruction_tests;
@@ -2552,14 +2551,14 @@ impl Session {
                 .await;
         }
         let legacy_events = msg.as_legacy_events(self.show_raw_agent_reasoning());
-        // Only terminal and realtime callbacks need the original event after delivery.
-        let post_send_event = if matches!(&msg, EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_))
-            || self.conversation.running_state().await.is_some()
-        {
-            Some(msg.clone())
-        } else {
-            None
-        };
+        let realtime_event = RealtimeMirrorEvent::from_event(&msg);
+        // Only terminal callbacks need the original event after delivery.
+        let post_send_event =
+            if matches!(&msg, EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_)) {
+                Some(msg.clone())
+            } else {
+                None
+            };
         if let EventMsg::Error(error) = &msg
             && error
                 .codex_error_info
@@ -2601,11 +2600,13 @@ impl Session {
                 .track_guardian_session_event(self.thread_id, &event);
         }
         self.send_event_raw(event).await;
-        if let Some(msg) = post_send_event {
-            self.maybe_notify_parent_of_terminal_turn(turn_context, &msg)
+        if let Some(msg) = &post_send_event {
+            self.maybe_notify_parent_of_terminal_turn(turn_context, msg)
                 .await;
-            self.maybe_mirror_event_text_to_realtime(&msg).await;
-            self.maybe_clear_realtime_handoff_for_event(&msg).await;
+        }
+        self.maybe_mirror_event_to_realtime(realtime_event).await;
+        if let Some(msg) = &post_send_event {
+            self.maybe_clear_realtime_handoff_for_event(msg).await;
         }
 
         for legacy in legacy_events {
@@ -2710,56 +2711,6 @@ impl Session {
                 &self.services.rollout_thread_trace,
             )
             .await;
-    }
-
-    async fn maybe_mirror_event_text_to_realtime(&self, msg: &EventMsg) {
-        if self.conversation.running_state().await.is_none() {
-            return;
-        }
-        match msg {
-            EventMsg::ItemStarted(event) => {
-                if let TurnItem::AgentMessage(item) = &event.item {
-                    self.conversation
-                        .register_handoff_stream_item(
-                            item.id.clone(),
-                            item.phase.clone(),
-                            agent_message_text(item),
-                        )
-                        .await;
-                }
-                return;
-            }
-            EventMsg::AgentMessageContentDelta(event) => {
-                if let Err(err) = self
-                    .conversation
-                    .stream_handoff_delta(&event.item_id, event.delta.clone())
-                    .await
-                {
-                    debug!("failed to stream event text to realtime conversation: {err}");
-                }
-                return;
-            }
-            EventMsg::ItemCompleted(event) => {
-                if let TurnItem::AgentMessage(item) = &event.item
-                    && self.conversation.finish_handoff_stream_item(&item.id).await
-                {
-                    return;
-                }
-            }
-            _ => {}
-        }
-        let result = match realtime_text_for_event(msg) {
-            Some(RealtimeEventText::Handoff(text, phase)) => {
-                self.conversation.handoff_out(text, phase).await
-            }
-            Some(RealtimeEventText::QuietReasoning(text)) => {
-                self.conversation.send_reasoning_status(&text).await
-            }
-            None => return,
-        };
-        if let Err(err) = result {
-            debug!("failed to mirror event text to realtime conversation: {err}");
-        }
     }
 
     async fn maybe_clear_realtime_handoff_for_event(&self, msg: &EventMsg) {

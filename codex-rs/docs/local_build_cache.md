@@ -3,12 +3,15 @@
 Use `cargo-local` for local Cargo loops that can create large debug artifacts:
 
 ```bash
+export PATH="$HOME/.cargo/bin:$PATH"
 CODEX_SANDBOX_NETWORK_DISABLED=1 cargo-local check -p codex-cli --bin codex
 CODEX_SANDBOX_NETWORK_DISABLED=1 cargo-local build -p codex-cli --bin codex --profile dev-small
 CODEX_SANDBOX_NETWORK_DISABLED=1 just-local test -p codex-core
 ```
 
 The repo `just` recipes and `scripts/debug-codex.sh` call this wrapper. The workspace VS Code rust-analyzer settings also call it for diagnostics, build-script/proc-macro loading, and runnables.
+
+Put the Rustup proxies before Homebrew in `PATH` so Cargo, rustc, and rustdoc honor the repository toolchain pin. Overriding only `CARGO_LOCAL_REAL_CARGO` selects Cargo but can still leave Homebrew rustc in use.
 
 Use `just-local test -p <crate>` for project tests so nextest and the repository test profile apply. Run `just-local bench-smoke` separately when benchmark validation is needed.
 

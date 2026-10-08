@@ -16,6 +16,7 @@ use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::Settings;
+use codex_protocol::items::AgentMessageContent;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::PermissionProfile;
@@ -35,6 +36,7 @@ use codex_protocol::protocol::ReviewLineRange;
 use codex_protocol::protocol::ReviewOutputEvent;
 use codex_protocol::protocol::ReviewRequest;
 use codex_protocol::protocol::ReviewTarget;
+use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::protocol::TurnEnvironmentRequests;
 use codex_protocol::review_format::render_review_output_text;
@@ -985,8 +987,10 @@ async fn review_resolves_inherited_summary_preferences() -> anyhow::Result<()> {
 /// Review delegates emit both structured items and legacy compatibility events.
 /// The delegate rollout is the canonical transcript, so the parent should not
 /// copy forwarded delegate events into its own rollout.
+#[test_case::test_case(ThreadHistoryMode::Legacy; "legacy")]
+#[test_case::test_case(ThreadHistoryMode::Paginated; "paginated")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn review_rollout_omits_forwarded_delegate_transcript() {
+async fn review_rollout_omits_forwarded_delegate_transcript(history_mode: ThreadHistoryMode) {
     let intermediate_text = "intermediate delegate note";
     let review_text = "final review assistant output";
     let server = MockServer::start().await;
@@ -1001,8 +1005,14 @@ async fn review_rollout_omits_forwarded_delegate_transcript() {
         ])],
     )
     .await;
-    let codex_home = Arc::new(TempDir::new().unwrap());
-    let codex = new_conversation_for_server(&server, codex_home.clone(), |_| {}).await;
+    let codex_home = Arc::new(TempDir::new().expect("create review home"));
+    let test = test_codex()
+        .with_home(Arc::clone(&codex_home))
+        .with_history_mode(history_mode)
+        .build_with_auto_env(&server)
+        .await
+        .expect("create review conversation");
+    let codex = &test.codex;
 
     codex
         .submit(Op::Review {
@@ -1014,16 +1024,24 @@ async fn review_rollout_omits_forwarded_delegate_transcript() {
             },
         })
         .await
-        .unwrap();
+        .expect("submit review");
 
-    let _complete = wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    let _complete = wait_for_event(codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     let path = codex.rollout_path().expect("rollout path");
     let lines = read_rollout_lines(&path);
-    let user_message_count =
-        rollout_event_count(&lines, |event| matches!(event, EventMsg::UserMessage(_)));
-    let agent_reasoning_count =
-        rollout_event_count(&lines, |event| matches!(event, EventMsg::AgentReasoning(_)));
+    let is_user_message = |event: &EventMsg| match event {
+        EventMsg::UserMessage(_) => true,
+        EventMsg::ItemCompleted(event) => matches!(event.item, TurnItem::UserMessage(_)),
+        _ => false,
+    };
+    let is_reasoning = |event: &EventMsg| match event {
+        EventMsg::AgentReasoning(_) => true,
+        EventMsg::ItemCompleted(event) => matches!(event.item, TurnItem::Reasoning(_)),
+        _ => false,
+    };
+    let user_message_count = rollout_event_count(&lines, is_user_message);
+    let agent_reasoning_count = rollout_event_count(&lines, is_reasoning);
 
     assert_eq!(
         0, user_message_count,
@@ -1046,16 +1064,12 @@ async fn review_rollout_omits_forwarded_delegate_transcript() {
     let delegate_lines = read_single_delegate_rollout(codex_home.path(), &path);
     assert_eq!(
         1,
-        rollout_event_count(&delegate_lines, |event| {
-            matches!(event, EventMsg::UserMessage(_))
-        }),
+        rollout_event_count(&delegate_lines, is_user_message),
         "delegate rollout should keep its user message"
     );
     assert_eq!(
         1,
-        rollout_event_count(&delegate_lines, |event| {
-            matches!(event, EventMsg::AgentReasoning(_))
-        }),
+        rollout_event_count(&delegate_lines, is_reasoning),
         "delegate rollout should keep its reasoning"
     );
     assert!(
@@ -1721,28 +1735,25 @@ fn collect_rollout_paths(dir: &std::path::Path, paths: &mut Vec<PathBuf>) {
 fn rollout_event_count(lines: &[RolloutLine], predicate: impl Fn(&EventMsg) -> bool) -> usize {
     lines
         .iter()
-        .filter(|line| match &line.item {
-            RolloutItem::EventMsg(event) => predicate(event),
-            RolloutItem::SessionMeta(_)
-            | RolloutItem::InterAgentCommunication(_)
-            | RolloutItem::InterAgentCommunicationMetadata { .. }
-            | RolloutItem::ResponseItem(_)
-            | RolloutItem::Compacted(_)
-            | RolloutItem::TokenUsageRecord(_)
-            | RolloutItem::WorldState(_)
-            | RolloutItem::SecurityRiskScore(_)
-            | RolloutItem::RetainedContext(_)
-            | RolloutItem::RealtimeItem(_)
-            | RolloutItem::TurnContext(_) => false,
-        })
+        .filter(|line| matches!(&line.item, RolloutItem::EventMsg(event) if predicate(event)))
         .count()
 }
 
 fn rollout_has_agent_message(lines: &[RolloutLine], text: &str) -> bool {
-    lines.iter().any(|line| {
-        matches!(
-            &line.item,
-            RolloutItem::EventMsg(EventMsg::AgentMessage(event)) if event.message == text
-        )
+    lines.iter().any(|line| match &line.item {
+        RolloutItem::EventMsg(EventMsg::AgentMessage(event)) => event.message == text,
+        RolloutItem::EventMsg(EventMsg::ItemCompleted(event)) => match &event.item {
+            TurnItem::AgentMessage(item) => {
+                item.content
+                    .iter()
+                    .map(|content| match content {
+                        AgentMessageContent::Text { text } => text.as_str(),
+                    })
+                    .collect::<String>()
+                    == text
+            }
+            _ => false,
+        },
+        _ => false,
     })
 }

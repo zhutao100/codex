@@ -910,8 +910,6 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
     use std::fs;
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::path::PathBuf;
     use std::process::Stdio;
