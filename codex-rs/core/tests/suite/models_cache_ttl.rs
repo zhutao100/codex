@@ -43,6 +43,8 @@ const DIFFERENT_VERSION_MODEL: &str = "codex-test-different-version";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn renews_cache_ttl_on_matching_models_etag() -> Result<()> {
+    core_test_support::skip_if_no_network_unless_localhost!(Ok(()));
+
     let server = MockServer::start().await;
 
     let remote_model = test_remote_model(REMOTE_MODEL, 1);
@@ -74,6 +76,19 @@ async fn renews_cache_ttl_on_matching_models_etag() -> Result<()> {
         .await;
 
     let cache_path = config.codex_home.join(CACHE_FILE);
+    let client_version = codex_core::models_manager::client_version_to_whole();
+    assert_eq!(
+        read_cache(&cache_path).await?.client_version,
+        Some(client_version.clone())
+    );
+    assert_eq!(
+        models_mock
+            .requests()
+            .iter()
+            .map(|request| request.url.query_pairs().into_owned().collect::<Vec<_>>())
+            .collect::<Vec<_>>(),
+        vec![vec![("client_version".to_string(), client_version)]]
+    );
     let stale_time = Utc.timestamp_opt(0, 0).single().expect("valid epoch");
     rewrite_cache_timestamp(&cache_path, stale_time).await?;
 
