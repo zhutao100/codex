@@ -128,7 +128,7 @@ Start a fresh thread when you need a new Codex conversation.
 { "method": "thread/start", "id": 10, "params": {
     // Optionally set config settings. If not specified, will use the user's
     // current config settings.
-    "model": "gpt-5.1-codex",
+    "model": "gpt-6.1-sol",
     "cwd": "$HOME/project",
     "approvalPolicy": "never",
     "sandbox": "workspaceWrite",
@@ -153,7 +153,7 @@ Start a fresh thread when you need a new Codex conversation.
     "thread": {
         "id": "thr_123",
         "preview": "",
-        "model": "gpt-5.2",
+        "model": "gpt-6.1-sol",
         "modelProvider": "openai",
         "createdAt": 1730910000
     }
@@ -203,8 +203,8 @@ Example:
 } }
 { "id": 20, "result": {
     "data": [
-        { "id": "thr_a", "preview": "Create a TUI", "model": "gpt-5.2", "modelProvider": "openai", "createdAt": 1730831111, "updatedAt": 1730831111 },
-        { "id": "thr_b", "preview": "Fix tests", "model": "gpt-5.2", "modelProvider": "openai", "createdAt": 1730750000, "updatedAt": 1730750000 }
+        { "id": "thr_a", "preview": "Create a TUI", "model": "gpt-6.1-sol", "modelProvider": "openai", "createdAt": 1730831111, "updatedAt": 1730831111 },
+        { "id": "thr_b", "preview": "Fix tests", "model": "gpt-6.1-sol", "modelProvider": "openai", "createdAt": 1730750000, "updatedAt": 1730750000 }
     ],
     "nextCursor": "opaque-token-or-null"
 } }
@@ -297,7 +297,7 @@ The `effort` override accepts `"none"`, `"minimal"`, `"low"`, `"medium"`, `"high
         "writableRoots": ["$HOME/project"],
         "networkAccess": true
     },
-    "model": "gpt-5.1-codex",
+    "model": "gpt-6.1-sol",
     "effort": "medium",
     "summary": "concise",
     "personality": "friendly",

@@ -56,7 +56,7 @@ Start a new session with optional overrides:
 
 Request `newConversation` params (subset):
 
-- `model`: string model id (e.g. "o3", "gpt-5.4", "gpt-5.3-codex")
+- `model`: string model id (e.g. "gpt-6.1-sol", "gpt-6-luna")
 - `profile`: optional named profile
 - `cwd`: optional working directory
 - `approvalPolicy`: `untrusted` | `on-request` | `on-failure` | `never`
@@ -155,13 +155,13 @@ For the complete request/response shapes and flow examples, see the [“Auth end
 ## Example: start and send a message
 
 ```json
-{ "jsonrpc": "2.0", "id": 1, "method": "newConversation", "params": { "model": "gpt-5.4", "approvalPolicy": "on-request" } }
+{ "jsonrpc": "2.0", "id": 1, "method": "newConversation", "params": { "model": "gpt-6.1-sol", "approvalPolicy": "on-request" } }
 ```
 
 Server responds:
 
 ```json
-{ "jsonrpc": "2.0", "id": 1, "result": { "conversationId": "c7b0…", "model": "gpt-5.4", "rolloutPath": "/path/to/rollout.jsonl" } }
+{ "jsonrpc": "2.0", "id": 1, "result": { "conversationId": "c7b0…", "model": "gpt-6.1-sol", "rolloutPath": "/path/to/rollout.jsonl" } }
 ```
 
 Then send input:

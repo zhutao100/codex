@@ -244,7 +244,7 @@ impl ModelsManager {
         config: &Config,
     ) -> Option<ModelInfo> {
         // First use the normal longest-prefix match. If that misses, allow a narrowly scoped
-        // retry for namespaced slugs like `custom/gpt-5.3-codex`.
+        // retry for namespaced slugs like `custom/gpt-6.1-sol`.
         let overlaid_candidates;
         let candidates = if let Some(overlay) = config.model_overlay.as_ref() {
             overlaid_candidates = overlay.apply_to_candidates(candidates);
@@ -805,14 +805,14 @@ mod tests {
                 ..Default::default()
             },
             models: vec![ModelOverlayEntry {
-                slug: "gpt-5.5".to_string(),
+                slug: "cache-only-model".to_string(),
                 model_provider: None,
                 patch: ModelInfoPatch::default(),
                 final_instruction_override: Some("custom instructions".to_string()),
             }],
             ..Default::default()
         });
-        let cached_model = remote_model("gpt-5.5", "GPT-5.5", 0);
+        let cached_model = remote_model("cache-only-model", "Cache Only", 0);
         manager
             .cache_manager
             .persist_cache(
@@ -829,7 +829,7 @@ mod tests {
             .await
             .expect("cache manipulation succeeds");
 
-        let model_info = manager.get_model_info("gpt-5.5", &config).await;
+        let model_info = manager.get_model_info("cache-only-model", &config).await;
         let mut expected = cached_model;
         expected.effective_context_window_percent = 98;
 
@@ -1023,11 +1023,11 @@ mod tests {
 
     #[test]
     fn construct_model_info_offline_applies_existing_model_field_overlay() {
-        let baseline = ModelsManager::construct_model_info_offline("gpt-5.4", &test_config());
+        let baseline = ModelsManager::construct_model_info_offline("gpt-6.1-sol", &test_config());
         let mut config = test_config();
         config.model_overlay = Some(ModelOverlay {
             models: vec![ModelOverlayEntry {
-                slug: "gpt-5.4".to_string(),
+                slug: "gpt-6.1-sol".to_string(),
                 model_provider: None,
                 patch: ModelInfoPatch {
                     context_window: Some(Some(1_000_000)),
@@ -1047,7 +1047,7 @@ mod tests {
             ..Default::default()
         });
 
-        let model = ModelsManager::construct_model_info_offline("gpt-5.4", &config);
+        let model = ModelsManager::construct_model_info_offline("gpt-6.1-sol", &config);
 
         assert_eq!(model.context_window, Some(1_000_000));
         assert_eq!(model.display_name, baseline.display_name);
@@ -1083,7 +1083,7 @@ mod tests {
                 ..Default::default()
             },
             models: vec![ModelOverlayEntry {
-                slug: "gpt-5.4".to_string(),
+                slug: "gpt-6.1-sol".to_string(),
                 model_provider: None,
                 patch: ModelInfoPatch {
                     context_window: Some(Some(512_000)),
@@ -1094,7 +1094,7 @@ mod tests {
             ..Default::default()
         });
 
-        let model = ModelsManager::construct_model_info_offline("gpt-5.4", &config);
+        let model = ModelsManager::construct_model_info_offline("gpt-6.1-sol", &config);
 
         assert_eq!(model.context_window, Some(256_000));
     }
@@ -1129,30 +1129,30 @@ mod tests {
         let mut config = test_config();
         config.model_overlay = Some(ModelOverlay {
             models: vec![ModelOverlayEntry {
-                slug: "gpt-5.4".to_string(),
+                slug: "gpt-6".to_string(),
                 model_provider: None,
                 patch: ModelInfoPatch::default(),
-                final_instruction_override: Some("patched gpt-5.4".to_string()),
+                final_instruction_override: Some("patched gpt-6".to_string()),
             }],
             final_instruction_override: Some("global final".to_string()),
             ..Default::default()
         });
 
         let exact = manager
-            .get_final_instruction_override("custom/gpt-5.4", &config)
+            .get_final_instruction_override("custom/gpt-6", &config)
             .await;
         let adjacent = manager
-            .get_final_instruction_override("gpt-5.4-mini", &config)
+            .get_final_instruction_override("gpt-6-luna", &config)
             .await;
 
-        assert_eq!(exact.as_deref(), Some("patched gpt-5.4"));
+        assert_eq!(exact.as_deref(), Some("patched gpt-6"));
         assert_eq!(adjacent.as_deref(), Some("global final"));
     }
 
     #[test]
     fn effective_model_instructions_prefers_final_override() {
         let config = test_config();
-        let model = ModelsManager::construct_model_info_offline("gpt-5.4", &config);
+        let model = ModelsManager::construct_model_info_offline("gpt-6.1-sol", &config);
 
         let instructions = ModelsManager::effective_model_instructions(
             &model,

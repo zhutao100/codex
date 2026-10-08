@@ -7,11 +7,11 @@
 # Top-level model selection.
 #
 # Config default: unset. Effective runtime default is selected from available
-# model metadata; the bundled default model is currently `gpt-5.4`.
-# model = "gpt-5.4"
+# model metadata; the bundled default model is currently `gpt-6.1-sol`.
+# model = "gpt-6.1-sol"
 
 # Config default: unset. `/review` uses the current session model.
-# review_model = "gpt-5.4"
+# review_model = "gpt-6.1-sol"
 
 # Config default: unset. `/review` uses the current session provider.
 # review_model_provider = "openai"
@@ -85,7 +85,7 @@
 # behavior unless that profile is active.
 #
 # [profiles.example]
-# model = "gpt-5.4"
+# model = "gpt-6.1-sol"
 # model_provider = "openai"
 # model_instructions_file = "~/.codex/profile-model-instructions.md"
 # model_reasoning_effort = "medium"

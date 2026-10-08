@@ -3631,17 +3631,18 @@ mod tests {
     #[tokio::test]
     async fn model_migration_prompt_only_shows_for_models_with_upgrades() {
         let seen = BTreeMap::new();
-        let available_models = model_presets_with_legacy_upgrade("legacy-test-model", "gpt-5.4");
+        let available_models =
+            model_presets_with_legacy_upgrade("legacy-test-model", "gpt-6.1-sol");
 
         assert!(should_show_model_migration_prompt(
             "legacy-test-model",
-            "gpt-5.4",
+            "gpt-6.1-sol",
             &seen,
             &available_models
         ));
         assert!(!should_show_model_migration_prompt(
-            "gpt-5.4",
-            "gpt-5.4",
+            "gpt-6.1-sol",
+            "gpt-6.1-sol",
             &seen,
             &available_models
         ));
@@ -3650,18 +3651,19 @@ mod tests {
     #[tokio::test]
     async fn model_migration_prompt_respects_hide_flag_and_self_target() {
         let mut seen = BTreeMap::new();
-        seen.insert("legacy-test-model".to_string(), "gpt-5.4".to_string());
-        let available_models = model_presets_with_legacy_upgrade("legacy-test-model", "gpt-5.4");
+        seen.insert("legacy-test-model".to_string(), "gpt-6.1-sol".to_string());
+        let available_models =
+            model_presets_with_legacy_upgrade("legacy-test-model", "gpt-6.1-sol");
 
         assert!(!should_show_model_migration_prompt(
             "legacy-test-model",
-            "gpt-5.4",
+            "gpt-6.1-sol",
             &seen,
             &available_models
         ));
         assert!(!should_show_model_migration_prompt(
-            "gpt-5.4",
-            "gpt-5.4",
+            "gpt-6.1-sol",
+            "gpt-6.1-sol",
             &seen,
             &available_models
         ));
@@ -3694,7 +3696,8 @@ mod tests {
             .await
             .expect("config");
 
-        let available_models = model_presets_with_legacy_upgrade("legacy-test-model", "gpt-5.4");
+        let available_models =
+            model_presets_with_legacy_upgrade("legacy-test-model", "gpt-6.1-sol");
         let current = available_models
             .iter()
             .find(|preset| preset.model == "legacy-test-model")

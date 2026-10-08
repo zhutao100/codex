@@ -29,6 +29,11 @@ use codex_core::config::types::ProgressLegendMode;
 use codex_core::config_loader::RequirementSource;
 use codex_core::features::Feature;
 use codex_core::models_manager::manager::ModelsManager;
+use codex_core::models_manager::overlay::ModelInfoPatch;
+use codex_core::models_manager::overlay::ModelInstructionsVariablesPatch;
+use codex_core::models_manager::overlay::ModelMessagesPatch;
+use codex_core::models_manager::overlay::ModelOverlay;
+use codex_core::models_manager::overlay::ModelOverlayEntry;
 use codex_core::protocol::AgentMessageDeltaEvent;
 use codex_core::protocol::AgentMessageEvent;
 use codex_core::protocol::AgentReasoningDeltaEvent;
@@ -1788,7 +1793,7 @@ async fn rate_limit_switch_prompt_skips_when_on_lower_cost_model() {
 #[tokio::test]
 async fn rate_limit_switch_prompt_shows_once_per_session() {
     let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
-    let (mut chat, _, _) = make_chatwidget_manual(Some("gpt-5.4")).await;
+    let (mut chat, _, _) = make_chatwidget_manual(Some("gpt-6.1-sol")).await;
     chat.auth_manager = AuthManager::from_auth_for_testing(auth);
 
     chat.on_rate_limit_snapshot(Some(snapshot(90.0)));
@@ -1812,7 +1817,7 @@ async fn rate_limit_switch_prompt_shows_once_per_session() {
 #[tokio::test]
 async fn rate_limit_switch_prompt_respects_hidden_notice() {
     let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
-    let (mut chat, _, _) = make_chatwidget_manual(Some("gpt-5.4")).await;
+    let (mut chat, _, _) = make_chatwidget_manual(Some("gpt-6.1-sol")).await;
     chat.auth_manager = AuthManager::from_auth_for_testing(auth);
     chat.config.notices.hide_rate_limit_model_nudge = Some(true);
 
@@ -1827,7 +1832,7 @@ async fn rate_limit_switch_prompt_respects_hidden_notice() {
 #[tokio::test]
 async fn rate_limit_switch_prompt_defers_until_task_complete() {
     let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
-    let (mut chat, _, _) = make_chatwidget_manual(Some("gpt-5.4")).await;
+    let (mut chat, _, _) = make_chatwidget_manual(Some("gpt-6.1-sol")).await;
     chat.auth_manager = AuthManager::from_auth_for_testing(auth);
 
     chat.bottom_pane.set_task_running(true);
@@ -1847,7 +1852,7 @@ async fn rate_limit_switch_prompt_defers_until_task_complete() {
 
 #[tokio::test]
 async fn rate_limit_switch_prompt_popup_snapshot() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-6.1-sol")).await;
     chat.auth_manager =
         AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
 
@@ -1860,7 +1865,7 @@ async fn rate_limit_switch_prompt_popup_snapshot() {
 
 #[tokio::test]
 async fn plan_implementation_popup_snapshot() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-6.1-sol")).await;
     chat.open_plan_implementation_prompt();
 
     let popup = render_bottom_popup(&chat, 80);
@@ -1869,7 +1874,7 @@ async fn plan_implementation_popup_snapshot() {
 
 #[tokio::test]
 async fn plan_implementation_popup_no_selected_snapshot() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-6.1-sol")).await;
     chat.open_plan_implementation_prompt();
     chat.handle_key_event(KeyEvent::from(KeyCode::Down));
 
@@ -1879,7 +1884,7 @@ async fn plan_implementation_popup_no_selected_snapshot() {
 
 #[tokio::test]
 async fn plan_implementation_popup_yes_emits_submit_message_event() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-6.1-sol")).await;
     chat.open_plan_implementation_prompt();
 
     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
@@ -1898,7 +1903,7 @@ async fn plan_implementation_popup_yes_emits_submit_message_event() {
 
 #[tokio::test]
 async fn submit_user_message_with_mode_sets_coding_collaboration_mode() {
-    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5.2")).await;
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(Some("gpt-6-luna")).await;
     chat.thread_id = Some(ThreadId::new());
     chat.set_feature_enabled(Feature::CollaborationModes, true);
 
@@ -1953,7 +1958,7 @@ async fn submit_user_message_carries_configured_service_tier() {
 
 #[tokio::test]
 async fn plan_implementation_popup_skips_replayed_turn_complete() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-6.1-sol")).await;
     chat.set_feature_enabled(Feature::CollaborationModes, true);
     let plan_mask =
         collaboration_modes::mask_for_kind(chat.models_manager.as_ref(), ModeKind::Plan)
@@ -1973,7 +1978,7 @@ async fn plan_implementation_popup_skips_replayed_turn_complete() {
 
 #[tokio::test]
 async fn plan_implementation_popup_shows_once_when_replay_precedes_live_turn_complete() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-6.1-sol")).await;
     chat.set_feature_enabled(Feature::CollaborationModes, true);
     let plan_mask =
         collaboration_modes::mask_for_kind(chat.models_manager.as_ref(), ModeKind::Plan)
@@ -2028,7 +2033,7 @@ async fn plan_implementation_popup_shows_once_when_replay_precedes_live_turn_com
 
 #[tokio::test]
 async fn plan_implementation_popup_skips_when_messages_queued() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-6.1-sol")).await;
     chat.set_feature_enabled(Feature::CollaborationModes, true);
     let plan_mask =
         collaboration_modes::mask_for_kind(chat.models_manager.as_ref(), ModeKind::Plan)
@@ -2048,7 +2053,7 @@ async fn plan_implementation_popup_skips_when_messages_queued() {
 
 #[tokio::test]
 async fn plan_implementation_popup_skips_without_proposed_plan() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-6.1-sol")).await;
     chat.set_feature_enabled(Feature::CollaborationModes, true);
     let plan_mask =
         collaboration_modes::mask_for_kind(chat.models_manager.as_ref(), ModeKind::Plan)
@@ -2074,7 +2079,7 @@ async fn plan_implementation_popup_skips_without_proposed_plan() {
 
 #[tokio::test]
 async fn plan_implementation_popup_shows_after_proposed_plan_output() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-6.1-sol")).await;
     chat.set_feature_enabled(Feature::CollaborationModes, true);
     let plan_mask =
         collaboration_modes::mask_for_kind(chat.models_manager.as_ref(), ModeKind::Plan)
@@ -2095,7 +2100,7 @@ async fn plan_implementation_popup_shows_after_proposed_plan_output() {
 
 #[tokio::test]
 async fn plan_implementation_popup_skips_when_rate_limit_prompt_pending() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-6.1-sol")).await;
     chat.auth_manager =
         AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
     chat.set_feature_enabled(Feature::CollaborationModes, true);
@@ -3806,22 +3811,22 @@ async fn experimental_mode_plan_applies_on_startup() {
 
 #[tokio::test]
 async fn set_model_updates_active_collaboration_mask() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-6.1-sol")).await;
     chat.set_feature_enabled(Feature::CollaborationModes, true);
     let plan_mask =
         collaboration_modes::mask_for_kind(chat.models_manager.as_ref(), ModeKind::Plan)
             .expect("expected plan collaboration mask");
     chat.set_collaboration_mask(plan_mask);
 
-    chat.set_model("gpt-5.4-mini");
+    chat.set_model("gpt-6-luna");
 
-    assert_eq!(chat.current_model(), "gpt-5.4-mini");
+    assert_eq!(chat.current_model(), "gpt-6-luna");
     assert_eq!(chat.active_collaboration_mode_kind(), ModeKind::Plan);
 }
 
 #[tokio::test]
 async fn set_reasoning_effort_updates_active_collaboration_mask() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-6.1-sol")).await;
     chat.set_feature_enabled(Feature::CollaborationModes, true);
     let plan_mask =
         collaboration_modes::mask_for_kind(chat.models_manager.as_ref(), ModeKind::Plan)
@@ -3899,10 +3904,11 @@ async fn collab_mode_toggle_on_applies_default_preset() {
 
 #[tokio::test]
 async fn user_turn_includes_personality_from_config() {
-    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(Some("bengalfox")).await;
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(Some("personality-test-model")).await;
+    enable_test_model_personality(&mut chat);
     chat.set_feature_enabled(Feature::Personality, true);
     chat.thread_id = Some(ThreadId::new());
-    chat.set_model("bengalfox");
+    chat.set_model("personality-test-model");
     chat.set_personality(Personality::Friendly);
 
     chat.bottom_pane
@@ -4623,7 +4629,7 @@ async fn experimental_features_toggle_saves_on_exit() {
 
 #[tokio::test]
 async fn model_selection_popup_snapshot() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-6.1-sol")).await;
     chat.thread_id = Some(ThreadId::new());
     chat.open_model_popup();
 
@@ -4633,12 +4639,35 @@ async fn model_selection_popup_snapshot() {
 
 #[tokio::test]
 async fn personality_selection_popup_snapshot() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("bengalfox")).await;
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("personality-test-model")).await;
+    enable_test_model_personality(&mut chat);
     chat.thread_id = Some(ThreadId::new());
     chat.open_personality_popup();
 
     let popup = render_bottom_popup(&chat, 80);
     assert_snapshot!("personality_selection_popup", popup);
+}
+
+fn enable_test_model_personality(chat: &mut ChatWidget) {
+    chat.config.model_overlay = Some(ModelOverlay {
+        models: vec![ModelOverlayEntry {
+            slug: chat.current_model().to_string(),
+            model_provider: None,
+            patch: ModelInfoPatch {
+                model_messages: Some(ModelMessagesPatch {
+                    instructions_template: Some("{{ personality }}".to_string()),
+                    instructions_variables: Some(ModelInstructionsVariablesPatch {
+                        personality_default: Some(String::new()),
+                        personality_friendly: Some("Friendly".to_string()),
+                        personality_pragmatic: Some("Pragmatic".to_string()),
+                    }),
+                }),
+                ..Default::default()
+            },
+            final_instruction_override: None,
+        }],
+        ..Default::default()
+    });
 }
 
 #[tokio::test]
@@ -4762,8 +4791,8 @@ fn model_shortcut_choices_include_current_non_auto_model() {
 
 #[tokio::test]
 async fn model_cap_error_does_not_switch_models() {
-    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(Some("boomslang")).await;
-    chat.set_model("boomslang");
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(Some("gpt-6-sol")).await;
+    chat.set_model("gpt-6-sol");
     while rx.try_recv().is_ok() {}
     while op_rx.try_recv().is_ok() {}
 
@@ -4772,7 +4801,7 @@ async fn model_cap_error_does_not_switch_models() {
         msg: EventMsg::Error(ErrorEvent {
             message: "model cap".to_string(),
             codex_error_info: Some(CodexErrorInfo::ModelCap {
-                model: "boomslang".to_string(),
+                model: "gpt-6-sol".to_string(),
                 reset_after_seconds: Some(120),
             }),
             client_user_message_id: None,
@@ -4782,7 +4811,7 @@ async fn model_cap_error_does_not_switch_models() {
     while let Ok(event) = rx.try_recv() {
         if let AppEvent::UpdateModel(model) = event {
             assert_eq!(
-                model, "boomslang",
+                model, "gpt-6-sol",
                 "did not expect model switch on model-cap error"
             );
         }
@@ -4915,12 +4944,12 @@ async fn startup_prompts_for_windows_sandbox_when_agent_requested() {
 
 #[tokio::test]
 async fn model_reasoning_selection_popup_snapshot() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-6.1-sol")).await;
 
     set_chatgpt_auth(&mut chat);
     chat.set_reasoning_effort(Some(ReasoningEffortConfig::High));
 
-    let preset = get_available_model(&chat, "gpt-5.4");
+    let preset = get_available_model(&chat, "gpt-6.1-sol");
     chat.open_reasoning_popup(preset);
 
     let popup = render_bottom_popup(&chat, 80);
@@ -4928,26 +4957,26 @@ async fn model_reasoning_selection_popup_snapshot() {
 }
 
 #[tokio::test]
-async fn model_reasoning_selection_popup_extra_high_warning_snapshot() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.2")).await;
+async fn model_reasoning_selection_popup_luna_snapshot() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-6-luna")).await;
 
     set_chatgpt_auth(&mut chat);
     chat.set_reasoning_effort(Some(ReasoningEffortConfig::XHigh));
 
-    let preset = get_available_model(&chat, "gpt-5.2");
+    let preset = get_available_model(&chat, "gpt-6-luna");
     chat.open_reasoning_popup(preset);
 
     let popup = render_bottom_popup(&chat, 80);
-    assert_snapshot!("model_reasoning_selection_popup_extra_high_warning", popup);
+    assert_snapshot!("model_reasoning_selection_popup_luna", popup);
 }
 
 #[tokio::test]
 async fn reasoning_popup_shows_extra_high_with_space() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-6.1-sol")).await;
 
     set_chatgpt_auth(&mut chat);
 
-    let preset = get_available_model(&chat, "gpt-5.4");
+    let preset = get_available_model(&chat, "gpt-6.1-sol");
     chat.open_reasoning_popup(preset);
 
     let popup = render_bottom_popup(&chat, 120);
@@ -5028,11 +5057,11 @@ async fn feedback_upload_consent_popup_snapshot() {
 
 #[tokio::test]
 async fn reasoning_popup_escape_returns_to_model_popup() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-6.1-sol")).await;
     chat.thread_id = Some(ThreadId::new());
     chat.open_model_popup();
 
-    let preset = get_available_model(&chat, "gpt-5.4");
+    let preset = get_available_model(&chat, "gpt-6.1-sol");
     chat.open_reasoning_popup(preset);
 
     let before_escape = render_bottom_popup(&chat, 80);
@@ -7712,7 +7741,16 @@ async fn chatwidget_exec_and_status_layout_vt100_snapshot() {
     })
     .unwrap();
 
-    assert_snapshot!(term.backend().vt100().screen().contents());
+    let contents = term
+        .backend()
+        .vt100()
+        .screen()
+        .contents()
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_snapshot!(contents);
 }
 
 // E2E vt100 snapshot for complex markdown with indented and nested fenced code blocks

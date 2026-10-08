@@ -3,10 +3,10 @@ source: tui/src/chatwidget/tests.rs
 expression: popup
 ---
   Approaching rate limits
-  Switch to GPT-5.4-Mini for lower credit usage?
+  Switch to GPT-6-Luna for lower credit usage?
 
-› 1. Switch to GPT-5.4-Mini                 Smaller frontier agentic coding
-                                            model.
+› 1. Switch to GPT-6-Luna                   Fast and affordable model for
+                                            easier tasks.
   2. Keep current model
   3. Keep current model (never show again)  Hide future rate limit reminders
                                             about switching models.

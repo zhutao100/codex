@@ -1,7 +1,6 @@
 ---
 source: tui/src/chatwidget/tests.rs
-assertion_line: 5761
-expression: term.backend().vt100().screen().contents()
+expression: contents
 ---
 
 
@@ -37,9 +36,9 @@ expression: term.backend().vt100().screen().contents()
   └ Search Change Approved
     Read diff_render.rs
 
-• Investigating rendering code · gpt-5.4 (reasoning default) · (0s • esc to paus
+• Investigating rendering code · gpt-6.1-sol (reasoning default) · (0s • esc to
 
 
 › Summarize recent commits
 
-  gpt-5.4 default · 100% left · ~/workspace/custom-builds/codex/codex-rs/tui
+  gpt-6.1-sol default · 100% left · ~/workspace/custom-builds/codex/codex-rs/tui

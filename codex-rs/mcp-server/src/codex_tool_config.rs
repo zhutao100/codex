@@ -23,7 +23,7 @@ pub struct CodexToolCallParam {
     /// The *initial user prompt* to start the Codex conversation.
     pub prompt: String,
 
-    /// Optional override for the model name (e.g. 'gpt-5.2', 'gpt-5.2-codex').
+    /// Optional override for the model name (e.g. 'gpt-6.1-sol', 'gpt-6-luna').
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
 
@@ -333,7 +333,7 @@ mod tests {
                 "type": "string"
               },
               "model": {
-                "description": "Optional override for the model name (e.g. 'gpt-5.2', 'gpt-5.2-codex').",
+                "description": "Optional override for the model name (e.g. 'gpt-6.1-sol', 'gpt-6-luna').",
                 "type": "string"
               },
               "profile": {

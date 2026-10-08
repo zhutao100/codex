@@ -1,10 +1,9 @@
 ---
 source: tui/src/chatwidget/tests.rs
-assertion_line: 5881
 expression: term.backend().vt100().screen().contents()
 ---
 
-• Working · gpt-5.4 (reasoning default) · (0s • esc to pause)
+• Working · gpt-6.1-sol (reasoning default) · (0s • esc to pause)
 
   ↳ Hello, world! 0
   ↳ Hello, world! 1
@@ -26,4 +25,4 @@ expression: term.backend().vt100().screen().contents()
 
 › Ask Codex to do anything
 
-  gpt-5.4 default · 100% left · ~/workspace/custom-builds/codex/codex-rs/tui
+  gpt-6.1-sol default · 100% left · ~/workspace/custom-builds/codex/codex-rs/tui

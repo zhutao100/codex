@@ -1905,11 +1905,11 @@ mod tests {
     }
 
     #[test]
-    fn test_build_specs_gpt5_2_codex_default() {
+    fn test_build_specs_gpt5_6_terra_default() {
         let mut features = Features::with_defaults();
         features.enable(Feature::CollaborationModes);
         assert_default_model_tools(
-            "gpt-5.2",
+            "gpt-5.6-terra",
             &features,
             Some(WebSearchMode::Cached),
             "shell_command",
@@ -1924,11 +1924,11 @@ mod tests {
     }
 
     #[test]
-    fn test_build_specs_gpt5_3_codex_default() {
+    fn test_build_specs_gpt6_sol_default() {
         let mut features = Features::with_defaults();
         features.enable(Feature::CollaborationModes);
         assert_default_model_tools(
-            "gpt-5.3-codex",
+            "gpt-6-sol",
             &features,
             Some(WebSearchMode::Cached),
             "shell_command",
@@ -1943,12 +1943,12 @@ mod tests {
     }
 
     #[test]
-    fn test_build_specs_gpt5_3_codex_unified_exec_web_search() {
+    fn test_build_specs_gpt6_astra_unified_exec_web_search() {
         let mut features = Features::with_defaults();
         features.enable(Feature::UnifiedExec);
         features.enable(Feature::CollaborationModes);
         assert_model_tools(
-            "gpt-5.3-codex-spark",
+            "gpt-6-astra",
             &features,
             Some(WebSearchMode::Live),
             &[
@@ -1958,16 +1958,17 @@ mod tests {
                 "request_user_input",
                 "apply_patch",
                 "web_search",
+                "view_image",
             ],
         );
     }
 
     #[test]
-    fn test_codex_5_4_mini_defaults() {
+    fn test_gpt6_luna_defaults() {
         let mut features = Features::with_defaults();
         features.enable(Feature::CollaborationModes);
         assert_default_model_tools(
-            "gpt-5.4-mini",
+            "gpt-6-luna",
             &features,
             Some(WebSearchMode::Cached),
             "shell_command",
@@ -1982,14 +1983,14 @@ mod tests {
     }
 
     #[test]
-    fn test_gpt_5_4_defaults() {
+    fn test_gpt6_1_sol_defaults() {
         let mut features = Features::with_defaults();
         features.enable(Feature::CollaborationModes);
         assert_default_model_tools(
-            "gpt-5.4",
+            "gpt-6.1-sol",
             &features,
             Some(WebSearchMode::Cached),
-            "shell",
+            "shell_command",
             &[
                 "update_plan",
                 "request_user_input",
@@ -2045,7 +2046,7 @@ mod tests {
     #[test]
     fn test_test_model_info_includes_sync_tool() {
         let config = test_config();
-        let mut model_info = ModelsManager::construct_model_info_offline("gpt-5.4", &config);
+        let mut model_info = ModelsManager::construct_model_info_offline("gpt-6.1-sol", &config);
         model_info.experimental_supported_tools = vec![
             "test_sync_tool".to_string(),
             "read_file".to_string(),

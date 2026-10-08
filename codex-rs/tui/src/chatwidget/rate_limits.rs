@@ -3,7 +3,7 @@
 use super::*;
 
 pub(super) const RATE_LIMIT_WARNING_THRESHOLDS: [f64; 3] = [75.0, 90.0, 95.0];
-pub(super) const NUDGE_MODEL_SLUG: &str = "gpt-5.4-mini";
+pub(super) const NUDGE_MODEL_SLUG: &str = "gpt-6-luna";
 pub(super) const RATE_LIMIT_SWITCH_PROMPT_THRESHOLD: f64 = 90.0;
 
 #[derive(Default)]

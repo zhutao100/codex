@@ -1,6 +1,5 @@
 ---
 source: tui/src/chatwidget/tests.rs
-assertion_line: 1853
 expression: terminal.backend()
 ---
 "                                                                                "
@@ -9,4 +8,4 @@ expression: terminal.backend()
 "                                                                                "
 "› Ask Codex to do anything                                                      "
 "                                                                                "
-"  gpt-5.4 default · 100% left · ~/workspace/custom-builds/codex/codex-rs/tui    "
+"  gpt-6.1-sol default · 100% left · ~/workspace/custom-builds/codex/codex-rs/tui"

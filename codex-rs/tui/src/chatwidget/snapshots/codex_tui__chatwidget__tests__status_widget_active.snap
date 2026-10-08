@@ -1,12 +1,11 @@
 ---
 source: tui/src/chatwidget/tests.rs
-assertion_line: 4746
 expression: terminal.backend()
 ---
 "                                                                                "
-"• Analyzing · gpt-5.4 (reasoning default) · (0s • esc to pause)                 "
+"• Analyzing · gpt-6.1-sol (reasoning default) · (0s • esc to pause)             "
 "                                                                                "
 "                                                                                "
 "› Ask Codex to do anything                                                      "
 "                                                                                "
-"  gpt-5.4 default · 100% left · ~/workspace/custom-builds/codex/codex-rs/tui    "
+"  gpt-6.1-sol default · 100% left · ~/workspace/custom-builds/codex/codex-rs/tui"
