@@ -6,6 +6,5 @@ expression: log_cell
 • Ran git log --oneline -n 3
   └ line 0
     line 1
-    … +99996 lines (ctrl + t to view transcript)
-    line 99998
-    line 99999
+    line 2
+    +99997 lines (⌃t to view transcript)

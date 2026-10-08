@@ -22,7 +22,7 @@ expression: sanitized
   Token usage:           1.2K total  (800
                          input + 400 output)
   Context window:        100% left (1.2K
-                         used / 272K)
+                         used / 164K)
   Monthly credit limit:  68% left
                          (resets 07:08 on
                          7 May)
