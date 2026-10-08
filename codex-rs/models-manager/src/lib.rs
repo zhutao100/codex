@@ -20,12 +20,17 @@ pub fn bundled_models_response()
     serde_json::from_str(include_str!("../models.json"))
 }
 
-/// Convert the client version string to a whole version string (e.g. "1.2.3-alpha.4" -> "1.2.3").
+/// Return the compile-time client version without prerelease or build metadata.
 pub fn client_version_to_whole() -> String {
-    format!(
-        "{}.{}.{}",
-        env!("CARGO_PKG_VERSION_MAJOR"),
-        env!("CARGO_PKG_VERSION_MINOR"),
-        env!("CARGO_PKG_VERSION_PATCH")
-    )
+    version_to_whole(option_env!("CODEX_VERSION_OVERRIDE").unwrap_or(env!("CARGO_PKG_VERSION")))
 }
+
+fn version_to_whole(version: &str) -> String {
+    version
+        .split_once(['-', '+'])
+        .map_or(version, |(whole, _)| whole)
+        .to_string()
+}
+
+#[cfg(test)]
+mod version_tests;

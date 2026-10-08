@@ -35,3 +35,4 @@ Thus, the design of the changes target to minimize the potentials of future reba
 - During upstream rebases, port custom behavior to its current owner instead of restoring deleted crates or old APIs. Preserve upstream history envelopes, instruction provenance, atomic settings updates, and sanitized Git URLs.
 - Model switches use upstream's incremental developer instructions and retain the original request instruction prefix; do not restore the retired session-wide base-instruction rewrite.
 - See [customization maintenance](docs/rebase_customizations.md) for upstream replacement decisions and invariants to preserve.
+- Keep model discovery's compile-time version override, `/models` query, and cache identity aligned; see [model client version](docs/model_client_version.md). Strip both prerelease and build metadata; do not substitute runtime package provenance for the compile-time contract.

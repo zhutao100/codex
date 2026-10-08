@@ -484,6 +484,7 @@ async fn command_auth_refresh_fetches_a_catalog_for_the_current_credentials() {
 
 #[tokio::test]
 async fn explicit_catalog_reuses_auth_headers_and_query_parameters() {
+    let client_version = codex_models_manager::client_version_to_whole();
     for auth in [
         CodexAuth::create_dummy_chatgpt_auth_for_testing(),
         CodexAuth::from_api_key("test-key"),
@@ -507,6 +508,7 @@ async fn explicit_catalog_reuses_auth_headers_and_query_parameters() {
             .and(header("x-provider-header", "preserved"))
             .and(query_param("deployment", "one"))
             .and(query_param("api-version", "2026-09"))
+            .and(query_param("client_version", client_version.as_str()))
             .respond_with(ResponseTemplate::new(/*s*/ 200).set_body_json(&expected))
             .expect(1)
             .mount(&server)
@@ -561,6 +563,13 @@ async fn explicit_catalog_reuses_auth_headers_and_query_parameters() {
                 expected
             );
         }
+        let cache: codex_models_manager::cache::ModelsCacheEntry =
+            serde_json::from_slice(&std::fs::read(home.path().join("models_cache.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            cache.client_version.as_deref(),
+            Some(client_version.as_str())
+        );
         if use_external_auth {
             assert!(!manager.needs_initialization());
             auth_manager
