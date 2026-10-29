@@ -2,9 +2,13 @@
 
 ## Implementation Status
 
-The workflow is present in this project: `Op::ReviewCompletedTurn`, `PostTurnCompletionReviewTask`, `core/post_turn_completion_review_prompt.md`, read-only review delegate configuration, post-turn output parsing, and continuation handoff are wired. Later hardening addressed two observed gaps: review delegates now receive the full compact user/final-assistant interaction history for the session instead of only a single reconstructed pair, and the prompt treats `fix_actions_advised` as a concrete follow-up signal for both bugs and incomplete user-request fulfillment.
+The baseline workflow is present: `Op::ReviewCompletedTurn`, `PostTurnCompletionReviewTask`, the dedicated prompt, read-only delegate configuration, output parsing, and continuation handoff. Coverage-driven review, prompt overrides, and review-scoped host instruction selection are also implemented.
 
-Post-turn completion review tasks are pause-aware. `/pause` during the delegate records a paused review continuation and emits `TurnPaused` without `ExitedReviewMode`; `/continue` restarts the post-turn review delegate for the captured completed-turn context. This prevents the TUI from rendering a false `<< Code review finished >>` banner and prevents `/continue` from sampling the parent conversation as a regular continuation.
+The current compact history preserves multiple real user rounds, but collapses multiple review-triggered continuations within one user request into its latest assistant message. The former claim that it supplies the full multi-round interaction history was too broad. The current handoff also does not require a self-contained replacement final answer.
+
+The proposed correction is [Bounded Review Context and Complete Final Answers](multi_round_context_and_final_answer.md): freeze genuine user context, retain an initial answer reference and exact latest candidate, exclude past reviewer verdicts, and require each follow-up final to stand alone. That document is authoritative for this follow-up's context, output, lifecycle, persistence, and budget rules. This update changes documentation only.
+
+Post-turn review is already pause-aware: `/pause` during the delegate records a paused review continuation and emits `TurnPaused` without `ExitedReviewMode`; `/continue` restarts the reviewer instead of sampling the parent as ordinary main work. The new episode metadata must preserve that behavior.
 
 ## Target Base
 
@@ -12,11 +16,13 @@ This proposal targets this project's current customized code shape with the cust
 
 ## Design Summary
 
-Add a sibling workflow named `post_turn_completion_review` that can be invoked manually through `/review-completed-turn` or automatically after a regular `TurnComplete` when `[features].auto_post_turn_completion_review = true` is enabled. The workflow spawns a read-only review delegate using the existing review model/provider selection, evaluates the last completed turn using a compact history of every regular round's user messages and final assistant message, and, when it advises concrete follow-up actions, injects an advisory developer message into the main session and continues without a new user turn.
+The sibling workflow `post_turn_completion_review` can be invoked manually through `/review-completed-turn` or automatically after regular `TurnComplete` when `[features].auto_post_turn_completion_review = true`. It spawns a read-only delegate using the existing review model/provider selection and can inject advisory developer input to continue the same main request. The proposed context now consists of a fixed genuine-user request frame, an optional historical initial answer, and the exact latest candidate; it does not accumulate every automated review round.
 
-The hardening layer also updates generic `/review` and post-turn review delegate setup so each review task can use review-scoped host `AGENTS.*.md` instructions and optional prompt files from `~/.codex/config.toml`, while retaining the built-in prompts and project-level `AGENTS.md` docs as fallbacks.
+The implemented hardening layer updates generic `/review` and post-turn review delegate setup so each review task can use review-scoped host `AGENTS.*.md` instructions and optional prompt files from `~/.codex/config.toml`, while retaining the built-in prompts and project-level `AGENTS.md` docs as fallbacks.
 
 The design intentionally keeps the delegate independent from the main agent's hidden reasoning and tool transcript. This makes the review useful for the specific blind points of context-efficient coding turns: missed files, partial reads, duplicated logic, final deliverable overclaims, and silent narrowing of the requested scope across a multi-round session.
+
+The sections below retain the original workflow design and identify follow-up changes where applicable. For current implementation locations and document status, see [README.md](README.md).
 
 ## User-Facing Shape
 
@@ -174,7 +180,7 @@ pub struct ExitedReviewModeEvent {
 }
 ```
 
-This keeps existing `/review` clients compatible because `review_output` remains unchanged. `tui/src/chatwidget.rs::on_exited_review_mode(...)` can render either `review_output` or `post_turn_completion_review_output` and keep the same start/finish banners.
+This keeps existing `/review` clients compatible because `review_output` remains unchanged. `tui/src/chatwidget/replay.rs::on_exited_review_mode(...)` can render either `review_output` or `post_turn_completion_review_output` and keep the same start/finish banners.
 
 ### Continuation source
 
@@ -192,16 +198,16 @@ This makes the event stream explicit when the main model resumes because an inde
 
 ## Completed-Turn Context Capture
 
-Add a small session-state record for the latest completed regular turn plus the compact session interaction history that led to it:
+### Current implementation and remaining defect
+
+The existing internal state is:
 
 ```rust
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CompletedTurnReviewRound {
     pub(crate) user_messages: Vec<String>,
     pub(crate) final_agent_message: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CompletedTurnForReview {
     pub(crate) turn_id: String,
     pub(crate) cwd: PathBuf,
@@ -211,30 +217,19 @@ pub(crate) struct CompletedTurnForReview {
 }
 ```
 
-Store it in `SessionState`:
+`SessionState.last_completed_regular_turn_for_review` caches the latest completed regular turn. `Session::on_task_finished` captures the task's final before the automatic review trigger. However, `capture_completed_regular_turn_for_review` rebuilds its compact history using `completed_turn_interaction_history_from_history` in `core/src/session/turn.rs`.
 
-```rust
-pub(crate) last_completed_regular_turn_for_review: Option<CompletedTurnForReview>,
-```
+That helper pairs each real user boundary with the last nonempty assistant message before the next real user boundary. This preserves `U1/A0/U2/A1`, but `U1/A0/developer(R1)/A1` becomes `U1/A1`. It must not be used as the authoritative live source of review-episode completions.
 
-Capture it when a `RegularTask` finishes and before the automatic review trigger runs. The capture path should preserve only:
+### Proposed bounded episode
 
-- text from real user-turn boundary messages for each completed round;
-- the final assistant message for each completed round;
-- the latest completed turn's `turn_id` and `cwd`.
+Capture the completed main task's returned final answer explicitly. Freeze its consumed user input and genuine earlier user context as a request frame. Preserve the first final as `initial_answer_reference` and replace a separate `candidate_final_answer` after each review-derived continuation. Keep at most those two answer texts for the current episode and serialize identical text once.
 
-Do not include:
+The reference is historical and may be wrong or incomplete. The candidate is the exact user-facing final and must stand alone. Preserve prior genuine user-round context for follow-ups such as "use option two," but do not append prior reviewer evaluations or earlier automated answer revisions. Original input and consumed steering belong to the current task; they must not also be reconstructed as earlier completed rounds.
 
-- `AgentReasoning`, `Reasoning`, or encrypted reasoning items;
-- shell/function/tool calls;
-- tool outputs;
-- approval events;
-- intermediate assistant deltas or non-final assistant messages within a round;
-- review-mode synthetic user/assistant messages.
+Keep reasoning, tool calls/results, approvals, intermediate assistant text, and review verdicts out of delegate context. Do not introduce fake user messages or let advice redefine user intent.
 
-Build `interaction_history` from the session history by pairing each real user-turn boundary with the last non-empty assistant message before the next real user turn. This pairing fixes the multi-round failure mode where the reviewer could receive the first user message and the latest assistant message as a single false pair. `Session::spawn_task(...)` still summarizes the current input into `RunningTask` for regular tasks before moving it; `Session::on_task_finished(...)` uses that explicit input as a fallback when history cannot reconstruct the current turn precisely.
-
-If resume support for manual `/review-completed-turn` is required, use the same reconstruction helper over the resumed history. The helper should ignore Codex-generated developer messages and review synthetic messages.
+The [follow-up design](multi_round_context_and_final_answer.md) defines request ownership, ticket identity, budget overflow, and persistence. Existing `TurnComplete` and `TurnContinued` events are not persisted, so reliable restart support requires explicit metadata. Compaction must preserve the snapshot; rollback and new input must restore or invalidate it. Legacy reconstruction must report uncertainty rather than assert an exact episode it cannot recover.
 
 ## Delegate Prompt And Input
 
@@ -265,24 +260,22 @@ The prompt should instruct the delegate to:
 - avoid style nits and speculative concerns;
 - output exactly `PostTurnCompletionReviewOutputEvent` JSON and no markdown fence.
 
-Pass the completed-turn context as the delegate's only user input:
+Proposed: pass a bounded explicit envelope as the delegate's only user input. The renderer and model prompt must use the same versioned contract:
 
 ```xml
-<completed_turn_review_context>
-  <turn_id>...</turn_id>
-  <cwd>...</cwd>
-  <session_interaction_history note="The highest-indexed round is the completed turn being reviewed.">
-    <round index="1">
-      <user_messages>
-        <message index="1"><![CDATA[...]]></message>
-      </user_messages>
-      <final_agent_message><![CDATA[...]]></final_agent_message>
-    </round>
-  </session_interaction_history>
+<completed_turn_review_context version="2">
+  <episode_id>...</episode_id>
+  <request_revision>...</request_revision>
+  <candidate_completion_id>...</candidate_completion_id>
+  <cwd><![CDATA[...]]></cwd>
+  <request_context provenance="exact">...genuine user context...</request_context>
+  <initial_answer_reference status="historical_unverified"><![CDATA[...]]></initial_answer_reference>
+  <candidate_final_answer><![CDATA[...exact latest main final...]]></candidate_final_answer>
+  <context_coverage request="complete" candidate="complete" reference="included" />
 </completed_turn_review_context>
 ```
 
-Do not pass the normal session history as `InitialHistory`; use `InitialHistory::New`. The delegate can inspect the repository read-only through tools, but the only conversation context it receives should be the compact per-round user/final-assistant history. Do not pass hidden reasoning, tool calls, or tool outputs.
+Keep `InitialHistory::New`. The reviewer can inspect current files read-only but receives no parent transcript, prior reviewer verdicts, hidden reasoning, or tool transcript. The initial reference is not evidence of present correctness and cannot compensate for an incomplete latest candidate. For deduplication, token limits, missing legacy context, and exact field semantics, use [the bounded-context specification](multi_round_context_and_final_answer.md).
 
 
 ## Review Effectiveness Hardening
@@ -292,12 +285,14 @@ The post-turn reviewer must be optimized for complementarity, not for repeating 
 Minimum prompt requirements:
 
 1. Treat the completed turn as an end-state artifact to verify, not as a request to perform a generic review.
-2. Build a request-fulfillment checklist from every user message in the supplied interaction history, including explicit requirements, constraints, verification asks, and promised follow-ups.
+2. Build the request-fulfillment checklist from genuine user context, applying later scope changes and cancellations. Treat earlier assistant promises as claims to assess rather than new user requirements.
 3. Start by deriving a coverage checklist from the request-fulfillment checklist, the final assistant message, changed or untracked files when available, repository manifests, neighboring modules, tests, schemas, protocol definitions, generated bindings, and registration points.
 4. Prefer whole-file reads for small and medium changed files. For large files, inspect the whole relevant symbol or module context plus imports, exports, registration tables, nearby tests, and paired helper functions. Do not rely only on `rg` hits followed by narrow `sed` ranges.
 5. Use multiple orthogonal searches for duplicate or related logic: new symbol names, semantic concepts, config keys, protocol variants, UI labels, test names, file families, and neighboring directory structure.
 6. For each suspected issue, cite concrete repository evidence in the `evaluation` text: file path, missing paired surface, conflicting existing helper, unsupported final-answer claim, unfulfilled user requirement, or test gap.
-7. Treat `fix_actions_advised` as the concrete follow-up signal despite its historical bug-fix name. Set it to true for actionable bugs, incomplete requested scope, missed deliverables, or required verification follow-up. Use false for speculative concerns, stylistic preferences, missing evidence, or findings that do not require the main session to continue.
+7. Treat `fix_actions_advised` as the concrete follow-up signal despite its historical bug-fix name. Set it to true for actionable bugs, incomplete scope, missed deliverables, or required verification follow-up.
+8. Proposed follow-up: assess whether the latest candidate alone communicates the current result. A correct repository with a delta-only answer can still require follow-up. An earlier answer must not make an incomplete candidate pass.
+9. Do not treat invalid output or unavailable mandatory context as a clean review; the two-field result is valid only when actually parsed as a nonempty evaluation.
 
 A useful `evaluation` format is Markdown inside the JSON string with short sections such as `Inspection coverage`, `Findings`, and `Fix actions advised`. The schema should stay unchanged so existing clients only need the `evaluation` text and the boolean signal.
 
@@ -353,7 +348,7 @@ let sub_agent_config = configure_review_delegate_config(
     ctx.model_info.slug.as_str(),
     ReviewDelegateConfigParams {
         base_instructions: prompt,
-        sandbox_policy: SandboxPolicy::ReadOnly,
+        sandbox_policy: SandboxPolicy::new_read_only_policy(),
         disable_collab: true,
         instruction_profile: ReviewDelegateInstructionProfile::PostTurnCompletionReview,
     },
@@ -365,9 +360,9 @@ Use `run_codex_thread_one_shot(...)` from `core/src/codex_delegate.rs` exactly a
 
 ## Review-Scoped Host Instructions
 
-`configure_review_delegate_config(...)` currently clones the parent `Config`, so the delegate inherits the parent `Config::user_instructions` that was loaded for the main session. `Codex::spawn(...)` then calls `project_doc::get_user_instructions(...)`, which combines host-level instructions from `Config::user_instructions`, project-level docs discovered by `core/src/project_doc.rs`, skills, and the hierarchical `AGENTS.md` note. Project-level instructions should remain available to review delegates, but host-level main-session tool-use and editing guidance should not control review methodology.
+`configure_review_delegate_config(...)` clones the parent config and then replaces `user_instructions` using `Config::load_host_instructions_from_filenames` and the selected review profile. `Codex::spawn(...)` still loads project-level instructions through `project_doc::get_user_instructions(...)`. This host separation is already implemented and should remain unchanged by the bounded-context work.
 
-Add a source-separated host instruction loader that can be used after cloning the parent config:
+The original design used the following illustrative helper; the current implementation uses `Config::load_host_instructions_from_filenames` instead:
 
 ```rust
 pub(crate) enum ReviewDelegateInstructionProfile {
@@ -411,39 +406,30 @@ High-level flow:
 
 1. `Op::ReviewCompletedTurn` enters `handlers::review_completed_turn(...)`.
 2. The handler checks that no task is active.
-3. The handler loads `last_completed_regular_turn_for_review` or reconstructs a fallback from history.
+3. The current handler loads the cached completed turn or reconstructs it from history. The proposed path loads an exact bounded episode snapshot or explicitly qualified legacy context; an automatic operation must match its scheduled ticket.
 4. If no valid context exists, emit a friendly `ErrorEvent` and return.
 5. Build a `TurnContext` using `new_default_turn_with_sub_id(...)`, then override the review delegate config inside the task as described above.
 6. Emit `EnteredReviewMode(ReviewRequest { target: ReviewTarget::Custom { ... }, user_facing_hint: Some("completed turn") })`.
 7. Run the read-only delegate with the resolved post-turn prompt, the structured completed-turn context, and the post-turn review instruction profile.
 8. The delegate follows the coverage-driven review protocol from the prompt rather than replaying the main session search strategy.
-9. Parse the final delegate `last_agent_message` as `PostTurnCompletionReviewOutputEvent`, with a fallback that stores unparsable text as `evaluation` and sets `fix_actions_advised = false`.
-10. Emit `ExitedReviewMode(ExitedReviewModeEvent { review_output: None, post_turn_completion_review_output: Some(output.clone()) })`.
-11. If `fix_actions_advised` is false, finish normally and emit `TurnComplete` for the review task.
-12. If `fix_actions_advised` is true, inject an advisory developer message into the main session, then continue the main session without a new user message.
+9. Parse the final delegate output. The current code normalizes invalid text to a false result; the proposed path distinguishes valid results from invalid/unavailable review internally.
+10. For a valid parsed output, emit `ExitedReviewMode` with `post_turn_completion_review_output: Some(output.clone())`. Proposed: invalid/unavailable review instead emits an exit without structured post-turn output and an appropriate diagnostic.
+11. For a valid nonempty evaluation with `fix_actions_advised = false`, finish without another main answer; the exact candidate already delivered remains the latest main final.
+12. For a valid positive result, verify ticket ownership and the applicable automatic allowance, then inject advisory developer input and the complete replacement-answer contract before continuing without a new user message. A manually requested review may perform its single handoff without resetting an exhausted automatic allowance.
 
 ## Automatic Trigger
 
-Extend `Session::on_task_finished(...)` after it emits the regular `TurnComplete` event and after it has stored `last_completed_regular_turn_for_review`:
+The existing `Session::on_task_finished` in `core/src/tasks/mod.rs` captures a regular completion, emits `TurnComplete`, then calls `maybe_auto_post_turn_completion_review`. That helper checks the regular task kind, feature flag, non-subagent source, nonempty answer, idle state, and available completed-turn cache before submitting `Op::ReviewCompletedTurn`.
 
-```rust
-if task_kind == TaskKind::Regular
-    && turn_context.features.enabled(Feature::AutoPostTurnCompletionReview)
-    && should_auto_review_completed_turn(turn_context.as_ref(), last_agent_message.as_deref())
-{
-    self.spawn_post_turn_completion_review(turn_context).await;
-}
-```
+A review-derived `ContinueTask` is regular and can trigger another review. The inspected implementation has no explicit review-iteration allowance or no-progress guard. A false verdict stops the loop, but malformed output also currently produces false; neither behavior should be described as a guaranteed successful finalization.
 
-`should_auto_review_completed_turn(...)` should return false when:
+Proposed changes:
 
-- `last_agent_message` is absent or whitespace;
-- `turn_context.session_source` is `SessionSource::SubAgent(_)`;
-- the task was not a regular main-session task;
-- the active completed turn was itself a continuation from `PostTurnCompletionReview` and a guard decides not to review repeated no-op loops;
-- the feature is disabled.
-
-The first implementation can allow repeated review-after-fix cycles because the workflow naturally stops when `fix_actions_advised = false`. Add a simple guard against reviewing the same `turn_id` twice concurrently.
+- Keep the automatic trigger on successful main completions and preserve the incomplete-work-notes exclusion.
+- Associate internal review submissions with the expected episode/request/candidate ticket; do not let a queued operation silently select a newer completion.
+- Bound retained episode context independently from the number of executions.
+- Optionally land the finite automatic-attempt policy specified in [the follow-up design](multi_round_context_and_final_answer.md). Its proposed default is three reviewer attempts, with an explicit unresolved status at exhaustion. This is not current behavior or a measured optimum.
+- Preserve manual invocation and the complete-answer contract for its advisory follow-up even when automatic review is disabled.
 
 ## Developer Message Handoff
 
@@ -452,6 +438,7 @@ When `fix_actions_advised` is true, wrap the evaluation in a developer message, 
 ```xml
 <post_turn_completion_review>
   <context>An independent post-turn review inspected the completed turn. The review may be correct or incorrect. Treat it as advisory input, verify the claims against the repository, and only act on findings that are actually applicable.</context>
+  <final_answer_contract>After applicable work, write a complete replacement answer to the active user request. Preserve still-valid results, incorporate corrections, remove superseded claims, identify deliverables and actual verification, and state unresolved limitations. The answer must stand alone without prior final messages or review feedback, including when all findings are rejected. Respect the requested format and brevity.</final_answer_contract>
   <fix_actions_advised>true</fix_actions_advised>
   <evaluation>
   ...review text...
@@ -461,21 +448,20 @@ When `fix_actions_advised` is true, wrap the evaluation in a developer message, 
 
 Record it with `DeveloperInstructions::new(message).into()` and `Session::record_conversation_items(...)` so the next model request sees a developer-role item. Do not emit it as a visible user message.
 
-Then continue the main session without recording a new user turn. Prefer a helper that reuses the existing continuation path while making the source explicit:
+Then continue the main session without recording a new user turn. The existing flow below is schematic: `checkpoint` has source `PostTurnCompletionReview`, the reviewed turn ID, model, pause reason, and regular target. The proposed ticket must also accompany this scheduling path:
 
 ```rust
-sess.continue_after_post_turn_completion_review(
-    turn_context,
-    PendingContinuation {
-        source: TurnContinuationSource::PostTurnCompletionReview,
-        continued_from_turn_id: Some(reviewed_turn_id),
-    },
-).await;
+// The review task records its fully populated PendingContinuation.
+sess.set_pending_post_turn_completion_review_continuation(Some(checkpoint))
+    .await;
+
+// On review-task completion, the helper takes that pending checkpoint.
+sess.continue_after_post_turn_completion_review(turn_context).await;
 ```
 
 This helper can call the same `ContinueTask` / `continue_turn(...)` machinery, but `prepare_history_for_continuation(...)` must not remove an interrupt marker for `PostTurnCompletionReview`. The existing `remove_interrupted_abort` boolean already handles this if it remains `checkpoint.source == TurnContinuationSource::Interrupted`.
 
-This preserves the important behavioral distinction: a new user message normally starts a new turn boundary, but the advisory developer message lets the main model continue the completed turn with the same prior conversation prefix and without changing the user's intent.
+This preserves the distinction between a new user request and an advisory continuation. The continuation must also retain explicit episode ownership across pause/compaction and return a complete user-facing replacement answer. Do not rely on a real user boundary to retain prior completion context. Durable handoff and stale-ticket rules are specified in [the follow-up design](multi_round_context_and_final_answer.md).
 
 ## TUI Changes
 
@@ -498,7 +484,7 @@ It should not support inline args and should not be available during a running t
 
 ### Dispatch
 
-In `tui/src/chatwidget.rs::dispatch_command(...)`:
+In `tui/src/chatwidget/slash_dispatch.rs::dispatch_command(...)`:
 
 ```rust
 SlashCommand::ReviewCompletedTurn => {
@@ -526,12 +512,12 @@ Keep the existing `>> Code review started: ... <<` and `<< Code review finished 
 
 ## Prompt File Draft
 
-A suitable first version of `core/post_turn_completion_review_prompt.md` as the built-in fallback prompt. If `post_turn_completion_review_prompt_file` is configured, the configured file replaces this prompt at runtime:
+Proposed prompt revision for the bounded envelope. The runtime prompt file is not changed by this documentation update. Configured prompt overrides remain supported; the task framing must still explain exact-candidate and historical-reference semantics:
 
 ```markdown
 # Post-turn completion review guidelines
 
-You are an independent reviewer for a completed Codex coding turn. Review the repository end-state and the final assistant deliverable from that completed turn.
+You are an independent reviewer for completed main work. Review the current repository/artifact end state and candidate_final_answer against the applicable genuine user request.
 
 Your purpose is to catch issues that a context-efficient coding agent may miss: relevant files not found by keyword search, partial file reads that missed nearby contracts, duplicated existing functionality, incomplete paired updates, missing registration/schema/test changes, and final-answer claims that do not match repository state.
 
@@ -541,11 +527,13 @@ Prefer whole-file inspection for small and medium relevant files. For large file
 
 You may inspect files and run read-only commands. Do not modify files. Do not request write approval. Do not use web search. If inherited instructions conflict with this review methodology, this prompt wins for the post-turn review task.
 
-Only use the completed-turn context supplied by the user message: the user messages and the final assistant message. Do not assume access to hidden reasoning, tool calls, or intermediate transcript events.
+Only use the explicit review context and current read-only inspection. Treat initial_answer_reference and earlier user-round answers as historical, potentially incorrect or superseded context. Do not assume access to hidden reasoning, tool calls, intermediate messages, or past reviewer findings.
+
+The candidate_final_answer is the exact latest answer delivered to the user. Check whether it stands alone at the requested level of detail, incorporates material corrections, preserves still-required explanations and deliverables, and accurately states verification and unresolved work. A historical answer cannot compensate for a delta-only candidate. Distinguish incomplete communication from missing implementation by inspecting available evidence.
 
 In the `evaluation` string, include concrete evidence for any finding: file path, missing paired surface, conflicting existing helper, unsupported final-answer claim, or test gap. A compact structure such as `Inspection coverage`, `Findings`, and `Fix actions advised` is preferred.
 
-Return `fix_actions_advised = true` only when the main session should continue and consider concrete follow-up actions. Use `false` for clean reviews, speculative concerns, low-confidence style nits, or issues that are not actionable from the current repository state.
+Return `fix_actions_advised = true` for concrete actionable defects, incomplete requested scope, missing deliverables, or an incomplete latest answer, including when repository changes are otherwise correct. Use `false` when no actionable follow-up is advised; it is not a proof of semantic completeness.
 
 Output exactly this JSON object and no markdown fence:
 
@@ -557,16 +545,15 @@ Output exactly this JSON object and no markdown fence:
 
 ## Parsing And Fallbacks
 
-Mirror the resilient parser in `core/src/tasks/review.rs::parse_review_output_event(...)`:
+The current parser first tries the complete final text as `PostTurnCompletionReviewOutputEvent`, then an extracted JSON substring. On failure it renders raw text with `fix_actions_advised = false`; empty output also becomes false. This is existing behavior, not a verified clean verdict.
 
-- first parse the whole final message as `PostTurnCompletionReviewOutputEvent`;
-- then try to extract the first JSON object substring;
-- if parsing still fails, use `evaluation = text` and `fix_actions_advised = false`;
-- if `evaluation` is empty, use a fallback such as `Post-turn reviewer produced no evaluation.`.
+Proposed: retain the public JSON object but represent parser/execution failure separately inside the task. A valid result requires successfully parsed fields and a nonempty evaluation. Invalid or missing output, unavailable mandatory context, and delegate failure must render a diagnostic or an exit without structured review output rather than a synthetic no-follow-up verdict. Do not infer a positive handoff from raw prose.
 
-Do not set `fix_actions_advised = true` from an unparsable response. False negatives are safer than untrusted autonomous continuation.
+No additional semantic-certification field is required. The exact candidate and complete context must be identified by the host, while the model assesses whether the work and answer are actually complete.
 
 ## Failure Handling
+
+The table combines the current baseline with proposed hardening. Ticket ownership, context budgets, invalid-result status, and a finite attempt allowance are proposed changes; the complete lifecycle specification is in the follow-up design.
 
 |Failure|Behavior|
 |---|---|
@@ -574,11 +561,16 @@ Do not set `fix_actions_advised = true` from an unparsable response. False negat
 |Active task is running|Emit `Cannot review a completed turn while another task is running.`|
 |Last completed regular turn has no final assistant message|Emit `The last completed turn has no final assistant message to review.`|
 |Delegate spawn fails|Emit `ErrorEvent` with prefix `Post-turn completion review failed`.|
-|Delegate interrupted|Emit `ExitedReviewMode` with no post-turn output and a short interrupted message; do not inject a developer message.|
-|Delegate output unparsable|Render the raw text as evaluation, set `fix_actions_advised = false`, and do not continue automatically.|
-|Developer-message continuation spawn fails|Emit an error and leave the advisory review visible in the transcript; do not retry automatically.|
+|Delegate interrupted|Emit `ExitedReviewMode` without post-turn output; do not inject advice. A pause preserves the review continuation and does not emit a false review-finished event.|
+|Delegate output unparsable or empty|Proposed: report invalid/unavailable review without a synthetic clean verdict; do not continue from raw prose.|
+|Required context exceeds the review budget|Omit optional historical reference first; if mandatory scope/candidate still do not fit, report unavailable coverage.|
+|Request/candidate changed while review ran|Discard stale side effects; do not inject advice into newer work.|
+|Automatic allowance exhausted, if implemented|Keep current answer and unresolved findings visible; do not mark review clean.|
+|Developer-message continuation cannot be queued or started|Current enqueue failure logs a warning. Proposed: report the failure visibly, retain the prepared handoff for defined recovery, and avoid an uncontrolled retry loop.|
 
-## Implementation Sequence
+## Original Workflow Implementation Sequence
+
+These steps record the baseline already present. The bounded-context follow-up has its own implementation sequence in [multi_round_context_and_final_answer.md](multi_round_context_and_final_answer.md).
 
 1. Add protocol types: `Op::ReviewCompletedTurn`, `PostTurnCompletionReviewOutputEvent`, optional field on `ExitedReviewModeEvent`, and `TurnContinuationSource::PostTurnCompletionReview`.
 2. Add `Feature::AutoPostTurnCompletionReview` and its `FeatureSpec` with key `auto_post_turn_completion_review`, `Stage::UnderDevelopment`, and `default_enabled = false`.
@@ -587,11 +579,11 @@ Do not set `fix_actions_advised = true` from an unparsable response. False negat
 5. Extract shared review delegate config setup from `core/src/tasks/review.rs` into a helper and update `/review` to use the `Review` instruction profile.
 6. Add review host filename config keys and the delegate host-instruction loader with the `/review` and post-turn `AGENTS.*.md` hierarchies.
 7. Add `core/src/tasks/post_turn_completion_review.rs` and wire it into `core/src/tasks/mod.rs`.
-8. Add `handlers::review_completed_turn(...)` in `core/src/codex.rs` and route `Op::ReviewCompletedTurn` to it.
+8. Add `handlers::review_completed_turn(...)` in `core/src/session/handlers.rs` and route `Op::ReviewCompletedTurn` to it.
 9. Add automatic trigger after regular `TurnComplete` when the feature is enabled.
 10. Add developer-message injection and post-completion continuation helper.
 11. Add TUI slash command, dispatch, task-running handling, and post-turn review rendering.
-12. Run `just write-config-schema` after adding `ConfigToml` keys.
+12. Regenerate the config schema through the repository-prescribed `just-local` wrapper after adding `ConfigToml` keys.
 13. Add tests.
 
 ## Test Plan
@@ -599,7 +591,7 @@ Do not set `fix_actions_advised = true` from an unparsable response. False negat
 ### Core tests
 
 - `ReviewCompletedTurn` on a fresh session emits a friendly `BadRequest` error and does not spawn a task.
-- A completed regular turn stores `CompletedTurnForReview` with only user text and final assistant text.
+- A completed regular turn captures authoritative terminal text; proposed episode state retains genuine user context, a historical initial answer, and the exact latest candidate.
 - The stored review context excludes reasoning, shell calls, tool outputs, approval events, and intermediate assistant events.
 - Manual `ReviewCompletedTurn` uses `review_model` when set.
 - Manual `ReviewCompletedTurn` applies `review_model_provider` and disables `Feature::RemoteModels` in the delegate config.
@@ -612,9 +604,18 @@ Do not set `fix_actions_advised = true` from an unparsable response. False negat
 - The post-turn review instruction profile keeps project-level `AGENTS.md` instructions available while excluding host main-session-only guidance when review-scoped host instructions are configured.
 - `fix_actions_advised = false` emits review output but does not record a developer message and does not continue the main session.
 - `fix_actions_advised = true` records exactly one developer message and starts a continuation with `TurnContinuationSource::PostTurnCompletionReview`.
-- An unparsable delegate response is rendered as evaluation with `fix_actions_advised = false`.
+- Proposed: an unparsable/empty delegate response is unavailable/invalid review, not a valid no-follow-up verdict.
 - Automatic review triggers after regular main-session `TurnComplete` only when the feature is enabled.
 - Automatic review does not trigger for review tasks, compact tasks, user-shell tasks, or sub-agent sessions.
+
+### Proposed same-request multi-review regressions
+
+- Exercise `U1 -> A0 -> R1(true) -> A1 -> R2` without any intervening user message. The second reviewer gets the frozen request, initial reference, and latest candidate, excluding `R1` and tool/reasoning history.
+- Repeat ten synthetic continuations and retain at most two episode answer texts; deduplicate identical first/latest answers.
+- Ensure every advisory handoff contains the replacement-answer contract, including all-findings-rejected and no-files-changed cases.
+- Treat a delta-only latest answer as a communication defect even when the reference is comprehensive.
+- Cover consumed steering, stale queued operations, pause/restart, compaction, rollback/fork, legacy provenance, invalid output, and mandatory-context overflow.
+- Use behavioral evaluations for semantic completeness; mocked outputs prove harness behavior only.
 
 ### TUI tests
 
@@ -641,11 +642,12 @@ Do not set `fix_actions_advised = true` from an unparsable response. False negat
 - `core/src/tasks/review.rs`: shared delegate config extraction must preserve `/review` model, sandbox, output, and provider behavior while adding the `Review` instruction profile.
 - `core/src/project_doc.rs` and `core/src/instructions/user_instructions.rs`: review-scoped host instruction loading and source separation from project docs.
 - `core/src/codex_delegate.rs`: should remain the delegate runner; avoid embedding post-turn-specific behavior here.
-- `core/src/codex.rs`: operation routing, completed-turn capture, automatic trigger, and continuation handoff.
+- `core/src/session/{handlers,mod,turn,review}.rs`: operation routing, capture/reconstruction, snapshot ownership, and review setup.
+- `core/src/rollout/*` and rollout type/schema consumers: narrow persisted episode metadata, replay, rollback, and fork handling.
 - `core/src/tasks/mod.rs`: `TaskKind` additions and task lifecycle interactions.
-- `tui/src/slash_command.rs` and `tui/src/chatwidget.rs`: slash command, task-running state, and review-mode rendering.
+- `tui/src/slash_command.rs` and `tui/src/chatwidget/{slash_dispatch,replay,streaming,turn_runtime}.rs`: command dispatch, task state, answer/copy behavior, and review rendering.
 - `core/templates/review/*`: no change required unless the implementation chooses to add post-turn-specific exit templates.
 
-## Bottom Line
+## Design direction
 
-Keep `post_turn_completion_review` as a narrow sibling to `/review`: use the same review model/provider and `codex_delegate` machinery, force read-only and web-disabled execution, feed the delegate only the completed turn's user/final messages, and use a boolean advisory output to decide whether to continue the main session through a developer message instead of creating a new user turn. The follow-up hardening is to make review genuinely complementary by strengthening the post-turn prompt, allowing both review prompts to be overridden from configured files, and separating review-safe host instructions through the `AGENTS.review.md` / `AGENTS.post-turn-review.md` hierarchy while preserving project-level `AGENTS.md` context.
+Keep the existing isolated post-turn reviewer, review-specific instructions, and advisory continuation flow. Add an explicit bounded episode snapshot and require the main model to produce a complete current answer after every review handoff. The historical reference restores useful context without introducing a transcript of prior verdicts; the latest candidate alone must satisfy the user's communication needs. The detailed decision, alternatives, limits, and lifecycle requirements are in [multi_round_context_and_final_answer.md](multi_round_context_and_final_answer.md).

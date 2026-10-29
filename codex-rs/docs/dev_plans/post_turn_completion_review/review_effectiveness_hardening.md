@@ -2,13 +2,13 @@
 
 ## Status
 
-Implemented. The baseline post-turn completion review workflow exists in this project; this document records the hardening layer that makes the reviewer less likely to repeat the main session's failure modes.
+The coverage methodology, prompt overrides, and review-scoped host instruction profiles described here are implemented in the inspected archive. This document records that hardening layer. It does not mean same-request review-loop context or self-contained final answers are fixed; those proposed changes are specified in [multi_round_context_and_final_answer.md](multi_round_context_and_final_answer.md).
 
 ## Problem
 
 The reviewer was intended to catch blind spots from context-efficient coding turns: missed files, partial reads, duplicated logic, missing paired updates, incomplete requested scope, and final-answer overclaims. Test runs showed that the reviewer often used the same strategy as the main session: infer intent, run keyword searches, read narrow line ranges, and decide from those slices. When the reviewer repeats that strategy, it can miss the same files and context the main session missed.
 
-The current prompt describes what to catch, but it does not define a distinct review methodology. The delegate also receives the normal instruction stream assembled from host-level `AGENTS.md`, project-level `AGENTS.md`, skills, and environment context. Project-level docs are useful to the reviewer, but host-level instructions can mix machine resource notes with main-session editing and efficient-search guidance.
+Before this hardening, the prompt described what to catch without defining a distinct review methodology. The delegate received the normal instruction stream assembled from host-level `AGENTS.md`, project-level `AGENTS.md`, skills, and environment context. Project-level docs are useful to the reviewer, but host-level instructions can mix machine resource notes with main-session editing and efficient-search guidance.
 
 ## Goals
 
@@ -37,12 +37,13 @@ When a prompt file is configured, read it during config loading or delegate setu
 Also add explicit post-turn methodology requirements to `core/post_turn_completion_review_prompt.md`:
 
 1. Do not perform a generic code review and do not merely replay keyword search plus narrow range reads.
-2. Build a request-fulfillment checklist from every user message in the supplied interaction history.
+2. Build a request-fulfillment checklist from genuine user context, respecting later amendments, cancellations, and the active task. The proposed bounded envelope preserves that context separately from the current episode's answer revisions.
 3. Derive a coverage checklist from the request-fulfillment checklist, final assistant answer, changed or untracked files when available, repository manifests, adjacent modules, tests, schemas, protocol definitions, generated bindings, and registration points.
 4. Prefer whole-file inspection for small and medium changed files. For large files, inspect whole symbol or module contexts plus imports, exports, registration tables, nearby tests, and paired helper functions.
 5. Search for duplicate or existing functionality with multiple signals: new symbol names, semantic concepts, config keys, protocol variants, UI labels, test names, file families, and neighboring directories.
 6. Require concrete evidence for each finding in `evaluation`: file path, missing paired surface, conflicting existing helper, unsupported final-answer claim, unfulfilled user requirement, or test gap.
 7. Keep `fix_actions_advised = true` for concrete follow-up work the main session should verify and potentially perform, including incomplete requested scope.
+8. Proposed follow-up: assess the exact latest candidate as a self-contained answer. Historical answers cannot compensate for an omitted deliverable or explanation; an incomplete latest answer can require follow-up even when code is correct.
 
 The prompt should also state that when inherited instructions conflict with this review methodology, the post-turn review prompt wins.
 
@@ -122,9 +123,18 @@ This gives the main session and the user visibility into whether the reviewer ac
 - Integration test: project-level `AGENTS.md` remains present in the post-turn delegate initial context while host main-session-only guidance is absent.
 - Behavior test: a delegate response with coverage text and `fix_actions_advised = false` does not continue the main session.
 - Behavior test: a delegate response with concrete findings and `fix_actions_advised = true` records one advisory developer message and triggers `TurnContinuationSource::PostTurnCompletionReview`.
-- Behavior test: a multi-round session passes every real round's user messages and final assistant message to the post-turn delegate, while omitting tool transcript and review synthetic turns.
+- Existing behavior test: multiple genuine user rounds retain their user messages and final answers while omitting tool transcript and synthetic review turns. This does not exercise repeated review continuations within one user request.
+- Proposed regression: one real user input, an initial final, a positive review, a delta-only follow-up, and a second review. The second reviewer receives frozen user context, the historical initial answer, and the exact latest candidate, without the first review evaluation.
+- Proposed regression: later iterations retain at most two episode answer texts; the latest candidate must stand alone even when the reference is complete.
+- Proposed regression: prompt overrides retain the envelope semantics, and the parent continuation always receives the replacement-answer contract.
 
-## Rollout
+## Follow-up boundary
+
+The historical methodology work remains applicable. Replace the old assumption that more compact rounds should always accumulate with the bounded episode model in [multi_round_context_and_final_answer.md](multi_round_context_and_final_answer.md). The parent can keep reviewer advice in its conversation; subsequent reviewers receive no prior verdicts.
+
+The follow-up keeps the public review result object unchanged. It does require internal distinction between valid parsed results and unavailable/invalid review, explicit request/candidate ownership, and durable state. Those are proposed changes, not claims about this implemented hardening layer.
+
+## Original rollout
 
 1. Land prompt hardening first because it is low-risk and directly addresses the observed behavior.
 2. Add runtime prompt-file overrides for `/review` and post-turn completion review.
