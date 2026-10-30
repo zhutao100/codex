@@ -97,6 +97,7 @@ pub(crate) struct CompletionReviewState {
     pub(crate) pending_inputs: Vec<AcceptedReviewInput>,
     pub(crate) replacement_answer_required: bool,
     pub(crate) main_task_id: Option<String>,
+    pub(crate) recovery_model: Option<String>,
     pub(crate) request_frame: ReviewRequestFrame,
     pub(crate) episode: Option<CompletedTurnForReview>,
     pub(crate) attempt: Option<ReviewTicket>,
@@ -113,6 +114,7 @@ impl Default for CompletionReviewState {
             pending_inputs: Vec::new(),
             replacement_answer_required: false,
             main_task_id: None,
+            recovery_model: None,
             request_frame: ReviewRequestFrame {
                 text_only: true,
                 exact: true,
@@ -158,6 +160,7 @@ impl CompletionReviewState {
     ) -> u64 {
         if new_task {
             self.replacement_answer_required = false;
+            self.recovery_model = None;
         }
         if let Some(episode) = self.eligible_episode() {
             let mut prior = episode.request_frame.prior_user_rounds.clone();
@@ -256,6 +259,7 @@ impl CompletionReviewState {
         self.handoff = None;
         self.replacement_answer_required = false;
         self.main_task_id = None;
+        self.recovery_model = None;
     }
 
     pub(crate) fn begin_review(&mut self, automatic: bool) -> Option<ReviewTicket> {
@@ -292,6 +296,7 @@ impl CompletionReviewState {
         self.clear_operations();
         self.main_task_id = None;
         self.replacement_answer_required = false;
+        self.recovery_model = None;
     }
 
     pub(crate) fn from_rollout(value: &serde_json::Value) -> Option<Self> {

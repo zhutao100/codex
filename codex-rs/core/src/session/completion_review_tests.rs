@@ -507,10 +507,16 @@ async fn completion_review_directory_rejection_preserves_the_pending_checkpoint(
 
 #[tokio::test]
 async fn completion_review_model_override_retargets_only_pending_main_work_durably() {
-    for (target, previously_selected) in [
-        (PendingContinuationTarget::Regular, false),
-        (PendingContinuationTarget::Regular, true),
-        (PendingContinuationTarget::PostTurnCompletionReview, false),
+    for (target, previously_selected, steered) in [
+        (PendingContinuationTarget::Regular, false, false),
+        (PendingContinuationTarget::Regular, true, false),
+        (PendingContinuationTarget::Regular, false, true),
+        (PendingContinuationTarget::Regular, true, true),
+        (
+            PendingContinuationTarget::PostTurnCompletionReview,
+            false,
+            false,
+        ),
     ] {
         let (session, context) = completed_session().await;
         let model = if context.model_info.slug == "gpt-5.4" {
@@ -557,11 +563,29 @@ async fn completion_review_model_override_retargets_only_pending_main_work_durab
         session
             .set_pending_continuation(Some(checkpoint.clone()))
             .await;
+        if steered {
+            assert!(
+                session
+                    .start_completion_review_main_task("main-followup")
+                    .await
+            );
+            let revision = session
+                .accept_completion_review_input(&steer_text_input("preserve the public API"), false)
+                .await;
+            assert!(
+                session
+                    .install_completion_review_input(&context, revision, true)
+                    .await
+            );
+        }
         let (_home, path) = attach_recorder(&session, &context).await;
         let mut expected = session.state.lock().await.completion_review.clone();
         let mut expected_checkpoint = checkpoint;
         if target == PendingContinuationTarget::Regular {
-            expected.handoff.as_mut().unwrap().model = model.into();
+            expected.recovery_model = Some(model.into());
+            if let Some(handoff) = expected.handoff.as_mut() {
+                handoff.model = model.into();
+            }
             expected_checkpoint.model = Some(model.into());
         }
         super::super::handlers::override_turn_context(
@@ -630,16 +654,31 @@ async fn completion_review_replay_distinguishes_prepared_started_and_reviewer() 
         .await
         .unwrap();
     let started = session.state.lock().await.completion_review.clone();
-    let replay = session
-        .reconstruct_history_from_rollout(&context, &[metadata(&started)])
-        .await;
-    assert_eq!(replay.completion_review, Some(started));
-    let checkpoint = replay.pending_continuation.unwrap();
-    assert_eq!(checkpoint.target, PendingContinuationTarget::Regular);
-    assert_eq!(
-        checkpoint.continued_from_turn_id.as_deref(),
-        Some("started-main")
-    );
+    for legacy in [false, true] {
+        let mut expected = started.clone();
+        let mut value = serde_json::to_value(&started).unwrap();
+        if legacy {
+            value.as_object_mut().unwrap().remove("recovery_model");
+            expected.recovery_model = None;
+        }
+        let replay = session
+            .reconstruct_history_from_rollout(
+                &context,
+                &[RolloutItem::PostTurnCompletionReviewState(value)],
+            )
+            .await;
+        assert_eq!(replay.completion_review, Some(expected));
+        assert_eq!(
+            replay.pending_continuation,
+            Some(PendingContinuation {
+                source: TurnContinuationSource::Interrupted,
+                continued_from_turn_id: Some("started-main".into()),
+                model: Some(context.model_info.slug.clone()),
+                pause_reason: None,
+                target: PendingContinuationTarget::Regular,
+            })
+        );
+    }
 }
 
 #[tokio::test]

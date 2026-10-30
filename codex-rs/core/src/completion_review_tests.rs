@@ -133,15 +133,18 @@ fn separate_user_task_keeps_only_previous_terminal_answer() {
 fn steering_a_review_followup_retains_the_known_previous_answer_as_context() {
     let mut state = completed_state();
     state.main_task_id = Some("review-followup".into());
+    state.recovery_model = Some("recovery-model".into());
     state.replacement_answer_required = true;
     let revision = state.accept_input(false, text_input("use option two from that answer"), None);
     consume(&mut state, revision);
     assert!(state.replacement_answer_required);
+    assert_eq!(state.recovery_model.as_deref(), Some("recovery-model"));
     state.capture(
         "amended".into(),
         PathBuf::new(),
         "complete amended result".into(),
     );
+    assert!(state.recovery_model.is_none());
     let episode = state.episode.unwrap();
     assert_eq!(
         episode.request_frame.prior_user_rounds,
@@ -176,9 +179,11 @@ fn accepted_but_unconsumed_input_invalidates_ticket_and_capture() {
 #[test]
 fn repeated_identical_user_text_still_invalidates_ticket() {
     let mut state = completed_state();
+    state.recovery_model = Some("previous-recovery-model".into());
     let ticket = state.begin_review(false).unwrap();
     state.accept_input(true, text_input("implement X and explain Y"), None);
     assert!(!state.ticket_is_current(&ticket));
+    assert!(state.recovery_model.is_none());
 }
 
 #[test]
@@ -222,12 +227,14 @@ fn new_request_gets_a_new_allowance() {
 #[test]
 fn branch_generation_invalidates_old_work_without_changing_candidate() {
     let mut state = completed_state();
+    state.recovery_model = Some("previous-recovery-model".into());
     let ticket = state.begin_review(false).unwrap();
     let text = state.episode.as_ref().unwrap().final_agent_message.clone();
     state.rebranch();
     assert!(!state.ticket_is_current(&ticket));
     assert_eq!(state.eligible_episode().unwrap().final_agent_message, text);
     assert!(state.attempt.is_none());
+    assert!(state.recovery_model.is_none());
 }
 
 #[test]

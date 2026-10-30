@@ -238,14 +238,19 @@ impl Session {
                 pause_reason: None,
                 target: PendingContinuationTarget::Regular,
             });
-        let interrupted_main_model = if pending_notes {
-            Some(turn_context.model_info.slug.clone())
-        } else {
-            current_metadata
-                .previous_turn_settings
-                .as_ref()
-                .map(|settings| settings.model.clone())
-        };
+        let interrupted_main_model = completion_review
+            .as_ref()
+            .and_then(|review| review.recovery_model.clone())
+            .or_else(|| {
+                if pending_notes {
+                    Some(turn_context.model_info.slug.clone())
+                } else {
+                    current_metadata
+                        .previous_turn_settings
+                        .as_ref()
+                        .map(|settings| settings.model.clone())
+                }
+            });
         if let Some(review) = completion_review.as_ref()
             && !review.pending_inputs.is_empty()
         {
@@ -281,7 +286,9 @@ impl Session {
                     pending_continuation = Some(PendingContinuation {
                         source: TurnContinuationSource::Interrupted,
                         continued_from_turn_id: Some(turn_id.clone()),
-                        model: review.handoff.as_ref().map(|handoff| handoff.model.clone()),
+                        model: review.recovery_model.clone().or_else(|| {
+                            review.handoff.as_ref().map(|handoff| handoff.model.clone())
+                        }),
                         pause_reason: None,
                         target: PendingContinuationTarget::Regular,
                     });

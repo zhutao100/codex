@@ -179,15 +179,18 @@ impl Session {
             return;
         };
         checkpoint.model = Some(model.to_string());
-        let Some(handoff) = state.completion_review.handoff.as_mut().filter(|handoff| {
+        if !state.completion_review.replacement_answer_required {
+            return;
+        }
+        state.completion_review.recovery_model = Some(model.to_string());
+        if let Some(handoff) = state.completion_review.handoff.as_mut().filter(|handoff| {
             matches!(
                 handoff.disposition,
                 ReviewHandoffDisposition::Started { .. }
             )
-        }) else {
-            return;
-        };
-        model.clone_into(&mut handoff.model);
+        }) {
+            model.clone_into(&mut handoff.model);
+        }
         drop(state);
         self.persist_completion_review_locked().await;
     }
@@ -479,6 +482,7 @@ impl Session {
             pause_reason: None,
             target: PendingContinuationTarget::Regular,
         };
+        review.recovery_model = checkpoint.model.clone();
         review.replacement_answer_required = true;
         drop(state);
         self.persist_completion_review_locked()

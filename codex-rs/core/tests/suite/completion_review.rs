@@ -453,6 +453,142 @@ async fn human_clarification_prevents_an_incomplete_request_from_being_declared_
     Ok(())
 }
 
+#[test_case::test_case(false; "paused")]
+#[test_case::test_case(true; "budget stopped")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn steered_followup_recovery_model_survives_restart(
+    budget_stopped: bool,
+) -> anyhow::Result<()> {
+    skip_if_no_network_unless_localhost!(Ok(()));
+    let server = MockServer::start().await;
+    let requests = mount_response_sequence(
+        &server,
+        vec![
+            sse_response(answer("Original complete answer.")),
+            sse_response(verdict("Verify and replace the complete answer.", true)),
+            sse_response(answer("Intermediate result before consuming steering."))
+                .set_delay(std::time::Duration::from_secs(5)),
+            sse_response(answer("Complete amended replacement.")),
+            sse_response(verdict("Checked the complete amended request.", false)),
+        ],
+    )
+    .await;
+    let home = Arc::new(TempDir::new()?);
+    let codex = new_conversation_for_server(&server, home.clone(), configure_recovery_models).await;
+    let original_request = "Complete the original user scope.";
+    submit_request(&codex, original_request).await;
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    codex.submit(Op::ReviewCompletedTurn).await?;
+    wait_for_captured_requests(&requests, 3).await;
+    let path = codex.rollout_path().context("expected rollout path")?;
+    let started = completion_state(&path)?;
+    let amendment = "Preserve the public API exactly.\n".repeat(2_000);
+    codex
+        .submit(Op::SteerInput {
+            expected_turn_id: started["main_task_id"]
+                .as_str()
+                .context("expected main owner")?
+                .into(),
+            items: vec![UserInput::Text {
+                text: amendment.clone(),
+                text_elements: vec![],
+            }],
+            client_user_message_id: Some("recovery-model-amendment".into()),
+        })
+        .await?;
+    if budget_stopped {
+        wait_for_event(&codex, |event| match event {
+            EventMsg::Error(event) => {
+                assert!(event.message.contains("Review follow-up context exceeds"));
+                true
+            }
+            _ => false,
+        })
+        .await;
+        wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    } else {
+        codex.submit(Op::Pause).await?;
+        wait_for_event(&codex, |event| match event {
+            EventMsg::Error(event) => panic!("steering failed: {}", event.message),
+            EventMsg::TurnPaused(_) => true,
+            _ => false,
+        })
+        .await;
+    }
+    let stopped = completion_state(&path)?;
+    assert!(stopped["handoff"].is_null());
+    assert_eq!(stopped["replacement_answer_required"], true);
+    codex
+        .submit(context_override(None, Some("completion-recovery-large")))
+        .await?;
+    codex.submit(Op::Shutdown).await?;
+    wait_for_event(&codex, |event| matches!(event, EventMsg::ShutdownComplete)).await;
+    let resumed =
+        resume_conversation_for_server(&server, home.clone(), path, configure_recovery_models)
+            .await;
+    resumed.submit(Op::Continue).await?;
+    wait_for_event(&resumed, |event| match event {
+        EventMsg::Error(event) => panic!("amended recovery failed: {}", event.message),
+        EventMsg::TurnComplete(event) => {
+            assert_eq!(
+                event.last_agent_message.as_deref(),
+                Some("Complete amended replacement.")
+            );
+            true
+        }
+        _ => false,
+    })
+    .await;
+    resumed.submit(Op::ReviewCompletedTurn).await?;
+    wait_for_event(&resumed, |event| {
+        matches!(event, EventMsg::ExitedReviewMode(_))
+    })
+    .await;
+    wait_for_event(&resumed, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    let captured = requests.requests();
+    assert_eq!(captured.len(), 5);
+    assert_eq!(
+        captured[3].body_json()["model"],
+        "completion-recovery-large"
+    );
+    let input = captured[3].input();
+    let instructions = input
+        .iter()
+        .filter(|item| item["role"] == "developer")
+        .find_map(|item| {
+            item["content"][0]["text"]
+                .as_str()
+                .filter(|text| text.contains("Consumed user request context (host snapshot):\n"))
+        })
+        .context("expected exact amended scope")?;
+    assert!(instructions.contains("self-contained final answer"));
+    let (_, frame) = instructions
+        .split_once("Consumed user request context (host snapshot):\n")
+        .context("expected request snapshot")?;
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(frame)?,
+        serde_json::json!({
+            "prior_user_rounds": [{
+                "user_messages": [original_request],
+                "final_agent_message": "Original complete answer.",
+            }],
+            "current_user_messages": [amendment],
+            "text_only": true,
+            "exact": true,
+        })
+    );
+    let review = packet(&captured[4]);
+    for required in [
+        original_request,
+        amendment.as_str(),
+        "Complete amended replacement.",
+    ] {
+        assert!(review.contains(required), "missing amended review scope");
+    }
+    server.verify().await;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn completed_snapshot_resumes_without_persisted_turn_complete_events() {
     skip_if_no_network_unless_localhost!();
