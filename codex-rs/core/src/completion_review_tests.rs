@@ -67,6 +67,25 @@ fn ten_followups_keep_frozen_request_and_initial_reference() {
 }
 
 #[test]
+fn replacement_candidate_tracks_the_actual_completion_directory() {
+    let mut state = completed_state();
+    state.begin_review(true).unwrap();
+    let mut expected = state.episode.clone().unwrap();
+    expected.turn_id = "replacement".into();
+    expected.cwd = PathBuf::from("/tmp/other-project");
+    expected.final_agent_message = "replacement from the actual task directory".into();
+    state.capture(
+        expected.turn_id.clone(),
+        expected.cwd.clone(),
+        expected.final_agent_message.clone(),
+    );
+    assert_eq!(state.eligible_episode(), Some(&expected));
+    let restored =
+        CompletionReviewState::from_rollout(&serde_json::to_value(&state).unwrap()).unwrap();
+    assert_eq!(restored, state);
+}
+
+#[test]
 fn steering_is_owned_by_current_request_not_a_fake_completed_round() {
     let mut state = CompletionReviewState::default();
     let first = state.accept_input(true, text_input("original"), None);

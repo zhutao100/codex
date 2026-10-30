@@ -280,7 +280,18 @@ pub async fn continue_last(sess: &Arc<Session>, sub_id: String) {
     {
         sess.set_pending_continuation(Some(checkpoint)).await;
     }
-    let Some(checkpoint) = sess.take_pending_continuation().await else {
+    let checkpoint = match sess.take_pending_continuation().await {
+        Ok(checkpoint) => checkpoint,
+        Err(error) => {
+            sess.send_event_raw(Event {
+                id: sub_id,
+                msg: EventMsg::Error(error.to_error_event(None)),
+            })
+            .await;
+            return;
+        }
+    };
+    let Some(checkpoint) = checkpoint else {
         sess.send_event_raw(Event {
             id: sub_id,
             msg: EventMsg::Error(ErrorEvent {

@@ -2354,9 +2354,25 @@ impl Session {
             .await;
     }
 
-    async fn take_pending_continuation(&self) -> Option<PendingContinuation> {
+    async fn take_pending_continuation(&self) -> Result<Option<PendingContinuation>, CodexErr> {
         let mut state = self.state.lock().await;
-        state.pending_continuation.take()
+        if state
+            .pending_continuation
+            .as_ref()
+            .is_some_and(|checkpoint| checkpoint.target == PendingContinuationTarget::Regular)
+            && state.completion_review.replacement_answer_required
+            && state
+                .completion_review
+                .episode
+                .as_ref()
+                .is_none_or(|episode| episode.cwd != state.session_configuration.cwd)
+        {
+            return Err(CodexErr::UnsupportedOperation(
+                "Cannot continue review-derived main work in a different working directory. Return to the completed task's directory and use /continue, or start a new request for the current directory."
+                    .into(),
+            ));
+        }
+        Ok(state.pending_continuation.take())
     }
 
     pub(crate) async fn set_pending_continuation(

@@ -14,6 +14,7 @@
 ## Completion Boundaries
 
 - Capture only the successful main task's returned nonempty `last_agent_message`, never the last assistant-role history item.
+- Capture the actual completed task's CWD on every candidate, including replacements within an existing episode. A configuration-only directory change does not retarget the candidate.
 - A main task has an explicit owner ID. A late callback cannot install its answer under a newer task's request frame.
 - Accepted input immediately invalidates an outstanding ticket. Only input consumed by subsequent main work joins the request frame.
 - Original input and consumed steering belong together; assistant progress between them does not create a completed prior round.
@@ -26,7 +27,7 @@
 
 - Generation and accepted/consumed request revisions.
 - Frozen known user context, original pending input payloads, client IDs, exact model-facing message bodies and their installation phases.
-- Initial historical reference, exact candidate, completion ID and automatic-attempt count.
+- Initial historical reference, exact candidate, completion ID, actual completed-task CWD and automatic-attempt count.
 - Current review ticket and optional prepared/started handoff with advisory text.
 - Main-task ownership, advisory-installation state and replacement-answer requirement.
 
@@ -67,7 +68,7 @@ Manual reservation joins the task lifecycle before selecting work, including the
 |Explicit model change during recovery|Retarget pending regular work and persist its started handoff's destination. Keep request/candidate snapshots, paused reviewer ownership and the notes capture's source model unchanged.|
 |Rollback/history replacement|Invalidate uncertain provenance and pending operations; never retain a future candidate.|
 |Fork|Recover only eligible metadata before the selected surviving user boundary; renew generation and clear delegate/main scheduling state. Metadata for an excluded next user must not retarget the fork.|
-|CWD change|Review the completed task's directory. Do not prepare or claim a main handoff into a different current project.|
+|CWD change|Review the latest candidate's actual task directory. Enforce the same CWD when preparing, claiming or resuming review-derived main work, including pause, budget recovery and restart. Reject a mismatched resume before consuming its checkpoint or starting a task; returning to the original directory permits retry. Ordinary non-review continuation is not restricted by this review-specific rule.|
 
 These are scheduling/ownership guarantees, not exactly-once tool or model side effects across process failures.
 

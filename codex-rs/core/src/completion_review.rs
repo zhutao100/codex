@@ -237,6 +237,7 @@ impl CompletionReviewState {
             && episode.history_generation == self.history_generation
         {
             episode.turn_id = turn_id;
+            episode.cwd = cwd;
             episode.final_agent_message = text;
         } else {
             self.episode = Some(CompletedTurnForReview {

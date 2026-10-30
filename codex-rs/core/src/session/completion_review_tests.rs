@@ -258,6 +258,70 @@ async fn completion_review_handoff_is_claimed_once_and_survives_compaction() {
 }
 
 #[tokio::test]
+async fn completion_review_directory_rejection_preserves_the_pending_checkpoint() {
+    for review_derived in [false, true] {
+        let (session, context) = completed_session().await;
+        let checkpoint = if review_derived {
+            let ticket = session.begin_completion_review(false).await.unwrap();
+            assert!(
+                session
+                    .prepare_completion_review_handoff(
+                        &ticket,
+                        "advisory and replacement contract".into(),
+                        context.model_info.slug.clone(),
+                    )
+                    .await
+            );
+            session
+                .claim_completion_review_handoff(&ticket, "main-followup")
+                .await
+                .unwrap()
+        } else {
+            PendingContinuation {
+                source: TurnContinuationSource::Interrupted,
+                continued_from_turn_id: Some(context.sub_id.clone()),
+                model: Some(context.model_info.slug.clone()),
+                pause_reason: None,
+                target: PendingContinuationTarget::Regular,
+            }
+        };
+        session
+            .set_pending_continuation(Some(checkpoint.clone()))
+            .await;
+        let before = session.state.lock().await.completion_review.clone();
+        session
+            .update_settings(SessionSettingsUpdate {
+                cwd: Some(context.cwd.join("other-project")),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        if review_derived {
+            assert!(matches!(
+                session.take_pending_continuation().await,
+                Err(CodexErr::UnsupportedOperation(_))
+            ));
+            {
+                let state = session.state.lock().await;
+                assert_eq!(state.completion_review, before);
+                assert_eq!(state.pending_continuation.as_ref(), Some(&checkpoint));
+            }
+            session
+                .update_settings(SessionSettingsUpdate {
+                    cwd: Some(context.cwd.clone()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            session.take_pending_continuation().await.unwrap(),
+            Some(checkpoint)
+        );
+    }
+}
+
+#[tokio::test]
 async fn completion_review_model_override_retargets_only_pending_main_work_durably() {
     for (target, previously_selected) in [
         (PendingContinuationTarget::Regular, false),
@@ -639,7 +703,7 @@ async fn completion_review_fork_excludes_metadata_for_the_next_unconsumed_user_b
         vec!["original request"]
     );
     assert_ne!(fork.history_generation, next.history_generation);
-    assert!(session.take_pending_continuation().await.is_none());
+    assert!(session.take_pending_continuation().await.unwrap().is_none());
     let _ = context;
 }
 
@@ -1169,7 +1233,7 @@ async fn completion_review_stop_joins_finalization_after_active_entry_is_removed
         );
         assert!(review.attempt.is_none());
         assert!(review.handoff.is_none());
-        assert!(session.take_pending_continuation().await.is_none());
+        assert!(session.take_pending_continuation().await.unwrap().is_none());
     }
 }
 

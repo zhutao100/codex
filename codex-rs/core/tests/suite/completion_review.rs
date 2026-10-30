@@ -66,6 +66,32 @@ fn compacted_answer() -> String {
     ])
 }
 
+fn context_override(cwd: Option<PathBuf>, model: Option<&str>) -> Op {
+    Op::OverrideTurnContext {
+        cwd,
+        approval_policy: None,
+        sandbox_policy: None,
+        windows_sandbox_level: None,
+        model: model.map(str::to_owned),
+        effort: None,
+        summary: None,
+        collaboration_mode: None,
+        personality: None,
+        service_tier: None,
+    }
+}
+
+fn completion_state(path: &std::path::Path) -> anyhow::Result<serde_json::Value> {
+    read_rollout_lines(path)
+        .into_iter()
+        .rev()
+        .find_map(|line| match line.item {
+            RolloutItem::PostTurnCompletionReviewState(state) => Some(state),
+            _ => None,
+        })
+        .context("expected completion-review state")
+}
+
 #[expect(clippy::expect_used)]
 fn packet(request: &ResponsesRequest) -> String {
     request
@@ -482,18 +508,7 @@ async fn review_followup_budget_recovery_preserves_scope(
     assert_eq!(requests.requests().len(), 2);
     if select_larger_model {
         codex
-            .submit(Op::OverrideTurnContext {
-                cwd: None,
-                approval_policy: None,
-                sandbox_policy: None,
-                windows_sandbox_level: None,
-                model: Some("completion-recovery-large".into()),
-                effort: None,
-                summary: None,
-                collaboration_mode: None,
-                personality: None,
-                service_tier: None,
-            })
+            .submit(context_override(None, Some("completion-recovery-large")))
             .await?;
     } else {
         codex.submit(Op::Compact).await?;
@@ -656,6 +671,142 @@ async fn stopped_review_followup_survives_standalone_compaction_and_restart(
             assert!(input.contains(text), "missing {text:?}; restart={restart}");
         }
         assert!(!input.contains("Cancelled output"));
+        server.verify().await;
+    }
+    Ok(())
+}
+
+#[test_case::test_case(false; "paused")]
+#[test_case::test_case(true; "budget stopped")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_followup_directory_ownership_survives_pause_and_restart(
+    budget_stopped: bool,
+) -> anyhow::Result<()> {
+    skip_if_no_network_unless_localhost!(Ok(()));
+    for restart in [false, true] {
+        let server = MockServer::start().await;
+        let initial = if budget_stopped {
+            "Exact candidate details.\n".repeat(1_500)
+        } else {
+            "Original complete answer.".into()
+        };
+        let mut replies = vec![
+            sse_response(answer(&initial)),
+            sse_response(verdict("Verify and replace the complete answer.", true)),
+        ];
+        if !budget_stopped {
+            replies.push(
+                sse_response(answer("Paused output must not be installed."))
+                    .set_delay(std::time::Duration::from_secs(5)),
+            );
+        }
+        replies.push(sse_response(answer(
+            "Complete replacement in the original project.",
+        )));
+        replies.push(sse_response(verdict(
+            "Checked the original project.",
+            false,
+        )));
+        let requests = mount_response_sequence(&server, replies).await;
+        let home = Arc::new(TempDir::new()?);
+        let original_cwd = home.path().join("workspace");
+        let other_cwd = home.path().join("other-project");
+        for (cwd, instructions) in [
+            (&original_cwd, "ORIGINAL_PROJECT_OWNERSHIP"),
+            (&other_cwd, "OTHER_PROJECT_OWNERSHIP"),
+        ] {
+            tokio::fs::create_dir_all(cwd).await?;
+            tokio::fs::write(cwd.join("AGENTS.md"), instructions).await?;
+        }
+        let codex =
+            new_conversation_for_server(&server, home.clone(), configure_recovery_models).await;
+        submit_request(&codex, "Finish the original project request.").await;
+        wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+        codex.submit(Op::ReviewCompletedTurn).await?;
+        let request_count = if budget_stopped {
+            wait_for_event(&codex, |event| {
+                matches!(event, EventMsg::Error(error)
+                    if error.message.contains("Review follow-up context exceeds"))
+            })
+            .await;
+            wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+            2
+        } else {
+            wait_for_captured_requests(&requests, 3).await;
+            codex.submit(Op::Pause).await?;
+            wait_for_event(&codex, |event| matches!(event, EventMsg::TurnPaused(_))).await;
+            3
+        };
+        let path = codex.rollout_path().context("expected rollout path")?;
+        let before = completion_state(&path)?;
+        codex
+            .submit(context_override(Some(other_cwd.clone()), None))
+            .await?;
+        let active = if restart {
+            codex.submit(Op::Shutdown).await?;
+            wait_for_event(&codex, |event| matches!(event, EventMsg::ShutdownComplete)).await;
+            resume_conversation_for_server(&server, home.clone(), path.clone(), move |config| {
+                configure_recovery_models(config);
+                config.cwd = other_cwd;
+            })
+            .await
+        } else {
+            codex
+        };
+        active.submit(Op::Continue).await?;
+        let event = wait_for_event(&active, |event| {
+            matches!(
+                event,
+                EventMsg::Error(_) | EventMsg::TurnStarted(_) | EventMsg::TurnContinued(_)
+            )
+        })
+        .await;
+        assert!(
+            matches!(event, EventMsg::Error(error)
+                if error.message.contains("working directory")
+                    && error.codex_error_info == Some(codex_protocol::protocol::CodexErrorInfo::BadRequest)),
+            "cross-directory work must be rejected before task startup; restart={restart}"
+        );
+        assert_eq!(requests.requests().len(), request_count);
+        assert_eq!(completion_state(&path)?, before);
+        active
+            .submit(context_override(
+                Some(original_cwd.clone()),
+                budget_stopped.then_some("completion-recovery-large"),
+            ))
+            .await?;
+        active.submit(Op::Continue).await?;
+        wait_for_event(&active, |event| match event {
+            EventMsg::Error(error) => {
+                panic!("original-directory recovery failed: {}", error.message)
+            }
+            EventMsg::TurnComplete(event) => {
+                assert_eq!(
+                    event.last_agent_message.as_deref(),
+                    Some("Complete replacement in the original project.")
+                );
+                true
+            }
+            _ => false,
+        })
+        .await;
+        assert_eq!(
+            completion_state(&path)?["episode"]["cwd"],
+            serde_json::to_value(&original_cwd)?
+        );
+        active.submit(Op::ReviewCompletedTurn).await?;
+        wait_for_event(&active, |event| {
+            matches!(event, EventMsg::ExitedReviewMode(_))
+        })
+        .await;
+        wait_for_event(&active, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+        let captured = requests.requests();
+        assert_eq!(captured.len(), request_count + 2);
+        let review = captured.last().context("expected final review")?;
+        let input = serde_json::to_string(&review.input())?;
+        assert!(input.contains("ORIGINAL_PROJECT_OWNERSHIP"));
+        assert!(!input.contains("OTHER_PROJECT_OWNERSHIP"));
+        assert!(packet(review).contains("Complete replacement in the original project."));
         server.verify().await;
     }
     Ok(())
