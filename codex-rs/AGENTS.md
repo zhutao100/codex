@@ -8,6 +8,12 @@ When an upstream refresh is explicitly requested, use `git pull --rebase origin 
 
 Thus, the design of the changes target to minimize the potentials of future rebase conflicts.
 
+# Context harness research
+
+- See the [source audit and improvement plans](docs/dev_plans/context_harness/README.md) for the verified context/output/delegation comparison. Keep source revisions and reference-worktree customizations explicit; do not infer this fork's behavior from newer tool descriptions.
+- This backend uses opt-in `collab`, fresh child threads and the `wait` tool; do not copy `fork_context`, `fork_turns` or `wait_agent` into its schema. Explorers do not gain a read-only guarantee from their role name.
+- Trace compaction dispatch before retention. Existing exact work-note carryover and streaming remote compaction are implemented behavior, not missing features; recoverable raw output is a separate proposed contract.
+
 # Agents operation tips
 
 - Always use the shared `cargo-local` wrapper instead of direct `cargo` for local build/check/test/run commands. It uses an external target dir when an agent-created `/Volumes/*/.codex-rs-build-root` marker directory is mounted, and otherwise falls back to the workspace `target/`. Keep its per-worktree target separation when building comparison baselines.

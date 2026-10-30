@@ -24,6 +24,15 @@ Run `just-local fmt` (in `codex-rs` directory) automatically after you have fini
 
 Before finalizing a large change to `codex-rs`, run `just-local fix -p <crate>` (in `codex-rs` directory) to fix linter issues. Scope multiple changed crates with repeated `-p` flags instead of defaulting to a workspace-wide Clippy build.
 
+## Codebase Research
+
+- `codex-rs/` is a subdirectory of the Git root. For cross-worktree or historical inspection, resolve the root and use `git -C "$repo"` with root-relative paths; confirm the selected paths exist before interpreting empty output.
+- Pin source revisions and check actual worktree branches. A customized reference worktree is not necessarily pristine upstream, and a directory name does not identify its checkout.
+- Reuse a small layout overview, then scope to the relevant crate/module. Prefer candidate filenames or filenames-only content search before expanding matching lines; index large files narrowly with `ctags`/`sg`.
+- `rg -m N` bounds matches per file, not the whole response. Inspect wrapper omission metadata and budget combined command output; capped/annotated views are not exhaustive machine inputs.
+- Trace tool/model/configuration gates, caller limits, history insertion and final request projection before making claims about runtime defaults. Source presence and prompt wording do not prove effective availability or enforcement.
+- Research-only documentation changes need reference/link checks and focused contract probes, not an unrelated Rust rebuild. Runtime/model-performance claims need actual end-to-end evidence, with scripted fixtures and live evaluations reported separately.
+
 ## TUI style conventions
 
 See `codex-rs/tui/styles.md`.
