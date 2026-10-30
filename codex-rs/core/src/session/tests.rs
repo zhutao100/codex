@@ -52,6 +52,8 @@ use pretty_assertions::assert_eq;
 
 #[path = "compaction_tests.rs"]
 mod compaction;
+#[path = "completion_review_tests.rs"]
+mod completion_review;
 use serde::Deserialize;
 use serde_json::json;
 use std::path::PathBuf;
@@ -276,6 +278,7 @@ async fn rollout_reconstruction_restores_reference_context_item_after_regular_tu
     assert_eq!(
         reconstructed,
         ReconstructedRollout {
+            completion_review: None,
             history,
             reference_context_item: Some(context_item.clone()),
             previous_turn_settings: Some(PreviousTurnSettings {
@@ -299,6 +302,7 @@ async fn rollout_reconstruction_does_not_commit_bare_context() {
     assert_eq!(
         reconstructed,
         ReconstructedRollout {
+            completion_review: None,
             history: Vec::new(),
             reference_context_item: None,
             previous_turn_settings: None,
@@ -324,6 +328,7 @@ async fn rollout_reconstruction_does_not_commit_contextual_user_message() {
     assert_eq!(
         reconstructed,
         ReconstructedRollout {
+            completion_review: None,
             history: vec![work_notes],
             reference_context_item: None,
             previous_turn_settings: None,
@@ -376,6 +381,7 @@ async fn rollout_reconstruction_review_output_does_not_commit_previous_settings(
     assert_eq!(
         reconstructed,
         ReconstructedRollout {
+            completion_review: None,
             history: expected_history,
             reference_context_item: Some(review_context),
             previous_turn_settings: Some(PreviousTurnSettings {
@@ -409,6 +415,7 @@ async fn rollout_reconstruction_clears_reference_context_item_after_legacy_compa
     assert_eq!(
         reconstructed,
         ReconstructedRollout {
+            completion_review: None,
             history: expected_history,
             reference_context_item: None,
             previous_turn_settings: Some(PreviousTurnSettings {
@@ -444,6 +451,7 @@ async fn rollout_reconstruction_ignores_adjacent_context_after_legacy_compaction
     assert_eq!(
         reconstructed,
         ReconstructedRollout {
+            completion_review: None,
             history: expected_history,
             reference_context_item: None,
             previous_turn_settings: Some(PreviousTurnSettings {
@@ -478,6 +486,7 @@ async fn rollout_reconstruction_restores_reference_context_item_after_replacemen
     assert_eq!(
         reconstructed,
         ReconstructedRollout {
+            completion_review: None,
             history: replacement_history,
             reference_context_item: Some(compacted_context.clone()),
             previous_turn_settings: Some(PreviousTurnSettings {
@@ -516,6 +525,7 @@ async fn rollout_reconstruction_suppresses_standalone_compaction_continuation() 
     assert_eq!(
         reconstructed,
         ReconstructedRollout {
+            completion_review: None,
             history: replacement_history,
             reference_context_item: None,
             previous_turn_settings: Some(PreviousTurnSettings {
@@ -552,6 +562,7 @@ async fn rollout_reconstruction_thread_rollback_recomputes_reference_context_ite
     assert_eq!(
         reconstructed,
         ReconstructedRollout {
+            completion_review: None,
             history: surviving_history,
             reference_context_item: Some(first_context.clone()),
             previous_turn_settings: Some(PreviousTurnSettings {
@@ -584,6 +595,7 @@ async fn rollout_reconstruction_thread_rollback_ignores_bare_context() {
     assert_eq!(
         reconstructed,
         ReconstructedRollout {
+            completion_review: None,
             history: Vec::new(),
             reference_context_item: None,
             previous_turn_settings: None,
@@ -629,6 +641,7 @@ async fn rollout_reconstruction_thread_rollback_restores_compaction_epoch_metada
     assert_eq!(
         reconstructed,
         ReconstructedRollout {
+            completion_review: None,
             history: replacement_history,
             reference_context_item: None,
             previous_turn_settings: Some(PreviousTurnSettings {
@@ -676,6 +689,7 @@ async fn rollout_reconstruction_thread_rollback_crossing_compaction_clears_metad
     assert_eq!(
         reconstructed,
         ReconstructedRollout {
+            completion_review: None,
             history: Vec::new(),
             reference_context_item: None,
             previous_turn_settings: None,
@@ -1856,6 +1870,8 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         pending_mcp_server_refresh_config: Mutex::new(None),
         active_turn: Mutex::new(None),
         compaction_installation: Arc::new(Mutex::new(())),
+        completion_review_installation: Arc::new(Mutex::new(())),
+        task_lifecycle: Mutex::new(()),
         services,
         next_internal_sub_id: AtomicU64::new(0),
     };
@@ -1996,6 +2012,8 @@ pub(crate) async fn make_session_and_context_with_rx() -> (
         pending_mcp_server_refresh_config: Mutex::new(None),
         active_turn: Mutex::new(None),
         compaction_installation: Arc::new(Mutex::new(())),
+        completion_review_installation: Arc::new(Mutex::new(())),
+        task_lifecycle: Mutex::new(()),
         services,
         next_internal_sub_id: AtomicU64::new(0),
     });
@@ -2170,6 +2188,7 @@ async fn steer_input_accepts_regular_active_turn() {
         vec![TurnInput::UserInput {
             content: input,
             client_id: None,
+            review_revision: Some(2),
         }]
     );
 }
@@ -2191,6 +2210,7 @@ async fn steer_input_accepts_matching_expected_turn_id() {
         vec![TurnInput::UserInput {
             content: input,
             client_id: None,
+            review_revision: Some(2),
         }]
     );
 }
@@ -2308,6 +2328,7 @@ async fn abort_empty_active_turn_preserves_pending_input() {
     let expected = TurnInput::UserInput {
         content: steer_text_input("pending steer"),
         client_id: None,
+        review_revision: None,
     };
     turn_state.lock().await.push_pending_input(expected.clone());
     *sess.active_turn.lock().await = Some(active_turn);
@@ -2327,10 +2348,12 @@ async fn turn_scoped_pending_input_drain_does_not_touch_replacement_turn() {
     let original_pending = TurnInput::UserInput {
         content: steer_text_input("original pending"),
         client_id: None,
+        review_revision: None,
     };
     let replacement_pending = TurnInput::UserInput {
         content: steer_text_input("replacement pending"),
         client_id: None,
+        review_revision: None,
     };
     original_turn_state
         .lock()
@@ -2488,163 +2511,6 @@ async fn task_finish_emits_turn_item_lifecycle_for_leftover_pending_user_input()
             .iter()
             .any(|item| item == &expected_response_item),
         "expected pending user input to be persisted into history on turn completion"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn regular_task_completion_stores_completed_turn_for_review() {
-    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
-    let input = vec![
-        UserInput::Text {
-            text: "first user message".to_string(),
-            text_elements: Vec::new(),
-        },
-        UserInput::Image {
-            image_url: "data:image/png;base64,aaa".to_string(),
-        },
-        UserInput::Text {
-            text: "second user message".to_string(),
-            text_elements: Vec::new(),
-        },
-    ];
-    sess.spawn_task(
-        Arc::clone(&tc),
-        input,
-        NeverEndingTask {
-            kind: TaskKind::Regular,
-            listen_to_cancellation_token: false,
-        },
-    )
-    .await;
-
-    sess.on_task_finished(
-        Arc::clone(&tc),
-        Some("final assistant message".to_string()),
-        TaskKind::Regular,
-    )
-    .await;
-
-    assert_eq!(
-        sess.last_completed_regular_turn_for_review().await,
-        Some(CompletedTurnForReview {
-            turn_id: tc.sub_id.clone(),
-            cwd: tc.cwd.clone(),
-            interaction_history: vec![CompletedTurnReviewRound {
-                user_messages: vec![
-                    "first user message".to_string(),
-                    "second user message".to_string()
-                ],
-                final_agent_message: "final assistant message".to_string(),
-            }],
-            user_messages: vec![
-                "first user message".to_string(),
-                "second user message".to_string()
-            ],
-            final_agent_message: "final assistant message".to_string(),
-        })
-    );
-}
-
-#[test]
-fn completed_turn_reconstruction_uses_user_and_final_assistant_text() {
-    let cwd = PathBuf::from("/tmp/project");
-    let history = vec![
-        DeveloperInstructions::new("developer note").into(),
-        user_message("implement the feature"),
-        ResponseItem::FunctionCall {
-            id: None,
-            name: "shell".to_string(),
-            arguments: "{}".to_string(),
-            call_id: "call-1".to_string(),
-        },
-        ResponseItem::FunctionCallOutput {
-            call_id: "call-1".to_string(),
-            output: FunctionCallOutputPayload::from_text("tool output".to_string()),
-        },
-        assistant_message("done"),
-    ];
-
-    assert_eq!(
-        completed_turn_for_review_from_history(&history, cwd.clone()),
-        Some(CompletedTurnForReview {
-            turn_id: "reconstructed-1-4".to_string(),
-            cwd,
-            interaction_history: vec![CompletedTurnReviewRound {
-                user_messages: vec!["implement the feature".to_string()],
-                final_agent_message: "done".to_string(),
-            }],
-            user_messages: vec!["implement the feature".to_string()],
-            final_agent_message: "done".to_string(),
-        })
-    );
-}
-
-#[test]
-fn completed_turn_reconstruction_skips_review_synthetic_turn() {
-    let cwd = PathBuf::from("/tmp/project");
-    let history = vec![
-        user_message("real request"),
-        assistant_message("real response"),
-        user_message(
-            "<user_action>\n  <context>User initiated a review task.</context>\n</user_action>",
-        ),
-        assistant_message("review output"),
-    ];
-
-    assert_eq!(
-        completed_turn_for_review_from_history(&history, cwd.clone()),
-        Some(CompletedTurnForReview {
-            turn_id: "reconstructed-0-1".to_string(),
-            cwd,
-            interaction_history: vec![CompletedTurnReviewRound {
-                user_messages: vec!["real request".to_string()],
-                final_agent_message: "real response".to_string(),
-            }],
-            user_messages: vec!["real request".to_string()],
-            final_agent_message: "real response".to_string(),
-        })
-    );
-}
-
-#[test]
-fn completed_turn_reconstruction_keeps_multi_round_interaction_history() {
-    let cwd = PathBuf::from("/tmp/project");
-    let history = vec![
-        user_message("round one request"),
-        ResponseItem::FunctionCall {
-            id: None,
-            name: "shell".to_string(),
-            arguments: "{}".to_string(),
-            call_id: "call-1".to_string(),
-        },
-        ResponseItem::FunctionCallOutput {
-            call_id: "call-1".to_string(),
-            output: FunctionCallOutputPayload::from_text("tool output".to_string()),
-        },
-        assistant_message("round one final"),
-        user_message("round two request"),
-        assistant_message("round two interim"),
-        assistant_message("round two final"),
-    ];
-
-    assert_eq!(
-        completed_turn_for_review_from_history(&history, cwd.clone()),
-        Some(CompletedTurnForReview {
-            turn_id: "reconstructed-4-6".to_string(),
-            cwd,
-            interaction_history: vec![
-                CompletedTurnReviewRound {
-                    user_messages: vec!["round one request".to_string()],
-                    final_agent_message: "round one final".to_string(),
-                },
-                CompletedTurnReviewRound {
-                    user_messages: vec!["round two request".to_string()],
-                    final_agent_message: "round two final".to_string(),
-                },
-            ],
-            user_messages: vec!["round two request".to_string()],
-            final_agent_message: "round two final".to_string(),
-        })
     );
 }
 

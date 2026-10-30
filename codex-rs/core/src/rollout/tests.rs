@@ -197,11 +197,15 @@ async fn clean_for_continue_uses_compaction_epoch_and_keeps_late_snapshots() -> 
     let snapshot = RolloutItem::ResponseItem(ResponseItem::GhostSnapshot {
         ghost_commit: codex_git::GhostCommit::new("snapshot".into(), None, vec![], vec![]),
     });
+    let review_state = RolloutItem::PostTurnCompletionReviewState(serde_json::to_value(
+        crate::completion_review::CompletionReviewState::default(),
+    )?);
     let items = [
         previous.clone(),
         checkpoint.clone(),
         call("unfinished"),
         snapshot.clone(),
+        review_state.clone(),
     ];
     let text = items
         .into_iter()
@@ -216,7 +220,7 @@ async fn clean_for_continue_uses_compaction_epoch_and_keeps_late_snapshots() -> 
         .collect();
     assert_eq!(
         serde_json::to_value(actual)?,
-        serde_json::to_value(vec![previous, checkpoint, snapshot])?,
+        serde_json::to_value(vec![previous, checkpoint, snapshot, review_state])?,
     );
     assert!(!RolloutRecorder::clean_for_continue(&path, false).await?);
     Ok(())
@@ -227,6 +231,9 @@ async fn clean_for_continue_removes_abort_custom_and_dangling_records() -> Resul
     let temp = TempDir::new().unwrap();
     let path = temp.path().join("rollout.jsonl");
     let conversation_id = ThreadId::from_string(&Uuid::from_u128(7).to_string())?;
+    let review_state = RolloutItem::PostTurnCompletionReviewState(serde_json::to_value(
+        crate::completion_review::CompletionReviewState::default(),
+    )?);
     let lines = [
         rollout_json_line(RolloutItem::SessionMeta(SessionMetaLine {
             meta: SessionMeta {
@@ -278,6 +285,7 @@ async fn clean_for_continue_removes_abort_custom_and_dangling_records() -> Resul
                 reason: TurnPauseReason::UserRequested,
             },
         ))),
+        rollout_json_line(review_state.clone()),
         "{broken".to_string(),
     ];
     fs::write(&path, format!("{}\n", lines.join("\n")))?;
@@ -291,7 +299,11 @@ async fn clean_for_continue_removes_abort_custom_and_dangling_records() -> Resul
     assert!(!cleaned.contains("{broken"));
     let (items, _thread_id, parse_errors) = RolloutRecorder::load_rollout_items(&path).await?;
     assert_eq!(parse_errors, 0);
-    assert_eq!(items.len(), 2);
+    assert_eq!(items.len(), 3);
+    assert_eq!(
+        serde_json::to_value(items.last())?,
+        serde_json::to_value(Some(&review_state))?
+    );
     Ok(())
 }
 

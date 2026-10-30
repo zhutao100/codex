@@ -15,6 +15,8 @@ pub(crate) struct Session {
     pub(super) pending_mcp_server_refresh_config: Mutex<Option<McpServerRefreshConfig>>,
     pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
     pub(crate) compaction_installation: Arc<Mutex<()>>,
+    pub(crate) completion_review_installation: Arc<Mutex<()>>,
+    pub(crate) task_lifecycle: Mutex<()>,
     pub(crate) services: SessionServices,
     pub(super) next_internal_sub_id: AtomicU64,
 }
@@ -437,6 +439,8 @@ impl Session {
             pending_mcp_server_refresh_config: Mutex::new(None),
             active_turn: Mutex::new(None),
             compaction_installation: Arc::new(Mutex::new(())),
+            completion_review_installation: Arc::new(Mutex::new(())),
+            task_lifecycle: Mutex::new(()),
             services,
             next_internal_sub_id: AtomicU64::new(0),
         });

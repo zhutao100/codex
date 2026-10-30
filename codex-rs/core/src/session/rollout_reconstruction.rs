@@ -1,4 +1,6 @@
 use super::*;
+use crate::completion_review::CompletionReviewState;
+use crate::completion_review::ReviewHandoffDisposition;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ReconstructedRollout {
@@ -6,6 +8,7 @@ pub(crate) struct ReconstructedRollout {
     pub(crate) reference_context_item: Option<TurnContextItem>,
     pub(crate) previous_turn_settings: Option<PreviousTurnSettings>,
     pub(crate) pending_continuation: Option<PendingContinuation>,
+    pub(crate) completion_review: Option<CompletionReviewState>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -99,6 +102,7 @@ impl Session {
         let mut awaiting_adjacent_post_compaction_context = false;
         let mut latest_compaction_tail_kind = CompactionTailKind::None;
         let mut checkpoint_after_latest_compaction = false;
+        let mut completion_review: Option<CompletionReviewState> = None;
 
         for item in rollout_items {
             match item {
@@ -113,6 +117,10 @@ impl Session {
                             current_metadata.commit_reference_context(pending_context.take());
                         } else {
                             current_metadata.commit_user_boundary(pending_context.take());
+                            if let Some(review) = completion_review.as_mut() {
+                                review.episode = None;
+                                review.clear_operations();
+                            }
                         }
                         current_epoch.push_checkpoint(&current_metadata);
                         checkpoint_after_latest_compaction = true;
@@ -150,6 +158,7 @@ impl Session {
                     }
                 }
                 RolloutItem::EventMsg(EventMsg::ThreadRolledBack(rollback)) => {
+                    completion_review = None;
                     awaiting_adjacent_post_compaction_context = false;
                     history.drop_last_n_user_turns(rollback.num_turns);
                     let turns_to_drop = usize::try_from(rollback.num_turns).unwrap_or(usize::MAX);
@@ -171,6 +180,9 @@ impl Session {
                 RolloutItem::EventMsg(EventMsg::TurnAborted(_)) => {
                     awaiting_adjacent_post_compaction_context = false;
                 }
+                RolloutItem::PostTurnCompletionReviewState(value) => {
+                    completion_review = CompletionReviewState::from_rollout(value);
+                }
                 RolloutItem::EventMsg(_) | RolloutItem::SessionMeta(_) => {
                     awaiting_adjacent_post_compaction_context = false;
                 }
@@ -190,7 +202,7 @@ impl Session {
                 .iter()
                 .rposition(|item| matches!(item, ResponseItem::Compaction { .. }))
                 .is_some_and(|index| turn::tail_needs_continuation(&history[index + 1..]));
-        let pending_continuation = ((history_needs_continuation(&history)
+        let mut pending_continuation = ((history_needs_continuation(&history)
             || encrypted_only_continuation)
             && !suppress_compaction_continuation)
             .then(|| PendingContinuation {
@@ -218,12 +230,56 @@ impl Session {
                 pause_reason: None,
                 target: PendingContinuationTarget::Regular,
             });
+        if let Some(review) = completion_review.as_ref()
+            && let Some(main_task_id) = review.main_task_id.as_ref()
+            && !review.request_frame.current_user_messages.is_empty()
+        {
+            pending_continuation = Some(PendingContinuation {
+                source: TurnContinuationSource::Interrupted,
+                continued_from_turn_id: Some(main_task_id.clone()),
+                model: current_metadata
+                    .previous_turn_settings
+                    .as_ref()
+                    .map(|settings| settings.model.clone()),
+                pause_reason: None,
+                target: PendingContinuationTarget::Regular,
+            });
+        }
+        if let Some(review) = completion_review.as_ref()
+            && let Some(ticket) = review.attempt.as_ref()
+            && review.ticket_is_current(ticket)
+        {
+            match review.handoff.as_ref().map(|handoff| &handoff.disposition) {
+                Some(ReviewHandoffDisposition::Prepared) => {
+                    pending_continuation = None;
+                }
+                Some(ReviewHandoffDisposition::Started { turn_id }) => {
+                    pending_continuation = Some(PendingContinuation {
+                        source: TurnContinuationSource::Interrupted,
+                        continued_from_turn_id: Some(turn_id.clone()),
+                        model: review.handoff.as_ref().map(|handoff| handoff.model.clone()),
+                        pause_reason: None,
+                        target: PendingContinuationTarget::Regular,
+                    });
+                }
+                None => {
+                    pending_continuation = Some(PendingContinuation {
+                        source: TurnContinuationSource::Paused,
+                        continued_from_turn_id: Some(ticket.candidate_completion_id.clone()),
+                        model: None,
+                        pause_reason: None,
+                        target: PendingContinuationTarget::PostTurnCompletionReview,
+                    });
+                }
+            }
+        }
 
         ReconstructedRollout {
             history,
             reference_context_item: current_metadata.reference_context_item,
             previous_turn_settings: current_metadata.previous_turn_settings,
             pending_continuation,
+            completion_review,
         }
     }
 }

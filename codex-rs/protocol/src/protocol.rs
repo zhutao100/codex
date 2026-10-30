@@ -1938,6 +1938,8 @@ pub enum RolloutItem {
     ResponseItem(ResponseItem),
     Compacted(CompactedItem),
     TurnContext(TurnContextItem),
+    /// Versioned host-owned completion-review metadata, not conversation input.
+    PostTurnCompletionReviewState(Value),
     EventMsg(EventMsg),
 }
 

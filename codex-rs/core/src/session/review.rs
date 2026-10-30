@@ -129,8 +129,9 @@ pub(crate) async fn spawn_post_turn_completion_review(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
     completed_turn: CompletedTurnForReview,
+    ticket: crate::completion_review::ReviewTicket,
 ) {
-    spawn_post_turn_completion_review_inner(sess, turn_context, completed_turn, None).await;
+    spawn_post_turn_completion_review_inner(sess, turn_context, completed_turn, ticket, None).await;
 }
 
 pub(crate) async fn spawn_paused_post_turn_completion_review(
@@ -138,15 +139,23 @@ pub(crate) async fn spawn_paused_post_turn_completion_review(
     turn_context: Arc<TurnContext>,
     completed_turn: CompletedTurnForReview,
     checkpoint: PendingContinuation,
+    ticket: crate::completion_review::ReviewTicket,
 ) {
-    spawn_post_turn_completion_review_inner(sess, turn_context, completed_turn, Some(checkpoint))
-        .await;
+    spawn_post_turn_completion_review_inner(
+        sess,
+        turn_context,
+        completed_turn,
+        ticket,
+        Some(checkpoint),
+    )
+    .await;
 }
 
 async fn spawn_post_turn_completion_review_inner(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
     completed_turn: CompletedTurnForReview,
+    ticket: crate::completion_review::ReviewTicket,
     checkpoint: Option<PendingContinuation>,
 ) {
     let review_request = ReviewRequest {
@@ -158,9 +167,9 @@ async fn spawn_post_turn_completion_review_inner(
     sess.send_event(&turn_context, EventMsg::EnteredReviewMode(review_request))
         .await;
     let task = if let Some(checkpoint) = checkpoint {
-        PostTurnCompletionReviewTask::resumed(completed_turn, checkpoint)
+        PostTurnCompletionReviewTask::resumed(completed_turn, ticket, checkpoint)
     } else {
-        PostTurnCompletionReviewTask::new(completed_turn)
+        PostTurnCompletionReviewTask::new(completed_turn, ticket)
     };
     sess.spawn_task(Arc::clone(&turn_context), Vec::new(), task)
         .await;

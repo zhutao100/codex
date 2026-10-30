@@ -466,6 +466,9 @@ impl RolloutRecorder {
                     RolloutItem::TurnContext(item) => {
                         items.push(RolloutItem::TurnContext(item));
                     }
+                    RolloutItem::PostTurnCompletionReviewState(item) => {
+                        items.push(RolloutItem::PostTurnCompletionReviewState(item));
+                    }
                     RolloutItem::EventMsg(ev) => {
                         if is_custom_control_event(&ev) {
                             continue;
@@ -527,9 +530,15 @@ impl RolloutRecorder {
             }
         }
 
-        while let Some((_line, item)) = kept_lines.last() {
+        let mut tail = kept_lines.len();
+        while tail > 0 {
+            tail -= 1;
+            let item = &kept_lines[tail].1;
+            if matches!(item, RolloutItem::PostTurnCompletionReviewState(_)) {
+                continue;
+            }
             if remove_interrupted_abort && is_interrupted_abort_signal(item) {
-                kept_lines.pop();
+                kept_lines.remove(tail);
                 changed = true;
             } else {
                 break;
@@ -543,6 +552,7 @@ impl RolloutRecorder {
                     matches!(
                         item,
                         RolloutItem::ResponseItem(ResponseItem::GhostSnapshot { .. })
+                            | RolloutItem::PostTurnCompletionReviewState(_)
                     )
                 })
                 .collect::<Vec<_>>();

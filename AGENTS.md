@@ -5,23 +5,24 @@ In the codex-rs folder where the rust code lives:
 - Crate names are prefixed with `codex-`. For example, the `core` folder's crate is named `codex-core`
 - When using format! and you can inline variables into {}, always do that.
 - Install any commands the repo relies on (for example `just`, `rg`, or `cargo-insta`) if they aren't already available before running instructions here.
+- Use `cargo-local` for local Cargo operations and `just-local` for recipes, so shared build targets and repository test exclusions remain active. Prefix test runs with `CODEX_SANDBOX_NETWORK_DISABLED=1`; do not assume the shell sets it.
 - Never add or modify any code related to `CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR` or `CODEX_SANDBOX_ENV_VAR`.
-  - You operate in a sandbox where `CODEX_SANDBOX_NETWORK_DISABLED=1` will be set whenever you use the `shell` tool. Any existing code that uses `CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR` was authored with this fact in mind. It is often used to early exit out of tests that the author knew you would not be able to run given your sandbox limitations.
-  - Similarly, when you spawn a process using Seatbelt (`/usr/bin/sandbox-exec`), `CODEX_SANDBOX=seatbelt` will be set on the child process. Integration tests that want to run Seatbelt themselves cannot be run under Seatbelt, so checks for `CODEX_SANDBOX=seatbelt` are also often used to early exit out of tests, as appropriate.
+  - Keep existing sandbox guards and exclusions. For mock-only HTTP/WebSocket fixtures, use `skip_if_no_network_unless_localhost!` and let `cargo-local` establish localhost capability; never forge the capability flag or count a skipped fixture as transport coverage.
+  - Seatbelt test runs may carry `CODEX_SANDBOX=seatbelt`. Tests that exercise nested Seatbelt or shell behavior must retain their repository exclusions rather than bypassing those checks.
 - Always collapse if statements per https://rust-lang.github.io/rust-clippy/master/index.html#collapsible_if
 - Always inline format! args when possible per https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
 - Use method references over closures when possible per https://rust-lang.github.io/rust-clippy/master/index.html#redundant_closure_for_method_calls
 - When possible, make `match` statements exhaustive and avoid wildcard arms.
 - When writing tests, prefer comparing the equality of entire objects over fields one by one.
 - When making a change that adds or changes an API, ensure that the documentation in the `docs/` folder is up to date if applicable.
-- If you change `ConfigToml` or nested config types, run `just write-config-schema` to update `codex-rs/core/config.schema.json`.
+- If you change `ConfigToml` or nested config types, run `just-local write-config-schema` to update `codex-rs/core/config.schema.json`.
 
-Run `just fmt` (in `codex-rs` directory) automatically after you have finished making Rust code changes; do not ask for approval to run it. Additionally, run the tests:
+Run `just-local fmt` (in `codex-rs` directory) automatically after you have finished making Rust code changes. Additionally, run the tests:
 
-1. Run the test for the specific project that was changed. For example, if changes were made in `codex-rs/tui`, run `cargo test -p codex-tui`.
-2. Once those pass, if any changes were made in common, core, or protocol, run the complete test suite with `cargo test --all-features`. project-specific or individual tests can be run without asking the user, but do ask the user before running the complete test suite.
+1. Run the affected crate's tests with `CODEX_SANDBOX_NETWORK_DISABLED=1 cargo-local test --quiet -p <crate>`. Broaden scoped tests and consumer checks when changing common, core, protocol, or shared behavior.
+2. Workspace-wide `cargo-local test --all-features` is a separate operation requiring explicit user authorization. Without it, finish scoped verification and report the unrun workspace suite instead of blocking the task. Bound host build/test parallelism; resource-intensive verification belongs in a VM.
 
-Before finalizing a large change to `codex-rs`, run `just fix -p <project>` (in `codex-rs` directory) to fix any linter issues in the code. Prefer scoping with `-p` to avoid slow workspace‑wide Clippy builds; only run `just fix` without `-p` if you changed shared crates.
+Before finalizing a large change to `codex-rs`, run `just-local fix -p <crate>` (in `codex-rs` directory) to fix linter issues. Scope multiple changed crates with repeated `-p` flags instead of defaulting to a workspace-wide Clippy build.
 
 ## TUI style conventions
 
@@ -62,17 +63,17 @@ See `codex-rs/tui/styles.md`.
 This repo uses snapshot tests (via `insta`), especially in `codex-rs/tui`, to validate rendered output. When UI or text output changes intentionally, update the snapshots as follows:
 
 - Run tests to generate any updated snapshots:
-  - `cargo test -p codex-tui`
+  - `CODEX_SANDBOX_NETWORK_DISABLED=1 cargo-local test --quiet -p codex-tui`
 - Check what’s pending:
-  - `cargo insta pending-snapshots -p codex-tui`
+  - `cargo-local insta pending-snapshots -p codex-tui`
 - Review changes by reading the generated `*.snap.new` files directly in the repo, or preview a specific file:
-  - `cargo insta show -p codex-tui path/to/file.snap.new`
+  - `cargo-local insta show -p codex-tui path/to/file.snap.new`
 - Only if you intend to accept all new snapshots in this crate, run:
-  - `cargo insta accept -p codex-tui`
+  - `cargo-local insta accept -p codex-tui`
 
 If you don’t have the tool:
 
-- `cargo install cargo-insta`
+- `cargo-local install cargo-insta`
 
 ### Test assertions
 
@@ -149,6 +150,6 @@ These guidelines apply to app-server protocol work in `codex-rs`, especially:
 
 - Update docs/examples when API behavior changes (at minimum `app-server/README.md`).
 - Regenerate schema fixtures when API shapes change:
-  `just write-app-server-schema`
-  (and `just write-app-server-schema --experimental` when experimental API fixtures are affected).
-- Validate with `cargo test -p codex-app-server-protocol`.
+  `just-local write-app-server-schema`
+  (and `just-local write-app-server-schema --experimental` when experimental API fixtures are affected).
+- Validate with `CODEX_SANDBOX_NETWORK_DISABLED=1 cargo-local test --quiet -p codex-app-server-protocol`.

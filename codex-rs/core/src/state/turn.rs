@@ -49,7 +49,7 @@ pub(crate) struct RunningTask {
     pub(crate) cancellation_token: CancellationToken,
     pub(crate) handle: Arc<AbortOnDropHandle<()>>,
     pub(crate) turn_context: Arc<TurnContext>,
-    pub(crate) completed_turn_user_messages: Vec<String>,
+    pub(crate) review_input_revision: Option<u64>,
     // Timer recorded when the task drops to capture the full turn duration.
     pub(crate) _timer: Option<codex_otel::Timer>,
 }
@@ -59,6 +59,7 @@ pub(crate) enum TurnInput {
     UserInput {
         content: Vec<UserInput>,
         client_id: Option<String>,
+        review_revision: Option<u64>,
     },
     ResponseItem(ResponseInputItem),
 }

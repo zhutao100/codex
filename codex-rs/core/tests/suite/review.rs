@@ -34,7 +34,7 @@ use core_test_support::responses::mount_response_sequence;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::sse_response;
-use core_test_support::skip_if_no_network;
+use core_test_support::skip_if_no_network_unless_localhost;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
@@ -49,13 +49,16 @@ use wiremock::MockServer;
 
 const REVIEW_PROVIDER_API_KEY_ENV: &str = "CODEX_REVIEW_TEST_PROVIDER_API_KEY";
 
+#[path = "completion_review.rs"]
+mod completion_review;
+
 /// Verify that submitting `Op::Review` spawns a child task and emits
 /// EnteredReviewMode -> ExitedReviewMode(None) -> TurnComplete
 /// in that order when the model returns a structured review JSON payload.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn review_op_emits_lifecycle_and_review_output() {
     // Skip under Codex sandbox network restrictions.
-    skip_if_no_network!();
+    skip_if_no_network_unless_localhost!();
 
     // Start mock Responses API server. Return a single assistant message whose
     // text is a JSON-encoded ReviewOutputEvent.
@@ -199,7 +202,7 @@ async fn review_op_emits_lifecycle_and_review_output() {
 #[cfg_attr(windows, tokio::test(flavor = "multi_thread", worker_threads = 4))]
 #[cfg_attr(not(windows), tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn review_op_with_plain_text_emits_review_fallback() {
-    skip_if_no_network!();
+    skip_if_no_network_unless_localhost!();
 
     let sse_raw = r#"[
         {"type":"response.output_item.done", "item":{
@@ -247,7 +250,7 @@ async fn review_op_with_plain_text_emits_review_fallback() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn review_completed_turn_positive_output_records_developer_advisory_and_continues() {
-    skip_if_no_network!();
+    skip_if_no_network_unless_localhost!();
 
     let review_json = serde_json::json!({
         "evaluation": "A concrete follow-up is needed.",
@@ -343,7 +346,7 @@ async fn review_completed_turn_positive_output_records_developer_advisory_and_co
     assert_eq!(requests.len(), 3);
     let delegate_input = serde_json::to_string(&requests[1].input()).expect("serialize input");
     assert!(
-        delegate_input.contains("<completed_turn_review_context>"),
+        delegate_input.contains("<completed_turn_review_context version=\\\"2\\\">"),
         "delegate input should contain completed-turn context: {delegate_input}"
     );
     assert!(delegate_input.contains("finish the change"));
@@ -369,7 +372,7 @@ async fn review_completed_turn_positive_output_records_developer_advisory_and_co
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn review_completed_turn_passes_multi_round_interaction_history() {
-    skip_if_no_network!();
+    skip_if_no_network_unless_localhost!();
 
     let review_json = serde_json::json!({
         "evaluation": "Inspection coverage: checked request-fulfillment checklist.\n\nFindings:\n- None.\n\nFix actions advised: no",
@@ -449,13 +452,13 @@ async fn review_completed_turn_passes_multi_round_interaction_history() {
     assert_eq!(requests.len(), 3);
     let delegate_input = serde_json::to_string(&requests[2].input()).expect("serialize input");
     assert!(
-        delegate_input.contains("<session_interaction_history"),
+        delegate_input.contains("<prior_user_rounds>"),
         "delegate input should contain session interaction history: {delegate_input}"
     );
     assert!(delegate_input.contains("<round index=\\\"1\\\">"));
     assert!(delegate_input.contains("round one request"));
     assert!(delegate_input.contains("round one final"));
-    assert!(delegate_input.contains("<round index=\\\"2\\\">"));
+    assert!(delegate_input.contains("<current_user_messages>"));
     assert!(delegate_input.contains("round two request"));
     assert!(delegate_input.contains("round two final"));
 
@@ -465,7 +468,7 @@ async fn review_completed_turn_passes_multi_round_interaction_history() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn review_completed_turn_false_output_does_not_continue() {
-    skip_if_no_network!();
+    skip_if_no_network_unless_localhost!();
 
     let review_json = serde_json::json!({
         "evaluation": "Inspection coverage: checked changed files and tests.\n\nFindings:\n- None.\n\nFix actions advised: no",
@@ -543,6 +546,7 @@ async fn review_completed_turn_false_output_does_not_continue() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn paused_post_turn_review_continues_review_delegate_not_parent_turn() {
+    skip_if_no_network_unless_localhost!();
     let review_json = serde_json::json!({
         "evaluation": "Inspection coverage: checked after resume.\n\nFindings:\n- None.\n\nFix actions advised: no",
         "fix_actions_advised": false
@@ -640,7 +644,7 @@ async fn paused_post_turn_review_continues_review_delegate_not_parent_turn() {
     let resumed_delegate_input =
         serde_json::to_string(&requests[2].input()).expect("serialize resumed delegate input");
     assert!(
-        resumed_delegate_input.contains("<completed_turn_review_context>"),
+        resumed_delegate_input.contains("<completed_turn_review_context version=\\\"2\\\">"),
         "resumed request should restart the post-turn review delegate, not continue the parent turn: {resumed_delegate_input}"
     );
     assert!(resumed_delegate_input.contains("finish the change"));
@@ -652,7 +656,7 @@ async fn paused_post_turn_review_continues_review_delegate_not_parent_turn() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn post_turn_review_delegate_keeps_project_docs_and_uses_review_host_instructions() {
-    skip_if_no_network!();
+    skip_if_no_network_unless_localhost!();
 
     let review_json = serde_json::json!({
         "evaluation": "Inspection coverage: checked project docs.\n\nFindings:\n- None.\n\nFix actions advised: no",
@@ -759,7 +763,7 @@ async fn post_turn_review_delegate_keeps_project_docs_and_uses_review_host_instr
 #[cfg_attr(windows, tokio::test(flavor = "multi_thread", worker_threads = 4))]
 #[cfg_attr(not(windows), tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn review_filters_agent_message_related_events() {
-    skip_if_no_network!();
+    skip_if_no_network_unless_localhost!();
 
     // Stream simulating a typing assistant message with deltas and finalization.
     let sse_raw = r#"[
@@ -828,7 +832,7 @@ async fn review_filters_agent_message_related_events() {
 #[cfg_attr(windows, tokio::test(flavor = "multi_thread", worker_threads = 4))]
 #[cfg_attr(not(windows), tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn review_does_not_emit_agent_message_on_structured_output() {
-    skip_if_no_network!();
+    skip_if_no_network_unless_localhost!();
 
     let review_json = serde_json::json!({
         "findings": [
@@ -991,7 +995,7 @@ async fn review_rollout_omits_forwarded_delegate_transcript() {
 /// request uses that model (and not the main chat model).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn review_uses_custom_review_model_from_config() {
-    skip_if_no_network!();
+    skip_if_no_network_unless_localhost!();
 
     // Minimal stream: just a completed event
     let sse_raw = r#"[
@@ -1324,7 +1328,7 @@ async fn unknown_review_model_provider_surfaces_error_event() {
 /// uses the session model.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn review_uses_session_model_when_review_model_unset() {
-    skip_if_no_network!();
+    skip_if_no_network_unless_localhost!();
 
     // Minimal stream: just a completed event
     let sse_raw = r#"[
@@ -1379,7 +1383,7 @@ async fn review_uses_session_model_when_review_model_unset() {
 #[cfg_attr(windows, tokio::test(flavor = "multi_thread", worker_threads = 4))]
 #[cfg_attr(not(windows), tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn review_input_isolated_from_parent_history() {
-    skip_if_no_network!();
+    skip_if_no_network_unless_localhost!();
 
     // Mock server for the single review request
     let sse_raw = r#"[
@@ -1555,7 +1559,7 @@ async fn review_input_isolated_from_parent_history() {
 /// parent session so later turns can reference the results.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn review_history_surfaces_in_parent_session() {
-    skip_if_no_network!();
+    skip_if_no_network_unless_localhost!();
 
     // Respond to both the review request and the subsequent parent request.
     let sse_raw = r#"[
@@ -1655,7 +1659,7 @@ async fn review_history_surfaces_in_parent_session() {
 /// when resolving base-branch review prompts (merge-base computation).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn review_uses_overridden_cwd_for_base_branch_merge_base() {
-    skip_if_no_network!();
+    skip_if_no_network_unless_localhost!();
 
     let sse_raw = r#"[{"type":"response.completed", "response": {"id": "__ID__"}}]"#;
     let (server, request_log) = start_responses_server_with_sse(sse_raw, 1).await;
@@ -1817,9 +1821,12 @@ where
     F: FnOnce(&mut Config) + Send + 'static,
 {
     let base_url = format!("{}/v1", server.uri());
+    let cwd = codex_home.path().join("workspace");
+    std::fs::create_dir_all(&cwd).expect("create stable test workspace");
     let mut builder = test_codex()
         .with_home(codex_home)
         .with_config(move |config| {
+            config.cwd = cwd;
             config.model_provider.base_url = Some(base_url.clone());
             mutator(config);
         });
@@ -1842,9 +1849,12 @@ where
     F: FnOnce(&mut Config) + Send + 'static,
 {
     let base_url = format!("{}/v1", server.uri());
+    let cwd = codex_home.path().join("workspace");
+    std::fs::create_dir_all(&cwd).expect("create stable test workspace");
     let mut builder = test_codex()
         .with_home(codex_home.clone())
         .with_config(move |config| {
+            config.cwd = cwd;
             config.model_provider.base_url = Some(base_url.clone());
             mutator(config);
         });
@@ -1905,6 +1915,7 @@ fn rollout_event_count(lines: &[RolloutLine], predicate: impl Fn(&EventMsg) -> b
             RolloutItem::SessionMeta(_)
             | RolloutItem::ResponseItem(_)
             | RolloutItem::Compacted(_)
+            | RolloutItem::PostTurnCompletionReviewState(_)
             | RolloutItem::TurnContext(_) => false,
         })
         .count()

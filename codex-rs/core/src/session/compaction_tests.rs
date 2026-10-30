@@ -331,6 +331,7 @@ async fn encrypted_only_replay_uses_inline_provenance_and_completion_tail() {
                 assert_eq!(
                     reconstructed,
                     ReconstructedRollout {
+                        completion_review: None,
                         history,
                         reference_context_item: inline.then(|| baseline.clone()),
                         previous_turn_settings: Some(PreviousTurnSettings {

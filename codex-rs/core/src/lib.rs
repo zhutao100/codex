@@ -24,6 +24,7 @@ pub use codex_thread::ThreadConfigSnapshot;
 mod agent;
 mod codex_delegate;
 mod command_safety;
+mod completion_review;
 pub mod config;
 pub mod config_loader;
 pub mod connectors;

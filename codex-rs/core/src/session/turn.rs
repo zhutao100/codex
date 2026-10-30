@@ -296,6 +296,8 @@ async fn run_turn_inner(
     cancellation_token: CancellationToken,
 ) -> Option<String> {
     let model_info = turn_context.model_info.clone();
+    sess.start_completion_review_main_task(&turn_context.sub_id)
+        .await;
     let auto_compact_limit = model_info.auto_compact_token_limit().unwrap_or(i64::MAX);
     let mut total_usage_tokens = sess.get_total_token_usage().await;
 
@@ -321,6 +323,7 @@ async fn run_turn_inner(
         .await;
     }
     let mut recovered_notes = false;
+    sess.consume_recorded_completion_review_inputs().await;
     let pending_notes = match pending_work_notes(sess.clone_history().await.raw_items()) {
         Ok(pending) => pending,
         Err(error) => {
@@ -495,6 +498,8 @@ async fn run_turn_inner(
 
         let initial_input_for_turn: ResponseInputItem = ResponseInputItem::from(input.clone());
         let response_item: ResponseItem = initial_input_for_turn.clone().into();
+        sess.consume_initial_completion_review_input(&turn_context.sub_id)
+            .await;
         sess.record_user_prompt_and_emit_turn_item(
             turn_context.as_ref(),
             &input,
@@ -513,6 +518,7 @@ async fn run_turn_inner(
 
     sess.maybe_start_ghost_snapshot(Arc::clone(&turn_context), cancellation_token.child_token())
         .await;
+    sess.record_completion_review_advisory(&turn_context).await;
     let mut last_agent_message: Option<String> = None;
     let mut can_drain_pending_input = input.is_empty() && !recovered_notes;
     // Although from the perspective of codex.rs, TurnDiffTracker has the lifecycle of a Task which contains
@@ -549,18 +555,41 @@ async fn run_turn_inner(
         };
         if !pending_input.is_empty() {
             for pending_input_item in pending_input {
+                sess.consume_pending_completion_review_input(&pending_input_item)
+                    .await;
                 sess.record_pending_input(turn_context.as_ref(), pending_input_item)
                     .await;
             }
         }
 
         // Construct the input that we will send to the model.
-        let sampling_request_input: Vec<ResponseItem> =
+        let mut sampling_request_input: Vec<ResponseItem> =
             if matches!(pre_compact_notes_state, PreCompactNotesState::AwaitingNotes) {
                 sampling_input_for_pre_compact_work_notes(&sess, &turn_context).await
             } else {
                 sess.prompt_history(turn_context.as_ref()).await
             };
+        if matches!(pre_compact_notes_state, PreCompactNotesState::Idle)
+            && let Some(instructions) = sess.completion_review_main_instructions(true).await
+        {
+            sampling_request_input.push(DeveloperInstructions::new(instructions).into());
+            let base = sess.get_base_instructions_for_turn(&turn_context).await;
+            let target = turn_context
+                .model_context_window()
+                .unwrap_or_default()
+                .saturating_sub(8_192);
+            if estimate_work_notes_prompt_tokens(&sampling_request_input, &base) > target {
+                sampling_request_input.pop();
+                let instructions = sess.completion_review_main_instructions(false).await?;
+                sampling_request_input.push(DeveloperInstructions::new(instructions).into());
+                if estimate_work_notes_prompt_tokens(&sampling_request_input, &base) > target {
+                    sess.send_event(&turn_context, EventMsg::Error(CodexErr::Fatal(
+                        "Review follow-up context exceeds the main model's payload budget. Compact or select a larger context window, then /continue. No truncated follow-up request was sent.".into()
+                    ).to_error_event(None))).await;
+                    return None;
+                }
+            }
+        }
 
         let sampling_request_input_messages = sampling_request_input
             .iter()
@@ -1125,158 +1154,6 @@ fn is_contextual_state_item(item: &ResponseItem) -> bool {
         }
         _ => false,
     }
-}
-
-pub(super) fn completed_turn_for_review_from_history(
-    items: &[ResponseItem],
-    cwd: PathBuf,
-) -> Option<CompletedTurnForReview> {
-    let (interaction_history, latest_user_index, latest_assistant_index) =
-        completed_turn_interaction_history_from_history(items)?;
-    let latest_round = interaction_history.last()?.clone();
-
-    Some(CompletedTurnForReview {
-        turn_id: format!("reconstructed-{latest_user_index}-{latest_assistant_index}"),
-        cwd,
-        user_messages: latest_round.user_messages.clone(),
-        final_agent_message: latest_round.final_agent_message,
-        interaction_history,
-    })
-}
-
-pub(super) fn completed_turn_interaction_history_from_history(
-    items: &[ResponseItem],
-) -> Option<(Vec<CompletedTurnReviewRound>, usize, usize)> {
-    let mut rounds = Vec::new();
-    let mut current_user_index: Option<usize> = None;
-    let mut current_user_messages: Vec<String> = Vec::new();
-    let mut current_final_agent_message: Option<String> = None;
-    let mut current_assistant_index: Option<usize> = None;
-    let mut latest_indices: Option<(usize, usize)> = None;
-    let mut ignoring_synthetic_review_turn = false;
-
-    for (index, item) in items.iter().enumerate() {
-        if is_review_rollout_user_message(item) {
-            push_completed_turn_review_round(
-                &mut rounds,
-                &mut latest_indices,
-                current_user_index,
-                current_user_messages.as_slice(),
-                current_final_agent_message.as_deref(),
-                current_assistant_index,
-            );
-            current_user_index = None;
-            current_user_messages.clear();
-            current_final_agent_message = None;
-            current_assistant_index = None;
-            ignoring_synthetic_review_turn = true;
-            continue;
-        }
-
-        if let Some(user_messages) = user_message_texts_for_review(item) {
-            ignoring_synthetic_review_turn = false;
-            push_completed_turn_review_round(
-                &mut rounds,
-                &mut latest_indices,
-                current_user_index,
-                current_user_messages.as_slice(),
-                current_final_agent_message.as_deref(),
-                current_assistant_index,
-            );
-            current_user_index = Some(index);
-            current_user_messages = user_messages;
-            current_final_agent_message = None;
-            current_assistant_index = None;
-            continue;
-        }
-
-        if ignoring_synthetic_review_turn {
-            continue;
-        }
-
-        if let Some(text) = assistant_message_text(item)
-            && !text.trim().is_empty()
-            && current_user_index.is_some()
-        {
-            current_final_agent_message = Some(text.trim().to_string());
-            current_assistant_index = Some(index);
-        }
-    }
-
-    push_completed_turn_review_round(
-        &mut rounds,
-        &mut latest_indices,
-        current_user_index,
-        current_user_messages.as_slice(),
-        current_final_agent_message.as_deref(),
-        current_assistant_index,
-    );
-
-    let (latest_user_index, latest_assistant_index) = latest_indices?;
-    Some((rounds, latest_user_index, latest_assistant_index))
-}
-
-fn push_completed_turn_review_round(
-    rounds: &mut Vec<CompletedTurnReviewRound>,
-    latest_indices: &mut Option<(usize, usize)>,
-    user_index: Option<usize>,
-    user_messages: &[String],
-    final_agent_message: Option<&str>,
-    assistant_index: Option<usize>,
-) {
-    let (Some(user_index), Some(final_agent_message), Some(assistant_index)) =
-        (user_index, final_agent_message, assistant_index)
-    else {
-        return;
-    };
-    if user_messages.is_empty() || final_agent_message.trim().is_empty() {
-        return;
-    }
-    rounds.push(CompletedTurnReviewRound {
-        user_messages: user_messages.to_vec(),
-        final_agent_message: final_agent_message.to_string(),
-    });
-    *latest_indices = Some((user_index, assistant_index));
-}
-
-fn assistant_message_text(item: &ResponseItem) -> Option<String> {
-    let ResponseItem::Message { role, content, .. } = item else {
-        return None;
-    };
-    if role != "assistant" {
-        return None;
-    }
-    let text = content
-        .iter()
-        .filter_map(|item| match item {
-            ContentItem::OutputText { text } | ContentItem::InputText { text } => {
-                Some(text.as_str())
-            }
-            ContentItem::InputImage { .. } => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    (!text.trim().is_empty()).then_some(text)
-}
-
-fn user_message_texts_for_review(item: &ResponseItem) -> Option<Vec<String>> {
-    if !is_user_turn_boundary_response_item(item) || is_review_rollout_user_message(item) {
-        return None;
-    }
-    let ResponseItem::Message { content, .. } = item else {
-        return None;
-    };
-    let texts = content
-        .iter()
-        .filter_map(|item| match item {
-            ContentItem::InputText { text } if !text.trim().is_empty() => Some(text.clone()),
-            ContentItem::OutputText { text } if !text.trim().is_empty() => Some(text.clone()),
-            ContentItem::InputText { .. }
-            | ContentItem::OutputText { .. }
-            | ContentItem::InputImage { .. } => None,
-        })
-        .collect::<Vec<_>>();
-    (!texts.is_empty()).then_some(texts)
 }
 
 pub(super) fn is_review_rollout_user_message(item: &ResponseItem) -> bool {

@@ -204,7 +204,6 @@ use crate::skills::injection::tool_kind_for_path;
 use crate::skills::resolve_skill_dependencies_for_turn;
 use crate::state::ActiveTurn;
 use crate::state::CompletedTurnForReview;
-use crate::state::CompletedTurnReviewRound;
 use crate::state::PendingContinuation;
 use crate::state::PendingContinuationTarget;
 use crate::state::PreviousTurnSettings;
@@ -254,6 +253,7 @@ use codex_utils_readiness::Readiness;
 use codex_utils_readiness::ReadinessFlag;
 use tokio::sync::watch;
 
+mod completion_review;
 mod handlers;
 mod mcp;
 mod read_only_temp;
@@ -269,8 +269,6 @@ use self::rollout_reconstruction::ReconstructedRollout;
 use self::session::Session;
 use self::session::SessionConfiguration;
 pub(crate) use self::session::SessionSettingsUpdate;
-use self::turn::completed_turn_for_review_from_history;
-use self::turn::completed_turn_interaction_history_from_history;
 #[cfg(test)]
 use self::turn::filter_connectors_for_input;
 use self::turn::history_needs_continuation;
@@ -748,6 +746,7 @@ impl Session {
             .reconstruct_history_from_rollout(turn_context, &rollout_items)
             .await;
         self.replace_with_reconstructed_rollout(reconstructed).await;
+        self.invalidate_completion_review_history().await;
         true
     }
 
@@ -887,6 +886,23 @@ impl Session {
                     .reconstruct_history_from_rollout(&turn_context, &rollout_items)
                     .await;
                 self.replace_with_reconstructed_rollout(reconstructed).await;
+                {
+                    let mut state = self.state.lock().await;
+                    state.completion_review =
+                        completion_review::completion_review_for_fork(&rollout_items)
+                            .unwrap_or_else(|| {
+                                let mut review =
+                                    crate::completion_review::CompletionReviewState::default();
+                                review.request_frame.exact = !state
+                                    .history
+                                    .raw_items()
+                                    .iter()
+                                    .any(is_user_turn_boundary_response_item);
+                                review
+                            });
+                    state.completion_review.rebranch();
+                    state.pending_continuation = None;
+                }
 
                 // Seed usage info from the recorded rollout so UIs can show token counts
                 // immediately on resume/fork.
@@ -899,11 +915,13 @@ impl Session {
                 if !rollout_items.is_empty() {
                     self.persist_rollout_items(&rollout_items).await;
                 }
+                self.persist_completion_review().await;
 
                 // Flush after seeding history and any persisted rollout copy.
                 self.flush_rollout().await;
             }
         }
+        self.recover_completion_review().await;
     }
 
     async fn replace_with_reconstructed_rollout(&self, reconstructed: ReconstructedRollout) {
@@ -914,6 +932,15 @@ impl Session {
             .set_reference_context_item(reconstructed.reference_context_item.clone());
         state.previous_turn_settings = reconstructed.previous_turn_settings;
         state.pending_continuation = reconstructed.pending_continuation;
+        state.completion_review = reconstructed.completion_review.unwrap_or_else(|| {
+            let mut review = crate::completion_review::CompletionReviewState::default();
+            review.request_frame.exact = !state
+                .history
+                .raw_items()
+                .iter()
+                .any(is_user_turn_boundary_response_item);
+            review
+        });
         state.initial_context_seeded = reconstructed.reference_context_item.is_some();
     }
 
@@ -1721,6 +1748,8 @@ impl Session {
     pub(crate) async fn replace_history(&self, items: Vec<ResponseItem>) {
         let mut state = self.state.lock().await;
         state.replace_history(items);
+        drop(state);
+        self.invalidate_completion_review_history().await;
     }
 
     pub(crate) async fn replace_compacted_history(
@@ -1771,6 +1800,8 @@ impl Session {
         state.previous_turn_settings = None;
         state.pending_continuation = None;
         state.initial_context_seeded = false;
+        drop(state);
+        self.invalidate_completion_review_history().await;
     }
 
     pub(crate) async fn record_context_updates_and_set_reference_context_item(
@@ -2110,7 +2141,9 @@ impl Session {
         pending_input: TurnInput,
     ) {
         match pending_input {
-            TurnInput::UserInput { content, client_id } => {
+            TurnInput::UserInput {
+                content, client_id, ..
+            } => {
                 let response_item: ResponseItem = ResponseInputItem::from(content.clone()).into();
                 self.record_user_prompt_and_emit_turn_item(
                     turn_context,
@@ -2255,9 +2288,11 @@ impl Session {
         }
 
         let mut ts = active_turn.turn_state.lock().await;
+        let review_revision = Some(self.accept_completion_review_input(&input, false).await);
         ts.push_pending_input(TurnInput::UserInput {
             content: input,
             client_id: client_user_message_id,
+            review_revision,
         });
         Ok(active_turn_id)
     }
@@ -2386,103 +2421,6 @@ impl Session {
         }
     }
 
-    pub(crate) async fn submit_internal_op(&self, id: String, op: Op) {
-        if self.tx_sub.send(Submission { id, op }).await.is_err() {
-            warn!("failed to submit internal session operation");
-        }
-    }
-
-    pub(crate) async fn set_pending_post_turn_completion_review_continuation(
-        &self,
-        pending_continuation: Option<PendingContinuation>,
-    ) {
-        let mut state = self.state.lock().await;
-        state.pending_post_turn_completion_review_continuation = pending_continuation;
-    }
-
-    pub(crate) async fn take_pending_post_turn_completion_review_continuation(
-        &self,
-    ) -> Option<PendingContinuation> {
-        let mut state = self.state.lock().await;
-        state
-            .pending_post_turn_completion_review_continuation
-            .take()
-    }
-
-    pub(crate) async fn last_completed_regular_turn_for_review(
-        &self,
-    ) -> Option<CompletedTurnForReview> {
-        let state = self.state.lock().await;
-        state.last_completed_regular_turn_for_review.clone()
-    }
-
-    pub(crate) async fn completed_turn_for_review(&self) -> Option<CompletedTurnForReview> {
-        let state = self.state.lock().await;
-        state
-            .last_completed_regular_turn_for_review
-            .clone()
-            .or_else(|| {
-                completed_turn_for_review_from_history(
-                    state.history.raw_items(),
-                    state.session_configuration.cwd.clone(),
-                )
-            })
-    }
-
-    pub(crate) async fn capture_completed_regular_turn_for_review(
-        &self,
-        turn_context: &TurnContext,
-        mut user_messages: Vec<String>,
-        final_agent_message: Option<&str>,
-    ) {
-        let Some(final_agent_message) = final_agent_message else {
-            return;
-        };
-        if final_agent_message.trim().is_empty() {
-            return;
-        }
-
-        let mut state = self.state.lock().await;
-        let mut interaction_history =
-            completed_turn_interaction_history_from_history(state.history.raw_items())
-                .map(|(rounds, _, _)| rounds)
-                .unwrap_or_default();
-
-        if !user_messages.is_empty()
-            && interaction_history
-                .last()
-                .is_none_or(|round| round.final_agent_message != final_agent_message)
-        {
-            if let Some(round) = interaction_history
-                .last_mut()
-                .filter(|round| round.user_messages == user_messages)
-            {
-                round.final_agent_message = final_agent_message.to_string();
-            } else {
-                interaction_history.push(CompletedTurnReviewRound {
-                    user_messages: user_messages.clone(),
-                    final_agent_message: final_agent_message.to_string(),
-                });
-            }
-        }
-
-        let Some(latest_round) = interaction_history.last().cloned() else {
-            return;
-        };
-        if user_messages.is_empty() {
-            user_messages = latest_round.user_messages;
-        }
-
-        let completed_turn = CompletedTurnForReview {
-            turn_id: turn_context.sub_id.clone(),
-            cwd: turn_context.cwd.clone(),
-            user_messages,
-            final_agent_message: final_agent_message.to_string(),
-            interaction_history,
-        };
-        state.last_completed_regular_turn_for_review = Some(completed_turn);
-    }
-
     async fn prepare_history_for_continuation(&self, remove_interrupted_abort: bool) {
         let mut state = self.state.lock().await;
         let mut items = state.history.raw_items().to_vec();
@@ -2496,7 +2434,17 @@ impl Session {
         }
     }
 
-    async fn clean_rollout_for_continuation(&self, remove_interrupted_abort: bool) {
+    async fn clean_rollout_for_continuation(self: &Arc<Self>, remove_interrupted_abort: bool) {
+        let _ = self
+            .completion_review_transaction(move |session| async move {
+                session
+                    .clean_rollout_for_continuation_locked(remove_interrupted_abort)
+                    .await;
+            })
+            .await;
+    }
+
+    async fn clean_rollout_for_continuation_locked(&self, remove_interrupted_abort: bool) {
         self.flush_rollout().await;
         let rollout_path = {
             let guard = self.services.rollout.lock().await;

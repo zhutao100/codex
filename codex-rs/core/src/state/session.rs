@@ -1,9 +1,10 @@
 //! Session-wide mutable state.
 
+use crate::completion_review::CompletionReviewState;
+use crate::completion_review::InternalReviewOperation;
 use codex_protocol::models::ResponseItem;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::path::PathBuf;
 
 use crate::context_manager::ContextManager;
 use crate::protocol::RateLimitSnapshot;
@@ -30,21 +31,6 @@ pub(crate) struct PendingContinuation {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct CompletedTurnReviewRound {
-    pub(crate) user_messages: Vec<String>,
-    pub(crate) final_agent_message: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct CompletedTurnForReview {
-    pub(crate) turn_id: String,
-    pub(crate) cwd: PathBuf,
-    pub(crate) interaction_history: Vec<CompletedTurnReviewRound>,
-    pub(crate) user_messages: Vec<String>,
-    pub(crate) final_agent_message: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PreviousTurnSettings {
     pub(crate) model: String,
 }
@@ -66,10 +52,8 @@ pub(crate) struct SessionState {
     pub(crate) previous_turn_settings: Option<PreviousTurnSettings>,
     /// Most recent paused/interrupted turn that can be continued without a new user input.
     pub(crate) pending_continuation: Option<PendingContinuation>,
-    /// Most recent completed regular turn that can be reviewed independently.
-    pub(crate) last_completed_regular_turn_for_review: Option<CompletedTurnForReview>,
-    /// Continuation requested by a post-turn completion review that advised fixes.
-    pub(crate) pending_post_turn_completion_review_continuation: Option<PendingContinuation>,
+    pub(crate) completion_review: CompletionReviewState,
+    pub(crate) internal_review_operations: HashMap<String, InternalReviewOperation>,
     /// Tracks whether automatic thread naming has already been attempted.
     pub(crate) auto_rename_attempted: bool,
     /// Tracks whether this session originated from a fork.
@@ -90,8 +74,8 @@ impl SessionState {
             initial_context_seeded: false,
             previous_turn_settings: None,
             pending_continuation: None,
-            last_completed_regular_turn_for_review: None,
-            pending_post_turn_completion_review_continuation: None,
+            completion_review: CompletionReviewState::default(),
+            internal_review_operations: HashMap::new(),
             auto_rename_attempted: false,
             is_forked_session: false,
         }

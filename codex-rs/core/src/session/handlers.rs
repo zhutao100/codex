@@ -13,6 +13,36 @@ pub(super) async fn submission_loop(
     // To break out of this loop, send Op::Shutdown.
     while let Ok(sub) = rx_sub.recv().await {
         debug!(?sub, "Submission");
+        if let Some(operation) = sess.take_completion_review_operation(&sub.id).await {
+            use crate::completion_review::InternalReviewOperation;
+            match operation {
+                InternalReviewOperation::Review(ticket) => {
+                    if sess.active_turn.lock().await.is_none()
+                        && sess.completion_review_ticket_is_current(&ticket).await
+                        && let Some(completed_turn) = sess.completed_turn_for_review().await
+                    {
+                        let context = sess.new_default_turn_with_sub_id(sub.id).await;
+                        spawn_post_turn_completion_review(
+                            Arc::clone(&sess),
+                            context,
+                            completed_turn,
+                            ticket,
+                        )
+                        .await;
+                    }
+                }
+                InternalReviewOperation::Continue(ticket) => {
+                    if sess.active_turn.lock().await.is_none()
+                        && let Some(checkpoint) =
+                            sess.claim_completion_review_handoff(&ticket, &sub.id).await
+                    {
+                        sess.set_pending_continuation(Some(checkpoint)).await;
+                        continue_last(&sess, sub.id).await;
+                    }
+                }
+            }
+            continue;
+        }
         match sub.op.clone() {
             Op::Interrupt => {
                 interrupt(&sess).await;
@@ -233,6 +263,23 @@ pub async fn continue_last(sess: &Arc<Session>, sub_id: String) {
         return;
     }
 
+    let prepared = {
+        let state = sess.state.lock().await;
+        state
+            .completion_review
+            .handoff
+            .as_ref()
+            .filter(|handoff| {
+                handoff.disposition == crate::completion_review::ReviewHandoffDisposition::Prepared
+                    && state.completion_review.ticket_is_current(&handoff.ticket)
+            })
+            .map(|handoff| handoff.ticket.clone())
+    };
+    if let Some(ticket) = prepared
+        && let Some(checkpoint) = sess.claim_completion_review_handoff(&ticket, &sub_id).await
+    {
+        sess.set_pending_continuation(Some(checkpoint)).await;
+    }
     let Some(checkpoint) = sess.take_pending_continuation().await else {
         sess.send_event_raw(Event {
             id: sub_id,
@@ -265,6 +312,7 @@ pub async fn continue_last(sess: &Arc<Session>, sub_id: String) {
             )
             .await
         else {
+            sess.set_pending_continuation(Some(checkpoint)).await;
             return;
         };
         turn_context
@@ -300,6 +348,10 @@ pub async fn continue_last(sess: &Arc<Session>, sub_id: String) {
                 turn_context,
                 completed_turn,
                 checkpoint,
+                match sess.current_completion_review_ticket().await {
+                    Some(ticket) => ticket,
+                    None => return,
+                },
             )
             .await;
         }
@@ -384,6 +436,26 @@ pub async fn user_input_or_turn(sess: &Arc<Session>, sub_id: String, op: Op) {
         Err(SteerInputError::NoActiveTurn(items)) => {
             current_context.otel_manager.user_prompt(&items);
             sess.clear_pending_continuation().await;
+            sess.refresh_mcp_servers_if_requested(&current_context)
+                .await;
+            sess.spawn_task(Arc::clone(&current_context), items, RegularTask)
+                .await;
+        }
+        Err(SteerInputError::ActiveTurnNotSteerable {
+            turn_kind: NonSteerableTurnKind::Review,
+        }) if sess
+            .active_turn
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|active| {
+                active
+                    .tasks
+                    .values()
+                    .any(|task| task.kind == crate::state::TaskKind::PostTurnCompletionReview)
+            }) =>
+        {
+            current_context.otel_manager.user_prompt(&items);
             sess.refresh_mcp_servers_if_requested(&current_context)
                 .await;
             sess.spawn_task(Arc::clone(&current_context), items, RegularTask)
@@ -1020,7 +1092,7 @@ pub async fn review_completed_turn(sess: &Arc<Session>, sub_id: String) {
         sess.send_event_raw(Event {
             id: sub_id,
             msg: EventMsg::Error(ErrorEvent {
-                message: "No completed Codex turn is available to review yet. Run a normal prompt first, wait for Codex to finish, then use /review-completed-turn."
+                message: "No completed Codex turn with exact consumed-request provenance is available to review yet. Run a normal prompt and wait for completion, including any pending amendments. For legacy or discarded history without a trusted snapshot, start a new session with the complete request."
                     .to_string(),
                 codex_error_info: Some(CodexErrorInfo::BadRequest),
                 client_user_message_id: None,
@@ -1045,5 +1117,8 @@ pub async fn review_completed_turn(sess: &Arc<Session>, sub_id: String) {
     }
 
     let turn_context = sess.new_default_turn_with_sub_id(sub_id).await;
-    spawn_post_turn_completion_review(Arc::clone(sess), turn_context, completed_turn).await;
+    if let Some(ticket) = sess.begin_completion_review(false).await {
+        spawn_post_turn_completion_review(Arc::clone(sess), turn_context, completed_turn, ticket)
+            .await;
+    }
 }

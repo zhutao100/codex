@@ -4,7 +4,7 @@ When you see this instruction, you're in a customized fork repo branch.
 
 Changes in this branch are drop-in diff commits staying on top of the upstream branch.
 
-The long-term maintenance pattern is: over time, keep calling `git pull origin main` to rebase the branch commits on top of the latest upstream code.
+When an upstream refresh is explicitly requested, use `git pull --rebase origin main` to replay the fork commits on upstream. Plain `git pull origin main` does not itself request a rebase; do not refresh upstream implicitly during feature work.
 
 Thus, the design of the changes target to minimize the potentials of future rebase conflicts.
 
@@ -23,5 +23,8 @@ Thus, the design of the changes target to minimize the potentials of future reba
 - Compaction recovery must preserve acknowledged input beyond a bounded notes capture and remain consistent in task finalization and rollout replay. Accept matching rejected tool outputs after notes, and leave capture cleanup to recovery. Background snapshot writes share the installation guard; previous-model compaction must resolve that model's provider and effective instructions.
 - Keep compaction source/request and destination/replacement contexts separate across failure and restart; notes usage cannot identify a pending downshift. Recover multipart notes with exact assistant output-text concatenation. Validate installation cancellation with a real recorder, actual task-stop handlers and replay, without a test-side flush after task-stop.
 - Output helpers must honor sampling's capture-specific plan-parsing decision; test plan tags on separate lines. Local summarization output stays private to its attempt until completion so failed attempts cannot corrupt notes recovery.
+- See [completion review](docs/features/post_turn_completion_review/README.md) before changing review capture, advisory continuation or review replay. Keep frozen consumed scope and initial/latest answer slots separate from prompt history, capture the returned terminal answer, and require complete replacement finals even under custom reviewer prompts.
+- Completion-review operations need exact request/candidate tickets and durable prepared/started handoffs. Preserve versioned metadata in rollout readers and continuation cleanup; `ResponseItem::Message.id` is not serialized and cannot identify a persisted advisory. Legacy or discarded context with uncertain provenance must stay explicitly unavailable.
+- Keep running task handles alive through completion persistence and serialize new task registration with finalization. Task-stop must join completion-review installation before publishing its stopped state; test cancellation with a real recorder and replay, without a test-side flush after stop.
 - See [local plugins](docs/features/local_plugins.md) for the minimal local skills/MCP backport. Keep installation separate from execution, preserve qualified skill mentions and MCP requirements filtering, and verify release binaries with the VM-only `scripts/verify-local-plugins.py`; do not migrate the direct-core TUI to app-server for this feature.
 - Keep plugin-selected skills out of the shared cwd cache. Forced skill listings and turn lookups must apply the caller's effective config so session overrides remain aligned with MCP activation.
