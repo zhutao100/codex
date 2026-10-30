@@ -99,9 +99,9 @@ fn packet(request: &ResponsesRequest) -> String {
         .into_iter()
         .find(|item| {
             item["role"] == "user"
-                && item["content"][0]["text"].as_str().is_some_and(|text| {
-                    text.contains("<completed_turn_review_context version=\"2\">")
-                })
+                && item["content"][0]["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("<completed_turn_review_context>"))
         })
         .and_then(|item| item["content"][0]["text"].as_str().map(str::to_string))
         .expect("review packet")

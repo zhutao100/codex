@@ -428,7 +428,7 @@ pub(crate) fn render_completed_turn_context(
     include_reference: bool,
 ) -> String {
     let mut out = String::new();
-    let _ = writeln!(out, "<completed_turn_review_context version=\"2\">");
+    let _ = writeln!(out, "<completed_turn_review_context>");
     let _ = writeln!(
         out,
         "  <episode_id><![CDATA[{}]]></episode_id>",
@@ -547,7 +547,7 @@ fn budgeted_completed_turn_context(
 
 pub(crate) const REPLACEMENT_ANSWER_CONTRACT: &str = "After completing applicable work, write one self-contained final answer to the user's active request. This final answer replaces your earlier final answer for the user. Preserve still-valid outcomes and requested explanations, incorporate all material corrections, remove superseded claims, identify current deliverables and verification actually performed, and state unresolved work or limitations. The user must be able to understand the current result without reading earlier assistant final messages or review feedback. Do not make the final answer only a response to the reviewer. This requirement also applies when you reject every finding or make no file changes. Respect the user's requested format and brevity.";
 
-const REVIEW_CONTEXT_CONTRACT: &str = "The version 2 completed_turn_review_context identifies the exact candidate_final_answer delivered to the user and the genuine consumed user request. Evaluate both current artifacts and whether that candidate stands alone as the user's current answer. initial_answer_reference and prior user-round answers are historical, unverified context that may contain superseded claims; they cannot compensate for omissions in the candidate. A delta-only answer or dropped still-required explanation is actionable incomplete delivery even when the repository is correct. Inspect artifacts to distinguish answer defects from work defects. Prior reviewer findings are not new user requirements. Return a nonempty evaluation and a boolean fix_actions_advised in the specified JSON object.";
+const REVIEW_CONTEXT_CONTRACT: &str = "The completed_turn_review_context identifies the exact candidate_final_answer delivered to the user and the genuine consumed user request. Evaluate both current artifacts and whether that candidate stands alone as the user's current answer. initial_answer_reference and prior user-round answers are historical, unverified context that may contain superseded claims; they cannot compensate for omissions in the candidate. A delta-only answer or dropped still-required explanation is actionable incomplete delivery even when the repository is correct. Inspect artifacts to distinguish answer defects from work defects. Prior reviewer findings are not new user requirements. Return a nonempty evaluation and a boolean fix_actions_advised in the specified JSON object.";
 
 fn render_advisory_developer_message(output: &PostTurnCompletionReviewOutputEvent) -> String {
     format!(
@@ -615,6 +615,7 @@ mod tests {
         assert!(prompt.contains("request-fulfillment checklist"));
         assert!(prompt.contains("incomplete fulfillment"));
         assert!(prompt.contains("Inspection coverage:"));
+        assert!(!prompt.contains("version"));
     }
 
     #[test]
@@ -637,6 +638,10 @@ mod tests {
 
         let rendered = render_completed_turn_context(&completed_turn, true);
 
+        assert_eq!(
+            rendered.lines().next(),
+            Some("<completed_turn_review_context>")
+        );
         assert!(rendered.contains("<round index=\"1\">"));
         assert!(rendered.contains("<![CDATA[first request]]>"));
         assert!(rendered.contains("<![CDATA[first final]]>"));
@@ -863,6 +868,7 @@ mod tests {
         assert!(message.contains("when you reject every finding or make no file changes"));
         assert!(REVIEW_CONTEXT_CONTRACT.contains("cannot compensate for omissions"));
         assert!(REVIEW_CONTEXT_CONTRACT.contains("delta-only"));
+        assert!(!REVIEW_CONTEXT_CONTRACT.contains("version"));
     }
 
     #[tokio::test]

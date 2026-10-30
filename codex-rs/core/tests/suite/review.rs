@@ -346,7 +346,7 @@ async fn review_completed_turn_positive_output_records_developer_advisory_and_co
     assert_eq!(requests.len(), 3);
     let delegate_input = serde_json::to_string(&requests[1].input()).expect("serialize input");
     assert!(
-        delegate_input.contains("<completed_turn_review_context version=\\\"2\\\">"),
+        delegate_input.contains("<completed_turn_review_context>"),
         "delegate input should contain completed-turn context: {delegate_input}"
     );
     assert!(delegate_input.contains("finish the change"));
@@ -644,7 +644,7 @@ async fn paused_post_turn_review_continues_review_delegate_not_parent_turn() {
     let resumed_delegate_input =
         serde_json::to_string(&requests[2].input()).expect("serialize resumed delegate input");
     assert!(
-        resumed_delegate_input.contains("<completed_turn_review_context version=\\\"2\\\">"),
+        resumed_delegate_input.contains("<completed_turn_review_context>"),
         "resumed request should restart the post-turn review delegate, not continue the parent turn: {resumed_delegate_input}"
     );
     assert!(resumed_delegate_input.contains("finish the change"));

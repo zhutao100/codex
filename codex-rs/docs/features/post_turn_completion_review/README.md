@@ -16,13 +16,15 @@ auto_post_turn_completion_review = true
 
 ## Context Contract
 
-An episode contains one consumed user-request basis and its review-derived main continuations. The version 2 packet contains:
+An episode contains one consumed user-request basis and its review-derived main continuations. The review context contains:
 
 1. Frozen genuine user context, including consumed steering and earlier known user rounds with their terminal answers.
 2. The episode's initial answer as a historical, unverified reference.
 3. The exact latest completed main answer as `candidate_final_answer`.
 
 The current episode contributes at most two answer texts. Identical initial/candidate text is serialized once. Older candidate revisions, reviewer evaluations, hidden reasoning, tool transcript and intermediate assistant messages are not appended. Text quoting review material remains exact data; it is not scrubbed.
+
+Review packets use `<completed_turn_review_context>`. The JSON result contains only `evaluation` and `fix_actions_advised`; storage metadata remains host-only.
 
 The historical reference may be incorrect or superseded. It must not compensate for an incomplete current candidate. Independent inspection distinguishes missing implementation from incomplete communication.
 
@@ -62,7 +64,7 @@ Post-turn host instructions prefer the post-turn filename, then the generic revi
 
 ## Provenance Limits
 
-Versioned rollout metadata restores exact snapshots without relying on nonpersisted `TurnComplete` events. Prepared handoffs are recoverably queued; started handoffs resume as interrupted main work, not a fresh advisory action. Interrupt/shutdown invalidates unstarted review scheduling but retains already-started main lineage and its replacement contract.
+Host-owned rollout metadata restores exact snapshots without relying on nonpersisted `TurnComplete` events. Prepared handoffs are recoverably queued; started handoffs resume as interrupted main work, not a fresh advisory action. Interrupt/shutdown invalidates unstarted review scheduling but retains already-started main lineage and its replacement contract.
 
 Acknowledged user input retains its original payload until installation is durable. Revision-specific installing/recorded markers recover both a missing message and a message written immediately before a crash, without deduplicating distinct identical amendments. Stop, pause, shutdown and manual review join terminal finalization even after its active-task entry has been removed. Manual review reserves the candidate snapshot and its ticket together; delegate entry validates that pair against current ownership.
 
@@ -70,7 +72,7 @@ A recognized amendment body retains the prior candidate as its directory owner a
 
 Only an explicit `model` or collaboration-mode selection changes a saved recovery destination. It remains durable after steering removes the advisory handoff, through pause or budget failure and restart with a different configured default. CWD, approval, reasoning-effort and other unrelated overrides preserve it. Completion, a new root request or a fork clears the old recovery selection.
 
-Legacy histories without trusted metadata, including the earlier version 1 snapshot format, or discarded histories whose request basis cannot be established, are unavailable for full review. Empty or encrypted-only prompt history does not establish exact provenance, and later referential input cannot restore missing requirements. Trusted version 2 metadata preserves known scope independently of compaction. Arbitrary assistant-role text is never promoted to a known completion. Start a new session with the complete request when that provenance is unavailable. Nontext user input also produces an explicit coverage limitation rather than a claimed full text-only review.
+Histories without trusted request snapshots, or discarded histories whose request basis cannot be established, are unavailable for full review. Empty or encrypted-only prompt history does not establish exact provenance, and later referential input cannot restore missing requirements. Trusted snapshots preserve known scope independently of compaction. Arbitrary assistant-role text is never promoted to a known completion. Start a new session with the complete request when that provenance is unavailable. Nontext user input also produces an explicit coverage limitation rather than a claimed full text-only review.
 
 Human clarification answers delivered through `request_user_input` are not currently captured as an exact question/answer frame. They continue to reach the main model normally, but explicitly disable full completion-review coverage for that request, including full-history forks. Fork recovery cannot restore coverage by selecting an older pre-clarification candidate. A warning explains the limitation; neither automatic nor manual review can declare that incomplete projection fully reviewed.
 

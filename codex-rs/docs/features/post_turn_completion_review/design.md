@@ -4,7 +4,7 @@
 
 |Surface|Responsibility|
 |---|---|
-|[Completion state](../../../core/src/completion_review.rs)|Versioned request frame, accepted/consumed input revisions, initial/latest answer slots, attempt allowance and tickets.|
+|[Completion state](../../../core/src/completion_review.rs)|Host-owned request frame, accepted/consumed input revisions, initial/latest answer slots, attempt allowance and tickets.|
 |[Session transitions](../../../core/src/session/completion_review.rs)|Durable capture, prepared/started claims, private scheduling, advisory installation and main-request framing.|
 |[Task lifecycle](../../../core/src/tasks/mod.rs)|Keep completion handles alive through finalization; serialize finalization with registration and stopping; retain acknowledged late input without treating it as consumed.|
 |[Review task](../../../core/src/tasks/post_turn_completion_review.rs)|Fresh delegate configuration, packet rendering/budgets, strict result handling and advisory output contract.|
@@ -23,7 +23,7 @@
 
 ## Durable Metadata
 
-`RolloutItem::PostTurnCompletionReviewState` carries a version 2 JSON payload whose typed implementation is internal to core. This avoids expanding the review result or app-server RPC payloads. The record contains:
+`RolloutItem::PostTurnCompletionReviewState` carries host-only JSON recovery metadata whose typed implementation is internal to core. Its format checks do not appear in model-facing packets, prompts or review results. This avoids expanding the review result or app-server RPC payloads. The record contains:
 
 - Generation and accepted/consumed request revisions.
 - Frozen known user context, original pending input payloads, client IDs, exact model-facing message bodies and their installation phases.
@@ -31,9 +31,9 @@
 - Current review ticket and optional prepared/started handoff with advisory text.
 - Main-task ownership, independent recovery destination, advisory-installation state and replacement-answer requirement.
 
-The optional `recovery_model` belongs to review-derived main work, not its advisory ticket. Claiming a handoff establishes it; explicit recovery-time selection retargets it even after steering clears the handoff. Steering preserves it, while successful completion, a new root request and fork initialization clear it. Older version 2 metadata without that field retains its handoff/turn-settings fallback; a selection never written by the older implementation cannot be inferred.
+The optional `recovery_model` belongs to review-derived main work, not its advisory ticket. Claiming a handoff establishes it; explicit recovery-time selection retargets it even after steering clears the handoff. Steering preserves it, while successful completion, a new root request and fork initialization clear it. Metadata without that field uses the handoff/turn-settings fallback; a selection never persisted cannot be inferred.
 
-It is not a `ResponseItem`, model summary, assistant output or UI cell. Unknown/incomplete metadata versions are unavailable, not reconstructed from model-produced XML.
+It is not a `ResponseItem`, model summary, assistant output or UI cell. Unsupported or incomplete metadata is unavailable, not reconstructed from model-produced XML.
 
 Only a genuinely new root session or trusted metadata establishes exact request provenance. Resume, fork and history replacement without that evidence retain unknown scope, even when prompt history is empty or contains only encrypted compaction. Missing visible user boundaries do not prove missing requirements never existed. Subsequent genuine input remains tracked but cannot restore unknown prior scope by itself.
 
@@ -51,7 +51,7 @@ Input installation persists an `Installing` marker for a specific accepted revis
 
 Recognizing that installation preserves the prior, now-ineligible candidate and its CWD. The accepted revision already invalidates review eligibility, while an unfinished review-derived main task still needs that directory owner to resume. An unrecognized user boundary continues to discard the candidate and disable exact provenance. Do not erase known recovery ownership merely because the matching body arrived before its `Recorded` snapshot.
 
-Once input installation starts, its short owned transaction survives caller cancellation and task-stop joins it. A consumed amendment therefore cannot be persisted ahead of its model-facing message. The earlier version 1 metadata cannot establish these guarantees and is conservatively unavailable rather than upgraded by inference.
+Once input installation starts, its short owned transaction survives caller cancellation and task-stop joins it. A consumed amendment therefore cannot be persisted ahead of its model-facing message. Metadata without durable input-installation ownership cannot establish these guarantees and stays unavailable rather than being upgraded by inference.
 
 Task-stop also joins the task lifecycle guard, including when finalization already removed the active-task entry. Only afterward may shutdown detach the recorder. Explicit pause/interrupt invalidate any private automatic-review ticket queued by the finalizer, so joining completion cannot accidentally start new review work after the stop. A started handoff instead belongs to interrupted main work; stop/shutdown retains its ticket, snapshots, selected destination and replacement contract rather than clearing that lineage as unstarted reviewer scheduling.
 
