@@ -318,9 +318,13 @@ async fn invalid_reviewer_output_exits_without_a_clean_verdict_or_continuation()
     server.verify().await;
 }
 
+#[test_case::test_case(false; "initial task")]
+#[test_case::test_case(true; "review followup")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn human_clarification_prevents_an_incomplete_request_from_being_declared_reviewed() {
-    skip_if_no_network_unless_localhost!();
+async fn human_clarification_prevents_an_incomplete_request_from_being_declared_reviewed(
+    review_followup: bool,
+) -> anyhow::Result<()> {
+    skip_if_no_network_unless_localhost!(Ok(()));
     let server = MockServer::start().await;
     let call_id = "scope-clarification";
     let questions = serde_json::json!({
@@ -334,23 +338,28 @@ async fn human_clarification_prevents_an_incomplete_request_from_being_declared_
             ]
         }]
     });
-    let requests = mount_sse_sequence(
-        &server,
-        vec![
-            sse(vec![
-                ev_response_created("clarification"),
-                ev_function_call(call_id, "request_user_input", &questions.to_string()),
-                ev_completed("clarification"),
-            ]),
-            answer("Complete result for the selected CLI-only scope."),
-        ],
-    )
-    .await;
-    let home = Arc::new(TempDir::new().unwrap());
-    let codex = new_conversation_for_server(&server, home.clone(), |config| {
+    let mut responses = Vec::new();
+    if review_followup {
+        responses.extend([
+            answer("Initial answer before clarification."),
+            verdict("Clarify the interface before completing the change.", true),
+        ]);
+    }
+    responses.extend([
+        sse(vec![
+            ev_response_created("clarification"),
+            ev_function_call(call_id, "request_user_input", &questions.to_string()),
+            ev_completed("clarification"),
+        ]),
+        answer("Complete result for the selected CLI-only scope."),
+    ]);
+    let requests = mount_sse_sequence(&server, responses).await;
+    let home = Arc::new(TempDir::new()?);
+    let mut builder = test_codex().with_home(home).with_config(|config| {
         config.features.enable(Feature::CollaborationModes);
-    })
-    .await;
+    });
+    let test = builder.build(&server).await?;
+    let codex = Arc::clone(&test.codex);
     codex
         .submit(Op::OverrideTurnContext {
             cwd: None,
@@ -371,9 +380,12 @@ async fn human_clarification_prevents_an_incomplete_request_from_being_declared_
             personality: None,
             service_tier: None,
         })
-        .await
-        .unwrap();
+        .await?;
     submit_request(&codex, "Plan the interface change; ask me which interface.").await;
+    if review_followup {
+        wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+        codex.submit(Op::ReviewCompletedTurn).await?;
+    }
     let event = wait_for_event(&codex, |event| {
         matches!(event, EventMsg::RequestUserInput(_))
     })
@@ -393,45 +405,52 @@ async fn human_clarification_prevents_an_incomplete_request_from_being_declared_
                 )]),
             },
         })
-        .await
-        .unwrap();
+        .await?;
     wait_for_event(&codex, |event| {
         matches!(event, EventMsg::Warning(event)
         if event.message.contains("human clarification answers"))
     })
     .await;
     wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
-    codex.submit(Op::ReviewCompletedTurn).await.unwrap();
+    codex.submit(Op::ReviewCompletedTurn).await?;
     wait_for_event(&codex, |event| {
         matches!(event, EventMsg::Error(event)
         if event.message.contains("exact consumed-request provenance"))
     })
     .await;
-    let requests = requests.requests();
-    assert_eq!(requests.len(), 2);
+    let captured = requests.requests();
+    assert_eq!(captured.len(), if review_followup { 4 } else { 2 });
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(
-            &requests[1]
+            &captured[captured.len() - 1]
                 .function_call_output_content_and_success(call_id)
-                .unwrap()
+                .context("expected clarification output")?
                 .0
-                .unwrap()
-        )
-        .unwrap(),
+                .context("expected clarification output text")?
+        )?,
         serde_json::json!({"answers": {"target": {"answers": ["CLI only"]}}})
     );
-    let lines = read_rollout_lines(&codex.rollout_path().unwrap());
-    let state = lines
-        .iter()
-        .rev()
-        .find_map(|line| match &line.item {
-            RolloutItem::PostTurnCompletionReviewState(state) => Some(state),
-            _ => None,
-        })
-        .unwrap();
+    let rollout_path = codex.rollout_path().context("expected parent rollout")?;
+    let state = completion_state(&rollout_path)?;
     assert_eq!(state["request_frame"]["exact"], false);
     assert!(state["attempt"].is_null());
+    let fork = test
+        .thread_manager
+        .fork_thread(usize::MAX, test.config.clone(), rollout_path)
+        .await?
+        .thread;
+    let fork_state = completion_state(&fork.rollout_path().context("expected fork rollout")?)?;
+    assert_eq!(fork_state["request_frame"]["exact"], false);
+    assert!(fork_state["attempt"].is_null());
+    fork.submit(Op::ReviewCompletedTurn).await?;
+    wait_for_event(&fork, |event| {
+        matches!(event, EventMsg::Error(event)
+        if event.message.contains("exact consumed-request provenance"))
+    })
+    .await;
+    assert_eq!(requests.requests().len(), captured.len());
     server.verify().await;
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

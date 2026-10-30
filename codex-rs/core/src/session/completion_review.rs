@@ -707,6 +707,10 @@ pub(super) fn completion_review_for_fork(items: &[RolloutItem]) -> Option<Comple
         match item {
             RolloutItem::PostTurnCompletionReviewState(value) => {
                 let state = CompletionReviewState::from_rollout(value)?;
+                // Lost provenance also invalidates older candidates in this generation.
+                if !state.request_frame.exact {
+                    return None;
+                }
                 if generation
                     .as_ref()
                     .is_some_and(|generation| generation != &state.history_generation)

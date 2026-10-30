@@ -871,9 +871,12 @@ async fn completion_review_fork_excludes_metadata_for_the_next_unconsumed_user_b
         super::super::completion_review::completion_review_for_fork(&prefix),
         Some(original.clone())
     );
+    let mut unavailable = next.clone();
+    unavailable.request_frame.exact = false;
     for marker in [
         RolloutItem::PostTurnCompletionReviewState(serde_json::json!({"version": 99})),
         metadata(&CompletionReviewState::default()),
+        metadata(&unavailable),
     ] {
         let mut invalidated = prefix.clone();
         invalidated.push(marker);
