@@ -679,9 +679,11 @@ mod tests {
                 .install_completion_review_input(&context, revision, true)
                 .await
         );
-        session
-            .start_completion_review_main_task(&context.sub_id)
-            .await;
+        assert!(
+            session
+                .start_completion_review_main_task(&context.sub_id)
+                .await
+        );
         session
             .capture_completed_regular_turn_for_review(&context, Some("latest completed answer"))
             .await;

@@ -32,9 +32,11 @@ async fn complete_new_request(
             .install_completion_review_input(context, revision, true)
             .await
     );
-    session
-        .start_completion_review_main_task(&context.sub_id)
-        .await;
+    assert!(
+        session
+            .start_completion_review_main_task(&context.sub_id)
+            .await
+    );
     session
         .capture_completed_regular_turn_for_review(context, Some(answer))
         .await;
@@ -79,9 +81,11 @@ async fn completion_review_capture_uses_task_result_not_assistant_role() {
     session
         .record_conversation_items(&context, &[assistant_message("commentary, not the final")])
         .await;
-    session
-        .start_completion_review_main_task(&context.sub_id)
-        .await;
+    assert!(
+        session
+            .start_completion_review_main_task(&context.sub_id)
+            .await
+    );
     session
         .capture_completed_regular_turn_for_review(&context, Some(" exact final\n"))
         .await;
@@ -120,9 +124,11 @@ async fn completion_review_captures_consumed_steering_without_progress_round() {
             .install_completion_review_input(&context, second, true)
             .await
     );
-    session
-        .start_completion_review_main_task(&context.sub_id)
-        .await;
+    assert!(
+        session
+            .start_completion_review_main_task(&context.sub_id)
+            .await
+    );
     session
         .capture_completed_regular_turn_for_review(&context, Some("final"))
         .await;
@@ -163,9 +169,11 @@ async fn completion_review_late_input_remains_unreviewed_until_consumed() {
     session
         .retain_completion_review_input(&context, input)
         .await;
-    session
-        .start_completion_review_main_task(&context.sub_id)
-        .await;
+    assert!(
+        session
+            .start_completion_review_main_task(&context.sub_id)
+            .await
+    );
     session
         .capture_completed_regular_turn_for_review(&context, Some("old sampling result"))
         .await;
@@ -177,9 +185,11 @@ async fn completion_review_late_input_remains_unreviewed_until_consumed() {
                 .await
         );
     }
-    session
-        .start_completion_review_main_task(&context.sub_id)
-        .await;
+    assert!(
+        session
+            .start_completion_review_main_task(&context.sub_id)
+            .await
+    );
     session
         .capture_completed_regular_turn_for_review(&context, Some("answer including amendment"))
         .await;
@@ -237,6 +247,7 @@ async fn completion_review_handoff_is_claimed_once_and_survives_compaction() {
     let prompt = session
         .completion_review_main_instructions(true)
         .await
+        .unwrap()
         .unwrap();
     assert!(prompt.contains("original request"));
     assert!(prompt.contains(" initial complete answer\n"));
@@ -302,6 +313,131 @@ async fn completion_review_persistence_failure_prevents_reviewer_and_main_startu
                 EventMsg::TurnStarted(_) | EventMsg::EnteredReviewMode(_)
             )
         }));
+    }
+}
+
+#[tokio::test]
+async fn completion_review_started_resumes_stop_before_sampling_on_failed_owner_persistence() {
+    for compacted in [false, true] {
+        let (session, mut context, events) = make_session_and_context_with_rx().await;
+        let (_home, path) = attach_recorder(&session, &context).await;
+        complete_new_request(&session, &context, "original request", "complete answer").await;
+        Arc::get_mut(&mut context).unwrap().sub_id = "started-main".into();
+        let ticket = session.begin_completion_review(false).await.unwrap();
+        assert!(
+            session
+                .prepare_completion_review_handoff(
+                    &ticket,
+                    "advisory and replacement contract".into(),
+                    context.model_info.slug.clone(),
+                )
+                .await
+        );
+        let checkpoint = session
+            .claim_completion_review_handoff(&ticket, &context.sub_id)
+            .await
+            .unwrap();
+        session.set_pending_continuation(Some(checkpoint)).await;
+        let ready = Arc::new(Notify::new());
+        session
+            .spawn_task(
+                Arc::clone(&context),
+                vec![],
+                CompletingReviewTask {
+                    ready: Arc::clone(&ready),
+                    finish: Arc::new(Notify::new()),
+                },
+            )
+            .await;
+        ready.notified().await;
+        super::super::handlers::pause(&session).await;
+        if compacted {
+            let replacement = vec![ResponseItem::Compaction {
+                encrypted_content: "compacted paused main work".into(),
+            }];
+            session
+                .replace_compacted_history(
+                    &context,
+                    replacement.clone(),
+                    None,
+                    CompactedItem {
+                        message: String::new(),
+                        replacement_history: Some(replacement),
+                    },
+                )
+                .await;
+            session.persist_completion_review().await;
+        }
+        let before = tokio::fs::read(&path).await.unwrap();
+        let snapshot = session.state.lock().await.completion_review.clone();
+        let history = session.clone_history().await.raw_items().to_vec();
+        *session.services.rollout.lock().await =
+            Some(RolloutRecorder::read_only_for_test(&path).await.unwrap());
+        while events.try_recv().is_ok() {}
+        super::super::handlers::continue_last(&session, "failed-resume".into()).await;
+        let event = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let event = events.recv().await.unwrap().msg;
+                if matches!(event, EventMsg::TurnStarted(_) | EventMsg::TurnComplete(_)) {
+                    return event;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        session.abort_all_tasks(TurnAbortReason::Replaced).await;
+        assert!(
+            matches!(event, EventMsg::TurnComplete(event) if event.last_agent_message.is_none()),
+            "failed Started resume must stop before sampling; compacted={compacted}"
+        );
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), before);
+        assert_eq!(
+            session.clone_history().await.raw_items(),
+            history.as_slice()
+        );
+        {
+            let state = session.state.lock().await;
+            assert_eq!(state.completion_review.episode, snapshot.episode);
+            assert_eq!(state.completion_review.handoff, snapshot.handoff);
+            assert!(state.completion_review.replacement_answer_required);
+            let pending = state.pending_continuation.as_ref().unwrap();
+            assert_eq!(pending.target, PendingContinuationTarget::Regular);
+            assert_eq!(
+                pending.model.as_deref(),
+                Some(context.model_info.slug.as_str())
+            );
+        }
+        assert!(
+            session
+                .completion_review_main_instructions(true)
+                .await
+                .is_err()
+        );
+        let pending = session.state.lock().await.pending_continuation.clone();
+        *session.services.rollout.lock().await = Some(
+            RolloutRecorder::new(
+                context.config.as_ref(),
+                crate::rollout::recorder::RolloutRecorderParams::resume(path.clone()),
+                None,
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        super::super::handlers::continue_last(&session, "missing-snapshot".into()).await;
+        assert!(session.active_turn.lock().await.is_none());
+        assert_eq!(session.state.lock().await.pending_continuation, pending);
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), before);
+        let (items, _, errors) = RolloutRecorder::load_rollout_items(&path).await.unwrap();
+        assert_eq!(errors, 0);
+        let recovered = session
+            .reconstruct_history_from_rollout(&context, &items)
+            .await;
+        assert_eq!(recovered.completion_review, Some(snapshot));
+        assert_eq!(
+            recovered.pending_continuation.unwrap().target,
+            PendingContinuationTarget::Regular
+        );
     }
 }
 
@@ -428,13 +564,16 @@ async fn completion_review_model_override_retargets_only_pending_main_work_durab
             expected.handoff.as_mut().unwrap().model = model.into();
             expected_checkpoint.model = Some(model.into());
         }
-        session
-            .update_settings(SessionSettingsUpdate {
+        super::super::handlers::override_turn_context(
+            &session,
+            "selected-recovery-model".into(),
+            SessionSettingsUpdate {
                 collaboration_mode: Some(mode),
                 ..Default::default()
-            })
-            .await
-            .unwrap();
+            },
+            true,
+        )
+        .await;
         {
             let state = session.state.lock().await;
             assert_eq!(state.completion_review, expected);
@@ -669,9 +808,11 @@ async fn completion_review_stale_tickets_cannot_prepare_or_claim_advice() {
             .install_completion_review_input(&context, revision, true)
             .await
     );
-    session
-        .start_completion_review_main_task(&context.sub_id)
-        .await;
+    assert!(
+        session
+            .start_completion_review_main_task(&context.sub_id)
+            .await
+    );
     session
         .capture_completed_regular_turn_for_review(&context, Some("new candidate"))
         .await;
@@ -695,9 +836,11 @@ async fn completion_review_stale_tickets_cannot_prepare_or_claim_advice() {
 async fn completion_review_old_task_cannot_capture_or_schedule_a_newer_candidate() {
     let (session, context) = completed_session().await;
     let original = session.completed_turn_for_review().await;
-    session
-        .start_completion_review_main_task("newer-main")
-        .await;
+    assert!(
+        session
+            .start_completion_review_main_task("newer-main")
+            .await
+    );
     session
         .capture_completed_regular_turn_for_review(&context, Some("stale old result"))
         .await;
@@ -1041,9 +1184,11 @@ async fn completion_review_input_installation_replays_every_durable_boundary() {
                 .count(),
             2
         );
-        resumed
-            .start_completion_review_main_task(&resumed_context.sub_id)
-            .await;
+        assert!(
+            resumed
+                .start_completion_review_main_task(&resumed_context.sub_id)
+                .await
+        );
         resumed
             .capture_completed_regular_turn_for_review(&resumed_context, Some("amended answer"))
             .await;
@@ -1189,10 +1334,12 @@ impl SessionTask for CompletingReviewTask {
         _input: Vec<UserInput>,
         _cancellation: CancellationToken,
     ) -> Option<String> {
-        session
-            .clone_session()
-            .start_completion_review_main_task(&context.sub_id)
-            .await;
+        assert!(
+            session
+                .clone_session()
+                .start_completion_review_main_task(&context.sub_id)
+                .await
+        );
         self.ready.notify_one();
         self.finish.notified().await;
         Some("durable terminal replacement".into())
@@ -1304,9 +1451,11 @@ impl SessionTask for InputInstallationTask {
         _cancellation: CancellationToken,
     ) -> Option<String> {
         let session = session.clone_session();
-        session
-            .start_completion_review_main_task(&context.sub_id)
-            .await;
+        assert!(
+            session
+                .start_completion_review_main_task(&context.sub_id)
+                .await
+        );
         self.ready.notify_one();
         self.enter.notified().await;
         assert!(

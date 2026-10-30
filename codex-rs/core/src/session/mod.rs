@@ -947,7 +947,6 @@ impl Session {
         &self,
         updates: SessionSettingsUpdate,
     ) -> ConstraintResult<(SessionConfiguration, bool)> {
-        let model_selected = updates.collaboration_mode.is_some();
         let (mut updated, sandbox_policy_changed, refresh_base_instructions) = {
             let state = self.state.lock().await;
             let current = state.session_configuration.clone();
@@ -985,11 +984,6 @@ impl Session {
 
         let mut state = self.state.lock().await;
         state.session_configuration = updated.clone();
-        drop(state);
-        if model_selected {
-            self.retarget_pending_regular_continuation_model(updated.collaboration_mode.model())
-                .await;
-        }
         Ok((updated, sandbox_policy_changed))
     }
 

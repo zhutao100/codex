@@ -468,13 +468,24 @@ async fn completed_snapshot_resumes_without_persisted_turn_complete_events() {
     server.verify().await;
 }
 
-#[test_case::test_case(false, false; "compact")]
-#[test_case::test_case(true, false; "larger model")]
-#[test_case::test_case(true, true; "larger model after restart")]
+#[derive(Clone, Copy, Debug)]
+enum NonModelRecoveryOverride {
+    Cwd,
+    Approval,
+    Effort,
+}
+
+#[test_case::test_case(false, false, None; "compact")]
+#[test_case::test_case(true, false, None; "larger model")]
+#[test_case::test_case(true, true, None; "larger model after restart")]
+#[test_case::test_case(true, true, Some(NonModelRecoveryOverride::Cwd); "cwd override after restart")]
+#[test_case::test_case(true, true, Some(NonModelRecoveryOverride::Approval); "approval override after restart")]
+#[test_case::test_case(true, true, Some(NonModelRecoveryOverride::Effort); "effort override after restart")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn review_followup_budget_recovery_preserves_scope(
     select_larger_model: bool,
     restart: bool,
+    non_model_override: Option<NonModelRecoveryOverride>,
 ) -> anyhow::Result<()> {
     skip_if_no_network_unless_localhost!(Ok(()));
     let server = MockServer::start().await;
@@ -527,6 +538,35 @@ async fn review_followup_budget_recovery_preserves_scope(
     } else {
         codex
     };
+    if let Some(non_model_override) = non_model_override {
+        let (cwd, approval_policy, effort) = match non_model_override {
+            NonModelRecoveryOverride::Cwd => (Some(home.path().join("workspace")), None, None),
+            NonModelRecoveryOverride::Approval => (
+                None,
+                Some(codex_protocol::protocol::AskForApproval::Never),
+                None,
+            ),
+            NonModelRecoveryOverride::Effort => (
+                None,
+                None,
+                Some(Some(codex_protocol::openai_models::ReasoningEffort::High)),
+            ),
+        };
+        active
+            .submit(Op::OverrideTurnContext {
+                cwd,
+                approval_policy,
+                sandbox_policy: None,
+                windows_sandbox_level: None,
+                model: None,
+                effort,
+                summary: None,
+                collaboration_mode: None,
+                personality: None,
+                service_tier: None,
+            })
+            .await?;
+    }
     active.submit(Op::Continue).await?;
     wait_for_event(&active, |event| match event {
         EventMsg::Error(event) => panic!("recovery failed: {}", event.message),

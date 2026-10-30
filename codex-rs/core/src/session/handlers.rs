@@ -65,6 +65,7 @@ pub(super) async fn submission_loop(
                 personality,
                 service_tier,
             } => {
+                let model_selected = model.is_some() || collaboration_mode.is_some();
                 let collaboration_mode = if let Some(collab_mode) = collaboration_mode {
                     collab_mode
                 } else {
@@ -89,6 +90,7 @@ pub(super) async fn submission_loop(
                         service_tier,
                         ..Default::default()
                     },
+                    model_selected,
                 )
                 .await;
             }
@@ -304,6 +306,18 @@ pub async fn continue_last(sess: &Arc<Session>, sub_id: String) {
         return;
     };
 
+    if checkpoint.target == PendingContinuationTarget::Regular
+        && let Err(error) = sess.completion_review_main_instructions(true).await
+    {
+        sess.set_pending_continuation(Some(checkpoint)).await;
+        sess.send_event_raw(Event {
+            id: sub_id,
+            msg: EventMsg::Error(error.to_error_event(None)),
+        })
+        .await;
+        return;
+    }
+
     let continuation_model = checkpoint.model.clone();
     let turn_context = if let Some(model) = continuation_model {
         let collaboration_mode = {
@@ -369,7 +383,17 @@ pub async fn continue_last(sess: &Arc<Session>, sub_id: String) {
     }
 }
 
-pub async fn override_turn_context(sess: &Session, sub_id: String, updates: SessionSettingsUpdate) {
+pub async fn override_turn_context(
+    sess: &Session,
+    sub_id: String,
+    updates: SessionSettingsUpdate,
+    model_selected: bool,
+) {
+    let recovery_model = updates
+        .collaboration_mode
+        .as_ref()
+        .filter(|_| model_selected)
+        .map(|mode| mode.model().to_string());
     if let Err(err) = sess.update_settings(updates).await {
         sess.send_event_raw(Event {
             id: sub_id,
@@ -380,6 +404,11 @@ pub async fn override_turn_context(sess: &Session, sub_id: String, updates: Sess
             }),
         })
         .await;
+        return;
+    }
+    if let Some(model) = recovery_model {
+        sess.retarget_pending_regular_continuation_model(&model)
+            .await;
     }
 }
 

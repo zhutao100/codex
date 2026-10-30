@@ -296,8 +296,23 @@ async fn run_turn_inner(
     cancellation_token: CancellationToken,
 ) -> Option<String> {
     let model_info = turn_context.model_info.clone();
-    sess.start_completion_review_main_task(&turn_context.sub_id)
+    if !sess
+        .start_completion_review_main_task(&turn_context.sub_id)
+        .await
+    {
+        sess.send_event(
+            &turn_context,
+            EventMsg::Error(
+                CodexErr::Fatal(
+                    "Main work could not persist its recovery owner. Repair persistence and resume from the last durable rollout. No model request was sent."
+                        .into(),
+                )
+                .to_error_event(None),
+            ),
+        )
         .await;
+        return None;
+    }
     let auto_compact_limit = model_info.auto_compact_token_limit().unwrap_or(i64::MAX);
     let mut total_usage_tokens = sess.get_total_token_usage().await;
 
@@ -595,9 +610,19 @@ async fn run_turn_inner(
             } else {
                 sess.prompt_history(turn_context.as_ref()).await
             };
-        if matches!(pre_compact_notes_state, PreCompactNotesState::Idle)
-            && let Some(instructions) = sess.completion_review_main_instructions(true).await
-        {
+        let review_instructions = if matches!(pre_compact_notes_state, PreCompactNotesState::Idle) {
+            match sess.completion_review_main_instructions(true).await {
+                Ok(instructions) => instructions,
+                Err(error) => {
+                    sess.send_event(&turn_context, EventMsg::Error(error.to_error_event(None)))
+                        .await;
+                    return None;
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(instructions) = review_instructions {
             sampling_request_input.push(DeveloperInstructions::new(instructions).into());
             let base = sess.get_base_instructions_for_turn(&turn_context).await;
             let target = turn_context
@@ -606,7 +631,15 @@ async fn run_turn_inner(
                 .saturating_sub(8_192);
             if estimate_work_notes_prompt_tokens(&sampling_request_input, &base) > target {
                 sampling_request_input.pop();
-                let instructions = sess.completion_review_main_instructions(false).await?;
+                let instructions = match sess.completion_review_main_instructions(false).await {
+                    Ok(Some(instructions)) => instructions,
+                    Ok(None) => return None,
+                    Err(error) => {
+                        sess.send_event(&turn_context, EventMsg::Error(error.to_error_event(None)))
+                            .await;
+                        return None;
+                    }
+                };
                 sampling_request_input.push(DeveloperInstructions::new(instructions).into());
                 if estimate_work_notes_prompt_tokens(&sampling_request_input, &base) > target {
                     sess.send_event(&turn_context, EventMsg::Error(CodexErr::Fatal(

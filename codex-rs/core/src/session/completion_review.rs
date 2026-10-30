@@ -162,10 +162,10 @@ impl Session {
         .unwrap_or(false)
     }
 
-    pub(crate) async fn start_completion_review_main_task(&self, turn_id: &str) {
+    pub(crate) async fn start_completion_review_main_task(&self, turn_id: &str) -> bool {
         let _guard = self.completion_review_installation.lock().await;
         self.state.lock().await.completion_review.main_task_id = Some(turn_id.to_string());
-        self.persist_completion_review_locked().await;
+        self.persist_completion_review_locked().await
     }
 
     pub(crate) async fn retarget_pending_regular_continuation_model(&self, model: &str) {
@@ -565,41 +565,50 @@ impl Session {
     pub(crate) async fn completion_review_main_instructions(
         &self,
         include_reference: bool,
-    ) -> Option<String> {
+    ) -> Result<Option<String>, CodexErr> {
         let state = self.state.lock().await;
         let review = &state.completion_review;
         if !review.replacement_answer_required {
-            return None;
+            return Ok(None);
         }
         let Some(handoff) = review.handoff.as_ref() else {
-            return Some(format!(
+            return Ok(Some(format!(
                 "{}\nConsumed user request context (host snapshot):\n{}",
                 crate::tasks::post_turn_completion_review::REPLACEMENT_ANSWER_CONTRACT,
-                serde_json::to_string(&review.request_frame).ok()?
-            ));
+                serde_json::to_string(&review.request_frame).map_err(|error| {
+                    CodexErr::Fatal(format!(
+                        "Could not serialize review follow-up scope: {error}"
+                    ))
+                })?
+            )));
         };
         if !matches!(
             handoff.disposition,
             ReviewHandoffDisposition::Started { .. }
         ) || !review.ticket_is_current(&handoff.ticket)
         {
-            return None;
+            return Err(CodexErr::Fatal(
+                "Review follow-up snapshots are unavailable. Repair persistence and resume from the last durable rollout, or supply a new complete request. No incomplete follow-up request was sent."
+                    .into(),
+            ));
         }
-        let episode = review.eligible_episode()?;
+        let episode = review
+            .eligible_episode()
+            .ok_or_else(|| CodexErr::Fatal("Review follow-up candidate is unavailable.".into()))?;
         let advisory: ResponseItem = DeveloperInstructions::new(handoff.advisory.clone()).into();
         let instructions = if state.history.raw_items().contains(&advisory) {
             crate::tasks::post_turn_completion_review::REPLACEMENT_ANSWER_CONTRACT
         } else {
             &handoff.advisory
         };
-        Some(format!(
+        Ok(Some(format!(
             "{}\n{}",
             instructions,
             crate::tasks::post_turn_completion_review::render_completed_turn_context(
                 episode,
                 include_reference
             )
-        ))
+        )))
     }
 
     pub(crate) async fn record_completion_review_advisory(
