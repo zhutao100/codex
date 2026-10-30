@@ -37,11 +37,15 @@ Only a genuinely new root session or trusted metadata establishes exact request 
 
 Snapshot writes and handoff transitions use a serialized persistence boundary. Persist completion before reserving its review; persist a prepared handoff before enqueue; persist the started claim before main work. Failed writes disable review eligibility and surface a diagnostic. A full/closed operation queue preserves recoverable work instead of waiting while task finalization holds its lifecycle guard.
 
+Recorder flush/shutdown acknowledgements carry the underlying I/O result, not just notification that the writer processed the command. A buffered write failure must reach the reservation or claim caller before task startup. Failure leaves the existing durable prefix intact and prevents the in-memory transition from authorizing new review work.
+
 Advisory preparation and installation finish their short durable transaction even if their caller is cancelled; task-stop joins that boundary before recording its stopped state. Pausing a reviewer clears an unconsumed prepared handoff and preserves its ticket for re-review. Pausing main work preserves started lineage and its output contract.
 
 Continuation cleanup and acknowledgement of unconsumed input use the same boundary. A cleanup rewrite cannot discard metadata or acknowledged input written concurrently, and stopping a task cannot leave those writes racing the published pause state.
 
 Input installation persists an `Installing` marker for a specific accepted revision before recording its user message, persists `Recorded` after that body, and only then consumes the revision into the request frame. Replay recognizes a body after its installing marker using the exact host-owned message; it never deduplicates by text found anywhere in history. Accepted inputs without a body are reinstalled before ordinary sampling, after pending notes recovery. Acknowledgement before main-task startup also establishes recoverable continuation work. Pending notes retain the resume-selected destination model while compaction resolves its separate source.
+
+Recognizing that installation preserves the prior, now-ineligible candidate and its CWD. The accepted revision already invalidates review eligibility, while an unfinished review-derived main task still needs that directory owner to resume. An unrecognized user boundary continues to discard the candidate and disable exact provenance. Do not erase known recovery ownership merely because the matching body arrived before its `Recorded` snapshot.
 
 Once input installation starts, its short owned transaction survives caller cancellation and task-stop joins it. A consumed amendment therefore cannot be persisted ahead of its model-facing message. The earlier version 1 metadata cannot establish these guarantees and is conservatively unavailable rather than upgraded by inference.
 

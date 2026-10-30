@@ -121,10 +121,12 @@ impl Session {
                         } else {
                             current_metadata.commit_user_boundary(pending_context.take());
                             if let Some(review) = completion_review.as_mut() {
+                                // A known amendment invalidates eligibility, not
+                                // the prior candidate's continuation directory.
                                 if !input_installed {
                                     review.request_frame.exact = false;
+                                    review.episode = None;
                                 }
-                                review.episode = None;
                                 review.clear_operations();
                             }
                         }

@@ -258,6 +258,54 @@ async fn completion_review_handoff_is_claimed_once_and_survives_compaction() {
 }
 
 #[tokio::test]
+async fn completion_review_persistence_failure_prevents_reviewer_and_main_startup() {
+    for followup_main in [false, true] {
+        let (session, context, events) = make_session_and_context_with_rx().await;
+        let (_home, path) = attach_recorder(&session, &context).await;
+        complete_new_request(&session, &context, "original request", "complete answer").await;
+        if followup_main {
+            let ticket = session.begin_completion_review(false).await.unwrap();
+            assert!(
+                session
+                    .prepare_completion_review_handoff(
+                        &ticket,
+                        "advisory and replacement contract".into(),
+                        context.model_info.slug.clone(),
+                    )
+                    .await
+            );
+        }
+        let before = tokio::fs::read(&path).await.unwrap();
+        *session.services.rollout.lock().await =
+            Some(RolloutRecorder::read_only_for_test(&path).await.unwrap());
+        while events.try_recv().is_ok() {}
+        if followup_main {
+            super::super::handlers::continue_last(&session, "failed-main".into()).await;
+        } else {
+            super::super::handlers::review_completed_turn(&session, "failed-review".into()).await;
+        }
+        let started = session.active_turn.lock().await.is_some();
+        session.abort_all_tasks(TurnAbortReason::Replaced).await;
+        assert!(!started);
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), before);
+        assert!(session.completed_turn_for_review().await.is_none());
+        let messages: Vec<_> = std::iter::from_fn(|| events.try_recv().ok())
+            .map(|event| event.msg)
+            .collect();
+        assert!(messages.iter().any(|event| {
+            matches!(event, EventMsg::Warning(warning)
+                if warning.message.contains("could not be persisted"))
+        }));
+        assert!(!messages.iter().any(|event| {
+            matches!(
+                event,
+                EventMsg::TurnStarted(_) | EventMsg::EnteredReviewMode(_)
+            )
+        }));
+    }
+}
+
+#[tokio::test]
 async fn completion_review_directory_rejection_preserves_the_pending_checkpoint() {
     for review_derived in [false, true] {
         let (session, context) = completed_session().await;

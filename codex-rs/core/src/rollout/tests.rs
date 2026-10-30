@@ -103,6 +103,40 @@ fn rollout_json_line(item: RolloutItem) -> String {
     .expect("rollout line should serialize")
 }
 
+#[test_case::test_case(false; "flush")]
+#[test_case::test_case(true; "shutdown")]
+#[tokio::test]
+async fn recorder_acknowledgement_propagates_flush_failure(shutdown: bool) -> Result<()> {
+    use tokio::io::AsyncWriteExt as _;
+
+    let file = tempfile::NamedTempFile::new()?;
+    let mut probe = tokio::fs::File::open(file.path()).await?;
+    let expected = async {
+        probe.write_all(b"read-only probe").await?;
+        probe.flush().await
+    }
+    .await
+    .unwrap_err();
+    let recorder = RolloutRecorder::read_only_for_test(file.path()).await?;
+    recorder
+        .record_items(&[RolloutItem::PostTurnCompletionReviewState(
+            serde_json::json!({"version": 2}),
+        )])
+        .await?;
+    let error = if shutdown {
+        recorder.shutdown().await
+    } else {
+        recorder.flush().await
+    }
+    .unwrap_err();
+    assert_eq!(
+        (error.kind(), error.raw_os_error()),
+        (expected.kind(), expected.raw_os_error())
+    );
+    assert!(tokio::fs::read(file.path()).await?.is_empty());
+    Ok(())
+}
+
 #[test]
 fn custom_pause_continue_events_are_not_persisted() {
     assert!(!crate::rollout::policy::should_persist_event_msg(

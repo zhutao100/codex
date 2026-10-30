@@ -90,10 +90,10 @@ enum RolloutCmd {
     AddItems(Vec<RolloutItem>),
     /// Ensure all prior writes are processed; respond when flushed.
     Flush {
-        ack: oneshot::Sender<()>,
+        ack: oneshot::Sender<std::io::Result<()>>,
     },
     Shutdown {
-        ack: oneshot::Sender<()>,
+        ack: oneshot::Sender<std::io::Result<()>>,
     },
 }
 
@@ -391,6 +391,27 @@ impl RolloutRecorder {
         self.state_db.clone()
     }
 
+    #[cfg(test)]
+    pub(crate) async fn read_only_for_test(path: &Path) -> std::io::Result<Self> {
+        let file = tokio::fs::File::open(path).await?;
+        let (tx, rx) = mpsc::channel(256);
+        tokio::spawn(rollout_writer(
+            file,
+            rx,
+            None,
+            PathBuf::new(),
+            path.to_path_buf(),
+            None,
+            None,
+            "test-provider".into(),
+        ));
+        Ok(Self {
+            tx,
+            rollout_path: path.to_path_buf(),
+            state_db: None,
+        })
+    }
+
     pub(crate) async fn record_items(&self, items: &[RolloutItem]) -> std::io::Result<()> {
         let mut filtered = Vec::new();
         for item in items {
@@ -418,7 +439,7 @@ impl RolloutRecorder {
             .await
             .map_err(|e| IoError::other(format!("failed to queue rollout flush: {e}")))?;
         rx.await
-            .map_err(|e| IoError::other(format!("failed waiting for rollout flush: {e}")))
+            .map_err(|e| IoError::other(format!("failed waiting for rollout flush: {e}")))?
     }
 
     pub(crate) async fn load_rollout_items(
@@ -597,7 +618,7 @@ impl RolloutRecorder {
         match self.tx.send(RolloutCmd::Shutdown { ack: tx_done }).await {
             Ok(_) => rx_done
                 .await
-                .map_err(|e| IoError::other(format!("failed waiting for rollout shutdown: {e}"))),
+                .map_err(|e| IoError::other(format!("failed waiting for rollout shutdown: {e}")))?,
             Err(e) => {
                 warn!("failed to send rollout shutdown command: {e}");
                 Err(IoError::other(format!(
@@ -724,20 +745,13 @@ async fn rollout_writer(
                 )
                 .await;
             }
-            RolloutCmd::Flush { ack } => {
-                // Ensure underlying file is flushed and then ack.
-                if let Err(e) = writer.file.flush().await {
-                    let _ = ack.send(());
-                    return Err(e);
+            RolloutCmd::Flush { ack } | RolloutCmd::Shutdown { ack } => {
+                if let Err(error) = writer.file.flush().await {
+                    let writer_error = IoError::new(error.kind(), error.to_string());
+                    let _ = ack.send(Err(error));
+                    return Err(writer_error);
                 }
-                let _ = ack.send(());
-            }
-            RolloutCmd::Shutdown { ack } => {
-                if let Err(e) = writer.file.flush().await {
-                    let _ = ack.send(());
-                    return Err(e);
-                }
-                let _ = ack.send(());
+                let _ = ack.send(Ok(()));
             }
         }
     }

@@ -893,6 +893,152 @@ async fn compacted_legacy_resume_cannot_review_a_referential_request_as_complete
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn started_followup_amendment_recovers_after_body_written_without_recorded_snapshot()
+-> anyhow::Result<()> {
+    skip_if_no_network_unless_localhost!(Ok(()));
+    let server = MockServer::start().await;
+    let requests = mount_response_sequence(
+        &server,
+        vec![
+            sse_response(answer("Original complete answer.")),
+            sse_response(verdict("Verify and replace the complete answer.", true)),
+            sse_response(answer("Interrupted follow-up."))
+                .set_delay(std::time::Duration::from_secs(5)),
+            sse_response(answer("Complete amended replacement.")),
+            sse_response(verdict("Checked the complete amended request.", false)),
+        ],
+    )
+    .await;
+    let home = Arc::new(TempDir::new()?);
+    let original_cwd = home.path().join("workspace");
+    let other_cwd = home.path().join("other-project");
+    tokio::fs::create_dir_all(&other_cwd).await?;
+    let codex = new_conversation_for_server(&server, home.clone(), configure_recovery_models).await;
+    submit_request(&codex, "Finish the original project request.").await;
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    codex.submit(Op::ReviewCompletedTurn).await?;
+    wait_for_captured_requests(&requests, 3).await;
+    let path = codex.rollout_path().context("expected rollout path")?;
+    let started = completion_state(&path)?;
+    assert!(started["handoff"]["disposition"]["Started"].is_object());
+    let amendment = "Also preserve the public API.";
+    let content = vec![UserInput::Text {
+        text: amendment.into(),
+        text_elements: vec![],
+    }];
+    let body: ResponseItem =
+        codex_protocol::models::ResponseInputItem::from(content.clone()).into();
+    codex
+        .submit(Op::SteerInput {
+            expected_turn_id: started["main_task_id"]
+                .as_str()
+                .context("expected main owner")?
+                .into(),
+            items: content,
+            client_user_message_id: Some("review-followup-amendment".into()),
+        })
+        .await?;
+    codex.submit(Op::Pause).await?;
+    wait_for_event(&codex, |event| match event {
+        EventMsg::Error(error) => panic!("steering failed: {}", error.message),
+        EventMsg::TurnPaused(_) => true,
+        _ => false,
+    })
+    .await;
+    codex.submit(Op::Shutdown).await?;
+    wait_for_event(&codex, |event| matches!(event, EventMsg::ShutdownComplete)).await;
+    let lines = read_rollout_lines(&path);
+    let body_index = lines
+        .iter()
+        .position(|line| matches!(&line.item, RolloutItem::ResponseItem(item) if item == &body))
+        .context("expected installed amendment body")?;
+    let installing = lines[..body_index]
+        .iter()
+        .rev()
+        .find_map(|line| match &line.item {
+            RolloutItem::PostTurnCompletionReviewState(state) => Some(state),
+            _ => None,
+        })
+        .context("expected installing marker")?;
+    assert_eq!(installing["replacement_answer_required"], true);
+    assert_eq!(
+        installing["pending_inputs"][0]["installation"],
+        "Installing"
+    );
+    assert_eq!(
+        installing["episode"]["cwd"],
+        serde_json::to_value(&original_cwd)?
+    );
+    // Keep the real accepted/Installing/body prefix, but omit the Recorded snapshot.
+    let prefix = lines[..=body_index]
+        .iter()
+        .map(serde_json::to_string)
+        .collect::<Result<Vec<_>, _>>()?
+        .join("\n")
+        + "\n";
+    tokio::fs::write(&path, prefix).await?;
+    let resumed =
+        resume_conversation_for_server(&server, home.clone(), path, configure_recovery_models)
+            .await;
+    resumed
+        .submit(context_override(Some(other_cwd), None))
+        .await?;
+    resumed.submit(Op::Continue).await?;
+    let rejected = wait_for_event(&resumed, |event| {
+        matches!(event, EventMsg::Error(_) | EventMsg::TurnStarted(_))
+    })
+    .await;
+    assert!(
+        matches!(rejected, EventMsg::Error(error) if error.message.contains("working directory"))
+    );
+    assert_eq!(requests.requests().len(), 3);
+    resumed
+        .submit(context_override(Some(original_cwd), None))
+        .await?;
+    resumed.submit(Op::Continue).await?;
+    wait_for_event(&resumed, |event| match event {
+        EventMsg::Error(error) => panic!("amendment recovery failed: {}", error.message),
+        EventMsg::TurnComplete(event) => {
+            assert_eq!(
+                event.last_agent_message.as_deref(),
+                Some("Complete amended replacement.")
+            );
+            true
+        }
+        _ => false,
+    })
+    .await;
+    resumed.submit(Op::ReviewCompletedTurn).await?;
+    wait_for_event(&resumed, |event| {
+        matches!(event, EventMsg::ExitedReviewMode(_))
+    })
+    .await;
+    wait_for_event(&resumed, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    let captured = requests.requests();
+    assert_eq!(captured.len(), 5);
+    assert_eq!(
+        captured[3]
+            .input()
+            .iter()
+            .filter(|item| item["role"] == "user" && item["content"][0]["text"] == amendment)
+            .count(),
+        1
+    );
+    let main_input = serde_json::to_string(&captured[3].input())?;
+    assert!(main_input.contains("self-contained final answer"));
+    let review = packet(&captured[4]);
+    for required in [
+        "Finish the original project request.",
+        amendment,
+        "Complete amended replacement.",
+    ] {
+        assert!(review.contains(required), "missing {required:?}");
+    }
+    server.verify().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn accepted_and_partially_installed_amendments_reach_model_and_next_review_after_restart() {
     skip_if_no_network_unless_localhost!();
     for body_written in [false, true] {
