@@ -449,7 +449,10 @@ impl Session {
             .await;
             return;
         }
-        self.clear_pending_continuation().await;
+        // Rewriting context does not complete the owner of pending main work.
+        if task_kind != TaskKind::Compact {
+            self.clear_pending_continuation().await;
+        }
         let incomplete_main = last_agent_message.is_none()
             && self
                 .completion_review_main_task_is_current(&turn_context.sub_id)

@@ -1,4 +1,5 @@
 use super::*;
+use anyhow::Context;
 use codex_core::features::Feature;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
@@ -26,6 +27,43 @@ fn verdict(evaluation: &str, followup: bool) -> String {
         })
         .to_string(),
     )
+}
+
+fn configure_recovery_models(config: &mut Config) {
+    config.model = Some("completion-recovery-small".into());
+    config.review_model = Some("completion-recovery-large".into());
+    config.features.enable(Feature::RemoteCompaction);
+    config.features.enable(Feature::RemoteCompactionV2);
+    config.model_overlay = Some(ModelOverlay {
+        models: [
+            ("completion-recovery-small", 24_000),
+            ("completion-recovery-large", 128_000),
+        ]
+        .into_iter()
+        .map(|(model, window)| ModelOverlayEntry {
+            slug: model.into(),
+            model_provider: None,
+            patch: ModelInfoPatch {
+                base_instructions: Some("Complete the requested work.".into()),
+                context_window: Some(Some(window)),
+                auto_compact_token_limit: Some(Some(200_000)),
+                ..Default::default()
+            },
+            final_instruction_override: None,
+        })
+        .collect(),
+        ..Default::default()
+    });
+}
+
+fn compacted_answer() -> String {
+    sse(vec![
+        serde_json::json!({
+            "type": "response.output_item.done",
+            "item": {"type": "compaction", "encrypted_content": "compacted review follow-up"},
+        }),
+        ev_completed("compact"),
+    ])
 }
 
 #[expect(clippy::expect_used)]
@@ -402,6 +440,225 @@ async fn completed_snapshot_resumes_without_persisted_turn_complete_events() {
     assert!(context.contains("durable request"));
     assert!(context.contains("<candidate_final_answer><![CDATA[ exact durable answer\n]]>"));
     server.verify().await;
+}
+
+#[test_case::test_case(false, false; "compact")]
+#[test_case::test_case(true, false; "larger model")]
+#[test_case::test_case(true, true; "larger model after restart")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_followup_budget_recovery_preserves_scope(
+    select_larger_model: bool,
+    restart: bool,
+) -> anyhow::Result<()> {
+    skip_if_no_network_unless_localhost!(Ok(()));
+    let server = MockServer::start().await;
+    let initial = "Exact candidate details.\n".repeat(1_500);
+    let mut replies = vec![
+        answer(&initial),
+        verdict("Verify the work and replace the complete answer.", true),
+    ];
+    if !select_larger_model {
+        replies.push(compacted_answer());
+    }
+    replies.push(answer("Recovered complete replacement."));
+    let requests = mount_sse_sequence(&server, replies).await;
+    let home = Arc::new(TempDir::new()?);
+    let codex = new_conversation_for_server(&server, home.clone(), configure_recovery_models).await;
+    submit_request(&codex, "Preserve every result and report verification.").await;
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    codex.submit(Op::ReviewCompletedTurn).await?;
+    wait_for_event(&codex, |event| match event {
+        EventMsg::Error(event) => {
+            assert!(event.message.contains("Review follow-up context exceeds"));
+            true
+        }
+        EventMsg::TurnComplete(event) if event.last_agent_message.is_some() => {
+            panic!("follow-up must stop before sending an over-budget request")
+        }
+        _ => false,
+    })
+    .await;
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    assert_eq!(requests.requests().len(), 2);
+    if select_larger_model {
+        codex
+            .submit(Op::OverrideTurnContext {
+                cwd: None,
+                approval_policy: None,
+                sandbox_policy: None,
+                windows_sandbox_level: None,
+                model: Some("completion-recovery-large".into()),
+                effort: None,
+                summary: None,
+                collaboration_mode: None,
+                personality: None,
+                service_tier: None,
+            })
+            .await?;
+    } else {
+        codex.submit(Op::Compact).await?;
+        wait_for_event(&codex, |event| match event {
+            EventMsg::Error(event) => panic!("compaction failed: {}", event.message),
+            EventMsg::TurnComplete(_) => true,
+            _ => false,
+        })
+        .await;
+    }
+    let active = if restart {
+        let path = codex.rollout_path().context("expected rollout path")?;
+        codex.submit(Op::Shutdown).await?;
+        wait_for_event(&codex, |event| matches!(event, EventMsg::ShutdownComplete)).await;
+        resume_conversation_for_server(&server, home.clone(), path, configure_recovery_models).await
+    } else {
+        codex
+    };
+    active.submit(Op::Continue).await?;
+    wait_for_event(&active, |event| match event {
+        EventMsg::Error(event) => panic!("recovery failed: {}", event.message),
+        EventMsg::TurnComplete(event) => {
+            assert_eq!(
+                event.last_agent_message.as_deref(),
+                Some("Recovered complete replacement.")
+            );
+            true
+        }
+        _ => false,
+    })
+    .await;
+    let captured = requests.requests();
+    assert_eq!(captured.len(), if select_larger_model { 3 } else { 4 });
+    let request = captured.last().context("expected recovery request")?;
+    assert_eq!(
+        request.body_json()["model"],
+        if select_larger_model {
+            "completion-recovery-large"
+        } else {
+            "completion-recovery-small"
+        }
+    );
+    let input = request.input();
+    assert!(input.iter().any(|item| {
+        item["role"] == "developer"
+            && item["content"][0]["text"].as_str().is_some_and(|text| {
+                text.contains(&initial)
+                    && text.contains("Preserve every result and report verification.")
+                    && text.contains("self-contained final answer")
+            })
+    }));
+    if !select_larger_model {
+        let compact_input = captured[2].input();
+        assert_eq!(
+            compact_input.last().context("expected compaction input")?["type"],
+            "compaction_trigger"
+        );
+        assert!(!serde_json::to_string(&input)?.contains("compaction_trigger"));
+    }
+    server.verify().await;
+    Ok(())
+}
+
+#[test_case::test_case(false; "pause")]
+#[test_case::test_case(true; "interrupt")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stopped_review_followup_survives_standalone_compaction_and_restart(
+    interrupt: bool,
+) -> anyhow::Result<()> {
+    skip_if_no_network_unless_localhost!(Ok(()));
+    for restart in [false, true] {
+        let server = MockServer::start().await;
+        let requests = mount_response_sequence(
+            &server,
+            vec![
+                sse_response(answer("Original complete answer.")),
+                sse_response(verdict("Verify and replace the complete answer.", true)),
+                sse_response(answer("Cancelled output must not be installed."))
+                    .set_delay(std::time::Duration::from_secs(5)),
+                sse_response(compacted_answer()),
+                sse_response(answer("Complete replacement after compaction.")),
+            ],
+        )
+        .await;
+        let home = Arc::new(TempDir::new()?);
+        let codex =
+            new_conversation_for_server(&server, home.clone(), configure_recovery_models).await;
+        submit_request(&codex, "Complete the original user scope.").await;
+        wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+        codex.submit(Op::ReviewCompletedTurn).await?;
+        wait_for_captured_requests(&requests, 3).await;
+        codex
+            .submit(if interrupt { Op::Interrupt } else { Op::Pause })
+            .await?;
+        let stopped = wait_for_event(&codex, |event| {
+            matches!(event, EventMsg::TurnPaused(_) | EventMsg::TurnAborted(_))
+        })
+        .await;
+        assert!(if interrupt {
+            matches!(stopped, EventMsg::TurnAborted(_))
+        } else {
+            matches!(stopped, EventMsg::TurnPaused(_))
+        });
+        codex.submit(Op::Compact).await?;
+        wait_for_event(&codex, |event| match event {
+            EventMsg::Error(event) => panic!("compaction failed: {}", event.message),
+            EventMsg::TurnComplete(_) => true,
+            _ => false,
+        })
+        .await;
+        let path = codex.rollout_path().context("expected rollout path")?;
+        let active = if restart {
+            codex.submit(Op::Shutdown).await?;
+            wait_for_event(&codex, |event| matches!(event, EventMsg::ShutdownComplete)).await;
+            resume_conversation_for_server(
+                &server,
+                home.clone(),
+                path.clone(),
+                configure_recovery_models,
+            )
+            .await
+        } else {
+            codex
+        };
+        active.submit(Op::Continue).await?;
+        let continued = wait_for_event(&active, |event| match event {
+            EventMsg::Error(event) => panic!("continuation failed: {}", event.message),
+            EventMsg::TurnContinued(_) => true,
+            _ => false,
+        })
+        .await;
+        assert!(
+            matches!(continued, EventMsg::TurnContinued(event) if event.source == if restart || interrupt {
+                TurnContinuationSource::Interrupted
+            } else {
+                TurnContinuationSource::Paused
+            })
+        );
+        wait_for_event(&active, |event| match event {
+            EventMsg::Error(event) => panic!("continued work failed: {}", event.message),
+            EventMsg::TurnComplete(event) => {
+                assert_eq!(
+                    event.last_agent_message.as_deref(),
+                    Some("Complete replacement after compaction.")
+                );
+                true
+            }
+            _ => false,
+        })
+        .await;
+        let captured = requests.requests();
+        assert_eq!(captured.len(), 5);
+        let input = serde_json::to_string(&captured[4].input())?;
+        for text in [
+            "Complete the original user scope.",
+            "Original complete answer.",
+            "Verify and replace the complete answer.",
+            "self-contained final answer",
+        ] {
+            assert!(input.contains(text), "missing {text:?}; restart={restart}");
+        }
+        assert!(!input.contains("Cancelled output"));
+        server.verify().await;
+    }
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

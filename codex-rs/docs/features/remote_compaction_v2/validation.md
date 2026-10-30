@@ -28,7 +28,7 @@ The new transport fixtures use the loopback-aware guard; the wrapper supplies it
 |HTTP|ChatGPT and API-key request construction; backend base path; ordinary tools/settings/cache parity; no legacy route; permanent 404 and configured retry budgets; manual and automatic follow-ups.|
 |Retention|Mixed stale context; old summaries; interruption markers; newest-first boundaries; escaped Unicode; image-only histories; atomic labels; no older backfill; base64 preservation; fixed-context limits.|
 |Notes|Exact multiline/multipart notes, including split sentinels/code and standalone multiline plan tags; live notes versus recorded notes and replayed replacement; bounded capture exclusion; matching function/MCP/custom rejections before or after notes; interrupted capture cleanup; pre-turn schema skip; source-model metadata and malformed metadata rejection; distinct previous/destination instructions and final overrides; missing-provider errors; preservation of later acknowledged input.|
-|Lifecycle/accounting|Matching start/completion; failure/Continue/steering/restart; nine downshift recovery cases covering failure/pause, Continue/new input, restart and older captures; cancellation before installation; actual pause/interrupt handlers aborting a parent blocked on a real recorder; snapshots completing during the stream; healthy socket reuse; exact local token baselines; long notes below the limit do not trigger another pre-turn compaction after restart.|
+|Lifecycle/accounting|Matching start/completion; failure/Continue/steering/restart; eleven downshift recovery cases covering failure/pause, Continue/new input, restart, older captures and explicit destination-model changes; standalone compaction preserves pending main ownership; cancellation before installation; actual pause/interrupt handlers aborting a parent blocked on a real recorder; snapshots completing during the stream; healthy socket reuse; exact local token baselines; long notes below the limit do not trigger another pre-turn compaction after restart.|
 |Replay|Exact durable replacement and adjacent reference read without a test-side flush; live/replayed history equality; source/destination selection before and after installation; encrypted-only inline versus standalone provenance; completed and incomplete tails; rollback; compaction-relative durable dangling-call cleanup.|
 |Local/legacy|Explicit legacy selection; output placeholder rewrite retaining calls and success flags; base-instruction estimate; local fallback with two failed summarizer attempts, Continue/new input and restart; failed output absent from recovery requests and durable replacement.|
 
@@ -36,8 +36,8 @@ The new transport fixtures use the loopback-aware guard; the wrapper supplies it
 
 |Check|Result|
 |---|---|
-|Core package, final guarded run|1,897 reported passes across four suites; 15 ignored and 44 excluded by the nested-sandbox skip list. Existing sandbox/network early returns are included in these package totals.|
-|Focused compaction run|56 unit tests and 61 reported integration passes; two unchanged legacy resume/fork cases returned at their explicit network guard. The other 59 integration cases ran, including all v2 fixtures and the local compaction/model-downshift fixtures using the loopback-aware guard.|
+|Core, protocol and state recovery rerun|2,038 reported passes across nine suites; 16 ignored and 44 filtered. Existing sandbox/network early returns are included in these package totals.|
+|Focused compaction rerun|127 reported passes across four suites, including all eleven downshift recovery cases. The v2 and local recovery fixtures use the loopback-aware guard; unchanged legacy guards elsewhere may still return early and are not additional transport coverage.|
 |Protocol, telemetry and app-server protocol packages|123 tests passed across nine suites.|
 |Schema generation|Config JSON and affected app-server JSON/TypeScript fixtures regenerated; schema tests passed.|
 |Formatting/lints/build|`just-local fmt`, scoped `just-local fix`, and `cargo-local build -p codex-cli --bin codex` completed. Existing lint warnings remain in unrelated task/util code and a pre-existing pending-input helper.|
@@ -62,7 +62,9 @@ Same fixture source/settings before and after compaction; all traffic used the n
 
 Byte counts describe decoded JSON request bodies, not compressed wire bytes. Image URLs are small on the wire but each consumes the retained-image budget. The three requests in each fixture were initial work, compaction and follow-up.
 
-The downshift recovery matrix sends 630,000 bytes of user text to a source model with a 200,000-token window, then selects a destination with a 100,000-token window and a 40,000-token automatic threshold. Notes report only ten tokens. All nine cases require recovery to use the source provider/model and ordinary follow-up to use the destination; each follow-up's approximate serialized input/instructions/tools cost remains below 40,000 tokens. Final overrides distinguish both models across resume without changing the existing session-instruction precedence.
+The baseline downshift recovery matrix sends 630,000 bytes of user text to a source model with a 200,000-token window, then selects a destination with a 100,000-token window and a 40,000-token automatic threshold. Notes report only ten tokens. Nine cases require recovery to use the source provider/model and ordinary follow-up to use the destination; each follow-up's approximate serialized input/instructions/tools cost remains below 40,000 tokens. Final overrides distinguish both models across resume without changing the existing session-instruction precedence.
+
+Two further cases explicitly select a different recovery destination immediately after failure or after pause/restart. That destination has a 160,000-token window and an 80,000-token automatic threshold. Compaction still uses the original source provider/model/instructions; the follow-up uses the new destination and its final override, stays below 80,000 approximate serialized tokens, and records the destination in the adjacent replacement reference context.
 
 ## Authenticated deployment check
 

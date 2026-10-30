@@ -258,6 +258,95 @@ async fn completion_review_handoff_is_claimed_once_and_survives_compaction() {
 }
 
 #[tokio::test]
+async fn completion_review_model_override_retargets_only_pending_main_work_durably() {
+    for (target, previously_selected) in [
+        (PendingContinuationTarget::Regular, false),
+        (PendingContinuationTarget::Regular, true),
+        (PendingContinuationTarget::PostTurnCompletionReview, false),
+    ] {
+        let (session, context) = completed_session().await;
+        let model = if context.model_info.slug == "gpt-5.4" {
+            "gpt-5.1"
+        } else {
+            "gpt-5.4"
+        };
+        let mode = context
+            .collaboration_mode
+            .with_updates(Some(model.into()), None, None);
+        if previously_selected {
+            session
+                .update_settings(SessionSettingsUpdate {
+                    collaboration_mode: Some(mode.clone()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        let ticket = session.begin_completion_review(false).await.unwrap();
+        let checkpoint = if target == PendingContinuationTarget::Regular {
+            assert!(
+                session
+                    .prepare_completion_review_handoff(
+                        &ticket,
+                        "advisory and replacement contract".into(),
+                        context.model_info.slug.clone(),
+                    )
+                    .await
+            );
+            session
+                .claim_completion_review_handoff(&ticket, "main-followup")
+                .await
+                .unwrap()
+        } else {
+            PendingContinuation {
+                source: TurnContinuationSource::Paused,
+                continued_from_turn_id: Some(context.sub_id.clone()),
+                model: Some(context.model_info.slug.clone()),
+                pause_reason: None,
+                target,
+            }
+        };
+        session
+            .set_pending_continuation(Some(checkpoint.clone()))
+            .await;
+        let (_home, path) = attach_recorder(&session, &context).await;
+        let mut expected = session.state.lock().await.completion_review.clone();
+        let mut expected_checkpoint = checkpoint;
+        if target == PendingContinuationTarget::Regular {
+            expected.handoff.as_mut().unwrap().model = model.into();
+            expected_checkpoint.model = Some(model.into());
+        }
+        session
+            .update_settings(SessionSettingsUpdate {
+                collaboration_mode: Some(mode),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        {
+            let state = session.state.lock().await;
+            assert_eq!(state.completion_review, expected);
+            assert_eq!(
+                state.pending_continuation.as_ref(),
+                Some(&expected_checkpoint)
+            );
+        }
+        if target == PendingContinuationTarget::Regular {
+            let (items, _, errors) = RolloutRecorder::load_rollout_items(&path).await.unwrap();
+            assert_eq!(errors, 0);
+            let replay = session
+                .reconstruct_history_from_rollout(&context, &items)
+                .await;
+            assert_eq!(replay.completion_review, Some(expected));
+            assert_eq!(
+                replay.pending_continuation.unwrap().model.as_deref(),
+                Some(model)
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn completion_review_replay_distinguishes_prepared_started_and_reviewer() {
     let (session, context) = completed_session().await;
     let ticket = session.begin_completion_review(true).await.unwrap();

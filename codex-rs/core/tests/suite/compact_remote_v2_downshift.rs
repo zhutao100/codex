@@ -17,11 +17,15 @@ pub(super) fn configure_providers(
     destination.base_url = Some(destination_base);
     config
         .model_providers
+        .insert("recovery".into(), destination.clone());
+    config
+        .model_providers
         .insert("destination".into(), destination);
     config.model_overlay = Some(ModelOverlay {
         models: [
             ("previous", 200_000, 180_000, "Previous"),
             ("destination", 100_000, 40_000, "Destination"),
+            ("recovery", 160_000, 80_000, "Recovery"),
         ]
         .into_iter()
         .map(|(provider, window, limit, label)| ModelOverlayEntry {
@@ -41,21 +45,39 @@ pub(super) fn configure_providers(
     });
 }
 
-#[test_case::test_case(false, false, false, false; "failed continue")]
-#[test_case::test_case(false, true, false, false; "failed new input")]
-#[test_case::test_case(true, false, false, false; "paused continue")]
-#[test_case::test_case(true, true, false, false; "paused new input")]
-#[test_case::test_case(false, false, true, false; "failed restart continue")]
-#[test_case::test_case(false, true, true, false; "failed restart new input")]
-#[test_case::test_case(true, false, true, false; "paused restart continue")]
-#[test_case::test_case(true, true, true, false; "paused restart new input")]
-#[test_case::test_case(false, false, true, true; "legacy capture restart continue")]
+fn model_override(model: &str) -> Op {
+    Op::OverrideTurnContext {
+        cwd: None,
+        approval_policy: None,
+        sandbox_policy: None,
+        windows_sandbox_level: None,
+        model: Some(model.into()),
+        effort: None,
+        summary: None,
+        collaboration_mode: None,
+        personality: None,
+        service_tier: None,
+    }
+}
+
+#[test_case::test_case(false, false, false, false, false; "failed continue")]
+#[test_case::test_case(false, true, false, false, false; "failed new input")]
+#[test_case::test_case(true, false, false, false, false; "paused continue")]
+#[test_case::test_case(true, true, false, false, false; "paused new input")]
+#[test_case::test_case(false, false, true, false, false; "failed restart continue")]
+#[test_case::test_case(false, true, true, false, false; "failed restart new input")]
+#[test_case::test_case(true, false, true, false, false; "paused restart continue")]
+#[test_case::test_case(true, true, true, false, false; "paused restart new input")]
+#[test_case::test_case(false, false, true, true, false; "legacy capture restart continue")]
+#[test_case::test_case(false, false, false, false, true; "failed continue with model override")]
+#[test_case::test_case(true, false, true, false, true; "paused restart with model override")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn model_downshift_recovery_preserves_source_and_destination(
     pause: bool,
     new_input: bool,
     restart: bool,
     legacy_capture: bool,
+    recovery_override: bool,
 ) -> Result<()> {
     skip_if_no_network_unless_localhost!(Ok(()));
     let (release, gate) = oneshot::channel();
@@ -107,18 +129,7 @@ async fn model_downshift_recovery_preserves_source_and_destination(
         .await?;
     complete(&test.codex).await;
     test.codex
-        .submit(Op::OverrideTurnContext {
-            cwd: None,
-            approval_policy: None,
-            sandbox_policy: None,
-            windows_sandbox_level: None,
-            model: Some("destination-provider-model".into()),
-            effort: None,
-            summary: None,
-            collaboration_mode: None,
-            personality: None,
-            service_tier: None,
-        })
+        .submit(model_override("destination-provider-model"))
         .await?;
     test.codex
         .submit(user_input("start destination work"))
@@ -161,6 +172,23 @@ async fn model_downshift_recovery_preserves_source_and_destination(
     } else {
         &test
     };
+    let (destination, instructions, limit) = if recovery_override {
+        active
+            .codex
+            .submit(model_override("recovery-provider-model"))
+            .await?;
+        (
+            "recovery-provider-model",
+            "Recovery model final override.",
+            80_000,
+        )
+    } else {
+        (
+            "destination-provider-model",
+            "Destination model final override.",
+            40_000,
+        )
+    };
     active
         .codex
         .submit(if new_input {
@@ -192,8 +220,8 @@ async fn model_downshift_recovery_preserves_source_and_destination(
         assert!(!body.to_string().contains("Compaction source model:"));
     }
     let body = followup.single_request().body_json();
-    assert_eq!(body["model"], "destination-provider-model");
-    assert_eq!(body["instructions"], "Destination model final override.");
+    assert_eq!(body["model"], destination);
+    assert_eq!(body["instructions"], instructions);
     assert!(!body.to_string().contains("discarded"));
     assert!(!body.to_string().contains("compaction_trigger"));
     assert_eq!(
@@ -213,13 +241,13 @@ async fn model_downshift_recovery_preserves_source_and_destination(
     let replacement = replacement_history(active.session_configured.rollout_path.as_ref().unwrap());
     assert_eq!(replacement.len(), 1);
     // This also catches accidentally applying the source model's 64K retention
-    // budget instead of the destination's 40K auto-compaction ceiling.
+    // budget instead of the selected destination's auto-compaction ceiling.
     let request_tokens: usize = ["input", "instructions", "tools"]
         .iter()
         .map(|key| body[key].to_string().chars().count().div_ceil(4))
         .sum();
     assert!(
-        request_tokens < 40_000,
+        request_tokens < limit,
         "destination request needs {request_tokens} tokens"
     );
     let lines: Vec<_> =
@@ -247,7 +275,7 @@ async fn model_downshift_recovery_preserves_source_and_destination(
     } else {
         panic!("continuation must persist an adjacent destination reference context");
     };
-    assert_eq!(reference.model, "destination-provider-model");
+    assert_eq!(reference.model, destination);
     old_server.shutdown().await;
     Ok(())
 }

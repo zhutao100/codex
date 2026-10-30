@@ -168,6 +168,30 @@ impl Session {
         self.persist_completion_review_locked().await;
     }
 
+    pub(crate) async fn retarget_pending_regular_continuation_model(&self, model: &str) {
+        let _guard = self.completion_review_installation.lock().await;
+        let mut state = self.state.lock().await;
+        let Some(checkpoint) = state
+            .pending_continuation
+            .as_mut()
+            .filter(|checkpoint| checkpoint.target == PendingContinuationTarget::Regular)
+        else {
+            return;
+        };
+        checkpoint.model = Some(model.to_string());
+        let Some(handoff) = state.completion_review.handoff.as_mut().filter(|handoff| {
+            matches!(
+                handoff.disposition,
+                ReviewHandoffDisposition::Started { .. }
+            )
+        }) else {
+            return;
+        };
+        model.clone_into(&mut handoff.model);
+        drop(state);
+        self.persist_completion_review_locked().await;
+    }
+
     pub(crate) async fn completion_review_main_task_is_current(&self, turn_id: &str) -> bool {
         self.state
             .lock()
@@ -619,7 +643,20 @@ impl Session {
     pub(crate) async fn stop_completion_review_operations(&self) {
         let _guard = self.completion_review_installation.lock().await;
         let mut state = self.state.lock().await;
-        state.completion_review.clear_operations();
+        let started_main = state
+            .completion_review
+            .handoff
+            .as_ref()
+            .is_some_and(|handoff| {
+                matches!(
+                    handoff.disposition,
+                    ReviewHandoffDisposition::Started { .. }
+                )
+            });
+        // A started handoff is resumable main work, not queued reviewer work.
+        if !started_main {
+            state.completion_review.clear_operations();
+        }
         if state.pending_continuation.as_ref().is_some_and(|pending| {
             pending.target == PendingContinuationTarget::PostTurnCompletionReview
         }) {

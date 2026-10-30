@@ -41,6 +41,7 @@ The latest main answer remains streamed and copyable. Review evaluation/status s
 - Manual review retains one advisory handoff after that allowance is exhausted and does not reset it. Pause/resume reuses the same ticket and allowance.
 - Payload budgeting uses the resolved review model's effective window, counts instructions and static tool schemas, reserves additional capacity for tools/output/inspection, and omits the optional historical reference first. Mandatory user scope and candidate text are never truncated.
 - If a delegate starts compaction, coverage becomes unavailable rather than accepting a verdict against rewritten context. Main continuations similarly retain exact mandatory snapshots or stop with a recoverable budget diagnostic.
+- A budget-stopped follow-up retains `/continue` ownership. Standalone `/compact` preserves that checkpoint; selecting a larger main model updates the recovery destination, including the durable started handoff. Neither recovery route changes frozen scope or the separate compaction source. Compaction cannot help when mandatory snapshots alone exceed the model's budget.
 
 ## Configuration
 
@@ -59,7 +60,7 @@ Post-turn host instructions prefer the post-turn filename, then the generic revi
 
 ## Provenance Limits
 
-Versioned rollout metadata restores exact snapshots without relying on nonpersisted `TurnComplete` events. Prepared handoffs are recoverably queued; started handoffs resume as interrupted main work, not a fresh advisory action.
+Versioned rollout metadata restores exact snapshots without relying on nonpersisted `TurnComplete` events. Prepared handoffs are recoverably queued; started handoffs resume as interrupted main work, not a fresh advisory action. Interrupt/shutdown invalidates unstarted review scheduling but retains already-started main lineage and its replacement contract.
 
 Acknowledged user input retains its original payload until installation is durable. Revision-specific installing/recorded markers recover both a missing message and a message written immediately before a crash, without deduplicating distinct identical amendments. Stop, pause, shutdown and manual review join terminal finalization even after its active-task entry has been removed. Manual review reserves the candidate snapshot and its ticket together; delegate entry validates that pair against current ownership.
 

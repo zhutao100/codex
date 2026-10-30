@@ -48,6 +48,8 @@ Requests for the selected model/personality keep the session's instructions, inc
 
 `CompactionContext` pairs the request/source context with the replacement/destination context. The destination supplies effective window and automatic limits, tool costs, canonical context, reference context and installation accounting. Local and legacy implementations share this separation at their existing replacement boundaries.
 
+Changing the selected regular model while continuation is pending updates that continuation's destination, not the capture's source. Standalone compaction rewrites context without completing the paused/interrupted owner; its finalization must preserve the existing continuation checkpoint.
+
 The developer capture request's second line is `Compaction source model: "JSON-encoded-model"`. Recovery resolves that model independently of the continuation model and current usage. Older requests without the line can infer a larger previous model before the new user boundary; the inference intentionally ignores reported notes usage. Malformed explicit metadata fails before mutation. No new rollout variant is required, and preparation excludes the request from compaction input.
 
 ## Retention and estimates

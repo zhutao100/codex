@@ -44,7 +44,7 @@ Input installation persists an `Installing` marker for a specific accepted revis
 
 Once input installation starts, its short owned transaction survives caller cancellation and task-stop joins it. A consumed amendment therefore cannot be persisted ahead of its model-facing message. The earlier version 1 metadata cannot establish these guarantees and is conservatively unavailable rather than upgraded by inference.
 
-Task-stop also joins the task lifecycle guard, including when finalization already removed the active-task entry. Only afterward may shutdown detach the recorder. Explicit pause/interrupt invalidate any private automatic-review ticket queued by the finalizer, so joining completion cannot accidentally start new review work after the stop.
+Task-stop also joins the task lifecycle guard, including when finalization already removed the active-task entry. Only afterward may shutdown detach the recorder. Explicit pause/interrupt invalidate any private automatic-review ticket queued by the finalizer, so joining completion cannot accidentally start new review work after the stop. A started handoff instead belongs to interrupted main work; stop/shutdown retains its ticket, snapshots, selected destination and replacement contract rather than clearing that lineage as unstarted reviewer scheduling.
 
 `ResponseItem::Message.id` is not serialized. Restart deduplication compares the exact host-owned developer item associated with the durable handoff, not an assumed persistent message ID. The main request only reinserts the advisory when compaction removed that item; it always re-establishes the replacement contract and exact request/candidate frame.
 
@@ -63,7 +63,8 @@ Manual reservation joins the task lifecycle before selecting work, including the
 |Paused reviewer|Continue the same reviewer/candidate/ticket without another automatic-attempt reservation.|
 |Paused review-derived main|Continue main work, preserving its replacement-answer requirement.|
 |New user input|Invalidate old advice immediately, track pending versus consumed input, and establish a new episode only after main completion.|
-|Compaction|Keep explicit host snapshots outside rewritten prompt history. Reinsert mandatory context and the output contract for main follow-ups.|
+|Compaction|Keep explicit host snapshots outside rewritten prompt history. Standalone compaction completion preserves the existing continuation checkpoint, including paused/interrupted main ownership. Reinsert mandatory context and the output contract for main follow-ups.|
+|Explicit model change during recovery|Retarget pending regular work and persist its started handoff's destination. Keep request/candidate snapshots, paused reviewer ownership and the notes capture's source model unchanged.|
 |Rollback/history replacement|Invalidate uncertain provenance and pending operations; never retain a future candidate.|
 |Fork|Recover only eligible metadata before the selected surviving user boundary; renew generation and clear delegate/main scheduling state. Metadata for an excluded next user must not retarget the fork.|
 |CWD change|Review the completed task's directory. Do not prepare or claim a main handoff into a different current project.|
@@ -89,6 +90,8 @@ The reference helps detect dropped content but is not authoritative. Cumulative 
 Use the resolved review model, not the parent's capacity. Deduplicate initial/latest text, omit the optional reference if necessary, and refuse a full review when mandatory material does not fit. Approximate token counts and explicit reserves are conservative planning tools, not exact tokenizer guarantees.
 
 Unexpected context pressure must not turn into a clean verdict: compaction during the delegate ends full-review coverage; malformed output, missing output, execution failure and unrepresentable nontext context stay unavailable. Main follow-ups also refuse to send truncated request/candidate snapshots.
+
+A budget-stopped main follow-up remains resumable without reclaiming its already-started handoff. `/compact` reduces ordinary history without consuming that continuation; an explicit main-model selection updates the pending destination rather than letting `/continue` restore the insufficient model. Honor that selection even when session settings already name it but a restored checkpoint still names the old model. Persist the destination in the existing started-handoff metadata so restart cannot undo the selection. If mandatory snapshots alone do not fit, compaction still cannot authorize truncation.
 
 `request_user_input` clarification answers are outside the currently captured request frame. Until structured question/answer ownership is implemented, receiving an answer marks coverage unavailable before delivering it to the waiting main task. Do not reconstruct human scope from arbitrary function-output JSON.
 

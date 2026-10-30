@@ -35,6 +35,7 @@ Disabling only `remote_compaction_v2` selects the legacy endpoint and can reprod
 ## Branch lifecycle
 
 - Manual compaction preserves existing notes without requesting new notes.
+- Standalone compaction completion preserves paused/interrupted continuation ownership. An explicit regular-model change retargets recovery's destination, not an outstanding notes capture's source model.
 - Pre-turn and model-downshift compaction share bounded notes capture. Preserve the source model with the request so failed/paused capture retries use its provider and instructions even after notes report low usage. Replacement budgets, tools, canonical context and reference context use the destination model.
 - Mid-turn compaction borrows the active client and preserves deferred-input ordering.
 - Recover an outstanding notes transaction before ordinary work or incoming user input is appended. Recognize completed notes and abort markers from durable history. A later real user message ends the capture segment; preserve it and subsequent work in the retry source. Reject ambiguous work inside the capture segment.
