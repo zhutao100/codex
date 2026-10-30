@@ -175,7 +175,7 @@ impl Session {
         cancel_token
     }
 
-    pub(super) async fn cancel_mcp_startup(&self) {
+    pub(crate) async fn cancel_mcp_startup(&self) {
         self.services
             .mcp_startup_cancellation_token
             .lock()

@@ -209,7 +209,6 @@ use crate::state::PendingContinuationTarget;
 use crate::state::PreviousTurnSettings;
 use crate::state::SessionServices;
 use crate::state::SessionState;
-use crate::state::TaskKind;
 use crate::state::TurnState;
 use crate::state_db;
 use crate::tasks::GhostSnapshotTask;
@@ -1590,6 +1589,8 @@ impl Session {
         };
         match entry {
             Some(tx_response) => {
+                self.mark_completion_review_clarification_unavailable(sub_id)
+                    .await;
                 tx_response.send(response).ok();
             }
             None => {
@@ -2288,7 +2289,14 @@ impl Session {
         }
 
         let mut ts = active_turn.turn_state.lock().await;
-        let review_revision = Some(self.accept_completion_review_input(&input, false).await);
+        let review_revision = Some(
+            self.accept_completion_review_input_with_client_id(
+                &input,
+                false,
+                client_user_message_id.clone(),
+            )
+            .await,
+        );
         ts.push_pending_input(TurnInput::UserInput {
             content: input,
             client_id: client_user_message_id,
@@ -2345,43 +2353,13 @@ impl Session {
 
     pub async fn interrupt_task(self: &Arc<Self>) {
         info!("interrupt received: abort current task, if any");
-        let has_active_turn = { self.active_turn.lock().await.is_some() };
-        if has_active_turn {
-            self.abort_all_tasks(TurnAbortReason::Interrupted).await;
-        } else {
-            self.cancel_mcp_startup().await;
-        }
+        self.abort_all_tasks(TurnAbortReason::Interrupted).await;
     }
 
     pub async fn pause_task(self: &Arc<Self>) {
         info!("pause received: pause current task, if any");
-        let active_task = {
-            let active = self.active_turn.lock().await;
-            active.as_ref().and_then(|active_turn| {
-                active_turn
-                    .tasks
-                    .first()
-                    .map(|(sub_id, task)| (sub_id.clone(), task.kind))
-            })
-        };
-        match active_task {
-            Some((_, TaskKind::Regular | TaskKind::PostTurnCompletionReview)) => {
-                self.pause_all_tasks(crate::protocol::TurnPauseReason::UserRequested)
-                    .await;
-            }
-            Some((sub_id, TaskKind::Review | TaskKind::Compact | TaskKind::UserShell)) => {
-                self.send_event_raw(Event {
-                    id: sub_id,
-                    msg: EventMsg::Warning(WarningEvent {
-                        message: "Pause is not available for this task.".to_string(),
-                    }),
-                })
-                .await;
-            }
-            None => {
-                self.cancel_mcp_startup().await;
-            }
-        }
+        self.pause_all_tasks(crate::protocol::TurnPauseReason::UserRequested)
+            .await;
     }
 
     async fn take_pending_continuation(&self) -> Option<PendingContinuation> {

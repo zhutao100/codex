@@ -307,6 +307,7 @@ async fn run_turn_inner(
     });
     sess.send_event(&turn_context, event).await;
     let turn_state = sess.turn_state_for_sub_id(&turn_context.sub_id).await;
+    let recovery_revisions = sess.completion_review_input_recovery_revisions().await;
     if let Some(checkpoint) = continuation.as_ref() {
         let remove_interrupted_abort = checkpoint.source == TurnContinuationSource::Interrupted;
         sess.prepare_history_for_continuation(remove_interrupted_abort)
@@ -323,7 +324,6 @@ async fn run_turn_inner(
         .await;
     }
     let mut recovered_notes = false;
-    sess.consume_recorded_completion_review_inputs().await;
     let pending_notes = match pending_work_notes(sess.clone_history().await.raw_items()) {
         Ok(pending) => pending,
         Err(error) => {
@@ -380,6 +380,17 @@ async fn run_turn_inner(
         }
         recovered_notes = true;
         total_usage_tokens = sess.get_total_token_usage().await;
+    }
+    if !recovery_revisions.is_empty() {
+        sess.seed_initial_context_if_needed(&turn_context).await;
+    }
+    for revision in recovery_revisions {
+        if !sess
+            .install_completion_review_input(&turn_context, revision, true)
+            .await
+        {
+            return None;
+        }
     }
 
     let (explicit_app_paths, skill_name_counts_lower) = if continuation.is_some() {
@@ -496,17 +507,26 @@ async fn run_turn_inner(
                 .await;
         }
 
-        let initial_input_for_turn: ResponseInputItem = ResponseInputItem::from(input.clone());
-        let response_item: ResponseItem = initial_input_for_turn.clone().into();
-        sess.consume_initial_completion_review_input(&turn_context.sub_id)
+        if let Some(revision) = sess
+            .initial_completion_review_input_revision(&turn_context.sub_id)
+            .await
+        {
+            if !sess
+                .install_completion_review_input(&turn_context, revision, true)
+                .await
+            {
+                return None;
+            }
+        } else {
+            let response_item: ResponseItem = ResponseInputItem::from(input.clone()).into();
+            sess.record_user_prompt_and_emit_turn_item(
+                turn_context.as_ref(),
+                &input,
+                response_item,
+                None,
+            )
             .await;
-        sess.record_user_prompt_and_emit_turn_item(
-            turn_context.as_ref(),
-            &input,
-            response_item,
-            None,
-        )
-        .await;
+        }
 
         if !skill_items.is_empty() {
             sess.record_conversation_items(&turn_context, &skill_items)
@@ -555,10 +575,16 @@ async fn run_turn_inner(
         };
         if !pending_input.is_empty() {
             for pending_input_item in pending_input {
-                sess.consume_pending_completion_review_input(&pending_input_item)
-                    .await;
-                sess.record_pending_input(turn_context.as_ref(), pending_input_item)
-                    .await;
+                if !sess
+                    .install_pending_completion_review_input(
+                        &turn_context,
+                        pending_input_item,
+                        true,
+                    )
+                    .await
+                {
+                    return None;
+                }
             }
         }
 

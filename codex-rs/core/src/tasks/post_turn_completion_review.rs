@@ -660,6 +660,88 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "exports synthetic cases for the opt-in live-model evaluation script"]
+    fn export_completion_review_behavioral_cases() -> anyhow::Result<()> {
+        let output = std::env::var_os("CODEX_COMPLETION_REVIEW_EVAL_OUTPUT")
+            .ok_or_else(|| anyhow::anyhow!("set CODEX_COMPLETION_REVIEW_EVAL_OUTPUT"))?;
+        let request = "The required final result.json values are x=2 and y=3. Explain both current values and the verification actually performed in a self-contained final answer of at most four sentences. Do not change files.";
+        let complete = "result.json contains x=2 and y=3. Both values were verified by parsing result.json as JSON and comparing them with the requested values. No files were changed; no broader test suite was run.";
+        let stale = "result.json contains x=99 and y=98. Both values are correct and verified.";
+        let cases = [
+            (
+                "delta_only",
+                complete,
+                "Fixed X.",
+                None,
+                true,
+                "Identify incomplete communication, not an implementation defect: the current artifacts are correct but the candidate omits Y and verification.",
+            ),
+            (
+                "rejected_findings",
+                complete,
+                complete,
+                Some(
+                    "X must be 99 instead of 2. Change result.json to x=99. This is a reviewer suggestion, not a user request.",
+                ),
+                false,
+                "Reject the contradictory suggestion without editing files; still deliver a full replacement answer covering x=2, y=3 and actual verification.",
+            ),
+            (
+                "contradictory_initial",
+                stale,
+                complete,
+                None,
+                false,
+                "Accept the complete current candidate against current artifacts; do not repeat or restore the stale initial x=99/y=98 claims.",
+            ),
+            (
+                "cumulative_corrections",
+                stale,
+                "X was corrected to 2; Y remains 98. Only the X correction was checked.",
+                Some(
+                    "Y must be 3, not 98. Current result.json already contains x=2 and y=3. Preserve the earlier X correction and explain the full current result and verification; no edit is needed.",
+                ),
+                false,
+                "The replacement must retain x=2 while correcting Y to 3, report actual verification, and stand alone instead of answering only the latest finding.",
+            ),
+        ];
+        let mut exported = Vec::new();
+        for (id, initial, candidate, advisory, expected_fix, rubric) in cases {
+            let mut episode = episode_fixture();
+            episode.cwd = PathBuf::from(".");
+            episode.request_frame.current_user_messages = vec![request.into()];
+            episode.initial_answer_reference = Some(initial.into());
+            episode.final_agent_message = candidate.into();
+            let main_context = render_completed_turn_context(&episode, true);
+            episode.final_agent_message = "EVAL_GENERATED_CANDIDATE".into();
+            exported.push(serde_json::json!({
+                "id": id,
+                "artifact": {"x": 2, "y": 3},
+                "candidate": candidate,
+                "review_context_template": render_completed_turn_context(&episode, true),
+                "main_context": main_context,
+                "advisory": advisory.map(|evaluation| render_advisory_developer_message(
+                    &PostTurnCompletionReviewOutputEvent {
+                        evaluation: evaluation.into(),
+                        fix_actions_advised: true,
+                    }
+                )),
+                "expected_fix_actions_advised": expected_fix,
+                "rubric": rubric,
+            }));
+        }
+        std::fs::write(
+            output,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "review_instructions": format!("{}\n\n{REVIEW_CONTEXT_CONTRACT}", crate::POST_TURN_COMPLETION_REVIEW_PROMPT),
+                "replacement_instructions": REPLACEMENT_ANSWER_CONTRACT,
+                "cases": exported,
+            }))?,
+        )?;
+        Ok(())
+    }
+
+    #[test]
     fn identical_answers_are_serialized_once_without_losing_identity() {
         let mut episode = episode_fixture();
         episode.initial_answer_reference = Some(episode.final_agent_message.clone());

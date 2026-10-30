@@ -36,6 +36,7 @@ use crate::protocol::TurnCompleteEvent;
 use crate::protocol::TurnContinuationSource;
 use crate::protocol::TurnPauseReason;
 use crate::protocol::TurnPausedEvent;
+use crate::protocol::WarningEvent;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::session_prefix::TURN_ABORTED_OPEN_TAG;
@@ -317,7 +318,34 @@ impl Session {
     }
 
     async fn stop_all_tasks(self: &Arc<Self>, reason: TaskStopReason) {
+        // Completion removes its active entry before persistence. Join that
+        // finalizer before observing idle state or shutting down the recorder.
+        let _lifecycle = self.task_lifecycle.lock().await;
+        if matches!(reason, TaskStopReason::Pause(_)) {
+            let unsupported = self.active_turn.lock().await.as_ref().and_then(|active| {
+                active.tasks.first().and_then(|(id, task)| match task.kind {
+                    TaskKind::Regular | TaskKind::PostTurnCompletionReview => None,
+                    TaskKind::Review | TaskKind::Compact | TaskKind::UserShell => Some(id.clone()),
+                })
+            });
+            if let Some(id) = unsupported {
+                self.send_event_raw(Event {
+                    id,
+                    msg: EventMsg::Warning(WarningEvent {
+                        message: "Pause is not available for this task.".into(),
+                    }),
+                })
+                .await;
+                return;
+            }
+        }
         let Some(taken_tasks) = self.take_all_running_tasks().await else {
+            if !matches!(reason, TaskStopReason::Abort(TurnAbortReason::Replaced)) {
+                // An automatic review may have been queued by the finalizer we
+                // just joined. Its private ticket must not outlive this stop.
+                self.stop_completion_review_operations().await;
+                self.cancel_mcp_startup().await;
+            }
             return;
         };
         for task in taken_tasks.tasks {

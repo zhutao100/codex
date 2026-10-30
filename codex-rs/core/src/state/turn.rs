@@ -158,4 +158,16 @@ impl TurnState {
     pub(crate) fn has_pending_input(&self) -> bool {
         !self.pending_input.is_empty()
     }
+
+    pub(crate) fn pending_completion_review_revisions(&self) -> Vec<u64> {
+        self.pending_input
+            .iter()
+            .filter_map(|input| match input {
+                TurnInput::UserInput {
+                    review_revision, ..
+                } => *review_revision,
+                TurnInput::ResponseItem(_) => None,
+            })
+            .collect()
+    }
 }

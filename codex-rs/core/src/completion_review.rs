@@ -2,6 +2,9 @@
 
 use std::path::PathBuf;
 
+use codex_protocol::models::ResponseInputItem;
+use codex_protocol::models::ResponseItem;
+use codex_protocol::user_input::UserInput;
 use serde::Deserialize;
 use serde::Serialize;
 use uuid::Uuid;
@@ -70,14 +73,22 @@ pub(crate) struct ReviewHandoff {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct AcceptedReviewInput {
-    pub(crate) revision: u64,
-    pub(crate) messages: Vec<String>,
-    pub(crate) text_only: bool,
-    pub(crate) recorded: bool,
+pub(crate) enum ReviewInputInstallation {
+    Accepted,
+    Installing,
+    Recorded,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct AcceptedReviewInput {
+    pub(crate) revision: u64,
+    pub(crate) content: Vec<UserInput>,
+    pub(crate) client_id: Option<String>,
+    pub(crate) response_item: ResponseItem,
+    pub(crate) installation: ReviewInputInstallation,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct CompletionReviewState {
     pub(crate) version: u32,
     pub(crate) history_generation: String,
@@ -95,7 +106,7 @@ pub(crate) struct CompletionReviewState {
 impl Default for CompletionReviewState {
     fn default() -> Self {
         Self {
-            version: 1,
+            version: 2,
             history_generation: Uuid::new_v4().to_string(),
             input_revision: 0,
             consumed_input_revision: 0,
@@ -136,8 +147,8 @@ impl CompletionReviewState {
     pub(crate) fn accept_input(
         &mut self,
         new_task: bool,
-        messages: Vec<String>,
-        text_only: bool,
+        content: Vec<UserInput>,
+        client_id: Option<String>,
     ) -> u64 {
         if new_task {
             self.replacement_answer_required = false;
@@ -160,27 +171,51 @@ impl CompletionReviewState {
         self.handoff = None;
         self.pending_inputs.push(AcceptedReviewInput {
             revision: self.input_revision,
-            messages,
-            text_only,
-            recorded: false,
+            response_item: ResponseInputItem::from(content.clone()).into(),
+            content,
+            client_id,
+            installation: ReviewInputInstallation::Accepted,
         });
         self.input_revision
     }
 
     pub(crate) fn consume_input(&mut self, revision: u64) {
-        let Some(index) = self
-            .pending_inputs
-            .iter()
-            .position(|input| input.revision == revision)
-        else {
+        let Some(index) = self.pending_inputs.iter().position(|input| {
+            input.revision == revision && input.installation == ReviewInputInstallation::Recorded
+        }) else {
             return;
         };
         let input = self.pending_inputs.remove(index);
-        self.request_frame
-            .current_user_messages
-            .extend(input.messages);
-        self.request_frame.text_only &= input.text_only;
+        for item in input.content {
+            let message = match item {
+                UserInput::Text { text, .. } => text,
+                UserInput::Skill { name, path } => {
+                    format!("Selected skill: {name} ({})", path.display())
+                }
+                UserInput::Mention { name, path } => format!("Selected mention: {name} ({path})"),
+                UserInput::Image { .. } | UserInput::LocalImage { .. } => {
+                    self.request_frame.text_only = false;
+                    "[Nontext user input is not available in this review projection.]".to_string()
+                }
+                _ => {
+                    self.request_frame.text_only = false;
+                    "[Unsupported user input.]".to_string()
+                }
+            };
+            self.request_frame.current_user_messages.push(message);
+        }
         self.consumed_input_revision = self.consumed_input_revision.max(revision);
+    }
+
+    pub(crate) fn observe_input_installation(&mut self, item: &ResponseItem) -> bool {
+        let Some(input) = self.pending_inputs.iter_mut().find(|input| {
+            input.installation == ReviewInputInstallation::Installing
+                && input.response_item == *item
+        }) else {
+            return false;
+        };
+        input.installation = ReviewInputInstallation::Recorded;
+        true
     }
 
     pub(crate) fn capture(&mut self, turn_id: String, cwd: PathBuf, text: String) {
@@ -255,7 +290,7 @@ impl CompletionReviewState {
     pub(crate) fn from_rollout(value: &serde_json::Value) -> Option<Self> {
         serde_json::from_value::<Self>(value.clone())
             .ok()
-            .filter(|state| state.version == 1)
+            .filter(|state| state.version == 2)
     }
 }
 

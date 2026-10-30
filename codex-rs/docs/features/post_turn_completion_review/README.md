@@ -61,6 +61,10 @@ Post-turn host instructions prefer the post-turn filename, then the generic revi
 
 Versioned rollout metadata restores exact snapshots without relying on nonpersisted `TurnComplete` events. Prepared handoffs are recoverably queued; started handoffs resume as interrupted main work, not a fresh advisory action.
 
-Legacy histories without trusted metadata, or discarded histories whose request basis cannot be established, are unavailable for full review. Arbitrary assistant-role text is never promoted to a known completion. Start a new session with the complete request when that provenance is unavailable. Nontext user input also produces an explicit coverage limitation rather than a claimed full text-only review.
+Acknowledged user input retains its original payload until installation is durable. Revision-specific installing/recorded markers recover both a missing message and a message written immediately before a crash, without deduplicating distinct identical amendments. Stop, pause and shutdown join terminal finalization even after its active-task entry has been removed.
+
+Legacy histories without trusted metadata, including the earlier version 1 snapshot format, or discarded histories whose request basis cannot be established, are unavailable for full review. Arbitrary assistant-role text is never promoted to a known completion. Start a new session with the complete request when that provenance is unavailable. Nontext user input also produces an explicit coverage limitation rather than a claimed full text-only review.
+
+Human clarification answers delivered through `request_user_input` are not currently captured as an exact question/answer frame. They continue to reach the main model normally, but explicitly disable full completion-review coverage for that request. A warning explains the limitation; neither automatic nor manual review can declare that incomplete projection fully reviewed.
 
 The harness enforces identity, isolation, revision bounds and scheduling ownership. Natural-language completeness remains a model requirement and an independent review judgment, not a deterministic certification. Current repository files are inspected at review time; tickets do not provide filesystem snapshot isolation.

@@ -1,15 +1,21 @@
 use super::*;
 use crate::completion_review::CompletionReviewState;
 use crate::completion_review::ReviewHandoffDisposition;
+use crate::completion_review::ReviewInputInstallation;
 use crate::completion_review::ReviewRequestFrame;
 use pretty_assertions::assert_eq;
+use tokio::sync::Notify;
 
 async fn completed_session() -> (Arc<Session>, Arc<TurnContext>) {
     let (session, context, _) = make_session_and_context_with_rx().await;
     let revision = session
         .accept_completion_review_input(&steer_text_input("original request"), true)
         .await;
-    session.consume_completion_review_input(revision).await;
+    assert!(
+        session
+            .install_completion_review_input(&context, revision, true)
+            .await
+    );
     session
         .start_completion_review_main_task(&context.sub_id)
         .await;
@@ -83,17 +89,22 @@ async fn completion_review_captures_consumed_steering_without_progress_round() {
     let first = session
         .accept_completion_review_input(&steer_text_input("original"), true)
         .await;
-    session.consume_completion_review_input(first).await;
+    assert!(
+        session
+            .install_completion_review_input(&context, first, true)
+            .await
+    );
     session
-        .record_conversation_items(
-            &context,
-            &[user_message("original"), assistant_message("progress")],
-        )
+        .record_conversation_items(&context, &[assistant_message("progress")])
         .await;
     let second = session
         .accept_completion_review_input(&steer_text_input("steering"), false)
         .await;
-    session.consume_completion_review_input(second).await;
+    assert!(
+        session
+            .install_completion_review_input(&context, second, true)
+            .await
+    );
     session
         .start_completion_review_main_task(&context.sub_id)
         .await;
@@ -121,7 +132,11 @@ async fn completion_review_late_input_remains_unreviewed_until_consumed() {
     let first = session
         .accept_completion_review_input(&steer_text_input("original request"), true)
         .await;
-    session.consume_completion_review_input(first).await;
+    assert!(
+        session
+            .install_completion_review_input(&context, first, true)
+            .await
+    );
     let revision = session
         .accept_completion_review_input(&steer_text_input("late amendment"), false)
         .await;
@@ -140,7 +155,13 @@ async fn completion_review_late_input_remains_unreviewed_until_consumed() {
         .capture_completed_regular_turn_for_review(&context, Some("old sampling result"))
         .await;
     assert!(session.completed_turn_for_review().await.is_none());
-    session.consume_recorded_completion_review_inputs().await;
+    for revision in session.completion_review_input_recovery_revisions().await {
+        assert!(
+            session
+                .install_completion_review_input(&context, revision, true)
+                .await
+        );
+    }
     session
         .start_completion_review_main_task(&context.sub_id)
         .await;
@@ -300,7 +321,11 @@ async fn completion_review_stale_tickets_cannot_prepare_or_claim_advice() {
     let revision = session
         .accept_completion_review_input(&steer_text_input("new user request"), true)
         .await;
-    session.consume_completion_review_input(revision).await;
+    assert!(
+        session
+            .install_completion_review_input(&context, revision, true)
+            .await
+    );
     session
         .start_completion_review_main_task(&context.sub_id)
         .await;
@@ -578,4 +603,392 @@ async fn completion_review_pause_joins_inflight_installation_before_durable_stop
             assert!(expected.handoff.is_none());
         }
     }
+}
+
+#[tokio::test]
+async fn completion_review_input_installation_replays_every_durable_boundary() {
+    for (installation, body_written, consumed) in [
+        (ReviewInputInstallation::Accepted, false, false),
+        (ReviewInputInstallation::Installing, false, false),
+        (ReviewInputInstallation::Installing, true, false),
+        (ReviewInputInstallation::Recorded, true, false),
+        (ReviewInputInstallation::Recorded, true, true),
+    ] {
+        let (session, context, _) = make_session_and_context_with_rx().await;
+        let (_home, path) = attach_recorder(&session, &context).await;
+        let content = steer_text_input("identical amendment");
+        let first = session.accept_completion_review_input(&content, true).await;
+        assert!(
+            session
+                .install_completion_review_input(&context, first, true)
+                .await
+        );
+        let second = session
+            .accept_completion_review_input_with_client_id(
+                &content,
+                false,
+                Some("amendment-client".into()),
+            )
+            .await;
+        let input = session.state.lock().await.completion_review.pending_inputs[0].clone();
+        if body_written {
+            session.state.lock().await.completion_review.pending_inputs[0].installation =
+                ReviewInputInstallation::Installing;
+            session.persist_completion_review().await;
+            session
+                .record_user_prompt_and_emit_turn_item(
+                    &context,
+                    &input.content,
+                    input.response_item.clone(),
+                    input.client_id,
+                )
+                .await;
+        }
+        session.state.lock().await.completion_review.pending_inputs[0].installation =
+            installation.clone();
+        if consumed {
+            session
+                .state
+                .lock()
+                .await
+                .completion_review
+                .consume_input(second);
+        }
+        // Leave the Installing/body-written fixture at its actual crash gap.
+        if installation != ReviewInputInstallation::Installing || !body_written {
+            session.persist_completion_review().await;
+        } else {
+            session.flush_rollout().await;
+        }
+        let (items, _, errors) = RolloutRecorder::load_rollout_items(&path).await.unwrap();
+        assert_eq!(errors, 0);
+        let (resumed, resumed_context, _) = make_session_and_context_with_rx().await;
+        let replay = resumed
+            .reconstruct_history_from_rollout(&resumed_context, &items)
+            .await;
+        if !consumed {
+            assert_eq!(
+                replay.completion_review.as_ref().unwrap().pending_inputs[0].installation,
+                if body_written {
+                    ReviewInputInstallation::Recorded
+                } else {
+                    installation
+                }
+            );
+            assert_eq!(
+                replay.pending_continuation.as_ref().unwrap().target,
+                PendingContinuationTarget::Regular
+            );
+        }
+        resumed.replace_with_reconstructed_rollout(replay).await;
+        for revision in resumed.completion_review_input_recovery_revisions().await {
+            assert!(
+                resumed
+                    .install_completion_review_input(&resumed_context, revision, true)
+                    .await
+            );
+        }
+        assert_eq!(
+            resumed
+                .clone_history()
+                .await
+                .raw_items()
+                .iter()
+                .filter(|item| *item == &input.response_item)
+                .count(),
+            2
+        );
+        resumed
+            .start_completion_review_main_task(&resumed_context.sub_id)
+            .await;
+        resumed
+            .capture_completed_regular_turn_for_review(&resumed_context, Some("amended answer"))
+            .await;
+        assert_eq!(
+            resumed
+                .completed_turn_for_review()
+                .await
+                .unwrap()
+                .request_frame,
+            ReviewRequestFrame {
+                prior_user_rounds: vec![],
+                current_user_messages: vec![
+                    "identical amendment".into(),
+                    "identical amendment".into(),
+                ],
+                text_only: true,
+                exact: true,
+            }
+        );
+    }
+}
+
+#[tokio::test]
+async fn completion_review_initial_acknowledgement_recovers_without_any_history_or_main_owner() {
+    let (session, context, _) = make_session_and_context_with_rx().await;
+    let (_home, path) = attach_recorder(&session, &context).await;
+    session
+        .accept_completion_review_input(&steer_text_input("accepted before task startup"), true)
+        .await;
+    let (items, _, errors) = RolloutRecorder::load_rollout_items(&path).await.unwrap();
+    assert_eq!(errors, 0);
+    let replay = session
+        .reconstruct_history_from_rollout(&context, &items)
+        .await;
+    assert!(replay.history.is_empty());
+    assert_eq!(
+        replay.pending_continuation.as_ref().unwrap().target,
+        PendingContinuationTarget::Regular
+    );
+    assert!(
+        replay
+            .completion_review
+            .as_ref()
+            .unwrap()
+            .main_task_id
+            .is_none()
+    );
+    session.replace_with_reconstructed_rollout(replay).await;
+    for revision in session.completion_review_input_recovery_revisions().await {
+        assert!(
+            session
+                .install_completion_review_input(&context, revision, true)
+                .await
+        );
+    }
+    assert_eq!(
+        session.clone_history().await.raw_items(),
+        &[user_message("accepted before task startup")]
+    );
+    assert!(
+        session
+            .state
+            .lock()
+            .await
+            .completion_review
+            .pending_inputs
+            .is_empty()
+    );
+}
+
+struct CompletingReviewTask {
+    ready: Arc<Notify>,
+    finish: Arc<Notify>,
+}
+
+impl SessionTask for CompletingReviewTask {
+    fn kind(&self) -> TaskKind {
+        TaskKind::Regular
+    }
+
+    async fn run(
+        self: Arc<Self>,
+        session: Arc<SessionTaskContext>,
+        context: Arc<TurnContext>,
+        _input: Vec<UserInput>,
+        _cancellation: CancellationToken,
+    ) -> Option<String> {
+        session
+            .clone_session()
+            .start_completion_review_main_task(&context.sub_id)
+            .await;
+        self.ready.notify_one();
+        self.finish.notified().await;
+        Some("durable terminal replacement".into())
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CompletionStop {
+    Pause,
+    Interrupt,
+    Shutdown,
+}
+
+#[tokio::test]
+async fn completion_review_stop_joins_finalization_after_active_entry_is_removed() {
+    for stop in [
+        CompletionStop::Pause,
+        CompletionStop::Interrupt,
+        CompletionStop::Shutdown,
+    ] {
+        let (session, mut context) = completed_session().await;
+        Arc::get_mut(&mut context)
+            .unwrap()
+            .features
+            .enable(Feature::AutoPostTurnCompletionReview);
+        let (_home, path) = attach_recorder(&session, &context).await;
+        let ready = Arc::new(Notify::new());
+        let finish = Arc::new(Notify::new());
+        session
+            .spawn_task(
+                Arc::clone(&context),
+                vec![],
+                CompletingReviewTask {
+                    ready: Arc::clone(&ready),
+                    finish: Arc::clone(&finish),
+                },
+            )
+            .await;
+        ready.notified().await;
+        let installation = session.completion_review_installation.lock().await;
+        finish.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while session.active_turn.lock().await.is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(session.task_lifecycle.try_lock().is_err());
+        let stopping_session = Arc::clone(&session);
+        let mut stopping = tokio::spawn(async move {
+            match stop {
+                CompletionStop::Pause => super::super::handlers::pause(&stopping_session).await,
+                CompletionStop::Interrupt => {
+                    super::super::handlers::interrupt(&stopping_session).await;
+                }
+                CompletionStop::Shutdown => {
+                    assert!(
+                        super::super::handlers::shutdown(&stopping_session, "shutdown".into())
+                            .await
+                    );
+                }
+            }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut stopping)
+                .await
+                .is_err()
+        );
+        assert!(session.services.rollout.lock().await.is_some());
+        drop(installation);
+        tokio::time::timeout(Duration::from_secs(2), stopping)
+            .await
+            .unwrap()
+            .unwrap();
+        // No test-side flush, including when shutdown has removed the recorder.
+        let (items, _, errors) = RolloutRecorder::load_rollout_items(&path).await.unwrap();
+        assert_eq!(errors, 0);
+        let replay = session
+            .reconstruct_history_from_rollout(&context, &items)
+            .await;
+        let review = replay.completion_review.unwrap();
+        assert_eq!(
+            review.eligible_episode().unwrap().final_agent_message,
+            "durable terminal replacement"
+        );
+        assert!(review.attempt.is_none());
+        assert!(review.handoff.is_none());
+        assert!(session.take_pending_continuation().await.is_none());
+    }
+}
+
+struct InputInstallationTask {
+    revision: u64,
+    ready: Arc<Notify>,
+    enter: Arc<Notify>,
+}
+
+impl SessionTask for InputInstallationTask {
+    fn kind(&self) -> TaskKind {
+        TaskKind::Regular
+    }
+
+    async fn run(
+        self: Arc<Self>,
+        session: Arc<SessionTaskContext>,
+        context: Arc<TurnContext>,
+        _input: Vec<UserInput>,
+        _cancellation: CancellationToken,
+    ) -> Option<String> {
+        let session = session.clone_session();
+        session
+            .start_completion_review_main_task(&context.sub_id)
+            .await;
+        self.ready.notify_one();
+        self.enter.notified().await;
+        assert!(
+            session
+                .install_completion_review_input(&context, self.revision, true)
+                .await
+        );
+        None
+    }
+}
+
+#[tokio::test]
+async fn completion_review_pause_joins_cancelled_input_installation_and_replays_it() {
+    let (session, context, _) = make_session_and_context_with_rx().await;
+    let (_home, path) = attach_recorder(&session, &context).await;
+    let revision = session
+        .accept_completion_review_input(&steer_text_input("acknowledged amendment"), true)
+        .await;
+    let ready = Arc::new(Notify::new());
+    let enter = Arc::new(Notify::new());
+    session
+        .spawn_task(
+            Arc::clone(&context),
+            vec![],
+            InputInstallationTask {
+                revision,
+                ready: Arc::clone(&ready),
+                enter: Arc::clone(&enter),
+            },
+        )
+        .await;
+    ready.notified().await;
+    let (cancel, handle) = {
+        let active = session.active_turn.lock().await;
+        let task = active.as_ref().unwrap().tasks.get(&context.sub_id).unwrap();
+        (task.cancellation_token.clone(), Arc::clone(&task.handle))
+    };
+    let state = session.state.lock().await;
+    enter.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while session.completion_review_installation.try_lock().is_ok() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let pausing_session = Arc::clone(&session);
+    let paused = tokio::spawn(async move { super::super::handlers::pause(&pausing_session).await });
+    cancel.cancelled().await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !handle.is_finished() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(state);
+    tokio::time::timeout(Duration::from_secs(2), paused)
+        .await
+        .unwrap()
+        .unwrap();
+    // Read immediately after the real stop handler, without a test-side flush.
+    let (items, _, errors) = RolloutRecorder::load_rollout_items(&path).await.unwrap();
+    assert_eq!(errors, 0);
+    let replay = session
+        .reconstruct_history_from_rollout(&context, &items)
+        .await;
+    let review = replay.completion_review.unwrap();
+    assert_eq!(
+        review.request_frame.current_user_messages,
+        vec!["acknowledged amendment"]
+    );
+    assert!(review.pending_inputs.is_empty());
+    assert_eq!(
+        replay
+            .history
+            .iter()
+            .filter(|item| *item == &user_message("acknowledged amendment"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        replay.pending_continuation.unwrap().target,
+        PendingContinuationTarget::Regular
+    );
 }

@@ -1,6 +1,12 @@
 use super::*;
 use codex_core::features::Feature;
+use codex_protocol::config_types::CollaborationMode;
+use codex_protocol::config_types::ModeKind;
+use codex_protocol::config_types::Settings;
+use codex_protocol::request_user_input::RequestUserInputAnswer;
+use codex_protocol::request_user_input::RequestUserInputResponse;
 use core_test_support::responses::ResponsesRequest;
+use core_test_support::responses::ev_function_call;
 use pretty_assertions::assert_eq;
 
 fn answer(text: &str) -> String {
@@ -48,6 +54,25 @@ async fn submit_request(codex: &CodexThread, text: &str) {
         })
         .await
         .unwrap();
+}
+
+#[expect(clippy::unwrap_used)]
+async fn append_crash_fixture(path: &std::path::Path, items: Vec<RolloutItem>) {
+    let mut file = tokio::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .await
+        .unwrap();
+    for item in items {
+        let line = RolloutLine {
+            timestamp: "2026-01-01T00:00:00.000Z".into(),
+            item,
+        };
+        file.write_all(format!("{}\n", serde_json::to_string(&line).unwrap()).as_bytes())
+            .await
+            .unwrap();
+    }
+    file.sync_all().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -229,6 +254,122 @@ async fn invalid_reviewer_output_exits_without_a_clean_verdict_or_continuation()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn human_clarification_prevents_an_incomplete_request_from_being_declared_reviewed() {
+    skip_if_no_network_unless_localhost!();
+    let server = MockServer::start().await;
+    let call_id = "scope-clarification";
+    let questions = serde_json::json!({
+        "questions": [{
+            "id": "target",
+            "header": "Target",
+            "question": "Which interface should be changed?",
+            "options": [
+                {"label": "CLI only", "description": "Leave the API unchanged."},
+                {"label": "API only", "description": "Leave the CLI unchanged."}
+            ]
+        }]
+    });
+    let requests = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("clarification"),
+                ev_function_call(call_id, "request_user_input", &questions.to_string()),
+                ev_completed("clarification"),
+            ]),
+            answer("Complete result for the selected CLI-only scope."),
+        ],
+    )
+    .await;
+    let home = Arc::new(TempDir::new().unwrap());
+    let codex = new_conversation_for_server(&server, home.clone(), |config| {
+        config.features.enable(Feature::CollaborationModes);
+    })
+    .await;
+    codex
+        .submit(Op::OverrideTurnContext {
+            cwd: None,
+            approval_policy: None,
+            sandbox_policy: None,
+            windows_sandbox_level: None,
+            model: None,
+            effort: None,
+            summary: None,
+            collaboration_mode: Some(CollaborationMode {
+                mode: ModeKind::Plan,
+                settings: Settings {
+                    model: "gpt-5.4".into(),
+                    reasoning_effort: None,
+                    developer_instructions: None,
+                },
+            }),
+            personality: None,
+            service_tier: None,
+        })
+        .await
+        .unwrap();
+    submit_request(&codex, "Plan the interface change; ask me which interface.").await;
+    let event = wait_for_event(&codex, |event| {
+        matches!(event, EventMsg::RequestUserInput(_))
+    })
+    .await;
+    let EventMsg::RequestUserInput(question) = event else {
+        panic!("expected clarification");
+    };
+    codex
+        .submit(Op::UserInputAnswer {
+            id: question.turn_id,
+            response: RequestUserInputResponse {
+                answers: std::collections::HashMap::from([(
+                    "target".into(),
+                    RequestUserInputAnswer {
+                        answers: vec!["CLI only".into()],
+                    },
+                )]),
+            },
+        })
+        .await
+        .unwrap();
+    wait_for_event(&codex, |event| {
+        matches!(event, EventMsg::Warning(event)
+        if event.message.contains("human clarification answers"))
+    })
+    .await;
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    codex.submit(Op::ReviewCompletedTurn).await.unwrap();
+    wait_for_event(&codex, |event| {
+        matches!(event, EventMsg::Error(event)
+        if event.message.contains("exact consumed-request provenance"))
+    })
+    .await;
+    let requests = requests.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(
+            &requests[1]
+                .function_call_output_content_and_success(call_id)
+                .unwrap()
+                .0
+                .unwrap()
+        )
+        .unwrap(),
+        serde_json::json!({"answers": {"target": {"answers": ["CLI only"]}}})
+    );
+    let lines = read_rollout_lines(&codex.rollout_path().unwrap());
+    let state = lines
+        .iter()
+        .rev()
+        .find_map(|line| match &line.item {
+            RolloutItem::PostTurnCompletionReviewState(state) => Some(state),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(state["request_frame"]["exact"], false);
+    assert!(state["attempt"].is_null());
+    server.verify().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn completed_snapshot_resumes_without_persisted_turn_complete_events() {
     skip_if_no_network_unless_localhost!();
     let server = MockServer::start().await;
@@ -260,6 +401,94 @@ async fn completed_snapshot_resumes_without_persisted_turn_complete_events() {
     assert!(context.contains("durable request"));
     assert!(context.contains("<candidate_final_answer><![CDATA[ exact durable answer\n]]>"));
     server.verify().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn accepted_and_partially_installed_amendments_reach_model_and_next_review_after_restart() {
+    skip_if_no_network_unless_localhost!();
+    for body_written in [false, true] {
+        let server = MockServer::start().await;
+        let requests = mount_sse_sequence(
+            &server,
+            vec![
+                answer("previous complete answer"),
+                answer("complete answer incorporating the accepted amendment"),
+                verdict("checked the amended request", false),
+            ],
+        )
+        .await;
+        let home = Arc::new(TempDir::new().unwrap());
+        let codex = new_conversation_for_server(&server, home.clone(), |_| {}).await;
+        submit_request(&codex, "original complete scope").await;
+        wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+        let path = codex.rollout_path().unwrap();
+        codex.submit(Op::Shutdown).await.unwrap();
+        wait_for_event(&codex, |event| matches!(event, EventMsg::ShutdownComplete)).await;
+        let mut state = read_rollout_lines(&path)
+            .into_iter()
+            .rev()
+            .find_map(|line| match line.item {
+                RolloutItem::PostTurnCompletionReviewState(state) => Some(state),
+                _ => None,
+            })
+            .unwrap();
+        let revision = state["input_revision"].as_u64().unwrap() + 1;
+        let content = vec![UserInput::Text {
+            text: "accepted amendment: preserve the public API".into(),
+            text_elements: vec![],
+        }];
+        let item: ResponseItem =
+            codex_protocol::models::ResponseInputItem::from(content.clone()).into();
+        let episode = &state["episode"];
+        state["request_frame"]["prior_user_rounds"] = serde_json::json!([{
+            "user_messages": episode["request_frame"]["current_user_messages"],
+            "final_agent_message": episode["final_agent_message"],
+        }]);
+        state["request_frame"]["current_user_messages"] = serde_json::json!([]);
+        state["input_revision"] = serde_json::json!(revision);
+        state["pending_inputs"] = serde_json::json!([{
+            "revision": revision,
+            "content": content,
+            "client_id": "accepted-amendment",
+            "response_item": item,
+            "installation": if body_written { "Installing" } else { "Accepted" },
+        }]);
+        state["main_task_id"] = serde_json::json!("interrupted-main");
+        let mut fixture = vec![RolloutItem::PostTurnCompletionReviewState(state)];
+        if body_written {
+            fixture.push(RolloutItem::ResponseItem(item));
+        }
+        append_crash_fixture(&path, fixture).await;
+        let resumed = resume_conversation_for_server(&server, home.clone(), path, |_| {}).await;
+        resumed.submit(Op::Continue).await.unwrap();
+        wait_for_event(&resumed, |event| matches!(event, EventMsg::TurnComplete(event)
+            if event.last_agent_message.as_deref() == Some("complete answer incorporating the accepted amendment"))).await;
+        resumed.submit(Op::ReviewCompletedTurn).await.unwrap();
+        wait_for_event(&resumed, |event| {
+            matches!(event, EventMsg::ExitedReviewMode(_))
+        })
+        .await;
+        wait_for_event(&resumed, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+        let requests = requests.requests();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(
+            requests[1]
+                .input()
+                .iter()
+                .filter(|input| {
+                    input["role"] == "user"
+                        && input["content"][0]["text"]
+                            == "accepted amendment: preserve the public API"
+                })
+                .count(),
+            1
+        );
+        let review = packet(&requests[2]);
+        assert!(review.contains("original complete scope"));
+        assert!(review.contains("accepted amendment: preserve the public API"));
+        assert!(review.contains("complete answer incorporating the accepted amendment"));
+        server.verify().await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -347,31 +576,14 @@ async fn durable_handoffs_recover_prepared_and_started_work_without_duplicate_ad
         state["replacement_answer_required"] = serde_json::json!(started);
         // This is the durable boundary left by a process stopping before enqueue
         // or immediately after the main task claimed the handoff.
-        let record = RolloutLine {
-            timestamp: "2026-01-01T00:00:00.000Z".into(),
-            item: RolloutItem::PostTurnCompletionReviewState(state),
-        };
-        let mut file = tokio::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .await
-            .unwrap();
+        let mut fixture = Vec::new();
         if advisory_already_written {
             let item: ResponseItem =
                 codex_protocol::models::DeveloperInstructions::new(advisory).into();
-            let prior = RolloutLine {
-                timestamp: record.timestamp.clone(),
-                item: RolloutItem::ResponseItem(item),
-            };
-            file.write_all(format!("{}\n", serde_json::to_string(&prior).unwrap()).as_bytes())
-                .await
-                .unwrap();
+            fixture.push(RolloutItem::ResponseItem(item));
         }
-        file.write_all(format!("{}\n", serde_json::to_string(&record).unwrap()).as_bytes())
-            .await
-            .unwrap();
-        file.sync_all().await.unwrap();
-        drop(file);
+        fixture.push(RolloutItem::PostTurnCompletionReviewState(state));
+        append_crash_fixture(&path, fixture).await;
         let resumed =
             resume_conversation_for_server(&server, home.clone(), path.clone(), |_| {}).await;
         if started {

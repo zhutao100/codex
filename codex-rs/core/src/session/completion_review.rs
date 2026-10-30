@@ -4,6 +4,7 @@ use crate::completion_review::CompletionReviewState;
 use crate::completion_review::InternalReviewOperation;
 use crate::completion_review::ReviewHandoff;
 use crate::completion_review::ReviewHandoffDisposition;
+use crate::completion_review::ReviewInputInstallation;
 use crate::completion_review::ReviewTicket;
 
 impl Session {
@@ -66,45 +67,99 @@ impl Session {
         input: &[UserInput],
         new_task: bool,
     ) -> u64 {
-        let messages = input
-            .iter()
-            .map(|item| match item {
-                UserInput::Text { text, .. } => text.clone(),
-                UserInput::Skill { name, path } => {
-                    format!("Selected skill: {name} ({})", path.display())
-                }
-                UserInput::Mention { name, path } => format!("Selected mention: {name} ({path})"),
-                UserInput::Image { .. } | UserInput::LocalImage { .. } => {
-                    "[Nontext user input is not available in this review projection.]".to_string()
-                }
-                _ => "[Unsupported user input.]".to_string(),
-            })
-            .collect();
-        let text_only = input.iter().all(|item| {
-            matches!(
-                item,
-                UserInput::Text { .. } | UserInput::Skill { .. } | UserInput::Mention { .. }
-            )
-        });
-        let _guard = self.completion_review_installation.lock().await;
-        let revision = self
-            .state
-            .lock()
+        self.accept_completion_review_input_with_client_id(input, new_task, None)
             .await
-            .completion_review
-            .accept_input(new_task, messages, text_only);
+    }
+
+    pub(crate) async fn accept_completion_review_input_with_client_id(
+        &self,
+        input: &[UserInput],
+        new_task: bool,
+        client_id: Option<String>,
+    ) -> u64 {
+        let _guard = self.completion_review_installation.lock().await;
+        let revision = self.state.lock().await.completion_review.accept_input(
+            new_task,
+            input.to_vec(),
+            client_id,
+        );
         self.persist_completion_review_locked().await;
         revision
     }
 
-    pub(crate) async fn consume_completion_review_input(&self, revision: u64) {
-        let _guard = self.completion_review_installation.lock().await;
-        self.state
-            .lock()
-            .await
-            .completion_review
-            .consume_input(revision);
-        self.persist_completion_review_locked().await;
+    pub(crate) async fn install_completion_review_input(
+        self: &Arc<Self>,
+        context: &Arc<TurnContext>,
+        revision: u64,
+        consume: bool,
+    ) -> bool {
+        let context = Arc::clone(context);
+        self.completion_review_transaction(move |session| async move {
+            let input = session
+                .state
+                .lock()
+                .await
+                .completion_review
+                .pending_inputs
+                .iter()
+                .find(|input| input.revision == revision)
+                .cloned();
+            let Some(input) = input else {
+                return true;
+            };
+            if input.installation != ReviewInputInstallation::Recorded {
+                if let Some(input) = session
+                    .state
+                    .lock()
+                    .await
+                    .completion_review
+                    .pending_inputs
+                    .iter_mut()
+                    .find(|input| input.revision == revision)
+                {
+                    input.installation = ReviewInputInstallation::Installing;
+                }
+                // This marker disambiguates identical messages if the process
+                // stops after writing the body but before its Recorded snapshot.
+                if !session.persist_completion_review_locked().await {
+                    return false;
+                }
+                session
+                    .record_user_prompt_and_emit_turn_item(
+                        &context,
+                        &input.content,
+                        input.response_item,
+                        input.client_id,
+                    )
+                    .await;
+                if let Some(input) = session
+                    .state
+                    .lock()
+                    .await
+                    .completion_review
+                    .pending_inputs
+                    .iter_mut()
+                    .find(|input| input.revision == revision)
+                {
+                    input.installation = ReviewInputInstallation::Recorded;
+                }
+                if !session.persist_completion_review_locked().await {
+                    return false;
+                }
+            }
+            if consume {
+                session
+                    .state
+                    .lock()
+                    .await
+                    .completion_review
+                    .consume_input(revision);
+                return session.persist_completion_review_locked().await;
+            }
+            true
+        })
+        .await
+        .unwrap_or(false)
     }
 
     pub(crate) async fn start_completion_review_main_task(&self, turn_id: &str) {
@@ -123,25 +178,41 @@ impl Session {
             == Some(turn_id)
     }
 
-    pub(crate) async fn consume_initial_completion_review_input(&self, turn_id: &str) {
-        let revision = self.active_turn.lock().await.as_ref().and_then(|active| {
+    pub(crate) async fn initial_completion_review_input_revision(
+        &self,
+        turn_id: &str,
+    ) -> Option<u64> {
+        self.active_turn.lock().await.as_ref().and_then(|active| {
             active
                 .tasks
                 .get(turn_id)
                 .and_then(|task| task.review_input_revision)
-        });
-        if let Some(revision) = revision {
-            self.consume_completion_review_input(revision).await;
-        }
+        })
     }
 
-    pub(crate) async fn consume_pending_completion_review_input(&self, input: &TurnInput) {
-        if let TurnInput::UserInput {
-            review_revision: Some(revision),
-            ..
-        } = input
-        {
-            self.consume_completion_review_input(*revision).await;
+    pub(crate) async fn install_pending_completion_review_input(
+        self: &Arc<Self>,
+        context: &Arc<TurnContext>,
+        input: TurnInput,
+        consume: bool,
+    ) -> bool {
+        match input {
+            TurnInput::UserInput {
+                review_revision: Some(revision),
+                ..
+            } => {
+                self.install_completion_review_input(context, revision, consume)
+                    .await
+            }
+            input => {
+                let context = Arc::clone(context);
+                self.completion_review_transaction(move |session| async move {
+                    session.record_pending_input(&context, input).await;
+                    session.persist_completion_review_locked().await
+                })
+                .await
+                .unwrap_or(false)
+            }
         }
     }
 
@@ -150,48 +221,37 @@ impl Session {
         context: &Arc<TurnContext>,
         input: TurnInput,
     ) {
-        let context = Arc::clone(context);
-        let _ = self
-            .completion_review_transaction(move |session| async move {
-                session.record_pending_input(&context, input.clone()).await;
-                if let TurnInput::UserInput {
-                    review_revision: Some(revision),
-                    ..
-                } = input
-                    && let Some(input) = session
-                        .state
-                        .lock()
-                        .await
-                        .completion_review
-                        .pending_inputs
-                        .iter_mut()
-                        .find(|input| input.revision == revision)
-                {
-                    input.recorded = true;
-                }
-                session.persist_completion_review_locked().await;
-            })
+        self.install_pending_completion_review_input(context, input, false)
             .await;
     }
 
-    pub(crate) async fn consume_recorded_completion_review_inputs(&self) {
-        let _guard = self.completion_review_installation.lock().await;
-        let mut state = self.state.lock().await;
-        let revisions = state
+    pub(crate) async fn completion_review_input_recovery_revisions(&self) -> Vec<u64> {
+        let active = self.active_turn.lock().await;
+        let mut live_revisions = Vec::new();
+        if let Some(active) = active.as_ref() {
+            live_revisions.extend(
+                active
+                    .tasks
+                    .values()
+                    .filter_map(|task| task.review_input_revision),
+            );
+            live_revisions.extend(
+                active
+                    .turn_state
+                    .lock()
+                    .await
+                    .pending_completion_review_revisions(),
+            );
+        }
+        self.state
+            .lock()
+            .await
             .completion_review
             .pending_inputs
             .iter()
-            .filter(|input| input.recorded)
+            .filter(|input| !live_revisions.contains(&input.revision))
             .map(|input| input.revision)
-            .collect::<Vec<_>>();
-        if revisions.is_empty() {
-            return;
-        }
-        for revision in revisions {
-            state.completion_review.consume_input(revision);
-        }
-        drop(state);
-        self.persist_completion_review_locked().await;
+            .collect()
     }
 
     pub(crate) async fn completed_turn_for_review(&self) -> Option<CompletedTurnForReview> {
@@ -291,6 +351,25 @@ impl Session {
         state.completion_review.clear_operations();
         drop(state);
         self.persist_completion_review_locked().await;
+    }
+
+    pub(crate) async fn mark_completion_review_clarification_unavailable(&self, turn_id: &str) {
+        let _guard = self.completion_review_installation.lock().await;
+        let mut state = self.state.lock().await;
+        let review = &mut state.completion_review;
+        if review.main_task_id.as_deref() != Some(turn_id) {
+            return;
+        }
+        review.request_frame.exact = false;
+        review.clear_operations();
+        drop(state);
+        self.persist_completion_review_locked().await;
+        self.send_event_raw(Event {
+            id: turn_id.to_string(),
+            msg: EventMsg::Warning(WarningEvent {
+                message: "Full completion review is unavailable: human clarification answers from request_user_input are not represented in the frozen request snapshot. The answer will not be declared fully reviewed.".into(),
+            }),
+        }).await;
     }
 
     pub(crate) async fn prepare_completion_review_handoff(
@@ -534,7 +613,14 @@ impl Session {
 
     pub(crate) async fn stop_completion_review_operations(&self) {
         let _guard = self.completion_review_installation.lock().await;
-        self.state.lock().await.completion_review.clear_operations();
+        let mut state = self.state.lock().await;
+        state.completion_review.clear_operations();
+        if state.pending_continuation.as_ref().is_some_and(|pending| {
+            pending.target == PendingContinuationTarget::PostTurnCompletionReview
+        }) {
+            state.pending_continuation = None;
+        }
+        drop(state);
         self.persist_completion_review_locked().await;
     }
 

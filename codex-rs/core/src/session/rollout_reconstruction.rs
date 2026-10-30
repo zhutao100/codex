@@ -108,6 +108,9 @@ impl Session {
             match item {
                 RolloutItem::ResponseItem(response_item) => {
                     awaiting_adjacent_post_compaction_context = false;
+                    let input_installed = completion_review
+                        .as_mut()
+                        .is_some_and(|review| review.observe_input_installation(response_item));
                     history.record_items(
                         std::iter::once(response_item),
                         turn_context.truncation_policy,
@@ -118,6 +121,9 @@ impl Session {
                         } else {
                             current_metadata.commit_user_boundary(pending_context.take());
                             if let Some(review) = completion_review.as_mut() {
+                                if !input_installed {
+                                    review.request_frame.exact = false;
+                                }
                                 review.episode = None;
                                 review.clear_operations();
                             }
@@ -230,6 +236,25 @@ impl Session {
                 pause_reason: None,
                 target: PendingContinuationTarget::Regular,
             });
+        let interrupted_main_model = if pending_notes {
+            Some(turn_context.model_info.slug.clone())
+        } else {
+            current_metadata
+                .previous_turn_settings
+                .as_ref()
+                .map(|settings| settings.model.clone())
+        };
+        if let Some(review) = completion_review.as_ref()
+            && !review.pending_inputs.is_empty()
+        {
+            pending_continuation = Some(PendingContinuation {
+                source: TurnContinuationSource::Interrupted,
+                continued_from_turn_id: review.main_task_id.clone(),
+                model: interrupted_main_model.clone(),
+                pause_reason: None,
+                target: PendingContinuationTarget::Regular,
+            });
+        }
         if let Some(review) = completion_review.as_ref()
             && let Some(main_task_id) = review.main_task_id.as_ref()
             && !review.request_frame.current_user_messages.is_empty()
@@ -237,10 +262,7 @@ impl Session {
             pending_continuation = Some(PendingContinuation {
                 source: TurnContinuationSource::Interrupted,
                 continued_from_turn_id: Some(main_task_id.clone()),
-                model: current_metadata
-                    .previous_turn_settings
-                    .as_ref()
-                    .map(|settings| settings.model.clone()),
+                model: interrupted_main_model,
                 pause_reason: None,
                 target: PendingContinuationTarget::Regular,
             });

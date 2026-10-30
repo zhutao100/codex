@@ -1,10 +1,43 @@
 use super::*;
 use pretty_assertions::assert_eq;
 
+fn text_input(text: &str) -> Vec<UserInput> {
+    vec![UserInput::Text {
+        text: text.into(),
+        text_elements: vec![],
+    }]
+}
+
+fn consume(state: &mut CompletionReviewState, revision: u64) {
+    state
+        .pending_inputs
+        .iter_mut()
+        .find(|input| input.revision == revision)
+        .unwrap()
+        .installation = ReviewInputInstallation::Recorded;
+    state.consume_input(revision);
+}
+
+#[test]
+fn accepted_input_cannot_be_consumed_before_its_history_installation() {
+    let mut state = CompletionReviewState::default();
+    let revision = state.accept_input(true, text_input("amendment"), None);
+    let accepted = state.clone();
+    state.consume_input(revision);
+    assert_eq!(state, accepted);
+    let expected = state.pending_inputs[0].response_item.clone();
+    assert!(!state.observe_input_installation(&expected));
+    state.pending_inputs[0].installation = ReviewInputInstallation::Installing;
+    assert!(state.observe_input_installation(&expected));
+    state.consume_input(revision);
+    assert!(state.pending_inputs.is_empty());
+    assert_eq!(state.request_frame.current_user_messages, vec!["amendment"]);
+}
+
 fn completed_state() -> CompletionReviewState {
     let mut state = CompletionReviewState::default();
-    let revision = state.accept_input(true, vec!["implement X and explain Y".into()], true);
-    state.consume_input(revision);
+    let revision = state.accept_input(true, text_input("implement X and explain Y"), None);
+    consume(&mut state, revision);
     state.capture(
         "main-0".into(),
         PathBuf::from("/tmp/project"),
@@ -36,10 +69,10 @@ fn ten_followups_keep_frozen_request_and_initial_reference() {
 #[test]
 fn steering_is_owned_by_current_request_not_a_fake_completed_round() {
     let mut state = CompletionReviewState::default();
-    let first = state.accept_input(true, vec!["original".into()], true);
-    state.consume_input(first);
-    let second = state.accept_input(false, vec!["steering".into()], true);
-    state.consume_input(second);
+    let first = state.accept_input(true, text_input("original"), None);
+    consume(&mut state, first);
+    let second = state.accept_input(false, text_input("steering"), None);
+    consume(&mut state, second);
     state.capture("main".into(), PathBuf::new(), "final".into());
     assert_eq!(
         state.eligible_episode().unwrap().request_frame,
@@ -60,8 +93,8 @@ fn separate_user_task_keeps_only_previous_terminal_answer() {
         PathBuf::new(),
         "corrected X and Y".into(),
     );
-    let revision = state.accept_input(true, vec!["use option two".into()], true);
-    state.consume_input(revision);
+    let revision = state.accept_input(true, text_input("use option two"), None);
+    consume(&mut state, revision);
     state.capture("second".into(), PathBuf::new(), "second answer".into());
     assert_eq!(
         state.episode.unwrap().request_frame,
@@ -82,8 +115,8 @@ fn steering_a_review_followup_retains_the_known_previous_answer_as_context() {
     let mut state = completed_state();
     state.main_task_id = Some("review-followup".into());
     state.replacement_answer_required = true;
-    let revision = state.accept_input(false, vec!["use option two from that answer".into()], true);
-    state.consume_input(revision);
+    let revision = state.accept_input(false, text_input("use option two from that answer"), None);
+    consume(&mut state, revision);
     assert!(state.replacement_answer_required);
     state.capture(
         "amended".into(),
@@ -109,7 +142,7 @@ fn accepted_but_unconsumed_input_invalidates_ticket_and_capture() {
     let mut state = completed_state();
     let ticket = state.begin_review(true).unwrap();
     let original = state.episode.clone();
-    state.accept_input(false, vec!["late amendment".into()], true);
+    state.accept_input(false, text_input("late amendment"), None);
     assert!(!state.ticket_is_current(&ticket));
     state.capture(
         "late-final".into(),
@@ -125,7 +158,7 @@ fn accepted_but_unconsumed_input_invalidates_ticket_and_capture() {
 fn repeated_identical_user_text_still_invalidates_ticket() {
     let mut state = completed_state();
     let ticket = state.begin_review(false).unwrap();
-    state.accept_input(true, vec!["implement X and explain Y".into()], true);
+    state.accept_input(true, text_input("implement X and explain Y"), None);
     assert!(!state.ticket_is_current(&ticket));
 }
 
@@ -161,8 +194,8 @@ fn automatic_allowance_survives_replacement_manual_review_and_replay() {
 fn new_request_gets_a_new_allowance() {
     let mut state = completed_state();
     state.episode.as_mut().unwrap().automatic_reviews_started = AUTOMATIC_REVIEW_LIMIT;
-    let revision = state.accept_input(true, vec!["next request".into()], true);
-    state.consume_input(revision);
+    let revision = state.accept_input(true, text_input("next request"), None);
+    consume(&mut state, revision);
     state.capture("next".into(), PathBuf::new(), "next answer".into());
     assert!(state.begin_review(true).is_some());
 }
@@ -182,7 +215,7 @@ fn branch_generation_invalidates_old_work_without_changing_candidate() {
 fn incomplete_or_future_metadata_is_not_reconstructed_as_exact() {
     assert!(CompletionReviewState::from_rollout(&serde_json::json!({"version": 1})).is_none());
     let mut value = serde_json::to_value(completed_state()).unwrap();
-    value["version"] = serde_json::json!(2);
+    value["version"] = serde_json::json!(99);
     assert!(CompletionReviewState::from_rollout(&value).is_none());
 }
 
