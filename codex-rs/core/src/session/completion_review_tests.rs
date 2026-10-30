@@ -8,21 +8,36 @@ use tokio::sync::Notify;
 
 async fn completed_session() -> (Arc<Session>, Arc<TurnContext>) {
     let (session, context, _) = make_session_and_context_with_rx().await;
+    complete_new_request(
+        &session,
+        &context,
+        "original request",
+        " initial complete answer\n",
+    )
+    .await;
+    (session, context)
+}
+
+async fn complete_new_request(
+    session: &Arc<Session>,
+    context: &Arc<TurnContext>,
+    request: &str,
+    answer: &str,
+) {
     let revision = session
-        .accept_completion_review_input(&steer_text_input("original request"), true)
+        .accept_completion_review_input(&steer_text_input(request), true)
         .await;
     assert!(
         session
-            .install_completion_review_input(&context, revision, true)
+            .install_completion_review_input(context, revision, true)
             .await
     );
     session
         .start_completion_review_main_task(&context.sub_id)
         .await;
     session
-        .capture_completed_regular_turn_for_review(&context, Some(" initial complete answer\n"))
+        .capture_completed_regular_turn_for_review(context, Some(answer))
         .await;
-    (session, context)
 }
 
 fn metadata(state: &CompletionReviewState) -> RolloutItem {
@@ -312,6 +327,133 @@ async fn completion_review_rollback_and_legacy_history_cannot_reuse_future_snaps
         ])
         .await;
     assert!(session.completed_turn_for_review().await.is_none());
+}
+
+#[tokio::test]
+async fn completion_review_compacted_legacy_resume_and_fork_keep_unknown_request_provenance() {
+    for version in [None, Some(1), Some(99)] {
+        for fork in [false, true] {
+            let (session, context) = completed_session().await;
+            let mut rollout = vec![
+                RolloutItem::ResponseItem(user_message("original request")),
+                RolloutItem::ResponseItem(assistant_message("option one: scan; option two: index")),
+                RolloutItem::Compacted(CompactedItem {
+                    message: String::new(),
+                    replacement_history: Some(vec![ResponseItem::Compaction {
+                        encrypted_content: "opaque prior user requirements".into(),
+                    }]),
+                }),
+            ];
+            if let Some(version) = version {
+                let mut value =
+                    serde_json::to_value(&session.state.lock().await.completion_review).unwrap();
+                value["version"] = serde_json::json!(version);
+                rollout.push(RolloutItem::PostTurnCompletionReviewState(value));
+            }
+            let initial = if fork {
+                InitialHistory::Forked(rollout)
+            } else {
+                InitialHistory::Resumed(ResumedHistory {
+                    conversation_id: session.conversation_id,
+                    history: rollout,
+                    rollout_path: PathBuf::from("unused-rollout"),
+                })
+            };
+            session.record_initial_history(initial).await;
+            assert!(
+                !session
+                    .clone_history()
+                    .await
+                    .raw_items()
+                    .iter()
+                    .any(is_user_turn_boundary_response_item)
+            );
+            complete_new_request(&session, &context, "use option two", "used option two").await;
+            assert_eq!(
+                session
+                    .state
+                    .lock()
+                    .await
+                    .completion_review
+                    .episode
+                    .as_ref()
+                    .unwrap()
+                    .request_frame,
+                ReviewRequestFrame {
+                    current_user_messages: vec!["use option two".into()],
+                    prior_user_rounds: vec![],
+                    text_only: true,
+                    exact: false,
+                }
+            );
+            assert!(session.reserve_manual_completion_review().await.is_none());
+            assert!(session.begin_completion_review(true).await.is_none());
+        }
+    }
+}
+
+#[tokio::test]
+async fn completion_review_trusted_compacted_resume_and_fork_preserve_referential_scope() {
+    for fork in [false, true] {
+        let (session, context) = completed_session().await;
+        let original = session.completed_turn_for_review().await.unwrap();
+        let state = session.state.lock().await.completion_review.clone();
+        let rollout = vec![
+            RolloutItem::Compacted(CompactedItem {
+                message: String::new(),
+                replacement_history: Some(vec![ResponseItem::Compaction {
+                    encrypted_content: "opaque prior user requirements".into(),
+                }]),
+            }),
+            metadata(&state),
+        ];
+        let initial = if fork {
+            InitialHistory::Forked(rollout)
+        } else {
+            InitialHistory::Resumed(ResumedHistory {
+                conversation_id: session.conversation_id,
+                history: rollout,
+                rollout_path: PathBuf::from("unused-rollout"),
+            })
+        };
+        session.record_initial_history(initial).await;
+        complete_new_request(&session, &context, "use option two", "used option two").await;
+        assert_eq!(
+            session
+                .completed_turn_for_review()
+                .await
+                .unwrap()
+                .request_frame,
+            ReviewRequestFrame {
+                prior_user_rounds: vec![crate::completion_review::CompletedTurnReviewRound {
+                    user_messages: original.request_frame.current_user_messages,
+                    final_agent_message: original.final_agent_message,
+                }],
+                current_user_messages: vec!["use option two".into()],
+                text_only: true,
+                exact: true,
+            }
+        );
+    }
+}
+
+#[tokio::test]
+async fn completion_review_replaced_history_cannot_regain_provenance_without_user_boundaries() {
+    for replacement in [
+        vec![],
+        vec![ResponseItem::Compaction {
+            encrypted_content: "opaque prior context".into(),
+        }],
+        vec![assistant_message(
+            "plaintext summary without visible user messages",
+        )],
+    ] {
+        let (session, context) = completed_session().await;
+        session.replace_history(replacement).await;
+        complete_new_request(&session, &context, "use option two", "used option two").await;
+        assert!(session.completed_turn_for_review().await.is_none());
+        assert!(session.reserve_manual_completion_review().await.is_none());
+    }
 }
 
 #[tokio::test]
@@ -774,6 +916,64 @@ async fn completion_review_initial_acknowledgement_recovers_without_any_history_
 struct CompletingReviewTask {
     ready: Arc<Notify>,
     finish: Arc<Notify>,
+}
+
+#[tokio::test]
+async fn completion_review_manual_reservation_joins_blocked_finalization() {
+    let (session, mut context) = completed_session().await;
+    let mut expected = session.completed_turn_for_review().await.unwrap();
+    Arc::get_mut(&mut context).unwrap().sub_id = "main-replacement".into();
+    expected.turn_id.clone_from(&context.sub_id);
+    expected.final_agent_message = "durable terminal replacement".into();
+    let (_home, path) = attach_recorder(&session, &context).await;
+    let ready = Arc::new(Notify::new());
+    let finish = Arc::new(Notify::new());
+    session
+        .spawn_task(
+            Arc::clone(&context),
+            vec![],
+            CompletingReviewTask {
+                ready: Arc::clone(&ready),
+                finish: Arc::clone(&finish),
+            },
+        )
+        .await;
+    ready.notified().await;
+    let installation = session.completion_review_installation.lock().await;
+    finish.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while session.active_turn.lock().await.is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let reviewing_session = Arc::clone(&session);
+    let mut reviewing =
+        tokio::spawn(async move { reviewing_session.reserve_manual_completion_review().await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), &mut reviewing)
+            .await
+            .is_err()
+    );
+    drop(installation);
+    let (candidate, ticket) = tokio::time::timeout(Duration::from_secs(2), reviewing)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(candidate, expected);
+    assert!(ticket.matches(&candidate));
+    assert!(session.completion_review_ticket_is_current(&ticket).await);
+    // The real reservation must flush both the replacement and its matching ticket.
+    let (items, _, errors) = RolloutRecorder::load_rollout_items(&path).await.unwrap();
+    assert_eq!(errors, 0);
+    let replay = session
+        .reconstruct_history_from_rollout(&context, &items)
+        .await;
+    let review = replay.completion_review.unwrap();
+    assert_eq!(review.eligible_episode(), Some(&candidate));
+    assert_eq!(review.attempt, Some(ticket));
 }
 
 impl SessionTask for CompletingReviewTask {

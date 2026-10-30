@@ -32,6 +32,8 @@
 
 It is not a `ResponseItem`, model summary, assistant output or UI cell. Unknown/incomplete metadata versions are unavailable, not reconstructed from model-produced XML.
 
+Only a genuinely new root session or trusted metadata establishes exact request provenance. Resume, fork and history replacement without that evidence retain unknown scope, even when prompt history is empty or contains only encrypted compaction. Missing visible user boundaries do not prove missing requirements never existed. Subsequent genuine input remains tracked but cannot restore unknown prior scope by itself.
+
 Snapshot writes and handoff transitions use a serialized persistence boundary. Persist completion before reserving its review; persist a prepared handoff before enqueue; persist the started claim before main work. Failed writes disable review eligibility and surface a diagnostic. A full/closed operation queue preserves recoverable work instead of waiting while task finalization holds its lifecycle guard.
 
 Advisory preparation and installation finish their short durable transaction even if their caller is cancelled; task-stop joins that boundary before recording its stopped state. Pausing a reviewer clears an unconsumed prepared handoff and preserves its ticket for re-review. Pausing main work preserves started lineage and its output contract.
@@ -51,6 +53,8 @@ The active snapshot and review packet have bounded answer revisions. The append-
 ## Tickets And Recovery
 
 A ticket identifies episode, request revision, history generation, exact candidate completion and attempt. Private operations associate the ticket with an opaque submission ID; public manual commands resolve the latest eligible completion. Dispatch, delegate entry, result acceptance, handoff preparation and main-task claim all validate ownership.
+
+Manual reservation joins the task lifecycle before selecting work, including the interval after the active-task entry is removed but finalization is still installing a newer answer. Under the installation guard, one state lock reserves the ticket and clones its candidate snapshot; persistence completes before either is returned. The delegate checks both the supplied snapshot's ticket identity and the ticket's live ownership. A snapshot read before finalization must never be paired with a ticket reserved afterward.
 
 |Transition|Behavior|
 |---|---|

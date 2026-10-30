@@ -126,6 +126,12 @@ impl Default for CompletionReviewState {
 }
 
 impl CompletionReviewState {
+    pub(crate) fn for_unknown_history() -> Self {
+        let mut state = Self::default();
+        state.request_frame.exact = false;
+        state
+    }
+
     pub(crate) fn eligible_episode(&self) -> Option<&CompletedTurnForReview> {
         self.episode.as_ref().filter(|episode| {
             episode.request_revision == self.input_revision

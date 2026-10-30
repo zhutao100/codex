@@ -5,9 +5,9 @@
 |Suite|Assertions|
 |---|---|
 |[State tests](../../../core/src/completion_review_tests.rs)|Ten same-request completions; frozen scope/reference; genuine prior user rounds; consumed steering; rejection of consumption before message installation; stale tickets; allowance/replay; branch generations and unknown metadata.|
-|[Session tests](../../../core/src/session/completion_review_tests.rs)|Authoritative final text; late input; accepted/installing/recorded/consumed crash boundaries; distinct identical amendments; acknowledgement before main startup; single handoff claim; compaction preservation; prepared versus started recovery; rollback/fork invalidation; input-installation cancellation and finalization joins through actual pause/interrupt/shutdown with a real recorder and no test-side flush.|
-|[Review task tests](../../../core/src/tasks/post_turn_completion_review.rs)|Exact CDATA data, deduplication, optional-reference-first budgets, mandatory overflow, nontext/legacy coverage, invalid evaluations and host-owned prompt contracts.|
-|[HTTP integration](../../../core/tests/suite/completion_review.rs)|One real request and three reviews; exact initial/latest packets without prior verdicts; custom-prompt framing; cap/manual behavior; invalid output; restart without persisted completion events; running-review replacement; prepared/started crash-boundary fixtures; accepted or partially installed amendments reach the model and next reviewer once; clarification answers explicitly prevent incomplete full-coverage claims.|
+|[Session tests](../../../core/src/session/completion_review_tests.rs)|Authoritative final text; late input; accepted/installing/recorded/consumed crash boundaries; distinct identical amendments; acknowledgement before main startup; single handoff claim; prepared versus started recovery; rollback/fork invalidation; encrypted compaction across resume/fork with missing, version 1, unknown or trusted metadata; discarded empty/encrypted/summary histories; manual snapshot/ticket reservation joins blocked finalization; input-installation cancellation and actual pause/interrupt/shutdown use a real recorder and replay without a test-side flush.|
+|[Review task tests](../../../core/src/tasks/post_turn_completion_review.rs)|Exact CDATA data, deduplication, optional-reference-first budgets, mandatory overflow, nontext/legacy coverage, invalid evaluations, host-owned prompt contracts and rejection of a current ticket paired with a different candidate.|
+|[HTTP integration](../../../core/tests/suite/completion_review.rs)|One real request and three reviews; exact initial/latest packets without prior verdicts; custom-prompt framing; cap/manual behavior; invalid output; restart without persisted completion events; encrypted legacy/version 1 resume followed by referential input stays unavailable without a reviewer POST; running-review replacement; prepared/started crash-boundary fixtures; accepted or partially installed amendments reach the model and next reviewer once; clarification answers explicitly prevent incomplete full-coverage claims.|
 |[Existing review integration](../../../core/tests/suite/review.rs)|Real user rounds, read-only configuration, provider selection, host/project instruction profiles, review pause/continue and generic `/review` behavior.|
 |[Recorder tests](../../../core/src/rollout/tests.rs)|Continuation cleanup retains host metadata while removing dangling work and interrupt markers.|
 
@@ -18,6 +18,7 @@ Mock-only tests use the repository's localhost-aware guard. Test workspaces are 
 Run through `cargo-local` and `just-local`, with bounded build/test parallelism and `CODEX_SANDBOX_NETWORK_DISABLED=1` for tests:
 
 ```bash
+export CARGO_BUILD_JOBS=2
 just-local fmt
 CODEX_SANDBOX_NETWORK_DISABLED=1 cargo-local test --quiet -p codex-core 'review::' -- --test-threads=2
 CODEX_SANDBOX_NETWORK_DISABLED=1 cargo-local test --quiet -p codex-core -- --test-threads=2
@@ -32,9 +33,9 @@ Workspace-wide testing remains a separately authorized VM workload. The reposito
 
 |Check|Result|
 |---|---|
-|Core, protocol and state crate suites|2,024 passed; 16 ignored; 44 filtered; nine suites; two test threads.|
-|Completion/review-focused tests|76 passed and one opt-in exporter ignored across four suites, including actual input-installation cancellation, finalization-stop joins and replay.|
-|Mock HTTP completion-review integration|Eight tests passed; 0.83 seconds test execution, 1.20 seconds command wall time on the validation host.|
+|Core, protocol and state crate suites|2,030 passed; 16 ignored; 44 filtered; nine suites; two test threads.|
+|Completion/review-focused tests|82 passed and one opt-in exporter ignored across four suites, including actual input-installation cancellation, finalization-stop/manual-reservation joins, unknown/trusted encrypted-history provenance and replay.|
+|Mock HTTP completion-review integration|Nine tests passed; 1.01 seconds test execution, 1.38 seconds command wall time on the validation host.|
 |Model-downshift recovery|Nine existing source/destination recovery cases passed with acknowledged input restored after pending notes.|
 |End-to-end request shape|One genuine user request, three reviewers and two main follow-ups produced six Responses requests. Later reviewers received the stable initial reference and exact latest candidate, never preceding verdicts.|
 |Scoped Clippy fix and consumer compilation|Passed for changed core code and TUI/exec/app-server consumers; existing warnings remain in unrelated code.|
@@ -42,6 +43,8 @@ Workspace-wide testing remains a separately authorized VM workload. The reposito
 |Documentation|Three feature documents; Markdown fences, relative links, unpadded tables and local-path redaction checked.|
 
 The HTTP timings describe local mock transport and harness overhead, not live-model latency. The loopback fixtures executed actual transport; early-return network guards elsewhere in the broader suites are not additional transport coverage. No workspace-wide all-feature run was performed.
+
+The manual reservation and unknown-provenance corrections reran deterministic and transport coverage above. They do not change prompts or answer contracts; the live behavioral results below remain the earlier evaluation, not a new live run of those lifecycle corrections.
 
 ## Live Behavioral Evaluation
 

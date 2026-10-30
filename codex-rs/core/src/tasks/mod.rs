@@ -608,7 +608,7 @@ impl Session {
             return;
         }
 
-        if let Some(ticket) = self
+        if let Some((_, ticket)) = self
             .begin_completion_review_for_candidate(true, Some(&turn_context.sub_id))
             .await
         {

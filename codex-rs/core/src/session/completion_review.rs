@@ -291,8 +291,21 @@ impl Session {
         self.persist_completion_review_locked().await;
     }
 
+    #[cfg(test)]
     pub(crate) async fn begin_completion_review(&self, automatic: bool) -> Option<ReviewTicket> {
         self.begin_completion_review_for_candidate(automatic, None)
+            .await
+            .map(|(_, ticket)| ticket)
+    }
+
+    pub(crate) async fn reserve_manual_completion_review(
+        &self,
+    ) -> Option<(CompletedTurnForReview, ReviewTicket)> {
+        let _lifecycle = self.task_lifecycle.lock().await;
+        if self.active_turn.lock().await.is_some() {
+            return None;
+        }
+        self.begin_completion_review_for_candidate(false, None)
             .await
     }
 
@@ -300,29 +313,21 @@ impl Session {
         &self,
         automatic: bool,
         expected_completion: Option<&str>,
-    ) -> Option<ReviewTicket> {
+    ) -> Option<(CompletedTurnForReview, ReviewTicket)> {
         let _guard = self.completion_review_installation.lock().await;
+        let mut state = self.state.lock().await;
+        let review = &mut state.completion_review;
         if let Some(expected) = expected_completion
-            && self
-                .state
-                .lock()
-                .await
-                .completion_review
-                .eligible_episode()?
-                .turn_id
-                != expected
+            && review.eligible_episode()?.turn_id != expected
         {
             return None;
         }
-        let ticket = self
-            .state
-            .lock()
-            .await
-            .completion_review
-            .begin_review(automatic)?;
+        let ticket = review.begin_review(automatic)?;
+        let completed_turn = review.eligible_episode()?.clone();
+        drop(state);
         self.persist_completion_review_locked()
             .await
-            .then_some(ticket)
+            .then_some((completed_turn, ticket))
     }
 
     pub(crate) async fn completion_review_ticket_is_current(&self, ticket: &ReviewTicket) -> bool {
@@ -639,13 +644,7 @@ impl Session {
     pub(crate) async fn invalidate_completion_review_history(&self) {
         let _guard = self.completion_review_installation.lock().await;
         let mut state = self.state.lock().await;
-        let exact = !state
-            .history
-            .raw_items()
-            .iter()
-            .any(is_user_turn_boundary_response_item);
-        state.completion_review = CompletionReviewState::default();
-        state.completion_review.request_frame.exact = exact;
+        state.completion_review = CompletionReviewState::for_unknown_history();
         drop(state);
         self.persist_completion_review_locked().await;
     }

@@ -1088,7 +1088,7 @@ pub async fn review_completed_turn(sess: &Arc<Session>, sub_id: String) {
         return;
     }
 
-    let Some(completed_turn) = sess.completed_turn_for_review().await else {
+    let Some((completed_turn, ticket)) = sess.reserve_manual_completion_review().await else {
         sess.send_event_raw(Event {
             id: sub_id,
             msg: EventMsg::Error(ErrorEvent {
@@ -1102,23 +1102,6 @@ pub async fn review_completed_turn(sess: &Arc<Session>, sub_id: String) {
         return;
     };
 
-    if completed_turn.final_agent_message.trim().is_empty() {
-        sess.send_event_raw(Event {
-            id: sub_id,
-            msg: EventMsg::Error(ErrorEvent {
-                message: "The last completed turn has no final assistant message to review. Run another prompt or retry after a completed response."
-                    .to_string(),
-                codex_error_info: Some(CodexErrorInfo::BadRequest),
-                client_user_message_id: None,
-            }),
-        })
-        .await;
-        return;
-    }
-
     let turn_context = sess.new_default_turn_with_sub_id(sub_id).await;
-    if let Some(ticket) = sess.begin_completion_review(false).await {
-        spawn_post_turn_completion_review(Arc::clone(sess), turn_context, completed_turn, ticket)
-            .await;
-    }
+    spawn_post_turn_completion_review(Arc::clone(sess), turn_context, completed_turn, ticket).await;
 }

@@ -76,7 +76,9 @@ impl SessionTask for PostTurnCompletionReviewTask {
         cancellation_token: CancellationToken,
     ) -> Option<String> {
         let sess = session.clone_session();
-        if !sess.completion_review_ticket_is_current(&self.ticket).await {
+        if !self.ticket.matches(&self.completed_turn)
+            || !sess.completion_review_ticket_is_current(&self.ticket).await
+        {
             return None;
         }
         session.session.services.otel_manager.counter(
@@ -657,6 +659,48 @@ mod tests {
             final_agent_message: "latest complete answer".into(),
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn a_current_ticket_cannot_review_a_different_candidate_snapshot() {
+        let (session, context, events) =
+            crate::session::tests::make_session_and_context_with_rx().await;
+        let revision = session
+            .accept_completion_review_input(
+                &[UserInput::Text {
+                    text: "original request".into(),
+                    text_elements: vec![],
+                }],
+                true,
+            )
+            .await;
+        assert!(
+            session
+                .install_completion_review_input(&context, revision, true)
+                .await
+        );
+        session
+            .start_completion_review_main_task(&context.sub_id)
+            .await;
+        session
+            .capture_completed_regular_turn_for_review(&context, Some("latest completed answer"))
+            .await;
+        let (mut stale, ticket) = session.reserve_manual_completion_review().await.unwrap();
+        stale.turn_id = "older-completion".into();
+        stale.final_agent_message = "older completed answer".into();
+        assert!(session.completion_review_ticket_is_current(&ticket).await);
+        while events.try_recv().is_ok() {}
+        let output = Arc::new(PostTurnCompletionReviewTask::new(stale, ticket.clone()))
+            .run(
+                Arc::new(SessionTaskContext::new(Arc::clone(&session))),
+                context,
+                vec![],
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(output, None);
+        assert!(events.try_recv().is_err());
+        assert!(session.completion_review_ticket_is_current(&ticket).await);
     }
 
     #[test]

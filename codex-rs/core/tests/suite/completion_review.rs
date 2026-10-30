@@ -3,6 +3,7 @@ use codex_core::features::Feature;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Settings;
+use codex_protocol::protocol::CompactedItem;
 use codex_protocol::request_user_input::RequestUserInputAnswer;
 use codex_protocol::request_user_input::RequestUserInputResponse;
 use core_test_support::responses::ResponsesRequest;
@@ -401,6 +402,86 @@ async fn completed_snapshot_resumes_without_persisted_turn_complete_events() {
     assert!(context.contains("durable request"));
     assert!(context.contains("<candidate_final_answer><![CDATA[ exact durable answer\n]]>"));
     server.verify().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compacted_legacy_resume_cannot_review_a_referential_request_as_complete_scope() {
+    skip_if_no_network_unless_localhost!();
+    for version in [None, Some(1)] {
+        let server = MockServer::start().await;
+        let requests = mount_sse_sequence(
+            &server,
+            vec![
+                answer("option one: scan; option two: index"),
+                answer("used option two"),
+            ],
+        )
+        .await;
+        let home = Arc::new(TempDir::new().unwrap());
+        let codex = new_conversation_for_server(&server, home.clone(), |_| {}).await;
+        submit_request(
+            &codex,
+            "choose a method that preserves the original requirements",
+        )
+        .await;
+        wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+        let path = codex.rollout_path().unwrap();
+        codex.submit(Op::Shutdown).await.unwrap();
+        wait_for_event(&codex, |event| matches!(event, EventMsg::ShutdownComplete)).await;
+        let lines = read_rollout_lines(&path);
+        let session_meta = lines
+            .iter()
+            .find(|line| matches!(line.item, RolloutItem::SessionMeta(_)))
+            .unwrap()
+            .item
+            .clone();
+        let mut legacy = vec![
+            session_meta,
+            RolloutItem::Compacted(CompactedItem {
+                message: String::new(),
+                replacement_history: Some(vec![ResponseItem::Compaction {
+                    encrypted_content: "opaque original user requirements".into(),
+                }]),
+            }),
+        ];
+        if let Some(version) = version {
+            let mut state = lines
+                .into_iter()
+                .rev()
+                .find_map(|line| match line.item {
+                    RolloutItem::PostTurnCompletionReviewState(state) => Some(state),
+                    _ => None,
+                })
+                .unwrap();
+            state["version"] = serde_json::json!(version);
+            legacy.push(RolloutItem::PostTurnCompletionReviewState(state));
+        }
+        tokio::fs::write(&path, b"").await.unwrap();
+        append_crash_fixture(&path, legacy).await;
+        let resumed =
+            resume_conversation_for_server(&server, home.clone(), path.clone(), |_| {}).await;
+        submit_request(&resumed, "use option two").await;
+        wait_for_event(&resumed, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+        resumed.submit(Op::ReviewCompletedTurn).await.unwrap();
+        let event = wait_for_event(&resumed, |event| {
+            matches!(event, EventMsg::Error(_) | EventMsg::EnteredReviewMode(_))
+        })
+        .await;
+        assert!(matches!(event, EventMsg::Error(event)
+                if event.message.contains("exact consumed-request provenance")));
+        assert_eq!(requests.requests().len(), 2);
+        let state = read_rollout_lines(&path)
+            .into_iter()
+            .rev()
+            .find_map(|line| match line.item {
+                RolloutItem::PostTurnCompletionReviewState(state) => Some(state),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(state["request_frame"]["exact"], false);
+        assert!(state["attempt"].is_null());
+        server.verify().await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -21,6 +21,7 @@ use crate::compact::CompactionImplementation;
 use crate::compact::compaction_implementation;
 use crate::compact::run_inline_auto_compact_task;
 use crate::compact_remote::run_inline_remote_auto_compact_task;
+use crate::completion_review::CompletionReviewState;
 use crate::connectors;
 use crate::exec_policy::ExecPolicyManager;
 use crate::features::FEATURES;
@@ -889,16 +890,7 @@ impl Session {
                     let mut state = self.state.lock().await;
                     state.completion_review =
                         completion_review::completion_review_for_fork(&rollout_items)
-                            .unwrap_or_else(|| {
-                                let mut review =
-                                    crate::completion_review::CompletionReviewState::default();
-                                review.request_frame.exact = !state
-                                    .history
-                                    .raw_items()
-                                    .iter()
-                                    .any(is_user_turn_boundary_response_item);
-                                review
-                            });
+                            .unwrap_or_else(CompletionReviewState::for_unknown_history);
                     state.completion_review.rebranch();
                     state.pending_continuation = None;
                 }
@@ -931,15 +923,9 @@ impl Session {
             .set_reference_context_item(reconstructed.reference_context_item.clone());
         state.previous_turn_settings = reconstructed.previous_turn_settings;
         state.pending_continuation = reconstructed.pending_continuation;
-        state.completion_review = reconstructed.completion_review.unwrap_or_else(|| {
-            let mut review = crate::completion_review::CompletionReviewState::default();
-            review.request_frame.exact = !state
-                .history
-                .raw_items()
-                .iter()
-                .any(is_user_turn_boundary_response_item);
-            review
-        });
+        state.completion_review = reconstructed
+            .completion_review
+            .unwrap_or_else(CompletionReviewState::for_unknown_history);
         state.initial_context_seeded = reconstructed.reference_context_item.is_some();
     }
 
