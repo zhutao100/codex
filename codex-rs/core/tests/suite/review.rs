@@ -190,6 +190,12 @@ async fn review_op_emits_lifecycle_and_review_output() {
         !saw_assistant_xml,
         "assistant review output contains user_action markup"
     );
+    let delegate = read_single_delegate_rollout(codex_home.path(), &path);
+    assert!(
+        !delegate
+            .iter()
+            .any(|line| matches!(line.item, RolloutItem::PostTurnCompletionReviewState(_)))
+    );
 
     let _codex_home_guard = codex_home;
     server.verify().await;

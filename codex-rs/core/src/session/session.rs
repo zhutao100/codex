@@ -73,6 +73,14 @@ pub(crate) struct SessionConfiguration {
 }
 
 impl SessionConfiguration {
+    pub(super) fn tracks_completion_review(&self) -> bool {
+        // Review delegates leave completion-review recovery to their parent.
+        !matches!(
+            self.session_source,
+            SessionSource::SubAgent(SubAgentSource::Review)
+        )
+    }
+
     pub(crate) fn codex_home(&self) -> &PathBuf {
         &self.codex_home
     }

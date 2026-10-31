@@ -15,6 +15,7 @@
 |Failed persistence handlers|A real durable rollout prefix is reopened through a read-only writer. Failed reservation and claim flushes emit the persistence warning without reviewer/main startup or modification of that prefix. Failed owner writes on actual paused Started handoffs, with and without installed encrypted compaction, stop before TurnStarted or sampling and preserve history, continuation ownership and the durable prefix. After writer repair, missing mandatory context rejects retry before task registration or persistence; replay of the untouched prefix restores the original exact snapshots.|
 |[Model-downshift integration](../../../core/tests/suite/compact_remote_v2_downshift.rs)|Pending notes keep their source provider, model and effective instructions while an explicit recovery-time override changes the ordinary follow-up and replacement budget to a different destination, immediately or after pause/restart.|
 |[Existing review integration](../../../core/tests/suite/review.rs)|Real user rounds, read-only configuration, provider selection, host/project instruction profiles, review pause/continue and generic `/review` behavior.|
+|Reviewer tracking policy|A real recorder and shutdown/replay preserve the exact ordinary request and evaluation without input revisions, candidate capture or review metadata. Scripted HTTP covers both review entry points; a positive post-turn verdict still claims the parent's handoff and produces a complete replacement, while the reviewer's rollout contains its exact packet and evaluation but no completion-review state.|
 |[Recorder tests](../../../core/src/rollout/tests.rs)|Continuation cleanup retains host metadata while removing dangling work and interrupt markers. Flush/shutdown acknowledgements propagate the original error kind and OS code from actual buffered I/O failures.|
 
 Mock-only tests use the repository's localhost-aware guard. Test workspaces are owned by retained temporary homes so project docs and restart CWDs survive builder teardown.
@@ -39,20 +40,21 @@ Workspace-wide testing remains a separately authorized VM workload. The reposito
 
 |Check|Result|
 |---|---|
-|Core, protocol and state crate suites|2,053 passed; 16 ignored; 44 filtered; nine suites; two test threads.|
-|Completion/review-focused tests|101 passed and one opt-in exporter ignored across four suites, including real finalization/stop/reservation joins, unknown/trusted provenance, budget recovery, amendment directory ownership, failed resumed-owner persistence, repaired-writer rejection of unavailable snapshots, explicit destination selection before or after steering, non-model overrides, clarification/fork barriers and replay.|
-|Mock HTTP completion-review integration|Twenty-three tests passed; 7.29 seconds test execution, 7.67 seconds command wall time on the validation host.|
+|Core crate suite|1,980 passed; 16 ignored; 44 filtered; four suites; two test threads.|
+|Completion/review-focused tests|Passed in the core suite; one opt-in exporter remains ignored. Coverage includes real finalization/stop/reservation joins, unknown/trusted provenance, budget recovery, amendment directory ownership, failed resumed-owner persistence, repaired-writer rejection of unavailable snapshots, explicit destination selection before or after steering, non-model overrides, clarification/fork barriers and replay.|
+|Mock HTTP completion-review integration|Passed in the core suite. The dedicated reviewer-persistence case took 0.18 seconds test execution and 0.58 seconds command wall time.|
 |Compaction-focused tests|127 reported passes across four suites; eleven source/destination recovery cases include explicit model changes before Continue, with acknowledged input and notes source preserved. Legacy early-return guards are not additional transport coverage.|
 |Recorder-focused tests|26 passed, including error-bearing flush/shutdown acknowledgements against actual read-only-file write faults.|
 |End-to-end request shape|One genuine user request, three reviewers and two main follow-ups produced six Responses requests. Later reviewers received the stable initial reference and exact latest candidate, never preceding verdicts.|
+|Reviewer persistence end-to-end|Three scripted Responses requests completed the main answer, positive reviewer verdict and replacement answer. The child retained its exact packet and evaluation with zero completion-review state records. Parent request scope, initial reference and replacement candidate survived shutdown; dedicated recorder shutdown/replay also passed without a test-side flush.|
 |Evaluation fixture export|Four production cases exported as JSON; parsed packet roots have no format attributes, prompts/contracts expose no storage versions, and no live-model calls are involved.|
 |Scoped Clippy fix and consumer compilation|Passed for changed core code and TUI/exec/app-server consumers; existing warnings remain in unrelated code.|
 |Live behavioral set|All four expected review verdicts matched in two runs, with two generated replacement answers per run and unchanged artifacts; manual assessment and limits below.|
 |Documentation|Completion-review and compaction documents; Markdown fences, relative links, unpadded tables and local-path redaction checked.|
 
-The HTTP timings include a deliberate five-second mocked response delay used to install steering before a budget stop; they do not measure live-model latency. The loopback fixtures executed actual transport; early-return network guards elsewhere in the broader suites are not additional transport coverage. No workspace-wide all-feature run was performed.
+The broader HTTP suite includes a deliberate five-second mocked response delay used to install steering before a budget stop; the dedicated reviewer-persistence case does not. These timings do not measure live-model latency. The loopback fixtures executed actual transport; early-return network guards elsewhere in the broader suites are not additional transport coverage. No workspace-wide all-feature run was performed.
 
-Recovery and framing changes reran the deterministic and transport coverage above. The live behavioral results below remain a separate earlier evaluation, not a new live run of these changes.
+Recovery, framing and reviewer-tracking changes reran the deterministic and transport coverage above. The live behavioral results below remain a separate earlier evaluation, not a new live run of these changes.
 
 ## Live Behavioral Evaluation
 

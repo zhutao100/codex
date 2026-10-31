@@ -678,7 +678,8 @@ mod tests {
                 }],
                 true,
             )
-            .await;
+            .await
+            .unwrap();
         assert!(
             session
                 .install_completion_review_input(&context, revision, true)

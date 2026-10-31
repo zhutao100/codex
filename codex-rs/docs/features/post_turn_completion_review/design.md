@@ -23,6 +23,10 @@
 
 ## Durable Metadata
 
+Completion-review tracking is disabled for `SessionSource::SubAgent(SubAgentSource::Review)`, shared by ordinary `/review` and post-turn review delegates. Their input follows the ordinary transcript path without review revisions, main-task ownership or candidate capture. Completion, pause and shutdown do not append `PostTurnCompletionReviewState` records to their rollouts. Other session sources retain existing tracking.
+
+The parent is the recovery owner: its snapshots, ticket, allowance and prepared/started handoffs remain unchanged. Resuming a paused reviewer uses the parent's saved candidate to create a fresh delegate, not the child's rollout. A reviewer rollout remains a readable transcript, not an independent completion-review recovery checkpoint. This runtime policy adds no storage or configuration fields; existing inline metadata remains readable and is not removed.
+
 `RolloutItem::PostTurnCompletionReviewState` carries host-only JSON recovery metadata whose typed implementation is internal to core. Its format checks do not appear in model-facing packets, prompts or review results. This avoids expanding the review result or app-server RPC payloads. The record contains:
 
 - Generation and accepted/consumed request revisions.
@@ -41,7 +45,7 @@ Snapshot writes and handoff transitions use a serialized persistence boundary. P
 
 Recorder flush/shutdown acknowledgements carry the underlying I/O result, not just notification that the writer processed the command. A buffered write failure must reach the reservation or claim caller before task startup. Failure leaves the existing durable prefix intact and prevents the in-memory transition from authorizing new review work.
 
-Every resumed main task must also persist its new owner before sampling, even when the handoff was already Started. Owner-write failure stops before history cleanup, snapshot injection or a model request; finalization retains interrupted continuation ownership. Missing mandatory context is an explicit error, distinct from an ordinary task that requires no review context. Continue preflight preserves the checkpoint on that error, including after the writer is repaired, so an invalidated in-memory snapshot cannot overwrite the last good recovery prefix.
+Every resumed review-tracked main task must also persist its new owner before sampling, even when the handoff was already Started. Owner-write failure stops before history cleanup, snapshot injection or a model request; finalization retains interrupted continuation ownership. Missing mandatory context is an explicit error, distinct from an ordinary task that requires no review context. Continue preflight preserves the checkpoint on that error, including after the writer is repaired, so an invalidated in-memory snapshot cannot overwrite the last good recovery prefix.
 
 Advisory preparation and installation finish their short durable transaction even if their caller is cancelled; task-stop joins that boundary before recording its stopped state. Pausing a reviewer clears an unconsumed prepared handoff and preserves its ticket for re-review. Pausing main work preserves started lineage and its output contract.
 

@@ -8,6 +8,7 @@ Independent read-only review of current work and the exact latest main answer. [
 - Automatic: `[features].auto_post_turn_completion_review = true`; disabled by default.
 - Uses `review_model` and `review_model_provider`, with the same provider selection as `/review`.
 - Always uses a fresh `InitialHistory::New` delegate, read-only policy, no approval escalation, disabled web search and disabled collaboration.
+- Reviewer delegates retain their ordinary transcripts but do not track completion-review input revisions, candidates or recovery snapshots. The parent owns the review ticket and recovery checkpoint; continuing an interrupted review starts a fresh delegate.
 
 ```toml
 [features]

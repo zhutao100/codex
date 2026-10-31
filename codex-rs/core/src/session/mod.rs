@@ -2275,14 +2275,13 @@ impl Session {
         }
 
         let mut ts = active_turn.turn_state.lock().await;
-        let review_revision = Some(
-            self.accept_completion_review_input_with_client_id(
+        let review_revision = self
+            .accept_completion_review_input_with_client_id(
                 &input,
                 false,
                 client_user_message_id.clone(),
             )
-            .await,
-        );
+            .await;
         ts.push_pending_input(TurnInput::UserInput {
             content: input,
             client_id: client_user_message_id,

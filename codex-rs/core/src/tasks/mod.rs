@@ -221,7 +221,7 @@ impl Session {
                 .await;
         }
         let review_input_revision = if task_kind == TaskKind::Regular && !input.is_empty() {
-            Some(self.accept_completion_review_input(&input, true).await)
+            self.accept_completion_review_input(&input, true).await
         } else {
             None
         };

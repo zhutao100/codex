@@ -231,6 +231,83 @@ async fn same_request_three_reviews_keep_initial_and_exact_latest_without_prior_
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reviewer_transcript_omits_completion_state_without_losing_parent_handoff() {
+    skip_if_no_network_unless_localhost!();
+    let server = MockServer::start().await;
+    let evaluation = serde_json::json!({
+        "evaluation": "Correct the missing verification result.",
+        "fix_actions_advised": true,
+    });
+    let requests = mount_sse_sequence(
+        &server,
+        vec![
+            answer("initial answer"),
+            answer(&evaluation.to_string()),
+            answer("complete replacement with verification"),
+        ],
+    )
+    .await;
+    let home = Arc::new(TempDir::new().unwrap());
+    let codex = new_conversation_for_server(&server, home.clone(), |_| {}).await;
+    submit_request(&codex, "implement and verify the complete request").await;
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    codex.submit(Op::ReviewCompletedTurn).await.unwrap();
+    wait_for_event(&codex, |event| {
+        matches!(event, EventMsg::TurnComplete(event)
+        if event.last_agent_message.as_deref() == Some("complete replacement with verification"))
+    })
+    .await;
+    codex.submit(Op::Shutdown).await.unwrap();
+    wait_for_event(&codex, |event| matches!(event, EventMsg::ShutdownComplete)).await;
+
+    let requests = requests.requests();
+    assert_eq!(requests.len(), 3);
+    let parent_path = codex.rollout_path().unwrap();
+    let delegate = read_single_delegate_rollout(home.path(), &parent_path);
+    assert!(
+        !delegate
+            .iter()
+            .any(|line| matches!(line.item, RolloutItem::PostTurnCompletionReviewState(_)))
+    );
+    for (expected_role, expected_content) in [
+        (
+            "user",
+            vec![ContentItem::InputText {
+                text: packet(&requests[1]),
+            }],
+        ),
+        (
+            "assistant",
+            vec![ContentItem::OutputText {
+                text: evaluation.to_string(),
+            }],
+        ),
+    ] {
+        assert!(delegate.iter().any(|line| matches!(
+            &line.item,
+            RolloutItem::ResponseItem(ResponseItem::Message { role, content, .. })
+                if role == expected_role && content == &expected_content
+        )));
+    }
+    let parent_state = completion_state(&parent_path).unwrap();
+    assert_eq!(
+        (
+            &parent_state["episode"]["request_frame"]["current_user_messages"],
+            &parent_state["episode"]["initial_answer_reference"],
+            &parent_state["episode"]["final_agent_message"],
+            &parent_state["handoff"],
+        ),
+        (
+            &serde_json::json!(["implement and verify the complete request"]),
+            &serde_json::json!("initial answer"),
+            &serde_json::json!("complete replacement with verification"),
+            &serde_json::Value::Null,
+        )
+    );
+    server.verify().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn automatic_cap_keeps_unresolved_findings_and_manual_handoff_does_not_reset_it() {
     skip_if_no_network_unless_localhost!();
     let server = MockServer::start().await;

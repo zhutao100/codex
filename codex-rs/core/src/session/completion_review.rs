@@ -30,7 +30,13 @@ impl Session {
     }
 
     async fn persist_completion_review_locked(&self) -> bool {
-        let snapshot = self.state.lock().await.completion_review.clone();
+        let snapshot = {
+            let state = self.state.lock().await;
+            if !state.session_configuration.tracks_completion_review() {
+                return true;
+            }
+            state.completion_review.clone()
+        };
         let recorder = self.services.rollout.lock().await.clone();
         let result = async {
             let item = RolloutItem::PostTurnCompletionReviewState(
@@ -66,7 +72,7 @@ impl Session {
         &self,
         input: &[UserInput],
         new_task: bool,
-    ) -> u64 {
+    ) -> Option<u64> {
         self.accept_completion_review_input_with_client_id(input, new_task, None)
             .await
     }
@@ -76,15 +82,19 @@ impl Session {
         input: &[UserInput],
         new_task: bool,
         client_id: Option<String>,
-    ) -> u64 {
+    ) -> Option<u64> {
         let _guard = self.completion_review_installation.lock().await;
-        let revision = self.state.lock().await.completion_review.accept_input(
-            new_task,
-            input.to_vec(),
-            client_id,
-        );
+        let revision = {
+            let mut state = self.state.lock().await;
+            if !state.session_configuration.tracks_completion_review() {
+                return None;
+            }
+            state
+                .completion_review
+                .accept_input(new_task, input.to_vec(), client_id)
+        };
         self.persist_completion_review_locked().await;
-        revision
+        Some(revision)
     }
 
     pub(crate) async fn install_completion_review_input(
@@ -164,7 +174,13 @@ impl Session {
 
     pub(crate) async fn start_completion_review_main_task(&self, turn_id: &str) -> bool {
         let _guard = self.completion_review_installation.lock().await;
-        self.state.lock().await.completion_review.main_task_id = Some(turn_id.to_string());
+        {
+            let mut state = self.state.lock().await;
+            if !state.session_configuration.tracks_completion_review() {
+                return true;
+            }
+            state.completion_review.main_task_id = Some(turn_id.to_string());
+        }
         self.persist_completion_review_locked().await
     }
 
@@ -282,12 +298,11 @@ impl Session {
     }
 
     pub(crate) async fn completed_turn_for_review(&self) -> Option<CompletedTurnForReview> {
-        self.state
-            .lock()
-            .await
-            .completion_review
-            .eligible_episode()
-            .cloned()
+        let state = self.state.lock().await;
+        if !state.session_configuration.tracks_completion_review() {
+            return None;
+        }
+        state.completion_review.eligible_episode().cloned()
     }
 
     pub(crate) async fn capture_completed_regular_turn_for_review(
@@ -299,22 +314,18 @@ impl Session {
             return;
         };
         let _guard = self.completion_review_installation.lock().await;
-        if self
-            .state
-            .lock()
-            .await
-            .completion_review
-            .main_task_id
-            .as_deref()
-            != Some(&turn_context.sub_id)
+        let mut state = self.state.lock().await;
+        if !state.session_configuration.tracks_completion_review()
+            || state.completion_review.main_task_id.as_deref() != Some(&turn_context.sub_id)
         {
             return;
         }
-        self.state.lock().await.completion_review.capture(
+        state.completion_review.capture(
             turn_context.sub_id.clone(),
             turn_context.cwd.clone(),
             text.to_string(),
         );
+        drop(state);
         self.persist_completion_review_locked().await;
     }
 
@@ -343,6 +354,9 @@ impl Session {
     ) -> Option<(CompletedTurnForReview, ReviewTicket)> {
         let _guard = self.completion_review_installation.lock().await;
         let mut state = self.state.lock().await;
+        if !state.session_configuration.tracks_completion_review() {
+            return None;
+        }
         let review = &mut state.completion_review;
         if let Some(expected) = expected_completion
             && review.eligible_episode()?.turn_id != expected
