@@ -196,6 +196,7 @@ pub(super) async fn submission_loop(
 use crate::config::Config;
 
 use super::SteerInputError;
+use crate::completion_review::CompletionReviewReservationError;
 use crate::mcp::auth::compute_auth_statuses;
 use crate::mcp::collect_mcp_snapshot_from_manager;
 use crate::mcp::effective_mcp_servers;
@@ -1114,32 +1115,27 @@ pub async fn review(
 }
 
 pub async fn review_completed_turn(sess: &Arc<Session>, sub_id: String) {
-    if sess.active_turn.lock().await.is_some() {
-        sess.send_event_raw(Event {
-            id: sub_id,
-            msg: EventMsg::Error(ErrorEvent {
-                message: "Cannot review a completed turn while another task is running."
-                    .to_string(),
-                codex_error_info: Some(CodexErrorInfo::BadRequest),
-                client_user_message_id: None,
-            }),
-        })
-        .await;
-        return;
-    }
-
-    let Some((completed_turn, ticket)) = sess.reserve_manual_completion_review().await else {
-        sess.send_event_raw(Event {
-            id: sub_id,
-            msg: EventMsg::Error(ErrorEvent {
-                message: "No completed Codex turn with exact consumed-request provenance is available to review yet. Run a normal prompt and wait for completion, including any pending amendments. For legacy or discarded history without a trusted snapshot, start a new session with the complete request."
-                    .to_string(),
-                codex_error_info: Some(CodexErrorInfo::BadRequest),
-                client_user_message_id: None,
-            }),
-        })
-        .await;
-        return;
+    let (completed_turn, ticket) = match sess.reserve_manual_completion_review().await {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            let codex_error_info = match error {
+                CompletionReviewReservationError::Persistence => CodexErrorInfo::Other,
+                CompletionReviewReservationError::TaskRunning
+                | CompletionReviewReservationError::InexactRequest
+                | CompletionReviewReservationError::PendingInput
+                | CompletionReviewReservationError::NoCompletedTurn => CodexErrorInfo::BadRequest,
+            };
+            sess.send_event_raw(Event {
+                id: sub_id,
+                msg: EventMsg::Error(ErrorEvent {
+                    message: error.to_string(),
+                    codex_error_info: Some(codex_error_info),
+                    client_user_message_id: None,
+                }),
+            })
+            .await;
+            return;
+        }
     };
 
     let turn_context = sess.new_default_turn_with_sub_id(sub_id).await;

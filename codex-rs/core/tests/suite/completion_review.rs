@@ -1244,7 +1244,9 @@ async fn compacted_legacy_resume_cannot_review_a_referential_request_as_complete
         })
         .await;
         assert!(matches!(event, EventMsg::Error(event)
-                if event.message.contains("exact consumed-request provenance")));
+                if event.message.contains("exact consumed-request provenance")
+                    && event.message.contains("Reloading or completing another prompt cannot restore")
+                    && !event.message.contains("Run a normal prompt")));
         assert_eq!(requests.requests().len(), 2);
         let state = read_rollout_lines(&path)
             .into_iter()
@@ -1256,6 +1258,27 @@ async fn compacted_legacy_resume_cannot_review_a_referential_request_as_complete
             .unwrap();
         assert_eq!(state["request_frame"]["exact"], false);
         assert!(state["attempt"].is_null());
+        resumed.submit(Op::Shutdown).await.unwrap();
+        wait_for_event(&resumed, |event| {
+            matches!(event, EventMsg::ShutdownComplete)
+        })
+        .await;
+        let reloaded =
+            resume_conversation_for_server(&server, home.clone(), path.clone(), |_| {}).await;
+        reloaded.submit(Op::ReviewCompletedTurn).await.unwrap();
+        let event = wait_for_event(&reloaded, |event| {
+            matches!(event, EventMsg::Error(_) | EventMsg::EnteredReviewMode(_))
+        })
+        .await;
+        assert!(matches!(event, EventMsg::Error(event)
+                if event.message.contains("Reloading or completing another prompt cannot restore")));
+        assert_eq!(completion_state(&path).unwrap(), state);
+        assert_eq!(requests.requests().len(), 2);
+        reloaded.submit(Op::Shutdown).await.unwrap();
+        wait_for_event(&reloaded, |event| {
+            matches!(event, EventMsg::ShutdownComplete)
+        })
+        .await;
         server.verify().await;
     }
 }

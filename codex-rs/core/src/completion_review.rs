@@ -11,6 +11,28 @@ use uuid::Uuid;
 
 pub(crate) const AUTOMATIC_REVIEW_LIMIT: u32 = 3;
 
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum CompletionReviewReservationError {
+    #[error("Cannot review a completed turn while another task is running.")]
+    TaskRunning,
+    #[error(
+        "No completed Codex turn with exact consumed-request provenance is available to review. This session has missing or invalidated request context. Reloading or completing another prompt cannot restore that context. Start a new session with the complete request, or recover the missing context from verified host-owned rollout metadata."
+    )]
+    InexactRequest,
+    #[error(
+        "No completed Codex turn with exact consumed-request provenance is available to review yet. Pending user input must be consumed by completed main work. Continue the task and wait for completion before reviewing."
+    )]
+    PendingInput,
+    #[error(
+        "No completed Codex turn is available to review yet. Run a normal prompt and wait for completion before reviewing."
+    )]
+    NoCompletedTurn,
+    #[error(
+        "Completion review state could not be persisted. Repair storage and reload the last durable rollout before retrying."
+    )]
+    Persistence,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CompletedTurnReviewRound {
     pub(crate) user_messages: Vec<String>,

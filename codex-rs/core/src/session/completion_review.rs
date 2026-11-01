@@ -1,5 +1,6 @@
 use super::*;
 use crate::completion_review::AUTOMATIC_REVIEW_LIMIT;
+use crate::completion_review::CompletionReviewReservationError;
 use crate::completion_review::CompletionReviewState;
 use crate::completion_review::InternalReviewOperation;
 use crate::completion_review::ReviewHandoff;
@@ -363,15 +364,16 @@ impl Session {
     pub(crate) async fn begin_completion_review(&self, automatic: bool) -> Option<ReviewTicket> {
         self.begin_completion_review_for_candidate(automatic)
             .await
+            .ok()
             .map(|(_, ticket)| ticket)
     }
 
     pub(crate) async fn reserve_manual_completion_review(
         &self,
-    ) -> Option<(CompletedTurnForReview, ReviewTicket)> {
+    ) -> Result<(CompletedTurnForReview, ReviewTicket), CompletionReviewReservationError> {
         let _lifecycle = self.task_lifecycle.lock().await;
         if self.active_turn.lock().await.is_some() {
-            return None;
+            return Err(CompletionReviewReservationError::TaskRunning);
         }
         self.begin_completion_review_for_candidate(false).await
     }
@@ -379,19 +381,38 @@ impl Session {
     async fn begin_completion_review_for_candidate(
         &self,
         automatic: bool,
-    ) -> Option<(CompletedTurnForReview, ReviewTicket)> {
+    ) -> Result<(CompletedTurnForReview, ReviewTicket), CompletionReviewReservationError> {
         let _guard = self.completion_review_installation.lock().await;
         let mut state = self.state.lock().await;
         if !state.session_configuration.tracks_completion_review() {
-            return None;
+            return Err(CompletionReviewReservationError::NoCompletedTurn);
         }
         let review = &mut state.completion_review;
-        let ticket = review.begin_review(automatic)?;
-        let completed_turn = review.eligible_episode()?.clone();
+        let ticket = review.begin_review(automatic).ok_or_else(|| {
+            if !review.request_frame.exact
+                || review
+                    .episode
+                    .as_ref()
+                    .is_some_and(|episode| !episode.request_frame.exact)
+            {
+                CompletionReviewReservationError::InexactRequest
+            } else if review.input_revision != review.consumed_input_revision
+                || !review.pending_inputs.is_empty()
+            {
+                CompletionReviewReservationError::PendingInput
+            } else {
+                CompletionReviewReservationError::NoCompletedTurn
+            }
+        })?;
+        let completed_turn = review
+            .eligible_episode()
+            .ok_or(CompletionReviewReservationError::NoCompletedTurn)?
+            .clone();
         drop(state);
-        self.persist_completion_review_locked()
-            .await
-            .then_some((completed_turn, ticket))
+        if !self.persist_completion_review_locked().await {
+            return Err(CompletionReviewReservationError::Persistence);
+        }
+        Ok((completed_turn, ticket))
     }
 
     pub(crate) async fn completion_review_ticket_is_current(&self, ticket: &ReviewTicket) -> bool {

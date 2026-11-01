@@ -1,4 +1,5 @@
 use super::*;
+use crate::completion_review::CompletionReviewReservationError;
 use crate::completion_review::CompletionReviewState;
 use crate::completion_review::ReviewHandoffDisposition;
 use crate::completion_review::ReviewInputInstallation;
@@ -75,6 +76,23 @@ async fn attach_recorder(
     let path = recorder.rollout_path().to_path_buf();
     *session.services.rollout.lock().await = Some(recorder);
     (home, path)
+}
+
+#[tokio::test]
+async fn completion_review_manual_reservation_distinguishes_missing_and_pending_work() {
+    let (session, _, _) = make_session_and_context_with_rx().await;
+    assert_eq!(
+        session.reserve_manual_completion_review().await,
+        Err(CompletionReviewReservationError::NoCompletedTurn)
+    );
+    session
+        .accept_completion_review_input(&steer_text_input("accepted request"), true, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        session.reserve_manual_completion_review().await,
+        Err(CompletionReviewReservationError::PendingInput)
+    );
 }
 
 #[tokio::test]
@@ -391,6 +409,13 @@ async fn completion_review_persistence_failure_prevents_reviewer_and_main_startu
             matches!(event, EventMsg::Warning(warning)
                 if warning.message.contains("could not be persisted"))
         }));
+        if !followup_main {
+            assert!(messages.iter().any(|event| {
+                matches!(event, EventMsg::Error(error)
+                    if error.message == CompletionReviewReservationError::Persistence.to_string()
+                        && error.codex_error_info == Some(CodexErrorInfo::Other))
+            }));
+        }
         assert!(!messages.iter().any(|event| {
             matches!(
                 event,
@@ -895,7 +920,10 @@ async fn completion_review_compacted_legacy_resume_and_fork_keep_unknown_request
                     exact: false,
                 }
             );
-            assert!(session.reserve_manual_completion_review().await.is_none());
+            assert_eq!(
+                session.reserve_manual_completion_review().await,
+                Err(CompletionReviewReservationError::InexactRequest)
+            );
             assert!(session.begin_completion_review(true).await.is_none());
         }
     }
@@ -961,7 +989,10 @@ async fn completion_review_replaced_history_cannot_regain_provenance_without_use
         session.replace_history(replacement).await;
         complete_new_request(&session, &context, "use option two", "used option two").await;
         assert!(session.completed_turn_for_review().await.is_none());
-        assert!(session.reserve_manual_completion_review().await.is_none());
+        assert_eq!(
+            session.reserve_manual_completion_review().await,
+            Err(CompletionReviewReservationError::InexactRequest)
+        );
     }
 }
 
@@ -1548,6 +1579,10 @@ async fn completion_review_manual_reservation_joins_blocked_finalization() {
         )
         .await;
     ready.notified().await;
+    assert_eq!(
+        session.reserve_manual_completion_review().await,
+        Err(CompletionReviewReservationError::TaskRunning)
+    );
     let installation = session.completion_review_installation.lock().await;
     finish.notify_one();
     tokio::time::timeout(Duration::from_secs(2), async {

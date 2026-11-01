@@ -71,6 +71,24 @@ Post-turn host instructions prefer the post-turn filename, then the generic revi
 
 ## Provenance Limits
 
+### Unavailable Review
+
+Manual reservation distinguishes the following conditions under the task lifecycle and snapshot installation locks:
+
+|Condition|Recovery|
+|---|---|
+|Another task is running|Wait for it to finish before reviewing.|
+|No completed candidate|Submit a normal request and wait for its terminal answer.|
+|Pending or unconsumed input|Continue main work and wait for completion.|
+|Missing or invalidated request provenance|Reloading or completing another prompt cannot restore missing requirements. Start a new session with the complete request, or recover the request basis from verified host-owned metadata.|
+|Failed checkpoint persistence|Repair storage and reload the last durable rollout. The command reports a storage error, not a missing-turn diagnostic.|
+
+A syntactically valid rollout can still have unavailable provenance after a metadata-format transition. Unsupported record tags are not usable checkpoints; forks copy recognized records, so the original ancestor may contain evidence no longer present in its descendants. New candidates inherit unavailable request scope rather than silently treating a later referential request as complete.
+
+Offline recovery requires the original request and terminal-completion checkpoints, every intervening consumed amendment, and verified fork boundaries. Preserve exact user data and candidate identity, account for rollback and clarification ownership, back up the original, and validate the reconstructed state through the production loader and resume path before appending a replacement checkpoint. Do not simply flip `exact`, infer a completion from assistant-role text, or promote compaction summaries into user requirements. No automatic legacy-format migration is provided; absent sufficient evidence, retain unavailable coverage.
+
+### Durable Scope
+
 Host-owned rollout metadata restores exact snapshots without relying on nonpersisted `TurnComplete` events. Prepared handoffs are recoverably queued; started handoffs resume as interrupted main work, not a fresh advisory action. Interrupt/shutdown invalidates unstarted review scheduling but retains already-started main lineage and its replacement contract.
 
 Acknowledged user input retains its original payload until installation is durable. Revision-specific installing/recorded markers recover both a missing message and a message written immediately before a crash, without deduplicating distinct identical amendments. Stop, pause, shutdown and manual review join terminal finalization even after its active-task entry has been removed. Manual review reserves the candidate snapshot and its ticket together; delegate entry validates that pair against current ownership.

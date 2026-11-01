@@ -73,6 +73,8 @@ A ticket identifies episode, request revision, history generation, exact candida
 
 Manual reservation joins the task lifecycle before selecting work, including the interval after the active-task entry is removed but finalization is still installing a newer answer. Under the installation guard, one state lock reserves the ticket and clones its candidate snapshot; persistence completes before either is returned. The delegate checks both the supplied snapshot's ticket identity and the ticket's live ownership. A snapshot read before finalization must never be paired with a ticket reserved afterward.
 
+Reservation failures retain their cause through the command handler: running task, missing candidate, pending input, unavailable provenance or failed persistence. Diagnose unavailable provenance before suggesting that pending input can restore eligibility. A new prompt can resolve missing work but cannot establish the requirements of an unknown prior scope. Storage failures remain storage errors rather than being collapsed into a generic missing-turn message. These internal errors add no wire or rollout fields.
+
 |Transition|Behavior|
 |---|---|
 |Prepared, before or after enqueue|Resume requeues the ticket. A duplicate claim cannot start another main task. `/continue` can claim a prepared handoff if enqueue was unavailable.|
