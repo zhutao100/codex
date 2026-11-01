@@ -162,6 +162,7 @@ Add a helper in `core/src/codex.rs` that records a developer message with sentin
 Token limit is approaching and follow-up work is still needed.
 
 Respond with exactly one assistant message and do not call tools.
+Put the notes in your final answer, not in commentary.
 Produce structured SESSION WORK NOTES for the next model after compaction.
 
 Required sections:
@@ -178,6 +179,8 @@ Required sections:
 
 Keep it concise but loss-resistant.
 Begin with: <AUTO_COMPACT_WORK_NOTES>
+End with: </AUTO_COMPACT_WORK_NOTES>
+Put all notes inside these tags and do not add text outside them.
 </AUTO_COMPACT_WORK_NOTES_REQUEST>
 ```
 
@@ -334,6 +337,8 @@ The feature should degrade safely:
 - If the model tries to call tools during the note round, runtime rejection should prevent side effects and the turn should still compact afterward.
 - If the model returns empty notes or a non-notes message (missing `<AUTO_COMPACT_WORK_NOTES>`), retry capture a small number of times and then compact without notes.
 - If real user input arrives during the note round, defer draining/replaying it until after compaction.
+- Read completed notes from the durable capture segment in both live capture paths and recovery, not just the last assistant message. Trailing reasoning and empty/whitespace-only output-text assistant messages are capture artifacts, not new work; do not count them as attempts or let them hide captured notes.
+- Preserve the complete captured text verbatim, including any text after the requested closing tag. Do not silently drop nonempty subsequent messages, non-text content or unmatched tool activity.
 
 ## Why This Stays Rebase-Friendly
 

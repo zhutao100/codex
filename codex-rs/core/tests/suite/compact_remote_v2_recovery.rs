@@ -31,18 +31,88 @@ fn multipart_notes() -> Value {
     event
 }
 
+fn notes_with_response_tail(mut notes: Value, final_text: &str) -> Vec<Value> {
+    notes["item"]["phase"] = json!("commentary");
+    let mut final_message = responses::ev_assistant_message("notes-final", final_text);
+    final_message["item"]["phase"] = json!("final_answer");
+    vec![
+        notes,
+        responses::ev_reasoning_item("notes-reasoning", &[], &[]),
+        final_message,
+        responses::ev_completed("notes"),
+    ]
+}
+
 fn work_and_notes() -> Vec<Vec<StreamingSseChunk>> {
+    let mut notes = vec![responses::ev_function_call(
+        "notes-tool",
+        "update_plan",
+        r#"{"plan":[]}"#,
+    )];
+    notes.extend(notes_with_response_tail(multipart_notes(), ""));
     vec![
         vec![chunk(vec![
             responses::ev_function_call("work", "unsupported_tool", "{}"),
             responses::ev_completed_with_tokens("work", 1_000_000),
         ])],
-        vec![chunk(vec![
-            responses::ev_function_call("notes-tool", "update_plan", r#"{"plan":[]}"#),
-            multipart_notes(),
-            responses::ev_completed("notes"),
-        ])],
+        vec![chunk(notes)],
     ]
+}
+
+#[test_case::test_case(false, ""; "inline empty final")]
+#[test_case::test_case(false, " \n\t"; "inline whitespace final")]
+#[test_case::test_case(true, " \n\t"; "pre turn whitespace final")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn notes_with_response_tail_compact_without_recapture(
+    pre_turn: bool,
+    final_text: &str,
+) -> Result<()> {
+    skip_if_no_network_unless_localhost!(Ok(()));
+    let notes = format!(
+        "{NOTES}\n</AUTO_COMPACT_WORK_NOTES> Formatting self-commentary after the closing tag."
+    );
+    let mut streams = work_and_notes();
+    if pre_turn {
+        streams[0] = vec![chunk(vec![
+            responses::ev_assistant_message("work", "first answer"),
+            responses::ev_completed_with_tokens("work", 1_000_000),
+        ])];
+    }
+    streams[1] = vec![chunk(notes_with_response_tail(
+        responses::ev_assistant_message("notes", &notes),
+        final_text,
+    ))];
+    streams.extend(successful_recovery());
+    let (server, _) = start_streaming_sse_server(streams).await;
+    let test = test_codex().build_with_streaming_server(&server).await?;
+    test.codex.submit(user_input("unfinished task")).await?;
+    complete(&test.codex).await;
+    if pre_turn {
+        test.codex.submit(user_input("next request")).await?;
+        complete(&test.codex).await;
+    }
+    let requests = server.requests().await;
+    assert_eq!(requests.len(), 4);
+    let capture: Value = serde_json::from_slice(&requests[1])?;
+    let request = capture["input"].as_array().unwrap().last().unwrap()["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(request.contains("Put the notes in your final answer, not in commentary."));
+    assert!(request.contains("End with: </AUTO_COMPACT_WORK_NOTES>"));
+    let compact: Value = serde_json::from_slice(&requests[2])?;
+    assert_compact_request(&compact);
+    assert!(!compact.to_string().contains("AUTO_COMPACT_WORK_NOTES"));
+    assert!(!compact.to_string().contains("Formatting self-commentary"));
+    let followup: Value = serde_json::from_slice(&requests[3])?;
+    assert_eq!(
+        user_messages(&followup)
+            .iter()
+            .filter(|text| text.ends_with(&notes))
+            .count(),
+        1
+    );
+    server.shutdown().await;
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

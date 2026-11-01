@@ -51,6 +51,18 @@ Multiline plan-note and local-fallback regressions reproduced three failures bef
 
 The initial raw-output core run included seven failures in the pre-existing shell/Seatbelt exclusion categories because raw mode bypasses the wrapper's skip list. The subsequent normal-wrapper runs applied those exclusions and passed. The complete workspace `--all-features` test suite was not run; scoped Clippy used all features for the affected crates.
 
+## Notes Response-Tail Recovery
+
+Verified 2026-11-01 in a disposable macOS 15.6.1 VM with two build jobs and two test threads.
+
+- Recorded failure: completed notes in commentary contained formatting self-commentary after the closing tag, then a separate reasoning item and an empty final-answer message. The scanner rejected the reasoning as later work before making a remote compaction request; `/continue` reached the same guard. The suffix inside the original notes message was not the rejected item.
+- Contract: accept trailing reasoning and empty/whitespace-only output-text assistant messages without changing exact captured notes or counting another attempt. Reject nonempty later messages, non-text content and unmatched tool activity without discarding history. Both live capture paths use the recovery scanner, so whitespace-only finals cannot hide earlier notes.
+- Full core verification: `CODEX_SANDBOX_NETWORK_DISABLED=1 cargo-local test --quiet -p codex-core -- --test-threads=2` reported 1,983 passes, 16 ignored and 44 filtered across four suites, with 49 seconds of test execution. Existing network-guard early returns remain included in aggregate package totals.
+- Formatting and lint: `just-local fmt`, scoped `just-local fix -p codex-core` and document-reference checks passed. Clippy retained existing warnings in unmodified code and made no source changes. All 38 v2 integration cases, including the three new response-tail cases, were included in the core run; the workspace-wide all-features suite was not run.
+- Executed loopback regressions: inline empty final, inline whitespace-only final and pre-turn whitespace-only final each assert exactly four Responses requests (work, notes, compaction, follow-up), no capture suffix in compaction input and exact whole-message notes in follow-up, including text after the closing tag. Existing failed-compaction, Continue, steering, interruption, restart and local-fallback fixtures also use the trailing-reasoning/empty-final response shape.
+- Replay/rejection coverage: completed notes and their response tail remain pending after rollout reconstruction; genuine later input remains in the source; nonempty assistant text, image content, input-text content and later tool calls remain rejected.
+- Prompt guidance now requests final-answer placement, both delimiters and no outside text. This is deterministic transport/recovery coverage, not a new live-model evaluation or a claim that prompt wording prevents malformed output.
+
 ## End-to-end fixture measurements
 
 Same fixture source/settings before and after compaction; all traffic used the normal Responses path. These are debug-build localhost measurements, not server latency or allocation benchmarks.

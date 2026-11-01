@@ -572,6 +572,21 @@ pub(crate) fn pending_work_notes(items: &[ResponseItem]) -> CodexResult<Option<P
             continue;
         }
         if pending.notes.is_some() {
+            // A response can finish with reasoning and an empty final message
+            // after emitting notes in commentary. These are still capture
+            // output, not subsequent work.
+            let is_capture_tail = match item {
+                ResponseItem::Reasoning { .. } => true,
+                ResponseItem::Message { role, content, .. } if role == "assistant" => {
+                    content.iter().all(|part| {
+                        matches!(part, ContentItem::OutputText { text } if text.trim().is_empty())
+                    })
+                }
+                _ => false,
+            };
+            if is_capture_tail {
+                continue;
+            }
             return Err(CodexErr::Fatal(
                 "Work followed a completed compaction-notes capture; preserving history instead of discarding that work".into(),
             ));

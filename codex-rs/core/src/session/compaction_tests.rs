@@ -390,15 +390,27 @@ async fn encrypted_only_replay_retains_incomplete_tool_rounds_and_respects_rollb
 }
 
 #[tokio::test]
-async fn completed_work_notes_remain_pending_work_after_restart() {
+async fn completed_work_notes_with_response_tail_remain_pending_work_after_restart() {
     let (session, context) = make_session_and_context().await;
     let request: ResponseItem = DeveloperInstructions::new(format!(
         "{}\nnotes",
         compact::AUTO_COMPACT_WORK_NOTES_REQUEST_TAG
     ))
     .into();
-    let notes = "<AUTO_COMPACT_WORK_NOTES>\n  Unicode ✅\nexact\n";
-    let history = vec![user_message("task"), request, assistant_message(notes)];
+    let notes = "<AUTO_COMPACT_WORK_NOTES>\n  Unicode ✅\nexact\n</AUTO_COMPACT_WORK_NOTES> trailing self-commentary";
+    let history = vec![
+        user_message("task"),
+        request,
+        assistant_message(notes),
+        ResponseItem::Reasoning {
+            id: String::new(),
+            summary: Vec::new(),
+            content: None,
+            encrypted_content: Some("capture reasoning".into()),
+        },
+        assistant_message(""),
+        assistant_message(" \n\t"),
+    ];
     let rollout: Vec<_> = history
         .iter()
         .cloned()
@@ -414,7 +426,7 @@ async fn completed_work_notes_remain_pending_work_after_restart() {
         pending,
         compact::PendingWorkNotes {
             request_index: 1,
-            capture_end: 3,
+            capture_end: history.len(),
             source_model: None,
             notes: Some(notes.into()),
             attempts: 1
@@ -438,11 +450,40 @@ async fn completed_work_notes_remain_pending_work_after_restart() {
     assert_eq!(prepared.preserved_work_notes, Some(notes.into()));
     assert_eq!(source.raw_items(), abandoned);
 
-    let mut ambiguous = ContextManager::new();
-    let mut items = history;
-    items.push(assistant_message("unidentified later work"));
-    ambiguous.replace(items);
-    assert!(compact::prepare_history_for_compaction(ambiguous, None).is_err());
+    for later_work in [
+        assistant_message("unidentified later work"),
+        ResponseItem::Message {
+            id: None,
+            role: "assistant".into(),
+            content: vec![ContentItem::InputImage {
+                image_url: "data:image/png;base64,image".into(),
+            }],
+            end_turn: None,
+            phase: None,
+        },
+        ResponseItem::Message {
+            id: None,
+            role: "assistant".into(),
+            content: vec![ContentItem::InputText {
+                text: String::new(),
+            }],
+            end_turn: None,
+            phase: None,
+        },
+        ResponseItem::FunctionCall {
+            id: None,
+            call_id: "later-work".into(),
+            name: "update_plan".into(),
+            arguments: "{}".into(),
+        },
+    ] {
+        let mut ambiguous = ContextManager::new();
+        let mut items = history.clone();
+        items.push(later_work);
+        ambiguous.replace(items.clone());
+        assert!(compact::prepare_history_for_compaction(ambiguous.clone(), None).is_err());
+        assert_eq!(ambiguous.raw_items(), items);
+    }
 }
 
 #[tokio::test]

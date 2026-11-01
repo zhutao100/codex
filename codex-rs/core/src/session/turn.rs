@@ -27,12 +27,6 @@ const AUTO_COMPACT_WORK_NOTES_OUTPUT_TOKEN_RESERVE_FRACTION: i64 = 20;
 const AUTO_COMPACT_WORK_NOTES_MIN_TOOL_OUTPUT_TOKENS: i64 = 128;
 const AUTO_COMPACT_WORK_NOTES_TOOL_OUTPUT_WRAPPER_TOKEN_ESTIMATE: usize = 256;
 
-fn is_auto_compact_work_notes_message(message: &str) -> bool {
-    message
-        .trim_start()
-        .starts_with(AUTO_COMPACT_WORK_NOTES_TAG)
-}
-
 async fn inject_pre_compact_work_notes_request(sess: &Session, turn_context: &TurnContext) {
     let source_model = serde_json::Value::String(turn_context.model_info.slug.clone());
     let request = format!(
@@ -41,6 +35,7 @@ async fn inject_pre_compact_work_notes_request(sess: &Session, turn_context: &Tu
 Token limit is approaching and follow-up work is still needed.\n\
 \n\
 Respond with exactly one assistant message and do not call tools.\n\
+Put the notes in your final answer, not in commentary.\n\
 Produce structured SESSION WORK NOTES for the next model after compaction.\n\
 \n\
 Required sections:\n\
@@ -57,11 +52,25 @@ Required sections:\n\
 \n\
 Keep it concise but loss-resistant.\n\
 Begin with: {AUTO_COMPACT_WORK_NOTES_TAG}\n\
+End with: </AUTO_COMPACT_WORK_NOTES>\n\
+Put all notes inside these tags and do not add text outside them.\n\
 </AUTO_COMPACT_WORK_NOTES_REQUEST>"
     );
     let message: ResponseItem = DeveloperInstructions::new(request).into();
     sess.record_conversation_items(turn_context, std::slice::from_ref(&message))
         .await;
+}
+
+async fn captured_pre_compact_work_notes(
+    sess: &Session,
+    turn_context: &TurnContext,
+) -> CodexResult<Option<String>> {
+    let pending = pending_work_notes(sess.clone_history().await.raw_items());
+    if let Err(error) = &pending {
+        sess.send_event(turn_context, EventMsg::Error(error.to_error_event(None)))
+            .await;
+    }
+    pending.map(|pending| pending.and_then(|pending| pending.notes))
 }
 
 async fn sampling_input_for_pre_compact_work_notes(
@@ -706,9 +715,11 @@ async fn run_turn_inner(
                 );
 
                 if matches!(pre_compact_notes_state, PreCompactNotesState::AwaitingNotes) {
-                    if let Some(notes) = sampling_request_last_agent_message
-                        && is_auto_compact_work_notes_message(&notes)
-                    {
+                    let notes = match captured_pre_compact_work_notes(&sess, &turn_context).await {
+                        Ok(notes) => notes,
+                        Err(_) => return None,
+                    };
+                    if let Some(notes) = notes {
                         match run_auto_compact(
                             &sess,
                             CompactionContext::new(&turn_context),
@@ -1129,10 +1140,8 @@ async fn run_pre_turn_compact(
             )
             .await;
             match output {
-                Ok(output) => {
-                    notes = output
-                        .last_agent_message
-                        .filter(|notes| is_auto_compact_work_notes_message(notes));
+                Ok(_) => {
+                    notes = captured_pre_compact_work_notes(sess, turn_context).await?;
                     attempts += 1;
                     if notes.is_some() {
                         break;
