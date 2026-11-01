@@ -231,6 +231,102 @@ async fn same_request_three_reviews_keep_initial_and_exact_latest_without_prior_
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn automatic_clean_review_persists_five_recoverable_checkpoints() {
+    skip_if_no_network_unless_localhost!();
+    let server = MockServer::start().await;
+    let requests = mount_sse_sequence(
+        &server,
+        vec![
+            answer("complete answer"),
+            verdict("no follow-up needed", false),
+        ],
+    )
+    .await;
+    let home = Arc::new(TempDir::new().unwrap());
+    let codex = new_conversation_for_server(&server, home.clone(), |config| {
+        config
+            .features
+            .enable(Feature::AutoPostTurnCompletionReview);
+    })
+    .await;
+    submit_request(&codex, "complete request").await;
+    wait_for_event(&codex, |event| matches!(event, EventMsg::ExitedReviewMode(exit)
+        if exit.post_turn_completion_review_output.as_ref().is_some_and(|output| !output.fix_actions_advised))).await;
+    wait_for_event(&codex, |event| {
+        matches!(event, EventMsg::TurnComplete(event) if event.last_agent_message.is_none())
+    })
+    .await;
+    codex.submit(Op::Shutdown).await.unwrap();
+    wait_for_event(&codex, |event| matches!(event, EventMsg::ShutdownComplete)).await;
+
+    let requests = requests.requests();
+    assert_eq!(requests.len(), 2);
+    let review_packet = packet(&requests[1]);
+    assert!(review_packet.contains("complete request"));
+    assert_eq!(review_packet.matches("complete answer").count(), 1);
+    let parent_path = codex.rollout_path().unwrap();
+    let lines = read_rollout_lines(&parent_path);
+    let states: Vec<_> = lines
+        .iter()
+        .filter_map(|line| match &line.item {
+            RolloutItem::PostTurnCompletionReviewState(state) => Some(state),
+            _ => None,
+        })
+        .collect();
+    let checkpoints: Vec<_> = states
+        .iter()
+        .map(|state| {
+            serde_json::json!([
+                state["pending_inputs"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|input| &input["installation"])
+                    .collect::<Vec<_>>(),
+                state["consumed_input_revision"],
+                !state["main_task_id"].is_null(),
+                !state["episode"].is_null(),
+                !state["attempt"].is_null(),
+            ])
+        })
+        .collect();
+    assert_eq!(
+        serde_json::json!(checkpoints),
+        serde_json::json!([
+            [["Accepted"], 0, true, false, false],
+            [["Installing"], 0, true, false, false],
+            [[], 1, true, false, false],
+            [[], 1, false, true, true],
+            [[], 1, false, true, false],
+        ])
+    );
+    let final_state = states.last().unwrap();
+    assert_eq!(
+        serde_json::json!([
+            final_state["episode"]["request_frame"]["current_user_messages"],
+            final_state["episode"]["initial_answer_reference"],
+            final_state["episode"]["final_agent_message"],
+            final_state["episode"]["automatic_reviews_started"],
+            final_state["handoff"],
+        ]),
+        serde_json::json!([
+            ["complete request"],
+            "complete answer",
+            "complete answer",
+            1,
+            null
+        ])
+    );
+    let delegate = read_single_delegate_rollout(home.path(), &parent_path);
+    assert!(
+        !delegate
+            .iter()
+            .any(|line| matches!(line.item, RolloutItem::PostTurnCompletionReviewState(_)))
+    );
+    server.verify().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reviewer_transcript_omits_completion_state_without_losing_parent_handoff() {
     skip_if_no_network_unless_localhost!();
     let server = MockServer::start().await;

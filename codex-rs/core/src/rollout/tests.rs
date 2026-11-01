@@ -137,6 +137,136 @@ async fn recorder_acknowledgement_propagates_flush_failure(shutdown: bool) -> Re
     Ok(())
 }
 
+async fn writable_recorder(path: &Path) -> Result<RolloutRecorder> {
+    let file = tokio::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .await?;
+    Ok(RolloutRecorder::with_file_for_test(file, path))
+}
+
+#[test_case::test_case(false; "pending")]
+#[test_case::test_case(true; "flushed")]
+#[tokio::test]
+async fn completion_review_snapshot_deduplication_preserves_state_transitions(
+    flush_initial: bool,
+) -> Result<()> {
+    let file = tempfile::NamedTempFile::new()?;
+    let recorder = writable_recorder(file.path()).await?;
+    let first = RolloutItem::PostTurnCompletionReviewState(serde_json::json!({"state": "A"}));
+    let second = RolloutItem::PostTurnCompletionReviewState(serde_json::json!({"state": "B"}));
+    recorder.record_items(std::slice::from_ref(&first)).await?;
+    if flush_initial {
+        recorder.flush().await?;
+    }
+    recorder
+        .record_items(&[first.clone(), second.clone(), first.clone(), first.clone()])
+        .await?;
+    recorder.flush().await?;
+    let (items, _, errors) = RolloutRecorder::load_rollout_items(file.path()).await?;
+    assert_eq!(errors, 0);
+    assert_eq!(
+        serde_json::to_value(items)?,
+        serde_json::to_value([first.clone(), second, first])?
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn unchanged_completion_review_snapshot_still_flushes_transcript() -> Result<()> {
+    let file = tempfile::NamedTempFile::new()?;
+    let recorder = writable_recorder(file.path()).await?;
+    let state = RolloutItem::PostTurnCompletionReviewState(serde_json::json!({"state": "A"}));
+    recorder.record_items(std::slice::from_ref(&state)).await?;
+    recorder.flush().await?;
+    let message = RolloutItem::ResponseItem(ResponseItem::Message {
+        id: None,
+        role: "assistant".into(),
+        content: vec![ContentItem::OutputText {
+            text: "durable transcript".into(),
+        }],
+        end_turn: None,
+        phase: None,
+    });
+    recorder
+        .record_items(&[message.clone(), state.clone()])
+        .await?;
+    recorder.flush().await?;
+    let (items, _, errors) = RolloutRecorder::load_rollout_items(file.path()).await?;
+    assert_eq!(errors, 0);
+    assert_eq!(
+        serde_json::to_value(items)?,
+        serde_json::to_value([state, message])?
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn completion_review_snapshot_cache_belongs_to_the_writer() -> Result<()> {
+    let file = tempfile::NamedTempFile::new()?;
+    let state = RolloutItem::PostTurnCompletionReviewState(serde_json::json!({"state": "A"}));
+    let recorder = writable_recorder(file.path()).await?;
+    recorder.record_items(std::slice::from_ref(&state)).await?;
+    recorder.shutdown().await?;
+    drop(recorder);
+    let recorder = writable_recorder(file.path()).await?;
+    recorder.record_items(std::slice::from_ref(&state)).await?;
+    recorder.shutdown().await?;
+    drop(recorder);
+    let before = tokio::fs::read(file.path()).await?;
+    let recorder = RolloutRecorder::read_only_for_test(file.path()).await?;
+    recorder.record_items(std::slice::from_ref(&state)).await?;
+    assert!(recorder.flush().await.is_err());
+    assert_eq!(tokio::fs::read(file.path()).await?, before);
+    let (items, _, errors) = RolloutRecorder::load_rollout_items(file.path()).await?;
+    assert_eq!(errors, 0);
+    assert_eq!(
+        serde_json::to_value(items)?,
+        serde_json::to_value([state.clone(), state])?
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn unchanged_completion_review_snapshot_propagates_buffered_write_failure() -> Result<()> {
+    use std::io::BufRead;
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+
+    core_test_support::skip_if_no_network_unless_localhost!(Ok(()));
+    let file = tempfile::NamedTempFile::new()?;
+    let (writer, reader) = UnixStream::pair()?;
+    let writer = tokio::fs::File::from_std(File::from(OwnedFd::from(writer)));
+    let recorder = RolloutRecorder::with_file_for_test(writer, file.path());
+    let state = RolloutItem::PostTurnCompletionReviewState(serde_json::json!({"state": "A"}));
+    recorder.record_items(std::slice::from_ref(&state)).await?;
+    recorder.flush().await?;
+    let mut reader = std::io::BufReader::new(reader);
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    let recorded: RolloutLine = serde_json::from_str(&line)?;
+    assert_eq!(
+        serde_json::to_value(recorded.item)?,
+        serde_json::to_value(&state)?
+    );
+    drop(reader);
+    recorder
+        .record_items(&[
+            RolloutItem::EventMsg(EventMsg::AgentMessage(
+                codex_protocol::protocol::AgentMessageEvent {
+                    message: "buffered transcript".into(),
+                },
+            )),
+            state,
+        ])
+        .await?;
+    let error = recorder.flush().await.unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+    assert!(recorder.flush().await.is_err());
+    Ok(())
+}
+
 #[test]
 fn custom_pause_continue_events_are_not_persisted() {
     assert!(!crate::rollout::policy::should_persist_event_msg(

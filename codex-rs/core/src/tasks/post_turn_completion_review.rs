@@ -677,6 +677,7 @@ mod tests {
                     text_elements: vec![],
                 }],
                 true,
+                None,
             )
             .await
             .unwrap();

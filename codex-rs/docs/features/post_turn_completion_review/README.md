@@ -15,6 +15,12 @@ Independent read-only review of current work and the exact latest main answer. [
 auto_post_turn_completion_review = true
 ```
 
+## Persistence
+
+The parent records changed recovery states only, while still flushing ordinary transcript writes. Initial input and its known task owner share a checkpoint; consumed input needs no separate `Recorded` snapshot; completion and automatic-review reservation share a checkpoint. A clean automatic episode normally writes five state records. Manual reservations, handoffs and resumed-owner changes retain their separate recovery boundaries.
+
+The JSONL format and recovery payloads are unchanged. Existing rollouts are not rewritten, and unknown-record handling in older readers is unchanged. See [durability and replay rules](design.md#durable-metadata).
+
 ## Context Contract
 
 An episode contains one consumed user-request basis and its review-derived main continuations. The review context contains:

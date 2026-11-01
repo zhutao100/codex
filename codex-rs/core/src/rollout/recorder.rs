@@ -394,6 +394,11 @@ impl RolloutRecorder {
     #[cfg(test)]
     pub(crate) async fn read_only_for_test(path: &Path) -> std::io::Result<Self> {
         let file = tokio::fs::File::open(path).await?;
+        Ok(Self::with_file_for_test(file, path))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_file_for_test(file: tokio::fs::File, path: &Path) -> Self {
         let (tx, rx) = mpsc::channel(256);
         tokio::spawn(rollout_writer(
             file,
@@ -405,11 +410,11 @@ impl RolloutRecorder {
             None,
             "test-provider".into(),
         ));
-        Ok(Self {
+        Self {
             tx,
             rollout_path: path.to_path_buf(),
             state_db: None,
-        })
+        }
     }
 
     pub(crate) async fn record_items(&self, items: &[RolloutItem]) -> std::io::Result<()> {
@@ -691,6 +696,8 @@ async fn rollout_writer(
 ) -> std::io::Result<()> {
     let mut writer = JsonlWriter {
         file: BufWriter::new(file),
+        last_flushed_completion_review_state: None,
+        pending_completion_review_state: None,
     };
     if let Some(builder) = state_builder.as_mut() {
         builder.rollout_path = rollout_path.clone();
@@ -746,7 +753,7 @@ async fn rollout_writer(
                 .await;
             }
             RolloutCmd::Flush { ack } | RolloutCmd::Shutdown { ack } => {
-                if let Err(error) = writer.file.flush().await {
+                if let Err(error) = writer.flush().await {
                     let writer_error = IoError::new(error.kind(), error.to_string());
                     let _ = ack.send(Err(error));
                     return Err(writer_error);
@@ -756,13 +763,15 @@ async fn rollout_writer(
         }
     }
 
-    writer.file.flush().await?;
+    writer.flush().await?;
 
     Ok(())
 }
 
 struct JsonlWriter {
     file: BufWriter<tokio::fs::File>,
+    last_flushed_completion_review_state: Option<Value>,
+    pending_completion_review_state: Option<Value>,
 }
 
 #[derive(serde::Serialize)]
@@ -773,7 +782,25 @@ struct RolloutLineRef<'a> {
 }
 
 impl JsonlWriter {
+    async fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush().await?;
+        if let Some(state) = self.pending_completion_review_state.take() {
+            self.last_flushed_completion_review_state = Some(state);
+        }
+        Ok(())
+    }
+
     async fn write_rollout_item(&mut self, rollout_item: &RolloutItem) -> std::io::Result<()> {
+        // Pending writes take precedence so A -> B -> A survives a single flush.
+        if let RolloutItem::PostTurnCompletionReviewState(state) = rollout_item
+            && self
+                .pending_completion_review_state
+                .as_ref()
+                .or(self.last_flushed_completion_review_state.as_ref())
+                == Some(state)
+        {
+            return Ok(());
+        }
         let timestamp_format: &[FormatItem] = format_description!(
             "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
         );
@@ -785,7 +812,11 @@ impl JsonlWriter {
             timestamp,
             item: rollout_item,
         };
-        self.write_line(&line).await
+        self.write_line(&line).await?;
+        if let RolloutItem::PostTurnCompletionReviewState(state) = rollout_item {
+            self.pending_completion_review_state = Some(state.clone());
+        }
+        Ok(())
     }
     async fn write_line(&mut self, item: &impl serde::Serialize) -> std::io::Result<()> {
         let mut json = serde_json::to_string(item)?;

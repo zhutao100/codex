@@ -2280,6 +2280,7 @@ impl Session {
                 &input,
                 false,
                 client_user_message_id.clone(),
+                None,
             )
             .await;
         ts.push_pending_input(TurnInput::UserInput {

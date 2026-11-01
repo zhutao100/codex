@@ -49,6 +49,10 @@ impl Session {
             Ok::<_, std::io::Error>(())
         }
         .await;
+        self.check_completion_review_persistence(result).await
+    }
+
+    async fn check_completion_review_persistence(&self, result: std::io::Result<()>) -> bool {
         if let Err(error) = result {
             self.state
                 .lock()
@@ -72,8 +76,9 @@ impl Session {
         &self,
         input: &[UserInput],
         new_task: bool,
+        main_task_id: Option<&str>,
     ) -> Option<u64> {
-        self.accept_completion_review_input_with_client_id(input, new_task, None)
+        self.accept_completion_review_input_with_client_id(input, new_task, None, main_task_id)
             .await
     }
 
@@ -82,6 +87,7 @@ impl Session {
         input: &[UserInput],
         new_task: bool,
         client_id: Option<String>,
+        main_task_id: Option<&str>,
     ) -> Option<u64> {
         let _guard = self.completion_review_installation.lock().await;
         let revision = {
@@ -89,9 +95,14 @@ impl Session {
             if !state.session_configuration.tracks_completion_review() {
                 return None;
             }
-            state
-                .completion_review
-                .accept_input(new_task, input.to_vec(), client_id)
+            let revision =
+                state
+                    .completion_review
+                    .accept_input(new_task, input.to_vec(), client_id);
+            if let Some(main_task_id) = main_task_id {
+                state.completion_review.main_task_id = Some(main_task_id.to_string());
+            }
+            revision
         };
         self.persist_completion_review_locked().await;
         Some(revision)
@@ -117,7 +128,8 @@ impl Session {
             let Some(input) = input else {
                 return true;
             };
-            if input.installation != ReviewInputInstallation::Recorded {
+            let needs_installation = input.installation != ReviewInputInstallation::Recorded;
+            if needs_installation {
                 if let Some(input) = session
                     .state
                     .lock()
@@ -130,7 +142,7 @@ impl Session {
                     input.installation = ReviewInputInstallation::Installing;
                 }
                 // This marker disambiguates identical messages if the process
-                // stops after writing the body but before its Recorded snapshot.
+                // stops after the body but before checkpointing installation.
                 if !session.persist_completion_review_locked().await {
                     return false;
                 }
@@ -142,6 +154,16 @@ impl Session {
                         input.client_id,
                     )
                     .await;
+                if consume {
+                    let recorder = session.services.rollout.lock().await.clone();
+                    let result = match recorder {
+                        Some(recorder) => recorder.flush().await,
+                        None => Ok(()),
+                    };
+                    if !session.check_completion_review_persistence(result).await {
+                        return false;
+                    }
+                }
                 if let Some(input) = session
                     .state
                     .lock()
@@ -153,9 +175,6 @@ impl Session {
                 {
                     input.installation = ReviewInputInstallation::Recorded;
                 }
-                if !session.persist_completion_review_locked().await {
-                    return false;
-                }
             }
             if consume {
                 session
@@ -164,9 +183,12 @@ impl Session {
                     .await
                     .completion_review
                     .consume_input(revision);
-                return session.persist_completion_review_locked().await;
             }
-            true
+            if needs_installation || consume {
+                session.persist_completion_review_locked().await
+            } else {
+                true
+            }
         })
         .await
         .unwrap_or(false)
@@ -313,6 +335,11 @@ impl Session {
         let Some(text) = final_agent_message.filter(|text| !text.trim().is_empty()) else {
             return;
         };
+        let reserve_automatic = turn_context
+            .features
+            .enabled(Feature::AutoPostTurnCompletionReview)
+            && !matches!(turn_context.session_source, SessionSource::SubAgent(_))
+            && self.active_turn.lock().await.is_none();
         let _guard = self.completion_review_installation.lock().await;
         let mut state = self.state.lock().await;
         if !state.session_configuration.tracks_completion_review()
@@ -325,13 +352,16 @@ impl Session {
             turn_context.cwd.clone(),
             text.to_string(),
         );
+        if reserve_automatic {
+            let _ = state.completion_review.begin_review(true);
+        }
         drop(state);
         self.persist_completion_review_locked().await;
     }
 
     #[cfg(test)]
     pub(crate) async fn begin_completion_review(&self, automatic: bool) -> Option<ReviewTicket> {
-        self.begin_completion_review_for_candidate(automatic, None)
+        self.begin_completion_review_for_candidate(automatic)
             .await
             .map(|(_, ticket)| ticket)
     }
@@ -343,14 +373,12 @@ impl Session {
         if self.active_turn.lock().await.is_some() {
             return None;
         }
-        self.begin_completion_review_for_candidate(false, None)
-            .await
+        self.begin_completion_review_for_candidate(false).await
     }
 
-    pub(crate) async fn begin_completion_review_for_candidate(
+    async fn begin_completion_review_for_candidate(
         &self,
         automatic: bool,
-        expected_completion: Option<&str>,
     ) -> Option<(CompletedTurnForReview, ReviewTicket)> {
         let _guard = self.completion_review_installation.lock().await;
         let mut state = self.state.lock().await;
@@ -358,11 +386,6 @@ impl Session {
             return None;
         }
         let review = &mut state.completion_review;
-        if let Some(expected) = expected_completion
-            && review.eligible_episode()?.turn_id != expected
-        {
-            return None;
-        }
         let ticket = review.begin_review(automatic)?;
         let completed_turn = review.eligible_episode()?.clone();
         drop(state);

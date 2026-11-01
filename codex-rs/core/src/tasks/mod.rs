@@ -221,7 +221,8 @@ impl Session {
                 .await;
         }
         let review_input_revision = if task_kind == TaskKind::Regular && !input.is_empty() {
-            self.accept_completion_review_input(&input, true).await
+            self.accept_completion_review_input(&input, true, Some(&turn_context.sub_id))
+                .await
         } else {
             None
         };
@@ -611,9 +612,9 @@ impl Session {
             return;
         }
 
-        if let Some((_, ticket)) = self
-            .begin_completion_review_for_candidate(true, Some(&turn_context.sub_id))
-            .await
+        if let Some(ticket) = self.current_completion_review_ticket().await
+            && ticket.automatic
+            && ticket.candidate_completion_id == turn_context.sub_id
         {
             self.queue_completion_review_operation(
                 crate::completion_review::InternalReviewOperation::Review(ticket),

@@ -9,7 +9,7 @@
 |[Task lifecycle](../../../core/src/tasks/mod.rs)|Keep completion handles alive through finalization; serialize finalization with registration and stopping; retain acknowledged late input without treating it as consumed.|
 |[Review task](../../../core/src/tasks/post_turn_completion_review.rs)|Fresh delegate configuration, packet rendering/budgets, strict result handling and advisory output contract.|
 |[Replay](../../../core/src/session/rollout_reconstruction.rs)|Restore explicit state independently of prompt history and infer the appropriate interrupted task target.|
-|[Recorder](../../../core/src/rollout/recorder.rs)|Preserve metadata during loading and continuation cleanup, including after dangling calls and interrupt markers.|
+|[Recorder](../../../core/src/rollout/recorder.rs)|Suppress unchanged snapshots without skipping transcript flushes; preserve metadata during loading and continuation cleanup, including after dangling calls and interrupt markers.|
 
 ## Completion Boundaries
 
@@ -25,7 +25,7 @@
 
 Completion-review tracking is disabled for `SessionSource::SubAgent(SubAgentSource::Review)`, shared by ordinary `/review` and post-turn review delegates. Their input follows the ordinary transcript path without review revisions, main-task ownership or candidate capture. Completion, pause and shutdown do not append `PostTurnCompletionReviewState` records to their rollouts. Other session sources retain existing tracking.
 
-The parent is the recovery owner: its snapshots, ticket, allowance and prepared/started handoffs remain unchanged. Resuming a paused reviewer uses the parent's saved candidate to create a fresh delegate, not the child's rollout. A reviewer rollout remains a readable transcript, not an independent completion-review recovery checkpoint. This runtime policy adds no storage or configuration fields; existing inline metadata remains readable and is not removed.
+The parent owns recovery through its snapshots, ticket, allowance and prepared/started handoffs. Resuming a paused reviewer uses the parent's saved candidate to create a fresh delegate, not the child's rollout. A reviewer rollout remains a readable transcript, not an independent completion-review recovery checkpoint. This runtime policy adds no storage or configuration fields; existing inline metadata remains readable and is not removed.
 
 `RolloutItem::PostTurnCompletionReviewState` carries host-only JSON recovery metadata whose typed implementation is internal to core. Its format checks do not appear in model-facing packets, prompts or review results. This avoids expanding the review result or app-server RPC payloads. The record contains:
 
@@ -41,9 +41,13 @@ It is not a `ResponseItem`, model summary, assistant output or UI cell. Unsuppor
 
 Only a genuinely new root session or trusted metadata establishes exact request provenance. Resume, fork and history replacement without that evidence retain unknown scope, even when prompt history is empty or contains only encrypted compaction. Missing visible user boundaries do not prove missing requirements never existed. Subsequent genuine input remains tracked but cannot restore unknown prior scope by itself.
 
-Snapshot writes and handoff transitions use a serialized persistence boundary. Persist completion before reserving its review; persist a prepared handoff before enqueue; persist the started claim before main work. Failed writes disable review eligibility and surface a diagnostic. A full/closed operation queue preserves recoverable work instead of waiting while task finalization holds its lifecycle guard.
+Snapshot writes and handoff transitions use a serialized persistence boundary. Finalization persists a completed candidate and any automatic-review reservation in one snapshot; later scheduling only enqueues that current ticket. Manual reservation remains a separate acknowledged transition. Persist a prepared handoff before enqueue and the started claim before main work. Failed writes disable review eligibility and surface a diagnostic. A full/closed operation queue preserves recoverable work instead of waiting while task finalization holds its lifecycle guard.
 
 Recorder flush/shutdown acknowledgements carry the underlying I/O result, not just notification that the writer processed the command. A buffered write failure must reach the reservation or claim caller before task startup. Failure leaves the existing durable prefix intact and prevents the in-memory transition from authorizing new review work.
+
+Each recorder writer suppresses a review snapshot equal to its latest written snapshot, including pending buffered writes. Pending state takes precedence over the flushed baseline, preserving transitions such as `A -> B -> A` before one flush. Only a successful flush advances the acknowledged baseline. Recorder clones share that writer; reopening or replacing a recorder starts without a cached baseline, even at the same path. Ordinary transcript records and flush/shutdown commands are never suppressed. Continuation cleanup preserves metadata, so its rewrite does not invalidate the latest retained snapshot.
+
+Known initial main-task ownership shares the accepted-input snapshot. A resumed or otherwise newly assigned owner still requires an acknowledged checkpoint before sampling. These changes preserve the existing JSONL record shape and exact recovery payloads; they do not rewrite historical rollouts or improve how older readers recognize unknown record types. Flush acknowledgement means buffered writes completed, not an `fsync` power-loss guarantee.
 
 Every resumed review-tracked main task must also persist its new owner before sampling, even when the handoff was already Started. Owner-write failure stops before history cleanup, snapshot injection or a model request; finalization retains interrupted continuation ownership. Missing mandatory context is an explicit error, distinct from an ordinary task that requires no review context. Continue preflight preserves the checkpoint on that error, including after the writer is repaired, so an invalidated in-memory snapshot cannot overwrite the last good recovery prefix.
 
@@ -51,9 +55,9 @@ Advisory preparation and installation finish their short durable transaction eve
 
 Continuation cleanup and acknowledgement of unconsumed input use the same boundary. A cleanup rewrite cannot discard metadata or acknowledged input written concurrently, and stopping a task cannot leave those writes racing the published pause state.
 
-Input installation persists an `Installing` marker for a specific accepted revision before recording its user message, persists `Recorded` after that body, and only then consumes the revision into the request frame. Replay recognizes a body after its installing marker using the exact host-owned message; it never deduplicates by text found anywhere in history. Accepted inputs without a body are reinstalled before ordinary sampling, after pending notes recovery. Acknowledgement before main-task startup also establishes recoverable continuation work. Pending notes retain the resume-selected destination model while compaction resolves its separate source.
+Input installation persists an `Installing` marker for a specific accepted revision before recording its user message. For immediate consumption, it flushes the body before consuming the revision into the request frame and persists the consumed state without an intermediate `Recorded` snapshot. Retained, unconsumed input still persists `Recorded` with its body. Replay recognizes a body after its installing marker using the exact host-owned message; it never deduplicates by text found anywhere in history. Accepted inputs without a body are reinstalled before ordinary sampling, after pending notes recovery. Acknowledgement before main-task startup also establishes recoverable continuation work. Pending notes retain the resume-selected destination model while compaction resolves its separate source.
 
-Recognizing that installation preserves the prior, now-ineligible candidate and its CWD. The accepted revision already invalidates review eligibility, while an unfinished review-derived main task still needs that directory owner to resume. An unrecognized user boundary continues to discard the candidate and disable exact provenance. Do not erase known recovery ownership merely because the matching body arrived before its `Recorded` snapshot.
+Recognizing that installation preserves the prior, now-ineligible candidate and its CWD. The accepted revision already invalidates review eligibility, while an unfinished review-derived main task still needs that directory owner to resume. An unrecognized user boundary continues to discard the candidate and disable exact provenance. Do not erase known recovery ownership merely because the matching body arrived before installation or consumption was checkpointed.
 
 Once input installation starts, its short owned transaction survives caller cancellation and task-stop joins it. A consumed amendment therefore cannot be persisted ahead of its model-facing message. Metadata without durable input-installation ownership cannot establish these guarantees and stays unavailable rather than being upgraded by inference.
 
@@ -61,7 +65,7 @@ Task-stop also joins the task lifecycle guard, including when finalization alrea
 
 `ResponseItem::Message.id` is not serialized. Restart deduplication compares the exact host-owned developer item associated with the durable handoff, not an assumed persistent message ID. The main request only reinserts the advisory when compaction removed that item; it always re-establishes the replacement contract and exact request/candidate frame.
 
-The active snapshot and review packet have bounded answer revisions. The append-only rollout still grows with actual work and includes repeated bounded snapshots; there is no claim of bounded session storage or constant cumulative cost.
+The active snapshot and review packet have bounded answer revisions. A clean automatic-review episode without steering or handoffs normally records five states: accepted input with owner, installing input, consumed input, completed candidate with automatic ticket, and finished review. Additional meaningful transitions remain recorded. The append-only rollout still grows with actual work; unchanged-snapshot suppression does not bound session storage or cumulative cost.
 
 ## Tickets And Recovery
 

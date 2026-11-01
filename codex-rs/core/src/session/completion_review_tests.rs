@@ -26,7 +26,7 @@ async fn complete_new_request(
     answer: &str,
 ) {
     let revision = session
-        .accept_completion_review_input(&steer_text_input(request), true)
+        .accept_completion_review_input(&steer_text_input(request), true, None)
         .await
         .unwrap();
     assert!(
@@ -96,6 +96,7 @@ async fn review_delegate_keeps_transcript_without_completion_review_state() {
             &content,
             true,
             Some("review-request".into()),
+            None,
         )
         .await;
     assert_eq!(review_revision, None);
@@ -185,7 +186,7 @@ async fn completion_review_capture_uses_task_result_not_assistant_role() {
 async fn completion_review_captures_consumed_steering_without_progress_round() {
     let (session, context, _) = make_session_and_context_with_rx().await;
     let first = session
-        .accept_completion_review_input(&steer_text_input("original"), true)
+        .accept_completion_review_input(&steer_text_input("original"), true, None)
         .await
         .unwrap();
     assert!(
@@ -197,7 +198,7 @@ async fn completion_review_captures_consumed_steering_without_progress_round() {
         .record_conversation_items(&context, &[assistant_message("progress")])
         .await;
     let second = session
-        .accept_completion_review_input(&steer_text_input("steering"), false)
+        .accept_completion_review_input(&steer_text_input("steering"), false, None)
         .await
         .unwrap();
     assert!(
@@ -232,7 +233,7 @@ async fn completion_review_captures_consumed_steering_without_progress_round() {
 async fn completion_review_late_input_remains_unreviewed_until_consumed() {
     let (session, context, _) = make_session_and_context_with_rx().await;
     let first = session
-        .accept_completion_review_input(&steer_text_input("original request"), true)
+        .accept_completion_review_input(&steer_text_input("original request"), true, None)
         .await
         .unwrap();
     assert!(
@@ -241,7 +242,7 @@ async fn completion_review_late_input_remains_unreviewed_until_consumed() {
             .await
     );
     let revision = session
-        .accept_completion_review_input(&steer_text_input("late amendment"), false)
+        .accept_completion_review_input(&steer_text_input("late amendment"), false, None)
         .await
         .unwrap();
     let input = TurnInput::UserInput {
@@ -397,6 +398,47 @@ async fn completion_review_persistence_failure_prevents_reviewer_and_main_startu
             )
         }));
     }
+}
+
+#[tokio::test]
+async fn completion_review_automatic_capture_failure_cannot_authorize_review() {
+    let (session, mut context, events) = make_session_and_context_with_rx().await;
+    Arc::get_mut(&mut context)
+        .unwrap()
+        .features
+        .enable(Feature::AutoPostTurnCompletionReview);
+    let (_home, path) = attach_recorder(&session, &context).await;
+    let revision = session
+        .accept_completion_review_input(
+            &steer_text_input("complete request"),
+            true,
+            Some(&context.sub_id),
+        )
+        .await
+        .unwrap();
+    assert!(
+        session
+            .install_completion_review_input(&context, revision, true)
+            .await
+    );
+    let before = tokio::fs::read(&path).await.unwrap();
+    *session.services.rollout.lock().await =
+        Some(RolloutRecorder::read_only_for_test(&path).await.unwrap());
+    while events.try_recv().is_ok() {}
+    session
+        .capture_completed_regular_turn_for_review(&context, Some("complete answer"))
+        .await;
+    let state = session.state.lock().await.completion_review.clone();
+    assert!(state.attempt.as_ref().unwrap().automatic);
+    assert_eq!(state.episode.unwrap().automatic_reviews_started, 1);
+    assert!(!state.request_frame.exact);
+    assert!(session.current_completion_review_ticket().await.is_none());
+    assert!(session.completed_turn_for_review().await.is_none());
+    assert_eq!(tokio::fs::read(&path).await.unwrap(), before);
+    assert!(std::iter::from_fn(|| events.try_recv().ok()).any(|event| {
+        matches!(event.msg, EventMsg::Warning(warning)
+            if warning.message.contains("could not be persisted"))
+    }));
 }
 
 #[tokio::test]
@@ -653,7 +695,11 @@ async fn completion_review_model_override_retargets_only_pending_main_work_durab
                     .await
             );
             let revision = session
-                .accept_completion_review_input(&steer_text_input("preserve the public API"), false)
+                .accept_completion_review_input(
+                    &steer_text_input("preserve the public API"),
+                    false,
+                    None,
+                )
                 .await
                 .unwrap();
             assert!(
@@ -924,7 +970,7 @@ async fn completion_review_stale_tickets_cannot_prepare_or_claim_advice() {
     let (session, context) = completed_session().await;
     let old = session.begin_completion_review(false).await.unwrap();
     let revision = session
-        .accept_completion_review_input(&steer_text_input("new user request"), true)
+        .accept_completion_review_input(&steer_text_input("new user request"), true, None)
         .await
         .unwrap();
     assert!(
@@ -958,7 +1004,11 @@ async fn completion_review_stale_tickets_cannot_prepare_or_claim_advice() {
 
 #[tokio::test]
 async fn completion_review_old_task_cannot_capture_or_schedule_a_newer_candidate() {
-    let (session, context) = completed_session().await;
+    let (session, mut context) = completed_session().await;
+    Arc::get_mut(&mut context)
+        .unwrap()
+        .features
+        .enable(Feature::AutoPostTurnCompletionReview);
     let original = session.completed_turn_for_review().await;
     assert!(
         session
@@ -969,12 +1019,7 @@ async fn completion_review_old_task_cannot_capture_or_schedule_a_newer_candidate
         .capture_completed_regular_turn_for_review(&context, Some("stale old result"))
         .await;
     assert_eq!(session.completed_turn_for_review().await, original);
-    assert!(
-        session
-            .begin_completion_review_for_candidate(true, Some("not-the-candidate"))
-            .await
-            .is_none()
-    );
+    assert!(session.current_completion_review_ticket().await.is_none());
 }
 
 #[tokio::test]
@@ -982,7 +1027,7 @@ async fn completion_review_fork_excludes_metadata_for_the_next_unconsumed_user_b
     let (session, context) = completed_session().await;
     let original = session.state.lock().await.completion_review.clone();
     session
-        .accept_completion_review_input(&steer_text_input("excluded future request"), true)
+        .accept_completion_review_input(&steer_text_input("excluded future request"), true, None)
         .await
         .unwrap();
     let next = session.state.lock().await.completion_review.clone();
@@ -1220,6 +1265,86 @@ async fn completion_review_pause_joins_inflight_installation_before_durable_stop
 }
 
 #[tokio::test]
+async fn completion_review_coalesced_input_replays_each_emitted_prefix() {
+    let (session, context, _) = make_session_and_context_with_rx().await;
+    let (_home, path) = attach_recorder(&session, &context).await;
+    let revision = session
+        .accept_completion_review_input(
+            &steer_text_input("complete request"),
+            true,
+            Some(&context.sub_id),
+        )
+        .await
+        .unwrap();
+    let accepted = session.state.lock().await.completion_review.clone();
+    let body = accepted.pending_inputs[0].response_item.clone();
+    assert!(
+        session
+            .start_completion_review_main_task(&context.sub_id)
+            .await
+    );
+    assert!(
+        session
+            .install_completion_review_input(&context, revision, true)
+            .await
+    );
+    let expected = session.state.lock().await.completion_review.clone();
+    let (items, _, errors) = RolloutRecorder::load_rollout_items(&path).await.unwrap();
+    assert_eq!(errors, 0);
+    let snapshots: Vec<_> = items
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| match item {
+            RolloutItem::PostTurnCompletionReviewState(state) => Some((
+                index,
+                serde_json::from_value::<CompletionReviewState>(state.clone()).unwrap(),
+            )),
+            _ => None,
+        })
+        .collect();
+    let mut installing = accepted.clone();
+    installing.pending_inputs[0].installation = ReviewInputInstallation::Installing;
+    assert_eq!(
+        snapshots.iter().map(|(_, state)| state).collect::<Vec<_>>(),
+        [&accepted, &installing, &expected]
+    );
+    let body_index = items
+        .iter()
+        .position(|item| matches!(item, RolloutItem::ResponseItem(item) if item == &body))
+        .unwrap();
+    for last in [snapshots[0].0, snapshots[1].0, body_index, snapshots[2].0] {
+        let (resumed, resumed_context, _) = make_session_and_context_with_rx().await;
+        let replay = resumed
+            .reconstruct_history_from_rollout(&resumed_context, &items[..=last])
+            .await;
+        resumed.replace_with_reconstructed_rollout(replay).await;
+        for revision in resumed.completion_review_input_recovery_revisions().await {
+            assert!(
+                resumed
+                    .install_completion_review_input(&resumed_context, revision, true)
+                    .await
+            );
+        }
+        assert_eq!(
+            resumed.state.lock().await.completion_review,
+            expected,
+            "prefix through item {last}"
+        );
+        assert_eq!(
+            resumed
+                .clone_history()
+                .await
+                .raw_items()
+                .iter()
+                .filter(|item| *item == &body)
+                .count(),
+            1,
+            "prefix through item {last}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn completion_review_input_installation_replays_every_durable_boundary() {
     for (installation, body_written, consumed) in [
         (ReviewInputInstallation::Accepted, false, false),
@@ -1232,7 +1357,7 @@ async fn completion_review_input_installation_replays_every_durable_boundary() {
         let (_home, path) = attach_recorder(&session, &context).await;
         let content = steer_text_input("identical amendment");
         let first = session
-            .accept_completion_review_input(&content, true)
+            .accept_completion_review_input(&content, true, None)
             .await
             .unwrap();
         assert!(
@@ -1245,6 +1370,7 @@ async fn completion_review_input_installation_replays_every_durable_boundary() {
                 &content,
                 false,
                 Some("amendment-client".into()),
+                None,
             )
             .await
             .unwrap();
@@ -1348,7 +1474,11 @@ async fn completion_review_initial_acknowledgement_recovers_without_any_history_
     let (session, context, _) = make_session_and_context_with_rx().await;
     let (_home, path) = attach_recorder(&session, &context).await;
     session
-        .accept_completion_review_input(&steer_text_input("accepted before task startup"), true)
+        .accept_completion_review_input(
+            &steer_text_input("accepted before task startup"),
+            true,
+            None,
+        )
         .await
         .unwrap();
     let (items, _, errors) = RolloutRecorder::load_rollout_items(&path).await.unwrap();
@@ -1605,7 +1735,7 @@ async fn completion_review_pause_joins_cancelled_input_installation_and_replays_
     let (session, context, _) = make_session_and_context_with_rx().await;
     let (_home, path) = attach_recorder(&session, &context).await;
     let revision = session
-        .accept_completion_review_input(&steer_text_input("acknowledged amendment"), true)
+        .accept_completion_review_input(&steer_text_input("acknowledged amendment"), true, None)
         .await
         .unwrap();
     let ready = Arc::new(Notify::new());
