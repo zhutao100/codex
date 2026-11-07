@@ -8,7 +8,9 @@ use codex_protocol::protocol::CompactedItem;
 use codex_protocol::request_user_input::RequestUserInputAnswer;
 use codex_protocol::request_user_input::RequestUserInputResponse;
 use core_test_support::responses::ResponsesRequest;
+use core_test_support::responses::ev_completed_with_tokens;
 use core_test_support::responses::ev_function_call;
+use core_test_support::responses::ev_reasoning_item;
 use pretty_assertions::assert_eq;
 
 fn answer(text: &str) -> String {
@@ -801,6 +803,125 @@ enum NonModelRecoveryOverride {
     Cwd,
     Approval,
     Effort,
+}
+
+#[test_case::test_case(false; "live")]
+#[test_case::test_case(true; "after restart")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_followup_uses_reported_usage_instead_of_full_history_byte_estimate(
+    restart: bool,
+) -> anyhow::Result<()> {
+    skip_if_no_network_unless_localhost!(Ok(()));
+    let server = MockServer::start().await;
+    let initial = "Exact completed candidate.";
+    let reasoning = "x".repeat(96_000);
+    let requests = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("initial"),
+                ev_reasoning_item("reasoning", &[], &[&reasoning]),
+                ev_assistant_message("candidate", initial),
+                ev_completed_with_tokens("initial", 4_000),
+            ]),
+            verdict(
+                "Verify the correction and replace the complete answer.",
+                true,
+            ),
+            sse(vec![
+                ev_response_created("followup"),
+                ev_function_call(
+                    "plan",
+                    "update_plan",
+                    r#"{"plan":[{"step":"Verify the correction","status":"completed"}]}"#,
+                ),
+                ev_completed_with_tokens("followup", 6_000),
+            ]),
+            answer("Complete verified replacement."),
+        ],
+    )
+    .await;
+    let home = Arc::new(TempDir::new()?);
+    let codex = new_conversation_for_server(&server, home.clone(), configure_recovery_models).await;
+    submit_request(&codex, "Preserve the exact scope and report verification.").await;
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    let active = if restart {
+        let path = codex.rollout_path().context("expected rollout path")?;
+        codex.submit(Op::Shutdown).await?;
+        wait_for_event(&codex, |event| matches!(event, EventMsg::ShutdownComplete)).await;
+        resume_conversation_for_server(&server, home.clone(), path, configure_recovery_models).await
+    } else {
+        codex
+    };
+    active.submit(Op::ReviewCompletedTurn).await?;
+    wait_for_event(&active, |event| match event {
+        EventMsg::Error(event) => panic!("follow-up failed: {}", event.message),
+        EventMsg::TurnComplete(event) if event.last_agent_message.is_some() => {
+            assert_eq!(
+                event.last_agent_message.as_deref(),
+                Some("Complete verified replacement.")
+            );
+            true
+        }
+        _ => false,
+    })
+    .await;
+    let captured = requests.requests();
+    assert_eq!(captured.len(), 4);
+    for request in &captured[2..] {
+        assert!(request.input().iter().any(|item| {
+            item["role"] == "developer"
+                && item["content"][0]["text"].as_str().is_some_and(|text| {
+                    text.contains(initial)
+                        && text.contains("Preserve the exact scope and report verification.")
+                        && text.contains("self-contained final answer")
+                })
+        }));
+    }
+    active.submit(Op::Shutdown).await?;
+    wait_for_event(&active, |event| matches!(event, EventMsg::ShutdownComplete)).await;
+    server.verify().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_followup_rejects_reported_usage_over_budget() -> anyhow::Result<()> {
+    skip_if_no_network_unless_localhost!(Ok(()));
+    let server = MockServer::start().await;
+    let requests = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("initial"),
+                ev_assistant_message("candidate", "Exact completed candidate."),
+                ev_completed_with_tokens("initial", 20_000),
+            ]),
+            verdict("Verify the work and replace the complete answer.", true),
+        ],
+    )
+    .await;
+    let home = Arc::new(TempDir::new()?);
+    let codex = new_conversation_for_server(&server, home.clone(), configure_recovery_models).await;
+    submit_request(&codex, "Preserve the exact scope.").await;
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    codex.submit(Op::ReviewCompletedTurn).await?;
+    wait_for_event(&codex, |event| match event {
+        EventMsg::Error(event) => {
+            assert!(event.message.contains("Review follow-up context exceeds"));
+            true
+        }
+        EventMsg::TurnComplete(event) if event.last_agent_message.is_some() => {
+            panic!("over-budget follow-up must not complete")
+        }
+        _ => false,
+    })
+    .await;
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    assert_eq!(requests.requests().len(), 2);
+    codex.submit(Op::Shutdown).await?;
+    wait_for_event(&codex, |event| matches!(event, EventMsg::ShutdownComplete)).await;
+    server.verify().await;
+    Ok(())
 }
 
 #[test_case::test_case(false, false, None; "compact")]

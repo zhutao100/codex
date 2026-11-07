@@ -632,14 +632,24 @@ async fn run_turn_inner(
             None
         };
         if let Some(instructions) = review_instructions {
-            sampling_request_input.push(DeveloperInstructions::new(instructions).into());
             let base = sess.get_base_instructions_for_turn(&turn_context).await;
+            // Reuse compaction's usage baseline plus unreported local items.
+            // Re-estimating the entire transcript from bytes can drift far
+            // above reported usage, especially with long reasoning histories.
+            let history_tokens = {
+                let state = sess.state.lock().await;
+                state
+                    .token_info()
+                    .filter(|info| info.last_token_usage.total_tokens > 0)
+                    .map(|_| state.get_total_token_usage(state.server_reasoning_included()))
+            }
+            .unwrap_or_else(|| estimate_work_notes_prompt_tokens(&sampling_request_input, &base));
             let target = turn_context
                 .model_context_window()
                 .unwrap_or_default()
                 .saturating_sub(8_192);
-            if estimate_work_notes_prompt_tokens(&sampling_request_input, &base) > target {
-                sampling_request_input.pop();
+            let mut review_item: ResponseItem = DeveloperInstructions::new(instructions).into();
+            if history_tokens.saturating_add(estimate_item_token_count(&review_item)) > target {
                 let instructions = match sess.completion_review_main_instructions(false).await {
                     Ok(Some(instructions)) => instructions,
                     Ok(None) => return None,
@@ -649,14 +659,17 @@ async fn run_turn_inner(
                         return None;
                     }
                 };
-                sampling_request_input.push(DeveloperInstructions::new(instructions).into());
-                if estimate_work_notes_prompt_tokens(&sampling_request_input, &base) > target {
+                review_item = DeveloperInstructions::new(instructions).into();
+                let prompt_tokens =
+                    history_tokens.saturating_add(estimate_item_token_count(&review_item));
+                if prompt_tokens > target {
                     sess.send_event(&turn_context, EventMsg::Error(CodexErr::Fatal(
-                        "Review follow-up context exceeds the main model's payload budget. Compact or select a larger context window, then /continue. No truncated follow-up request was sent.".into()
+                        format!("Review follow-up context exceeds the main model's payload budget ({prompt_tokens} estimated tokens, {target} available). Compact or select a larger context window, then /continue. No truncated follow-up request was sent.")
                     ).to_error_event(None))).await;
                     return None;
                 }
             }
+            sampling_request_input.push(review_item);
         }
 
         let sampling_request_input_messages = sampling_request_input
