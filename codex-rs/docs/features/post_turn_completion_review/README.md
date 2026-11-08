@@ -1,6 +1,6 @@
 # Post-Turn Completion Review
 
-Independent read-only review of current work and the exact latest main answer. [State and decisions](design.md). [Verification](validation.md).
+Independent read-only review of current work and the exact latest main answer. [State and decisions](design.md). [Verification](validation.md). [Budget accounting and upstream comparison](budget_accounting.md).
 
 ## Invocation
 
@@ -52,6 +52,7 @@ The latest main answer remains streamed and copyable. Review evaluation/status s
 - Manual review retains one advisory handoff after that allowance is exhausted and does not reset it. Pause/resume reuses the same ticket and allowance.
 - Payload budgeting uses the resolved review model's effective window, counts instructions and static tool schemas, reserves additional capacity for tools/output/inspection, and omits the optional historical reference first. Mandatory user scope and candidate text are never truncated.
 - Main follow-up budgeting uses the session's token-usage baseline plus unreported local items, charging only the replacement delta for the injected review frame already represented in that baseline. Host-only frame accounting and reasoning-inclusion semantics survive restart; compaction and local recomputation establish a new baseline. Without a positive usage baseline it falls back to the full prompt's byte estimate. Overflow diagnostics include the estimated count and available budget.
+- Known accounting gap: the legacy ledger uses the latest model output rather than the last usable-usage boundary. Output from missing-usage or failed responses can be omitted from the hard follow-up estimate. The [budget audit](budget_accounting.md#remaining-finding-unreported-model-output) records a transport reproduction and upstream alignment requirements.
 - If a delegate starts compaction, coverage becomes unavailable rather than accepting a verdict against rewritten context. Main continuations similarly retain exact mandatory snapshots or stop with a recoverable budget diagnostic.
 - A budget-stopped follow-up retains `/continue` ownership. Standalone `/compact` preserves that checkpoint; selecting a larger main model updates the durable recovery destination even when steering has invalidated the advisory handoff. Neither recovery route changes exact request scope or the separate compaction source. Compaction cannot help when mandatory snapshots alone exceed the model's budget.
 

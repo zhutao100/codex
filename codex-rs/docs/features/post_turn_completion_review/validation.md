@@ -59,6 +59,8 @@ Workspace-wide testing remains a separately authorized VM workload. The reposito
 |Live behavioral set|All four expected review verdicts matched in two runs, with two generated replacement answers per run and unchanged artifacts; manual assessment and limits below.|
 |Documentation|Completion-review and compaction documents; Markdown fences, relative links, unpadded tables and local-path redaction checked.|
 
+Subsequent [budget-accounting audit](budget_accounting.md): the unchanged-source `completion_review` selection passed 94 tests with one ignored exporter; the separate library `usage` selection passed 19 tests. A copied private rollout completed one mocked `/continue` request with exact snapshots and unchanged original bytes. A separate missing-usage transport probe failed its overflow-rejection assertion (`4` POSTs instead of `3`), confirming the remaining legacy-boundary finding; it is not included as passing coverage. Temporary probes were removed, and no upstream runtime change or rebuild was needed.
+
 The broader HTTP suite includes a deliberate five-second mocked response delay used to install steering before a budget stop; the dedicated five-checkpoint case does not. These timings do not measure live-model latency. The loopback fixtures executed actual transport; early-return network guards elsewhere in the broader suites are not additional transport coverage. No workspace-wide all-feature run was performed.
 
 Snapshot suppression and checkpoint coalescing reran the deterministic and transport coverage above. The live behavioral results below remain a separate earlier evaluation, not a new live run of these changes.
