@@ -699,6 +699,7 @@ async fn drain_to_completed(
     // Keep uncommitted summarizer output out of the live notes capture. Each
     // retry gets a fresh buffer; only a completed attempt supplies the summary.
     let mut output = Vec::new();
+    let mut server_reasoning_included = false;
     loop {
         let maybe_event = stream.next().await;
         let Some(event) = maybe_event else {
@@ -712,14 +713,18 @@ async fn drain_to_completed(
                 output.push(item);
             }
             Ok(ResponseEvent::ServerReasoningIncluded(included)) => {
-                sess.set_server_reasoning_included(included).await;
+                server_reasoning_included = included;
             }
             Ok(ResponseEvent::RateLimits(snapshot)) => {
                 sess.update_rate_limits(turn_context, snapshot).await;
             }
             Ok(ResponseEvent::Completed { token_usage, .. }) => {
-                sess.update_token_usage_info(turn_context, token_usage.as_ref())
-                    .await;
+                sess.update_token_usage_info(
+                    turn_context,
+                    token_usage.as_ref(),
+                    server_reasoning_included,
+                )
+                .await;
                 return Ok(output);
             }
             Ok(_) => continue,

@@ -924,13 +924,16 @@ async fn review_followup_rejects_reported_usage_over_budget() -> anyhow::Result<
     Ok(())
 }
 
-#[test_case::test_case(false, false; "live")]
-#[test_case::test_case(true, false; "after restart")]
-#[test_case::test_case(false, true; "reported overflow")]
+#[test_case::test_case(false, false, false; "live")]
+#[test_case::test_case(true, false, false; "after restart")]
+#[test_case::test_case(false, true, false; "reported overflow")]
+#[test_case::test_case(false, false, true; "earlier reasoning live")]
+#[test_case::test_case(true, false, true; "earlier reasoning after restart")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn review_followup_counts_request_context_once_near_budget(
     restart: bool,
     over_budget: bool,
+    prior_reasoning: bool,
 ) -> anyhow::Result<()> {
     skip_if_no_network_unless_localhost!(Ok(()));
     let server = MockServer::start().await;
@@ -961,9 +964,28 @@ async fn review_followup_counts_request_context_once_near_budget(
     if !over_budget {
         replies.push(sse_response(answer("Complete near-budget replacement.")));
     }
+    let prior_requests = usize::from(prior_reasoning);
+    if prior_reasoning {
+        replies.insert(
+            0,
+            sse_response(sse(vec![
+                ev_response_created("prior"),
+                ev_reasoning_item("earlier-reasoning", &[], &[&"x".repeat(20_100)]),
+                ev_assistant_message("earlier-answer", "Earlier complete answer."),
+                ev_completed_with_tokens("prior", 5_000),
+            ])),
+        );
+        for reply in &mut replies {
+            *reply = reply.clone().insert_header("x-reasoning-included", "1");
+        }
+    }
     let requests = mount_response_sequence(&server, replies).await;
     let home = Arc::new(TempDir::new()?);
     let codex = new_conversation_for_server(&server, home.clone(), configure_recovery_models).await;
+    if prior_reasoning {
+        submit_request(&codex, "Prior genuine user request.").await;
+        wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    }
     submit_request(&codex, "Preserve the exact scope and candidate.").await;
     wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
     codex.submit(Op::ReviewCompletedTurn).await?;
@@ -980,14 +1002,14 @@ async fn review_followup_counts_request_context_once_near_budget(
         })
         .await;
         wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
-        assert_eq!(requests.requests().len(), 3);
+        assert_eq!(requests.requests().len(), 3 + prior_requests);
         codex.submit(Op::Shutdown).await?;
         wait_for_event(&codex, |event| matches!(event, EventMsg::ShutdownComplete)).await;
         server.verify().await;
         return Ok(());
     }
     let active = if restart {
-        wait_for_captured_requests(&requests, 4).await;
+        wait_for_captured_requests(&requests, 4 + prior_requests).await;
         codex.submit(Op::Pause).await?;
         wait_for_event(&codex, |event| matches!(event, EventMsg::TurnPaused(_))).await;
         let path = codex.rollout_path().context("expected rollout path")?;
@@ -1014,14 +1036,17 @@ async fn review_followup_counts_request_context_once_near_budget(
     })
     .await;
     let captured = requests.requests();
-    assert_eq!(captured.len(), if restart { 5 } else { 4 });
-    for request in &captured[2..] {
+    assert_eq!(captured.len(), if restart { 5 } else { 4 } + prior_requests);
+    for request in &captured[2 + prior_requests..] {
         assert!(request.input().iter().any(|item| {
             item["role"] == "developer"
                 && item["content"][0]["text"].as_str().is_some_and(|text| {
                     text.contains(&initial)
                         && text.contains("Preserve the exact scope and candidate.")
                         && text.contains("self-contained final answer")
+                        && (!prior_reasoning
+                            || (text.contains("Prior genuine user request.")
+                                && text.contains("Earlier complete answer.")))
                 })
         }));
     }

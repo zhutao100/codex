@@ -230,6 +230,7 @@ async fn compaction_usage_counts_preserved_notes_once_after_installation_and_res
                 ..Default::default()
             }),
             5_000,
+            false,
         )
         .await;
     let notes = compact::preserved_work_notes_message(&"long exact notes\n".repeat(2_000));
@@ -260,7 +261,7 @@ async fn compaction_usage_counts_preserved_notes_once_after_installation_and_res
         .unwrap();
     assert_eq!(session.get_total_token_usage().await, expected);
     assert_eq!(session.clone_history().await.request_context_tokens(), 0);
-    let info = session.state.lock().await.token_info();
+    let info = session.state.lock().await.token_info().unwrap();
     let (resumed, resumed_context) = make_session_and_context().await;
     resumed
         .record_initial_history(InitialHistory::Resumed(ResumedHistory {
@@ -269,8 +270,13 @@ async fn compaction_usage_counts_preserved_notes_once_after_installation_and_res
             history: vec![
                 RolloutItem::Compacted(compacted),
                 RolloutItem::TurnContext(reference),
+                RolloutItem::TokenUsageContext {
+                    info: info.clone(),
+                    request_context_tokens: 0,
+                    server_reasoning_included: true,
+                },
                 RolloutItem::EventMsg(EventMsg::TokenCount(TokenCountEvent {
-                    info,
+                    info: Some(info),
                     rate_limits: None,
                 })),
             ],
@@ -279,6 +285,7 @@ async fn compaction_usage_counts_preserved_notes_once_after_installation_and_res
     assert_eq!(resumed.clone_history().await.raw_items(), replacement);
     assert_eq!(resumed.get_total_token_usage().await, expected);
     assert_eq!(resumed.clone_history().await.request_context_tokens(), 0);
+    assert!(resumed.state.lock().await.server_reasoning_included());
     let next = user_message("new input");
     resumed
         .record_into_history(std::slice::from_ref(&next), &resumed_context)

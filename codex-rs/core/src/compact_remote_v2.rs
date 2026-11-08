@@ -424,6 +424,7 @@ async fn collect_compaction_output(
 ) -> CodexResult<CompactionOutput> {
     let mut candidate = None;
     let mut count = 0;
+    let mut server_reasoning_included = false;
     while let Some(event) = stream.next().await {
         match event? {
             ResponseEvent::OutputItemDone(item @ ResponseItem::Compaction { .. }) => {
@@ -437,8 +438,12 @@ async fn collect_compaction_output(
                 token_usage,
                 ..
             } => {
-                sess.update_token_usage_info(context, token_usage.as_ref())
-                    .await;
+                sess.update_token_usage_info(
+                    context,
+                    token_usage.as_ref(),
+                    server_reasoning_included,
+                )
+                .await;
                 if count != 1 {
                     return Err(CodexErr::Fatal(format!(
                         "Remote compaction v2 expected exactly one compaction output, got {count}"
@@ -451,7 +456,7 @@ async fn collect_compaction_output(
             }
             ResponseEvent::RateLimits(snapshot) => sess.update_rate_limits(context, snapshot).await,
             ResponseEvent::ServerReasoningIncluded(included) => {
-                sess.set_server_reasoning_included(included).await
+                server_reasoning_included = included;
             }
             _ => {}
         }

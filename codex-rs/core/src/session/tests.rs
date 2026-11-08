@@ -109,22 +109,41 @@ fn request_context_usage_replays_atomic_prefixes_and_duplicate_token_events() {
         RolloutItem::TokenUsageContext {
             info: info.clone(),
             request_context_tokens: 5_000,
+            server_reasoning_included: true,
         },
         event.clone(),
         event.clone(),
         RolloutItem::TokenUsageContext {
             info: info.clone(),
             request_context_tokens: 0,
+            server_reasoning_included: false,
         },
         event,
     ];
-    for (prefix, context_tokens) in [(1, 0), (2, 5_000), (3, 5_000), (4, 5_000), (5, 0), (6, 0)] {
+    for (prefix, context_tokens, reasoning_included) in [
+        (1, 0, false),
+        (2, 5_000, true),
+        (3, 5_000, true),
+        (4, 5_000, true),
+        (5, 0, false),
+        (6, 0, false),
+    ] {
         assert_eq!(
             Session::last_token_usage_context_from_rollout(&records[..prefix]),
-            Some((info.clone(), context_tokens)),
+            Some((info.clone(), context_tokens, reasoning_included)),
             "prefix {prefix}"
         );
     }
+    let mut legacy = serde_json::to_value(&records[1]).unwrap();
+    legacy["payload"]
+        .as_object_mut()
+        .unwrap()
+        .remove("server_reasoning_included");
+    let legacy = serde_json::from_value(legacy).unwrap();
+    assert_eq!(
+        Session::last_token_usage_context_from_rollout(&[legacy]),
+        Some((info.clone(), 5_000, false))
+    );
     let records = [
         records[1].clone(),
         RolloutItem::Compacted(CompactedItem {
@@ -134,7 +153,7 @@ fn request_context_usage_replays_atomic_prefixes_and_duplicate_token_events() {
     ];
     assert_eq!(
         Session::last_token_usage_context_from_rollout(&records),
-        Some((info.clone(), 0))
+        Some((info.clone(), 0, true))
     );
     let mut changed = info.clone();
     changed.last_token_usage.total_tokens += 1;
@@ -142,6 +161,7 @@ fn request_context_usage_replays_atomic_prefixes_and_duplicate_token_events() {
         RolloutItem::TokenUsageContext {
             info,
             request_context_tokens: 5_000,
+            server_reasoning_included: true,
         },
         RolloutItem::EventMsg(EventMsg::TokenCount(TokenCountEvent {
             info: Some(changed.clone()),
@@ -150,8 +170,45 @@ fn request_context_usage_replays_atomic_prefixes_and_duplicate_token_events() {
     ];
     assert_eq!(
         Session::last_token_usage_context_from_rollout(&records),
-        Some((changed, 0))
+        Some((changed, 0, false))
     );
+}
+
+#[tokio::test]
+async fn reasoning_accounting_changes_only_with_a_completed_usage_baseline() {
+    let (session, context) = make_session_and_context().await;
+    let usage = TokenUsage {
+        input_tokens: 11_200,
+        total_tokens: 11_200,
+        ..Default::default()
+    };
+    for (reported, frame_tokens, reasoning_included, expected) in [
+        (true, 5_000, true, (5_000, true)),
+        (false, 0, false, (5_000, true)),
+        (true, 0, false, (0, false)),
+        (false, 5_000, true, (0, false)),
+    ] {
+        let before = session.state.lock().await.token_info();
+        session
+            .update_token_usage_info_with_request_context(
+                &context,
+                reported.then_some(&usage),
+                frame_tokens,
+                reasoning_included,
+            )
+            .await;
+        let state = session.state.lock().await;
+        assert_eq!(
+            (
+                state.history.request_context_tokens(),
+                state.server_reasoning_included()
+            ),
+            expected
+        );
+        if !reported {
+            assert_eq!(state.token_info(), before);
+        }
+    }
 }
 
 fn review_rollout_user_message(text: &str) -> ResponseItem {

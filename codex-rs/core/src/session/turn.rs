@@ -2229,6 +2229,7 @@ async fn try_run_sampling_request(
     let mut last_agent_message: Option<String> = None;
     let mut active_item: Option<TurnItem> = None;
     let mut should_emit_turn_diff = false;
+    let mut server_reasoning_included = false;
     let plan_mode = turn_context.collaboration_mode.mode == ModeKind::Plan
         && matches!(tool_execution_mode, ToolCallExecutionMode::Normal);
     let mut plan_mode_state = plan_mode.then(|| PlanModeStreamState::new(&turn_context.sub_id));
@@ -2365,7 +2366,7 @@ async fn try_run_sampling_request(
                 }
             }
             ResponseEvent::ServerReasoningIncluded(included) => {
-                sess.set_server_reasoning_included(included).await;
+                server_reasoning_included = included;
             }
             ResponseEvent::ServerModel(server_model) => {
                 if !turn_context
@@ -2417,6 +2418,7 @@ async fn try_run_sampling_request(
                     &turn_context,
                     token_usage.as_ref(),
                     request_context_tokens,
+                    server_reasoning_included,
                 )
                 .await;
                 should_emit_turn_diff = true;

@@ -1945,6 +1945,8 @@ pub enum RolloutItem {
         info: TokenUsageInfo,
         #[ts(type = "number")]
         request_context_tokens: i64,
+        #[serde(default)]
+        server_reasoning_included: bool,
     },
     EventMsg(EventMsg),
 }
