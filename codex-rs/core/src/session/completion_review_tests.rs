@@ -4,9 +4,59 @@ use crate::completion_review::CompletionReviewState;
 use crate::completion_review::ReviewHandoffDisposition;
 use crate::completion_review::ReviewInputInstallation;
 use crate::completion_review::ReviewRequestFrame;
+use crate::session::turn::insert_completion_review_instructions;
 use codex_protocol::models::ResponseInputItem;
 use pretty_assertions::assert_eq;
 use tokio::sync::Notify;
+
+#[test_case::test_case(vec![], 0; "empty history")]
+#[test_case::test_case(vec![assistant_message("local compacted summary")], 0; "assistant only history")]
+#[test_case::test_case(
+    vec![
+        user_message("request"),
+        assistant_message("initial answer"),
+        DeveloperInstructions::new("review advisory").into(),
+    ],
+    3;
+    "recorded advisory"
+)]
+#[test_case::test_case(
+    vec![
+        DeveloperInstructions::new("previous advisory").into(),
+        assistant_message("previous work"),
+        user_message("amended request"),
+        assistant_message("work after steering"),
+    ],
+    3;
+    "steered scope without handoff"
+)]
+#[test_case::test_case(
+    vec![
+        user_message("retained request"),
+        ResponseItem::Compaction { encrypted_content: "opaque context".into() },
+        assistant_message("exact work notes"),
+    ],
+    2;
+    "encrypted compaction with notes"
+)]
+fn completion_review_request_frame_keeps_a_stable_prefix(
+    mut history: Vec<ResponseItem>,
+    expected_index: usize,
+) {
+    let frame: ResponseItem = DeveloperInstructions::new("exact review frame").into();
+    let mut request = history.clone();
+    insert_completion_review_instructions(&mut request, frame.clone());
+    let mut expected = history[..expected_index].to_vec();
+    expected.push(frame.clone());
+    expected.extend_from_slice(&history[expected_index..]);
+    assert_eq!(request, expected);
+
+    let output = assistant_message("new follow-up output");
+    history.push(output.clone());
+    insert_completion_review_instructions(&mut history, frame);
+    expected.push(output);
+    assert_eq!(history, expected);
+}
 
 async fn completed_session() -> (Arc<Session>, Arc<TurnContext>) {
     let (session, context, _) = make_session_and_context_with_rx().await;

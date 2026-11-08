@@ -32,7 +32,9 @@ use core_test_support::responses::WebSocketConnectionConfig;
 use core_test_support::responses::WebSocketTestServer;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
+use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_output_text_delta;
+use core_test_support::responses::ev_reasoning_item;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::start_websocket_server;
 use core_test_support::responses::start_websocket_server_with_headers;
@@ -676,6 +678,115 @@ async fn responses_websocket_reuses_completed_connection_across_turns() {
         None
     );
 
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_websocket_completion_review_followup_uses_incremental_create() {
+    skip_if_no_network_unless_localhost!();
+
+    let plan = r#"{"plan":[{"step":"Verify the review","status":"completed"}]}"#;
+    let server = start_websocket_server(vec![
+        vec![
+            vec![
+                ev_response_created("initial"),
+                ev_assistant_message("candidate", "Initial complete answer."),
+                ev_completed("initial"),
+            ],
+            vec![
+                ev_response_created("followup-1"),
+                ev_reasoning_item("reasoning", &["Check the advisory."], &[]),
+                ev_function_call("plan-1", "update_plan", plan),
+                ev_completed("followup-1"),
+            ],
+            vec![
+                ev_response_created("followup-2"),
+                ev_function_call("plan-2", "update_plan", plan),
+                ev_completed("followup-2"),
+            ],
+            vec![
+                ev_response_created("replacement"),
+                ev_assistant_message("replacement-answer", "Complete verified replacement."),
+                ev_completed("replacement"),
+            ],
+        ],
+        vec![vec![
+            ev_response_created("review"),
+            ev_assistant_message(
+                "verdict",
+                r#"{"evaluation":"Verify the correction.","fix_actions_advised":true}"#,
+            ),
+            ev_completed("review"),
+        ]],
+    ])
+    .await;
+    let mut builder = test_codex().with_config(|config| {
+        config.features.enable(Feature::ResponsesWebsocketsV2);
+        config
+            .features
+            .disable(Feature::AutoPostTurnCompletionReview);
+    });
+    let test = builder.build_with_websocket_server(&server).await.unwrap();
+    test.submit_turn("Preserve the exact request and complete answer.")
+        .await
+        .unwrap();
+    test.codex.submit(Op::ReviewCompletedTurn).await.unwrap();
+    wait_for_event(&test.codex, |event| match event {
+        EventMsg::Error(event) => panic!("review follow-up failed: {}", event.message),
+        EventMsg::TurnComplete(event) if event.last_agent_message.is_some() => {
+            assert_eq!(
+                event.last_agent_message.as_deref(),
+                Some("Complete verified replacement.")
+            );
+            true
+        }
+        _ => false,
+    })
+    .await;
+
+    let connections = server.connections();
+    assert_eq!(
+        connections.iter().map(Vec::len).collect::<Vec<_>>(),
+        vec![4, 1]
+    );
+    let initial = connections[0][0].body_json();
+    let followup = connections[0][1].body_json();
+    assert_eq!(followup.get("previous_response_id"), None);
+    assert_eq!(followup["prompt_cache_key"], initial["prompt_cache_key"]);
+    let input = followup["input"].as_array().unwrap();
+    let frames = input
+        .iter()
+        .filter(|item| {
+            item["role"] == "developer"
+                && item["content"][0]["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("<completed_turn_review_context>"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(frames.len(), 1);
+    let frame = frames[0]["content"][0]["text"].as_str().unwrap();
+    assert!(frame.contains("Preserve the exact request and complete answer."));
+    assert!(frame.contains("Initial complete answer."));
+    assert!(frame.contains("self-contained final answer"));
+
+    for (index, response_id, call_id) in [(2, "followup-1", "plan-1"), (3, "followup-2", "plan-2")]
+    {
+        let request = connections[0][index].body_json();
+        assert_eq!(request["previous_response_id"], json!(response_id));
+        assert_eq!(
+            request["input"],
+            json!([{
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": "Plan updated",
+            }])
+        );
+    }
+    test.codex.submit(Op::Shutdown).await.unwrap();
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::ShutdownComplete)
+    })
+    .await;
     server.shutdown().await;
 }
 

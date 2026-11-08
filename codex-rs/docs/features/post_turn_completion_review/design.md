@@ -67,6 +67,8 @@ Task-stop also joins the task lifecycle guard, including when finalization alrea
 
 `ResponseItem::Message.id` is not serialized. Restart deduplication compares the exact host-owned developer item associated with the durable handoff, not an assumed persistent message ID. The main request only reinserts the advisory when compaction removed that item; it always re-establishes the replacement contract and exact request/candidate frame.
 
+That request-only frame is inserted after the last system/developer/user message or encrypted compaction item, before subsequent assistant reasoning and tools; an input without those boundaries uses index zero. Placement is derived from the prepared history, so replay and compaction need no additional anchor metadata. Appending the frame to the current tail on every tool round changes the preceding request instead of extending it and disables incremental WebSocket continuation. See the [prefix contract and historical regression](request_prefix.md).
+
 The active snapshot and review packet have bounded answer revisions. A clean automatic-review episode without steering or handoffs normally records five states: accepted input with owner, installing input, consumed input, completed candidate with automatic ticket, and finished review. Additional meaningful transitions remain recorded. The append-only rollout still grows with actual work; unchanged-snapshot suppression does not bound session storage or cumulative cost.
 
 ## Tickets And Recovery

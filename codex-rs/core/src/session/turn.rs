@@ -254,6 +254,23 @@ fn truncate_text_for_work_notes(text: &mut String, target_tokens: usize) -> bool
     true
 }
 
+pub(super) fn insert_completion_review_instructions(
+    input: &mut Vec<ResponseItem>,
+    instructions: ResponseItem,
+) {
+    // Keep request-only context before the work it governs, not at the moving
+    // transcript tail. Tool rounds must extend the preceding request verbatim.
+    let index = input
+        .iter()
+        .rposition(|item| {
+            matches!(item, ResponseItem::Message { role, .. }
+                if matches!(role.as_str(), "system" | "developer" | "user"))
+                || matches!(item, ResponseItem::Compaction { .. })
+        })
+        .map_or(0, |index| index + 1);
+    input.insert(index, instructions);
+}
+
 /// Takes a user message as input and runs a loop where, at each sampling request, the model
 /// replies with either:
 ///
@@ -688,7 +705,7 @@ async fn run_turn_inner(
                 }
             }
             request_context_tokens = estimate_item_token_count(&review_item);
-            sampling_request_input.push(review_item);
+            insert_completion_review_instructions(&mut sampling_request_input, review_item);
         }
 
         let sampling_request_input_messages = sampling_request_input

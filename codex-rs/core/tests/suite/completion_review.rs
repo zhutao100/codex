@@ -868,6 +868,8 @@ async fn review_followup_uses_reported_usage_instead_of_full_history_byte_estima
     .await;
     let captured = requests.requests();
     assert_eq!(captured.len(), 4);
+    let first_input = captured[2].input();
+    assert_eq!(&captured[3].input()[..first_input.len()], &first_input);
     for request in &captured[2..] {
         assert!(request.input().iter().any(|item| {
             item["role"] == "developer"
@@ -1037,6 +1039,10 @@ async fn review_followup_counts_request_context_once_near_budget(
     .await;
     let captured = requests.requests();
     assert_eq!(captured.len(), if restart { 5 } else { 4 } + prior_requests);
+    let first_input = captured[2 + prior_requests].input();
+    for request in &captured[3 + prior_requests..] {
+        assert_eq!(&request.input()[..first_input.len()], &first_input);
+    }
     for request in &captured[2 + prior_requests..] {
         assert!(request.input().iter().any(|item| {
             item["role"] == "developer"
@@ -1169,6 +1175,15 @@ async fn review_followup_budget_recovery_preserves_scope(
     if !select_larger_model {
         replies.push(compacted_answer());
     }
+    replies.push(sse(vec![
+        ev_response_created("recovered-followup"),
+        ev_function_call(
+            "recovery-plan",
+            "update_plan",
+            r#"{"plan":[{"step":"Verify the recovery","status":"completed"}]}"#,
+        ),
+        ev_completed("recovered-followup"),
+    ]));
     replies.push(answer("Recovered complete replacement."));
     let requests = mount_sse_sequence(&server, replies).await;
     let home = Arc::new(TempDir::new()?);
@@ -1253,7 +1268,7 @@ async fn review_followup_budget_recovery_preserves_scope(
     })
     .await;
     let captured = requests.requests();
-    assert_eq!(captured.len(), if select_larger_model { 3 } else { 4 });
+    assert_eq!(captured.len(), if select_larger_model { 4 } else { 5 });
     let request = captured.last().context("expected recovery request")?;
     assert_eq!(
         request.body_json()["model"],
@@ -1264,6 +1279,8 @@ async fn review_followup_budget_recovery_preserves_scope(
         }
     );
     let input = request.input();
+    let first_input = captured[captured.len() - 2].input();
+    assert_eq!(&input[..first_input.len()], &first_input);
     assert!(input.iter().any(|item| {
         item["role"] == "developer"
             && item["content"][0]["text"].as_str().is_some_and(|text| {

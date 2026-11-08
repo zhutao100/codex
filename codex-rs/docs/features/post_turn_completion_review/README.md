@@ -39,6 +39,8 @@ The historical reference may be incorrect or superseded. It must not compensate 
 
 Every review-derived main continuation receives a host-owned complete-answer contract, including after pause, restart and compaction. It must answer the active user request at the requested level of detail, preserve still-valid results, incorporate material corrections, remove superseded claims, and accurately state verification and limitations. This applies when all findings are rejected or no files change.
 
+The request-only contract and exact snapshots stay at the latest instruction/compaction boundary, before follow-up reasoning and tools. Ordinary tool rounds therefore preserve the preceding request prefix and remain eligible for incremental WebSocket continuation. See the [request-prefix contract and regression history](request_prefix.md); transport eligibility is not a guarantee of server cache hits.
+
 Main follow-ups remain bound to the candidate's project directory when claimed or resumed, including after restart. A different current working directory produces a recoverable error before task startup and leaves the continuation intact. Return to the completed task's directory to continue, or submit a new request for the new directory. Each replacement candidate records its actual completed-task directory, which the independent reviewer uses.
 
 The latest main answer remains streamed and copyable. Review evaluation/status stays separate; a clean review does not generate another synthesis answer or rewrite previous waterfall entries.
