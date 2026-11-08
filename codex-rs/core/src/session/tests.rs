@@ -88,6 +88,72 @@ fn assistant_message(text: &str) -> ResponseItem {
     }
 }
 
+#[test]
+fn request_context_usage_replays_atomic_prefixes_and_duplicate_token_events() {
+    let info = TokenUsageInfo::new_or_append(
+        &None,
+        &Some(TokenUsage {
+            input_tokens: 11_200,
+            total_tokens: 11_200,
+            ..Default::default()
+        }),
+        Some(24_000),
+    )
+    .unwrap();
+    let event = RolloutItem::EventMsg(EventMsg::TokenCount(TokenCountEvent {
+        info: Some(info.clone()),
+        rate_limits: None,
+    }));
+    let records = [
+        event.clone(),
+        RolloutItem::TokenUsageContext {
+            info: info.clone(),
+            request_context_tokens: 5_000,
+        },
+        event.clone(),
+        event.clone(),
+        RolloutItem::TokenUsageContext {
+            info: info.clone(),
+            request_context_tokens: 0,
+        },
+        event,
+    ];
+    for (prefix, context_tokens) in [(1, 0), (2, 5_000), (3, 5_000), (4, 5_000), (5, 0), (6, 0)] {
+        assert_eq!(
+            Session::last_token_usage_context_from_rollout(&records[..prefix]),
+            Some((info.clone(), context_tokens)),
+            "prefix {prefix}"
+        );
+    }
+    let records = [
+        records[1].clone(),
+        RolloutItem::Compacted(CompactedItem {
+            message: String::new(),
+            replacement_history: Some(Vec::new()),
+        }),
+    ];
+    assert_eq!(
+        Session::last_token_usage_context_from_rollout(&records),
+        Some((info.clone(), 0))
+    );
+    let mut changed = info.clone();
+    changed.last_token_usage.total_tokens += 1;
+    let records = [
+        RolloutItem::TokenUsageContext {
+            info,
+            request_context_tokens: 5_000,
+        },
+        RolloutItem::EventMsg(EventMsg::TokenCount(TokenCountEvent {
+            info: Some(changed.clone()),
+            rate_limits: None,
+        })),
+    ];
+    assert_eq!(
+        Session::last_token_usage_context_from_rollout(&records),
+        Some((changed, 0))
+    );
+}
+
 fn review_rollout_user_message(text: &str) -> ResponseItem {
     ResponseItem::Message {
         id: Some("review_rollout_user".to_string()),

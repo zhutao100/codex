@@ -398,6 +398,19 @@ async fn clean_for_continue_removes_abort_custom_and_dangling_records() -> Resul
     let review_state = RolloutItem::PostTurnCompletionReviewState(serde_json::to_value(
         crate::completion_review::CompletionReviewState::default(),
     )?);
+    let usage_context = RolloutItem::TokenUsageContext {
+        info: codex_protocol::protocol::TokenUsageInfo::new_or_append(
+            &None,
+            &Some(codex_protocol::protocol::TokenUsage {
+                input_tokens: 11_200,
+                total_tokens: 11_200,
+                ..Default::default()
+            }),
+            None,
+        )
+        .unwrap(),
+        request_context_tokens: 5_000,
+    };
     let lines = [
         rollout_json_line(RolloutItem::SessionMeta(SessionMetaLine {
             meta: SessionMeta {
@@ -450,6 +463,7 @@ async fn clean_for_continue_removes_abort_custom_and_dangling_records() -> Resul
             },
         ))),
         rollout_json_line(review_state.clone()),
+        rollout_json_line(usage_context.clone()),
         "{broken".to_string(),
     ];
     fs::write(&path, format!("{}\n", lines.join("\n")))?;
@@ -463,10 +477,10 @@ async fn clean_for_continue_removes_abort_custom_and_dangling_records() -> Resul
     assert!(!cleaned.contains("{broken"));
     let (items, _thread_id, parse_errors) = RolloutRecorder::load_rollout_items(&path).await?;
     assert_eq!(parse_errors, 0);
-    assert_eq!(items.len(), 3);
+    assert_eq!(items.len(), 4);
     assert_eq!(
-        serde_json::to_value(items.last())?,
-        serde_json::to_value(Some(&review_state))?
+        serde_json::to_value(&items[2..])?,
+        serde_json::to_value([review_state, usage_context])?
     );
     Ok(())
 }

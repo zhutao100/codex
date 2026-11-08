@@ -191,7 +191,9 @@ impl Session {
                 RolloutItem::PostTurnCompletionReviewState(value) => {
                     completion_review = CompletionReviewState::from_rollout(value);
                 }
-                RolloutItem::EventMsg(_) | RolloutItem::SessionMeta(_) => {
+                RolloutItem::EventMsg(_)
+                | RolloutItem::SessionMeta(_)
+                | RolloutItem::TokenUsageContext { .. } => {
                     awaiting_adjacent_post_compaction_context = false;
                 }
             }

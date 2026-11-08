@@ -631,25 +631,44 @@ async fn run_turn_inner(
         } else {
             None
         };
+        let mut request_context_tokens = 0;
         if let Some(instructions) = review_instructions {
             let base = sess.get_base_instructions_for_turn(&turn_context).await;
             // Reuse compaction's usage baseline plus unreported local items.
             // Re-estimating the entire transcript from bytes can drift far
             // above reported usage, especially with long reasoning histories.
-            let history_tokens = {
+            let (history_tokens, included_context_tokens) = {
                 let state = sess.state.lock().await;
                 state
                     .token_info()
                     .filter(|info| info.last_token_usage.total_tokens > 0)
-                    .map(|_| state.get_total_token_usage(state.server_reasoning_included()))
+                    .map(|_| {
+                        (
+                            state.get_total_token_usage(state.server_reasoning_included()),
+                            state.history.request_context_tokens(),
+                        )
+                    })
             }
-            .unwrap_or_else(|| estimate_work_notes_prompt_tokens(&sampling_request_input, &base));
+            .unwrap_or_else(|| {
+                (
+                    estimate_work_notes_prompt_tokens(&sampling_request_input, &base),
+                    0,
+                )
+            });
+            // Reported usage already includes the preceding request-only frame.
+            // Charge its replacement delta, not a second complete frame.
+            let estimate_prompt_tokens = |item: &ResponseItem| {
+                let context_tokens = estimate_item_token_count(item);
+                history_tokens
+                    .saturating_add(context_tokens.saturating_sub(included_context_tokens))
+                    .max(context_tokens)
+            };
             let target = turn_context
                 .model_context_window()
                 .unwrap_or_default()
                 .saturating_sub(8_192);
             let mut review_item: ResponseItem = DeveloperInstructions::new(instructions).into();
-            if history_tokens.saturating_add(estimate_item_token_count(&review_item)) > target {
+            if estimate_prompt_tokens(&review_item) > target {
                 let instructions = match sess.completion_review_main_instructions(false).await {
                     Ok(Some(instructions)) => instructions,
                     Ok(None) => return None,
@@ -660,8 +679,7 @@ async fn run_turn_inner(
                     }
                 };
                 review_item = DeveloperInstructions::new(instructions).into();
-                let prompt_tokens =
-                    history_tokens.saturating_add(estimate_item_token_count(&review_item));
+                let prompt_tokens = estimate_prompt_tokens(&review_item);
                 if prompt_tokens > target {
                     sess.send_event(&turn_context, EventMsg::Error(CodexErr::Fatal(
                         format!("Review follow-up context exceeds the main model's payload budget ({prompt_tokens} estimated tokens, {target} available). Compact or select a larger context window, then /continue. No truncated follow-up request was sent.")
@@ -669,6 +687,7 @@ async fn run_turn_inner(
                     return None;
                 }
             }
+            request_context_tokens = estimate_item_token_count(&review_item);
             sampling_request_input.push(review_item);
         }
 
@@ -698,6 +717,7 @@ async fn run_turn_inner(
             &mut client_session,
             turn_metadata_header.as_deref(),
             sampling_request_input,
+            request_context_tokens,
             tool_selection,
             tool_execution_mode,
             cancellation_token.child_token(),
@@ -1142,6 +1162,7 @@ async fn run_pre_turn_compact(
                 &mut client_session,
                 metadata.as_deref(),
                 input,
+                0,
                 SamplingRequestToolSelection {
                     explicit_app_paths: &[],
                     skill_name_counts_lower: &skill_name_counts_lower,
@@ -1441,6 +1462,7 @@ async fn run_sampling_request(
     client_session: &mut ModelClientSession,
     turn_metadata_header: Option<&str>,
     input: Vec<ResponseItem>,
+    request_context_tokens: i64,
     tool_selection: SamplingRequestToolSelection<'_>,
     tool_execution_mode: ToolCallExecutionMode,
     cancellation_token: CancellationToken,
@@ -1480,6 +1502,7 @@ async fn run_sampling_request(
             turn_metadata_header,
             Arc::clone(&turn_diff_tracker),
             &prompt,
+            request_context_tokens,
             tool_execution_mode,
             cancellation_token.child_token(),
         )
@@ -2165,6 +2188,7 @@ async fn try_run_sampling_request(
     turn_metadata_header: Option<&str>,
     turn_diff_tracker: SharedTurnDiffTracker,
     prompt: &Prompt,
+    request_context_tokens: i64,
     tool_execution_mode: ToolCallExecutionMode,
     cancellation_token: CancellationToken,
 ) -> CodexResult<SamplingRequestResult> {
@@ -2389,8 +2413,12 @@ async fn try_run_sampling_request(
                 if let Some(state) = plan_mode_state.as_mut() {
                     flush_proposed_plan_segments_all(&sess, &turn_context, state).await;
                 }
-                sess.update_token_usage_info(&turn_context, token_usage.as_ref())
-                    .await;
+                sess.update_token_usage_info_with_request_context(
+                    &turn_context,
+                    token_usage.as_ref(),
+                    request_context_tokens,
+                )
+                .await;
                 should_emit_turn_diff = true;
 
                 if let Some(false) = end_turn {

@@ -27,6 +27,7 @@ pub(crate) struct ContextManager {
     item_token_estimates: Vec<i64>,
     total_item_tokens: i64,
     token_info: Option<TokenUsageInfo>,
+    request_context_tokens: i64,
     reference_context_item: Option<TurnContextItem>,
 }
 
@@ -37,6 +38,7 @@ impl ContextManager {
             item_token_estimates: Vec::new(),
             total_item_tokens: 0,
             token_info: TokenUsageInfo::new_or_append(&None, &None, None),
+            request_context_tokens: 0,
             reference_context_item: None,
         }
     }
@@ -47,6 +49,15 @@ impl ContextManager {
 
     pub(crate) fn set_token_info(&mut self, info: Option<TokenUsageInfo>) {
         self.token_info = info;
+        self.request_context_tokens = 0;
+    }
+
+    pub(crate) fn request_context_tokens(&self) -> i64 {
+        self.request_context_tokens
+    }
+
+    pub(crate) fn set_request_context_tokens(&mut self, tokens: i64) {
+        self.request_context_tokens = tokens;
     }
 
     pub(crate) fn reference_context_item(&self) -> Option<TurnContextItem> {
@@ -58,6 +69,7 @@ impl ContextManager {
     }
 
     pub(crate) fn set_token_usage_full(&mut self, context_window: i64) {
+        self.request_context_tokens = 0;
         match &mut self.token_info {
             Some(info) => info.fill_to_context_window(context_window),
             None => {
@@ -239,6 +251,7 @@ impl ContextManager {
         usage: &TokenUsage,
         model_context_window: Option<i64>,
     ) {
+        self.request_context_tokens = 0;
         self.token_info = TokenUsageInfo::new_or_append(
             &self.token_info,
             &Some(usage.clone()),

@@ -872,9 +872,14 @@ impl Session {
 
                 // Seed usage info from the recorded rollout so UIs can show token counts
                 // immediately on resume/fork.
-                if let Some(info) = Self::last_token_info_from_rollout(&rollout_items) {
+                if let Some((info, request_context_tokens)) =
+                    Self::last_token_usage_context_from_rollout(&rollout_items)
+                {
                     let mut state = self.state.lock().await;
                     state.set_token_info(Some(info));
+                    state
+                        .history
+                        .set_request_context_tokens(request_context_tokens);
                 }
 
                 // Defer seeding the session's initial context until the first turn starts so
@@ -897,9 +902,14 @@ impl Session {
 
                 // Seed usage info from the recorded rollout so UIs can show token counts
                 // immediately on resume/fork.
-                if let Some(info) = Self::last_token_info_from_rollout(&rollout_items) {
+                if let Some((info, request_context_tokens)) =
+                    Self::last_token_usage_context_from_rollout(&rollout_items)
+                {
                     let mut state = self.state.lock().await;
                     state.set_token_info(Some(info));
+                    state
+                        .history
+                        .set_request_context_tokens(request_context_tokens);
                 }
 
                 // If persisting, persist all rollout items as-is (recorder filters)
@@ -929,11 +939,39 @@ impl Session {
         state.initial_context_seeded = reconstructed.reference_context_item.is_some();
     }
 
-    fn last_token_info_from_rollout(rollout_items: &[RolloutItem]) -> Option<TokenUsageInfo> {
-        rollout_items.iter().rev().find_map(|item| match item {
-            RolloutItem::EventMsg(EventMsg::TokenCount(ev)) => ev.info.clone(),
-            _ => None,
-        })
+    fn last_token_usage_context_from_rollout(
+        rollout_items: &[RolloutItem],
+    ) -> Option<(TokenUsageInfo, i64)> {
+        let mut baseline: Option<(TokenUsageInfo, i64)> = None;
+        for item in rollout_items {
+            match item {
+                RolloutItem::TokenUsageContext {
+                    info,
+                    request_context_tokens,
+                } => baseline = Some((info.clone(), (*request_context_tokens).max(0))),
+                RolloutItem::EventMsg(EventMsg::TokenCount(TokenCountEvent {
+                    info: Some(info),
+                    ..
+                })) => {
+                    // Repeated UI events retain the host baseline's accounting.
+                    // A different legacy/local baseline carries no known credit.
+                    if baseline
+                        .as_ref()
+                        .is_none_or(|(previous, _)| previous != info)
+                    {
+                        baseline = Some((info.clone(), 0));
+                    }
+                }
+                RolloutItem::Compacted(_)
+                | RolloutItem::EventMsg(EventMsg::ThreadRolledBack(_)) => {
+                    if let Some((_, request_context_tokens)) = baseline.as_mut() {
+                        *request_context_tokens = 0;
+                    }
+                }
+                _ => {}
+            }
+        }
+        baseline
     }
 
     pub(crate) async fn update_settings(
@@ -1975,20 +2013,56 @@ impl Session {
         turn_context: &TurnContext,
         token_usage: Option<&TokenUsage>,
     ) {
-        {
+        self.update_token_usage_info_with_request_context(turn_context, token_usage, 0)
+            .await;
+    }
+
+    pub(crate) async fn update_token_usage_info_with_request_context(
+        &self,
+        turn_context: &TurnContext,
+        token_usage: Option<&TokenUsage>,
+        request_context_tokens: i64,
+    ) {
+        let record_context = {
             let mut state = self.state.lock().await;
             if let Some(token_usage) = token_usage {
+                let previous_context_tokens = state.history.request_context_tokens();
                 state
                     .update_token_info_from_usage(token_usage, turn_context.model_context_window());
+                state
+                    .history
+                    .set_request_context_tokens(request_context_tokens);
+                previous_context_tokens != 0 || request_context_tokens != 0
+            } else {
+                false
             }
+        };
+        if record_context {
+            self.persist_token_usage_context().await;
         }
         self.send_token_count_event(turn_context).await;
     }
 
+    async fn persist_token_usage_context(&self) {
+        let item = {
+            let state = self.state.lock().await;
+            state
+                .token_info()
+                .map(|info| RolloutItem::TokenUsageContext {
+                    info,
+                    request_context_tokens: state.history.request_context_tokens(),
+                })
+        };
+        if let Some(item) = item {
+            self.persist_rollout_items(&[item]).await;
+        }
+    }
+
     pub(crate) async fn recompute_token_usage(&self, turn_context: &TurnContext) {
         let base_instructions = self.get_base_instructions().await;
-        {
+        let record_context = {
             let mut state = self.state.lock().await;
+            let record_context = state.history.request_context_tokens() != 0;
             let Some(estimated_total_tokens) = state
                 .history
                 .estimate_token_count_with_base_instructions(&base_instructions)
@@ -2022,6 +2096,10 @@ impl Session {
             }
 
             state.set_token_info(Some(info));
+            record_context
+        };
+        if record_context {
+            self.persist_token_usage_context().await;
         }
         self.send_token_count_event(turn_context).await;
     }
@@ -2076,9 +2154,14 @@ impl Session {
     }
 
     pub(crate) async fn set_total_tokens_full(&self, turn_context: &TurnContext) {
+        let mut record_context = false;
         if let Some(context_window) = turn_context.model_context_window() {
             let mut state = self.state.lock().await;
+            record_context = state.history.request_context_tokens() != 0;
             state.set_token_usage_full(context_window);
+        }
+        if record_context {
+            self.persist_token_usage_context().await;
         }
         self.send_token_count_event(turn_context).await;
     }

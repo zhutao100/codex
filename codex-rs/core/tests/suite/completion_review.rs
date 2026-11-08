@@ -924,6 +924,113 @@ async fn review_followup_rejects_reported_usage_over_budget() -> anyhow::Result<
     Ok(())
 }
 
+#[test_case::test_case(false, false; "live")]
+#[test_case::test_case(true, false; "after restart")]
+#[test_case::test_case(false, true; "reported overflow")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_followup_counts_request_context_once_near_budget(
+    restart: bool,
+    over_budget: bool,
+) -> anyhow::Result<()> {
+    skip_if_no_network_unless_localhost!(Ok(()));
+    let server = MockServer::start().await;
+    let initial = "Exact candidate detail.\n".repeat(800);
+    let mut replies = vec![
+        sse_response(sse(vec![
+            ev_response_created("initial"),
+            ev_assistant_message("candidate", &initial),
+            ev_completed_with_tokens("initial", 5_000),
+        ])),
+        sse_response(verdict("Verify and replace the complete answer.", true)),
+        sse_response(sse(vec![
+            ev_response_created("followup"),
+            ev_function_call(
+                "plan",
+                "update_plan",
+                r#"{"plan":[{"step":"Verify the correction","status":"completed"}]}"#,
+            ),
+            ev_completed_with_tokens("followup", if over_budget { 15_000 } else { 11_200 }),
+        ])),
+    ];
+    if restart {
+        replies.push(
+            sse_response(answer("Cancelled output must not be installed."))
+                .set_delay(std::time::Duration::from_secs(5)),
+        );
+    }
+    if !over_budget {
+        replies.push(sse_response(answer("Complete near-budget replacement.")));
+    }
+    let requests = mount_response_sequence(&server, replies).await;
+    let home = Arc::new(TempDir::new()?);
+    let codex = new_conversation_for_server(&server, home.clone(), configure_recovery_models).await;
+    submit_request(&codex, "Preserve the exact scope and candidate.").await;
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    codex.submit(Op::ReviewCompletedTurn).await?;
+    if over_budget {
+        wait_for_event(&codex, |event| match event {
+            EventMsg::Error(event) => {
+                assert!(event.message.contains("Review follow-up context exceeds"));
+                true
+            }
+            EventMsg::TurnComplete(event) if event.last_agent_message.is_some() => {
+                panic!("over-budget tool round must not complete")
+            }
+            _ => false,
+        })
+        .await;
+        wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+        assert_eq!(requests.requests().len(), 3);
+        codex.submit(Op::Shutdown).await?;
+        wait_for_event(&codex, |event| matches!(event, EventMsg::ShutdownComplete)).await;
+        server.verify().await;
+        return Ok(());
+    }
+    let active = if restart {
+        wait_for_captured_requests(&requests, 4).await;
+        codex.submit(Op::Pause).await?;
+        wait_for_event(&codex, |event| matches!(event, EventMsg::TurnPaused(_))).await;
+        let path = codex.rollout_path().context("expected rollout path")?;
+        codex.submit(Op::Shutdown).await?;
+        wait_for_event(&codex, |event| matches!(event, EventMsg::ShutdownComplete)).await;
+        let resumed =
+            resume_conversation_for_server(&server, home.clone(), path, configure_recovery_models)
+                .await;
+        resumed.submit(Op::Continue).await?;
+        resumed
+    } else {
+        codex
+    };
+    wait_for_event(&active, |event| match event {
+        EventMsg::Error(event) => panic!("near-budget follow-up failed: {}", event.message),
+        EventMsg::TurnComplete(event) if event.last_agent_message.is_some() => {
+            assert_eq!(
+                event.last_agent_message.as_deref(),
+                Some("Complete near-budget replacement.")
+            );
+            true
+        }
+        _ => false,
+    })
+    .await;
+    let captured = requests.requests();
+    assert_eq!(captured.len(), if restart { 5 } else { 4 });
+    for request in &captured[2..] {
+        assert!(request.input().iter().any(|item| {
+            item["role"] == "developer"
+                && item["content"][0]["text"].as_str().is_some_and(|text| {
+                    text.contains(&initial)
+                        && text.contains("Preserve the exact scope and candidate.")
+                        && text.contains("self-contained final answer")
+                })
+        }));
+    }
+    active.submit(Op::Shutdown).await?;
+    wait_for_event(&active, |event| matches!(event, EventMsg::ShutdownComplete)).await;
+    server.verify().await;
+    Ok(())
+}
+
 #[test_case::test_case(false, false, None; "compact")]
 #[test_case::test_case(true, false, None; "larger model")]
 #[test_case::test_case(true, true, None; "larger model after restart")]

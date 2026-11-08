@@ -221,6 +221,17 @@ async fn continuation_cleanup_preserves_notes_before_rejected_outputs_are_record
 #[tokio::test]
 async fn compaction_usage_counts_preserved_notes_once_after_installation_and_restart() {
     let (session, context) = make_session_and_context().await;
+    session
+        .update_token_usage_info_with_request_context(
+            &context,
+            Some(&TokenUsage {
+                input_tokens: 11_200,
+                total_tokens: 11_200,
+                ..Default::default()
+            }),
+            5_000,
+        )
+        .await;
     let notes = compact::preserved_work_notes_message(&"long exact notes\n".repeat(2_000));
     let replacement = vec![
         user_message("original task"),
@@ -248,6 +259,7 @@ async fn compaction_usage_counts_preserved_notes_once_after_installation_and_res
         .estimate_token_count_with_base_instructions(&session.get_base_instructions().await)
         .unwrap();
     assert_eq!(session.get_total_token_usage().await, expected);
+    assert_eq!(session.clone_history().await.request_context_tokens(), 0);
     let info = session.state.lock().await.token_info();
     let (resumed, resumed_context) = make_session_and_context().await;
     resumed
@@ -266,6 +278,7 @@ async fn compaction_usage_counts_preserved_notes_once_after_installation_and_res
         .await;
     assert_eq!(resumed.clone_history().await.raw_items(), replacement);
     assert_eq!(resumed.get_total_token_usage().await, expected);
+    assert_eq!(resumed.clone_history().await.request_context_tokens(), 0);
     let next = user_message("new input");
     resumed
         .record_into_history(std::slice::from_ref(&next), &resumed_context)

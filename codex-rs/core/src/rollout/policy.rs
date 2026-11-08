@@ -12,6 +12,7 @@ pub(crate) fn is_persisted_response_item(item: &RolloutItem) -> bool {
         RolloutItem::Compacted(_)
         | RolloutItem::TurnContext(_)
         | RolloutItem::SessionMeta(_)
+        | RolloutItem::TokenUsageContext { .. }
         | RolloutItem::PostTurnCompletionReviewState(_) => true,
     }
 }

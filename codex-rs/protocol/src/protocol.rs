@@ -1940,6 +1940,12 @@ pub enum RolloutItem {
     TurnContext(TurnContextItem),
     /// Versioned host-owned completion-review metadata, not conversation input.
     PostTurnCompletionReviewState(Value),
+    /// Host-owned usage baseline accounting, not conversation input or a UI event.
+    TokenUsageContext {
+        info: TokenUsageInfo,
+        #[ts(type = "number")]
+        request_context_tokens: i64,
+    },
     EventMsg(EventMsg),
 }
 

@@ -495,6 +495,9 @@ impl RolloutRecorder {
                     RolloutItem::PostTurnCompletionReviewState(item) => {
                         items.push(RolloutItem::PostTurnCompletionReviewState(item));
                     }
+                    item @ RolloutItem::TokenUsageContext { .. } => {
+                        items.push(item);
+                    }
                     RolloutItem::EventMsg(ev) => {
                         if is_custom_control_event(&ev) {
                             continue;
@@ -560,7 +563,11 @@ impl RolloutRecorder {
         while tail > 0 {
             tail -= 1;
             let item = &kept_lines[tail].1;
-            if matches!(item, RolloutItem::PostTurnCompletionReviewState(_)) {
+            if matches!(
+                item,
+                RolloutItem::PostTurnCompletionReviewState(_)
+                    | RolloutItem::TokenUsageContext { .. }
+            ) {
                 continue;
             }
             if remove_interrupted_abort && is_interrupted_abort_signal(item) {
@@ -579,6 +586,7 @@ impl RolloutRecorder {
                         item,
                         RolloutItem::ResponseItem(ResponseItem::GhostSnapshot { .. })
                             | RolloutItem::PostTurnCompletionReviewState(_)
+                            | RolloutItem::TokenUsageContext { .. }
                     )
                 })
                 .collect::<Vec<_>>();
