@@ -27,7 +27,7 @@ Source references: upstream `core/src/compact_remote_v2.rs`, `compact_remote_v2_
 |An output helper independently re-enabled plan parsing during capture.|Pass sampling's parsing decision through output handling; verify standalone multiline plan tags in live and replayed notes.|
 |Failed local summarization appended uncommitted output after completed notes and blocked recovery.|Buffer output per attempt and construct the summary only from a completed attempt, without mutating live source history.|
 |64,000 retained tokens can exceed smaller windows once fixed context is added.|Use it as a ceiling; reserve all known fixed costs and apply the destination model's limits on downshift.|
-|Recomputed usage counted preserved notes twice.|Store a baseline at the last model item, excluding adjustments subsequently added by live/replayed context accounting.|
+|Recomputed usage counted preserved notes twice.|Store a full-history baseline with its covered-item count, so notes are included once during live accounting and replay.|
 |A valid encrypted-only replacement could not continue after restart.|Use the existing inline-compaction epoch and tail-completion semantics; fix dangling-call cleanup to respect the same epoch.|
 |Clearing unfinished WebSocket tracking could make a bad socket cacheable.|Reset after successful installation; discard an unfinished notes socket when local/legacy compaction completed through a different request. Preserve completed physical connections.|
 |The replacement writer alone was not cancellation-safe.|Shield installation in a short child task and join its guard from task-stop before pause/abort state is built.|
@@ -68,7 +68,7 @@ Output fitting rewrites only a contiguous supported trailing output suffix, igno
 
 The persistence regression blocks a real recorder after memory replacement, invokes actual pause/interrupt handling, and waits for its grace timeout to abort the parent. Task-stop must remain blocked until the installer completes. The test reads the file without an extra flush, compares the exact replacement/reference pair and event ordering, and replays it against live history.
 
-Recomputation stores the estimated baseline at the last model-generated item, subtracting the local-tail and reasoning adjustments already handled by `get_total_token_usage`. Preserved notes after the encrypted summary are therefore added once. Existing `TokenCount` records restore the same baseline after restart, and newly appended input adds its cost once; no new token-info format is needed.
+Recomputation stores the full estimated baseline with the installed history length in the existing host-only `TokenUsageContext` record. Preserved notes after the encrypted summary are already covered; only subsequently appended items are added by `get_total_token_usage`. Ordered replay restores that boundary after restart. Legacy records without an explicit boundary retain the last-model-item approximation at the record's position, preserving their older notes-excluding baseline. Public `TokenCount` payloads are unchanged.
 
 The installer gathers current undo snapshots while holding the same guard as the background snapshot writer. A snapshot recorded during the remote request enters the replacement; a writer acquiring the guard after installation appends after that checkpoint.
 

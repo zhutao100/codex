@@ -99,17 +99,15 @@ impl SessionState {
         self.history.replace(items);
     }
 
-    pub(crate) fn set_token_info(&mut self, info: Option<TokenUsageInfo>) {
-        self.history.set_token_info(info);
-    }
-
     // Token/rate limit helpers
     pub(crate) fn update_token_info_from_usage(
         &mut self,
         usage: &TokenUsage,
         model_context_window: Option<i64>,
+        input_item_count: usize,
     ) {
-        self.history.update_token_info(usage, model_context_window);
+        self.history
+            .update_token_info(usage, model_context_window, input_item_count);
     }
 
     pub(crate) fn token_info(&self) -> Option<TokenUsageInfo> {

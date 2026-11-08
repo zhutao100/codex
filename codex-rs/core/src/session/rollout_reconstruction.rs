@@ -5,10 +5,19 @@ use crate::completion_review::ReviewHandoffDisposition;
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ReconstructedRollout {
     pub(crate) history: Vec<ResponseItem>,
+    pub(crate) token_usage: Option<ReconstructedTokenUsage>,
     pub(crate) reference_context_item: Option<TurnContextItem>,
     pub(crate) previous_turn_settings: Option<PreviousTurnSettings>,
     pub(crate) pending_continuation: Option<PendingContinuation>,
     pub(crate) completion_review: Option<CompletionReviewState>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ReconstructedTokenUsage {
+    pub(crate) info: TokenUsageInfo,
+    pub(crate) request_context_tokens: i64,
+    pub(crate) server_reasoning_included: bool,
+    pub(crate) last_usage_item_count: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -96,6 +105,7 @@ impl Session {
         rollout_items: &[RolloutItem],
     ) -> ReconstructedRollout {
         let mut history = ContextManager::new();
+        let mut server_reasoning_included = false;
         let mut current_metadata = ReplayMetadata::default();
         let mut current_epoch = ReplayEpoch::default();
         let mut pending_context: Option<TurnContextItem> = None;
@@ -191,14 +201,48 @@ impl Session {
                 RolloutItem::PostTurnCompletionReviewState(value) => {
                     completion_review = CompletionReviewState::from_rollout(value);
                 }
-                RolloutItem::EventMsg(_)
-                | RolloutItem::SessionMeta(_)
-                | RolloutItem::TokenUsageContext { .. } => {
+                RolloutItem::TokenUsageContext {
+                    info,
+                    request_context_tokens,
+                    server_reasoning_included: included,
+                    last_usage_item_count,
+                } => {
+                    awaiting_adjacent_post_compaction_context = false;
+                    if let Some(covered_item_count) = last_usage_item_count {
+                        // Continuation cleanup can remove a previously covered suffix.
+                        history.set_token_info_with_boundary(
+                            Some(info.clone()),
+                            (*covered_item_count).min(history.raw_items().len()),
+                        );
+                    } else {
+                        history.set_token_info(Some(info.clone()));
+                    }
+                    history.set_request_context_tokens((*request_context_tokens).max(0));
+                    server_reasoning_included = *included;
+                }
+                RolloutItem::EventMsg(EventMsg::TokenCount(TokenCountEvent {
+                    info: Some(info),
+                    ..
+                })) => {
+                    awaiting_adjacent_post_compaction_context = false;
+                    // Repeated UI events must not cover later, unreported output.
+                    if history.token_info().as_ref() != Some(info) {
+                        history.set_token_info(Some(info.clone()));
+                        server_reasoning_included = false;
+                    }
+                }
+                RolloutItem::EventMsg(_) | RolloutItem::SessionMeta(_) => {
                     awaiting_adjacent_post_compaction_context = false;
                 }
             }
         }
 
+        let token_usage = history.token_info().map(|info| ReconstructedTokenUsage {
+            info,
+            request_context_tokens: history.request_context_tokens(),
+            server_reasoning_included,
+            last_usage_item_count: history.last_usage_item_count(),
+        });
         let history = history.raw_items().to_vec();
         let pending_notes = !matches!(compact::pending_work_notes(&history), Ok(None));
         let suppress_compaction_continuation = latest_compaction_tail_kind
@@ -309,6 +353,7 @@ impl Session {
 
         ReconstructedRollout {
             history,
+            token_usage,
             reference_context_item: current_metadata.reference_context_item,
             previous_turn_settings: current_metadata.previous_turn_settings,
             pending_continuation,

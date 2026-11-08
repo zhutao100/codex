@@ -280,6 +280,9 @@ async fn remote_compact_trims_function_call_history_to_fit_context_window() -> R
                 config.features.enable(Feature::RemoteCompaction);
                 config.features.disable(Feature::RemoteCompactionV2);
                 config.model_context_window = Some(2_000);
+                // Exercise manual output trimming, not automatic compaction
+                // of the fixture's intentionally unreported history.
+                config.model_auto_compact_token_limit = Some(200_000);
             }),
     )
     .await?;

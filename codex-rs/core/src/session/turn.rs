@@ -1467,6 +1467,7 @@ async fn run_sampling_request(
     tool_execution_mode: ToolCallExecutionMode,
     cancellation_token: CancellationToken,
 ) -> CodexResult<SamplingRequestResult> {
+    let input_item_count = sess.state.lock().await.history.raw_items().len();
     let router = sampling_tool_router(
         &sess,
         &turn_context,
@@ -1503,6 +1504,7 @@ async fn run_sampling_request(
             Arc::clone(&turn_diff_tracker),
             &prompt,
             request_context_tokens,
+            input_item_count,
             tool_execution_mode,
             cancellation_token.child_token(),
         )
@@ -2189,6 +2191,7 @@ async fn try_run_sampling_request(
     turn_diff_tracker: SharedTurnDiffTracker,
     prompt: &Prompt,
     request_context_tokens: i64,
+    input_item_count: usize,
     tool_execution_mode: ToolCallExecutionMode,
     cancellation_token: CancellationToken,
 ) -> CodexResult<SamplingRequestResult> {
@@ -2419,6 +2422,7 @@ async fn try_run_sampling_request(
                     token_usage.as_ref(),
                     request_context_tokens,
                     server_reasoning_included,
+                    input_item_count,
                 )
                 .await;
                 should_emit_turn_diff = true;

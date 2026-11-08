@@ -1,6 +1,6 @@
 # Streaming remote compaction
 
-Implemented on `custom-0.98.0`. [Design and backport decisions](design.md). [Validation and deployment evidence](validation.md).
+Streaming Responses compaction. [Design and backport decisions](design.md). [Validation and deployment evidence](validation.md).
 
 ## Selection
 
@@ -47,7 +47,7 @@ Disabling only `remote_compaction_v2` selects the legacy endpoint and can reprod
 - Preserve undo snapshots, including snapshots arriving during notes capture, the compaction stream or interrupted tool work. Snapshot recording and replacement installation share a guard. Snapshots remain absent from model requests.
 - Install canonical context before the last real user, then the last plaintext summary, then the encrypted summary, or append it if none exists. Image-only input is a real user anchor.
 - Append notes after the encrypted summary and snapshots after notes. Persist exactly this vector plus the appropriate adjacent reference context.
-- Recomputed usage stores the model-item baseline; local tail items, including notes, are added once during live accounting and replay.
+- Recomputed usage covers the entire installed history, including notes, and persists that covered-item count with the baseline. Live accounting and replay add only later unreported items.
 - Cancellation before installation preserves live history. Once installation starts, task-stop waits for its memory/persistence/completion boundary.
 - Clear logical WebSocket continuation after installation; reuse only healthy physical connections. Unfinished requests remain marked unfinished on failure or cancellation.
 - Replay uses inline-compaction provenance to infer pending work even when retention removes all real users. Pending captures keep the resume-selected destination; installed inline replacements use their persisted reference model. Later completion and rollback suppress continuation inference.

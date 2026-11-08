@@ -27,6 +27,8 @@ pub(crate) struct ContextManager {
     item_token_estimates: Vec<i64>,
     total_item_tokens: i64,
     token_info: Option<TokenUsageInfo>,
+    /// Items at this index and later are not covered by the stored usage baseline.
+    last_usage_item_count: usize,
     request_context_tokens: i64,
     reference_context_item: Option<TurnContextItem>,
 }
@@ -38,6 +40,7 @@ impl ContextManager {
             item_token_estimates: Vec::new(),
             total_item_tokens: 0,
             token_info: TokenUsageInfo::new_or_append(&None, &None, None),
+            last_usage_item_count: 0,
             request_context_tokens: 0,
             reference_context_item: None,
         }
@@ -48,8 +51,29 @@ impl ContextManager {
     }
 
     pub(crate) fn set_token_info(&mut self, info: Option<TokenUsageInfo>) {
+        let covered_item_count = if info
+            .as_ref()
+            .is_some_and(|info| info.last_token_usage.total_tokens > 0)
+        {
+            self.last_model_item_count().unwrap_or(self.items.len())
+        } else {
+            0
+        };
+        self.set_token_info_with_boundary(info, covered_item_count);
+    }
+
+    pub(crate) fn set_token_info_with_boundary(
+        &mut self,
+        info: Option<TokenUsageInfo>,
+        covered_item_count: usize,
+    ) {
         self.token_info = info;
+        self.last_usage_item_count = covered_item_count;
         self.request_context_tokens = 0;
+    }
+
+    pub(crate) fn last_usage_item_count(&self) -> usize {
+        self.last_usage_item_count
     }
 
     pub(crate) fn request_context_tokens(&self) -> i64 {
@@ -69,6 +93,7 @@ impl ContextManager {
     }
 
     pub(crate) fn set_token_usage_full(&mut self, context_window: i64) {
+        self.last_usage_item_count = self.items.len();
         self.request_context_tokens = 0;
         match &mut self.token_info {
             Some(info) => info.fill_to_context_window(context_window),
@@ -181,6 +206,18 @@ impl ContextManager {
 
     pub(crate) fn replace(&mut self, items: Vec<ResponseItem>) {
         self.replace_items(items);
+        self.set_token_info(self.token_info.clone());
+    }
+
+    pub(crate) fn replace_for_continuation(&mut self, items: Vec<ResponseItem>) {
+        let unchanged_prefix = self
+            .items
+            .iter()
+            .zip(&items)
+            .take_while(|(old, new)| old == new)
+            .count();
+        self.last_usage_item_count = self.last_usage_item_count.min(unchanged_prefix);
+        self.replace_items(items);
     }
 
     /// Replace image content in the last turn if it originated from a tool output.
@@ -250,13 +287,18 @@ impl ContextManager {
         &mut self,
         usage: &TokenUsage,
         model_context_window: Option<i64>,
+        input_item_count: usize,
     ) {
-        self.request_context_tokens = 0;
-        self.token_info = TokenUsageInfo::new_or_append(
+        let info = TokenUsageInfo::new_or_append(
             &self.token_info,
             &Some(usage.clone()),
             model_context_window,
         );
+        let covered_item_count = self
+            .last_model_item_count()
+            .unwrap_or(0)
+            .max(input_item_count);
+        self.set_token_info_with_boundary(info, covered_item_count);
     }
 
     fn get_non_last_reasoning_items_tokens(&self) -> i64 {
@@ -268,7 +310,8 @@ impl ContextManager {
         self.items
             .iter()
             .zip(&self.item_token_estimates)
-            .take(last_user_index)
+            // Unreported reasoning is already charged in the tail estimate.
+            .take(last_user_index.min(self.last_usage_item_count))
             .filter(|item| {
                 matches!(
                     item.0,
@@ -281,13 +324,11 @@ impl ContextManager {
             .fold(0i64, |acc, (_, estimate)| acc.saturating_add(*estimate))
     }
 
-    fn items_after_last_model_generated_item(&self) -> &[ResponseItem] {
-        let start = self
-            .items
+    fn last_model_item_count(&self) -> Option<usize> {
+        self.items
             .iter()
             .rposition(is_model_generated_item)
-            .map_or(self.items.len(), |index| index.saturating_add(1));
-        &self.items[start..]
+            .map(|index| index + 1)
     }
 
     /// When true, the server already accounted for past reasoning tokens and
@@ -302,17 +343,14 @@ impl ContextManager {
     }
 
     pub(crate) fn get_unreported_token_usage(&self, server_reasoning_included: bool) -> i64 {
-        let after_last_model_generated_start =
-            self.items.len() - self.items_after_last_model_generated_item().len();
-        let items_after_last_model_generated_tokens = self.item_token_estimates
-            [after_last_model_generated_start..]
+        let unreported_tokens = self.item_token_estimates[self.last_usage_item_count..]
             .iter()
             .fold(0i64, |acc, estimate| acc.saturating_add(*estimate));
         if server_reasoning_included {
-            items_after_last_model_generated_tokens
+            unreported_tokens
         } else {
             self.get_non_last_reasoning_items_tokens()
-                .saturating_add(items_after_last_model_generated_tokens)
+                .saturating_add(unreported_tokens)
         }
     }
 
@@ -346,6 +384,7 @@ impl ContextManager {
     #[cfg(test)]
     fn normalize_history(&mut self) {
         normalize::normalize_history(&mut self.items);
+        self.last_usage_item_count = 0;
         self.rebuild_token_estimates();
     }
 
@@ -359,16 +398,16 @@ impl ContextManager {
     #[cfg(test)]
     fn pop_item(&mut self) -> Option<ResponseItem> {
         let index = self.items.len().checked_sub(1)?;
-        let token_estimate = self.item_token_estimates.remove(index);
-        let item = self.items.remove(index);
-        self.total_item_tokens = self.total_item_tokens.saturating_sub(token_estimate);
-        Some(item)
+        Some(self.remove_item_at(index))
     }
 
     fn remove_item_at(&mut self, index: usize) -> ResponseItem {
         let token_estimate = self.item_token_estimates.remove(index);
         let item = self.items.remove(index);
         self.total_item_tokens = self.total_item_tokens.saturating_sub(token_estimate);
+        if index < self.last_usage_item_count {
+            self.last_usage_item_count -= 1;
+        }
         item
     }
 
@@ -386,6 +425,8 @@ impl ContextManager {
     fn truncate_items(&mut self, len: usize) {
         self.items.truncate(len);
         self.item_token_estimates.truncate(len);
+        self.last_usage_item_count = self.last_usage_item_count.min(self.items.len());
+        self.request_context_tokens = 0;
         self.total_item_tokens = self
             .item_token_estimates
             .iter()

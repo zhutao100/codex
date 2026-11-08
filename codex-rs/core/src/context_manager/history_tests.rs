@@ -185,43 +185,80 @@ fn non_last_reasoning_tokens_return_zero_when_no_user_messages() {
 
 #[test]
 fn non_last_reasoning_tokens_ignore_entries_after_last_user() {
-    let history = create_history_with_items(vec![
+    let mut history = create_history_with_items(vec![
         reasoning_with_encrypted_content(900),
         user_msg("first"),
         reasoning_with_encrypted_content(1_000),
         user_msg("second"),
         reasoning_with_encrypted_content(2_000),
     ]);
+    history.last_usage_item_count = history.raw_items().len();
     // first: (900 * 0.75 - 650) / 4 = 6.25 tokens
     // second: (1000 * 0.75 - 650) / 4 = 25 tokens
     // first + second = 62.5
     assert_eq!(history.get_non_last_reasoning_items_tokens(), 32);
 }
 
-#[test]
-fn items_after_last_model_generated_item_include_local_tail() {
-    let assistant = assistant_msg("assistant boundary");
-    let user = user_msg("next user message");
-    let output = custom_tool_call_output("call-tail", "tail custom output");
-    let history = create_history_with_items(vec![assistant, user.clone(), output.clone()]);
-    let expected = vec![user, output];
-
+#[test_case::test_case(false; "missing usage")]
+#[test_case::test_case(true; "zero usage")]
+fn usage_without_a_baseline_counts_initial_input(reported_zero: bool) {
+    let item = user_msg("initial user message");
+    let mut history = create_history_with_items(vec![item.clone()]);
+    if reported_zero {
+        history.set_token_info(TokenUsageInfo::new_or_append(
+            &None,
+            &Some(TokenUsage::default()),
+            None,
+        ));
+    }
     assert_eq!(
-        history.items_after_last_model_generated_item(),
-        expected.as_slice()
+        history.get_total_token_usage(false),
+        estimate_item_token_count(&item)
     );
 }
 
-#[test]
-fn items_after_last_model_generated_item_exclude_model_tail() {
-    let history = create_history_with_items(vec![ResponseItem::FunctionCall {
-        id: None,
-        name: "model-generated".to_string(),
-        arguments: "{}".to_string(),
-        call_id: "call-tail".to_string(),
-    }]);
+#[test_case::test_case(false; "reasoning excluded")]
+#[test_case::test_case(true; "reasoning included")]
+fn usage_boundary_keeps_unreported_model_output(includes_reasoning: bool) {
+    let mut history = create_history_with_items(vec![assistant_msg("covered")]);
+    history.update_token_info(
+        &TokenUsage {
+            total_tokens: 100,
+            ..Default::default()
+        },
+        None,
+        0,
+    );
+    let tail = vec![
+        user_msg("next request"),
+        reasoning_with_encrypted_content(2_000),
+        user_msg("later boundary"),
+    ];
+    history.record_items(&tail, TruncationPolicy::Tokens(10_000));
+    assert_eq!(
+        history.get_total_token_usage(includes_reasoning),
+        100 + tail.iter().map(estimate_item_token_count).sum::<i64>()
+    );
 
-    assert!(history.items_after_last_model_generated_item().is_empty());
+    // A completed response with no output still covers its submitted input.
+    let input_item_count = history.raw_items().len();
+    history.update_token_info(
+        &TokenUsage {
+            total_tokens: 200,
+            ..Default::default()
+        },
+        None,
+        input_item_count,
+    );
+    let earlier_reasoning = if includes_reasoning {
+        0
+    } else {
+        estimate_item_token_count(&tail[1])
+    };
+    assert_eq!(
+        history.get_total_token_usage(includes_reasoning),
+        200 + earlier_reasoning
+    );
 }
 
 #[test]
@@ -241,12 +278,45 @@ fn total_token_usage_includes_all_items_after_last_model_generated_item() {
             ..Default::default()
         },
         None,
+        2,
     );
 
     assert_eq!(
         history.get_total_token_usage(true),
         100 + estimate_item_token_count(&trailing_user)
             + estimate_item_token_count(&trailing_output)
+    );
+}
+
+#[test]
+fn continuation_cleanup_preserves_usage_boundary_before_unreported_reasoning() {
+    let covered = assistant_msg("covered");
+    let mut history = create_history_with_items(vec![covered.clone()]);
+    history.update_token_info(
+        &TokenUsage {
+            total_tokens: 100,
+            ..Default::default()
+        },
+        None,
+        0,
+    );
+    let reasoning = reasoning_with_encrypted_content(2_000);
+    let dangling = ResponseItem::FunctionCall {
+        id: None,
+        name: "tool".into(),
+        arguments: "{}".into(),
+        call_id: "unfinished".into(),
+    };
+    history.record_items([&reasoning, &dangling], TruncationPolicy::Tokens(10_000));
+    history.replace_for_continuation(vec![covered, reasoning.clone()]);
+    assert_eq!(
+        history.get_total_token_usage(true),
+        100 + estimate_item_token_count(&reasoning)
+    );
+    history.remove_first_item();
+    assert_eq!(
+        history.get_total_token_usage(true),
+        100 + estimate_item_token_count(&reasoning)
     );
 }
 

@@ -1056,6 +1056,97 @@ async fn review_followup_counts_request_context_once_near_budget(
     Ok(())
 }
 
+#[test_case::test_case(false, false; "missing usage live")]
+#[test_case::test_case(false, true; "missing usage after restart")]
+#[test_case::test_case(true, false; "failed stream live")]
+#[test_case::test_case(true, true; "failed stream after restart")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_followup_rejects_unreported_model_output(
+    failed_stream: bool,
+    restart: bool,
+) -> anyhow::Result<()> {
+    skip_if_no_network_unless_localhost!(Ok(()));
+    let server = MockServer::start().await;
+    let mut unreported = vec![
+        ev_response_created("unreported"),
+        ev_reasoning_item("unreported-reasoning", &[], &[&"x".repeat(96_000)]),
+    ];
+    if !failed_stream {
+        unreported.extend([
+            ev_function_call(
+                "plan",
+                "update_plan",
+                r#"{"plan":[{"step":"Verify","status":"completed"}]}"#,
+            ),
+            serde_json::json!({
+                "type": "response.completed",
+                "response": {"id": "without-usage"},
+            }),
+        ]);
+    }
+    let requests = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_assistant_message("candidate", "Exact completed candidate."),
+                ev_completed_with_tokens("initial", 4_000),
+            ]),
+            verdict("Verify and replace the complete answer.", true),
+            sse(unreported),
+        ],
+    )
+    .await;
+    let configure = |config: &mut Config| {
+        configure_recovery_models(config);
+        config.model_provider.stream_max_retries = Some(0);
+    };
+    let home = Arc::new(TempDir::new()?);
+    let codex = new_conversation_for_server(&server, home.clone(), configure).await;
+    submit_request(&codex, "Preserve the exact scope.").await;
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    codex.submit(Op::ReviewCompletedTurn).await?;
+    if failed_stream {
+        wait_for_event(&codex, |event| matches!(event, EventMsg::Error(_))).await;
+        wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+        codex.submit(Op::Continue).await?;
+    }
+    wait_for_followup_budget_rejection(&codex).await;
+    assert_eq!(requests.requests().len(), 3);
+
+    let active = if restart {
+        let path = codex.rollout_path().context("expected rollout path")?;
+        codex.submit(Op::Shutdown).await?;
+        wait_for_event(&codex, |event| matches!(event, EventMsg::ShutdownComplete)).await;
+        let resumed = resume_conversation_for_server(&server, home, path, configure).await;
+        resumed.submit(Op::Continue).await?;
+        wait_for_followup_budget_rejection(&resumed).await;
+        assert_eq!(requests.requests().len(), 3);
+        resumed
+    } else {
+        codex
+    };
+    active.submit(Op::Shutdown).await?;
+    wait_for_event(&active, |event| matches!(event, EventMsg::ShutdownComplete)).await;
+    server.verify().await;
+    Ok(())
+}
+
+async fn wait_for_followup_budget_rejection(codex: &CodexThread) {
+    wait_for_event(codex, |event| match event {
+        EventMsg::Error(event) => {
+            assert!(event.message.contains("Review follow-up context exceeds"));
+            assert!(event.message.contains("14608 available"));
+            true
+        }
+        EventMsg::TurnComplete(event) if event.last_agent_message.is_some() => {
+            panic!("unreported overflow must not complete")
+        }
+        _ => false,
+    })
+    .await;
+    wait_for_event(codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+}
+
 #[test_case::test_case(false, false, None; "compact")]
 #[test_case::test_case(true, false, None; "larger model")]
 #[test_case::test_case(true, true, None; "larger model after restart")]

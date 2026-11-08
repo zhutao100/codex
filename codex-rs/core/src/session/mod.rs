@@ -870,19 +870,6 @@ impl Session {
 
                 self.replace_with_reconstructed_rollout(reconstructed).await;
 
-                // Seed usage info from the recorded rollout so UIs can show token counts
-                // immediately on resume/fork.
-                if let Some((info, request_context_tokens, server_reasoning_included)) =
-                    Self::last_token_usage_context_from_rollout(&rollout_items)
-                {
-                    let mut state = self.state.lock().await;
-                    state.set_token_info(Some(info));
-                    state
-                        .history
-                        .set_request_context_tokens(request_context_tokens);
-                    state.set_server_reasoning_included(server_reasoning_included);
-                }
-
                 // Defer seeding the session's initial context until the first turn starts so
                 // turn/start overrides can be merged before we write to the rollout.
                 self.flush_rollout().await;
@@ -901,19 +888,6 @@ impl Session {
                     state.pending_continuation = None;
                 }
 
-                // Seed usage info from the recorded rollout so UIs can show token counts
-                // immediately on resume/fork.
-                if let Some((info, request_context_tokens, server_reasoning_included)) =
-                    Self::last_token_usage_context_from_rollout(&rollout_items)
-                {
-                    let mut state = self.state.lock().await;
-                    state.set_token_info(Some(info));
-                    state
-                        .history
-                        .set_request_context_tokens(request_context_tokens);
-                    state.set_server_reasoning_included(server_reasoning_included);
-                }
-
                 // If persisting, persist all rollout items as-is (recorder filters)
                 if !rollout_items.is_empty() {
                     self.persist_rollout_items(&rollout_items).await;
@@ -930,6 +904,18 @@ impl Session {
     async fn replace_with_reconstructed_rollout(&self, reconstructed: ReconstructedRollout) {
         let mut state = self.state.lock().await;
         state.replace_history(reconstructed.history);
+        if let Some(usage) = reconstructed.token_usage {
+            state
+                .history
+                .set_token_info_with_boundary(Some(usage.info), usage.last_usage_item_count);
+            state
+                .history
+                .set_request_context_tokens(usage.request_context_tokens);
+            state.set_server_reasoning_included(usage.server_reasoning_included);
+        } else {
+            state.history.set_token_info_with_boundary(None, 0);
+            state.set_server_reasoning_included(false);
+        }
         state
             .history
             .set_reference_context_item(reconstructed.reference_context_item.clone());
@@ -939,48 +925,6 @@ impl Session {
             .completion_review
             .unwrap_or_else(CompletionReviewState::for_unknown_history);
         state.initial_context_seeded = reconstructed.reference_context_item.is_some();
-    }
-
-    fn last_token_usage_context_from_rollout(
-        rollout_items: &[RolloutItem],
-    ) -> Option<(TokenUsageInfo, i64, bool)> {
-        let mut baseline: Option<(TokenUsageInfo, i64, bool)> = None;
-        for item in rollout_items {
-            match item {
-                RolloutItem::TokenUsageContext {
-                    info,
-                    request_context_tokens,
-                    server_reasoning_included,
-                } => {
-                    baseline = Some((
-                        info.clone(),
-                        (*request_context_tokens).max(0),
-                        *server_reasoning_included,
-                    ));
-                }
-                RolloutItem::EventMsg(EventMsg::TokenCount(TokenCountEvent {
-                    info: Some(info),
-                    ..
-                })) => {
-                    // Repeated UI events retain the host baseline's accounting.
-                    // A different legacy/local baseline carries no known credit.
-                    if baseline
-                        .as_ref()
-                        .is_none_or(|(previous, _, _)| previous != info)
-                    {
-                        baseline = Some((info.clone(), 0, false));
-                    }
-                }
-                RolloutItem::Compacted(_)
-                | RolloutItem::EventMsg(EventMsg::ThreadRolledBack(_)) => {
-                    if let Some((_, request_context_tokens, _)) = baseline.as_mut() {
-                        *request_context_tokens = 0;
-                    }
-                }
-                _ => {}
-            }
-        }
-        baseline
     }
 
     pub(crate) async fn update_settings(
@@ -2028,6 +1972,7 @@ impl Session {
             token_usage,
             0,
             server_reasoning_included,
+            0,
         )
         .await;
     }
@@ -2038,23 +1983,36 @@ impl Session {
         token_usage: Option<&TokenUsage>,
         request_context_tokens: i64,
         server_reasoning_included: bool,
+        input_item_count: usize,
     ) {
         let record_context = {
             let mut state = self.state.lock().await;
-            if let Some(token_usage) = token_usage {
-                let previous_context_tokens = state.history.request_context_tokens();
-                let previous_reasoning_included = state.server_reasoning_included();
-                state
-                    .update_token_info_from_usage(token_usage, turn_context.model_context_window());
+            if let Some(token_usage) = token_usage.filter(|usage| usage.total_tokens > 0) {
+                state.update_token_info_from_usage(
+                    token_usage,
+                    turn_context.model_context_window(),
+                    input_item_count,
+                );
                 state
                     .history
                     .set_request_context_tokens(request_context_tokens);
                 state.set_server_reasoning_included(server_reasoning_included);
-                previous_context_tokens != 0
-                    || request_context_tokens != 0
-                    || previous_reasoning_included
-                    || server_reasoning_included
+                true
             } else {
+                // Preserve the initial zero-usage UI event without treating it
+                // as coverage or replacing a preceding usable baseline.
+                if state.token_info().is_none()
+                    && let Some(token_usage) = token_usage
+                {
+                    state.history.set_token_info_with_boundary(
+                        TokenUsageInfo::new_or_append(
+                            &None,
+                            &Some(token_usage.clone()),
+                            turn_context.model_context_window(),
+                        ),
+                        0,
+                    );
+                }
                 false
             }
         };
@@ -2073,6 +2031,7 @@ impl Session {
                     info,
                     request_context_tokens: state.history.request_context_tokens(),
                     server_reasoning_included: state.server_reasoning_included(),
+                    last_usage_item_count: Some(state.history.last_usage_item_count()),
                 })
         };
         if let Some(item) = item {
@@ -2090,10 +2049,6 @@ impl Session {
             else {
                 return;
             };
-            // Store a baseline at the last model item, just like server usage.
-            // Local notes/inputs after it are added by get_total_token_usage,
-            // including after restoring this TokenCount from a rollout.
-            let unreported_tokens = state.history.get_unreported_token_usage(true);
             let mut info = state.token_info().unwrap_or(TokenUsageInfo {
                 total_token_usage: TokenUsage::default(),
                 last_token_usage: TokenUsage::default(),
@@ -2105,16 +2060,17 @@ impl Session {
                 cached_input_tokens: 0,
                 output_tokens: 0,
                 reasoning_output_tokens: 0,
-                total_tokens: estimated_total_tokens
-                    .saturating_sub(unreported_tokens)
-                    .max(0),
+                total_tokens: estimated_total_tokens.max(0),
             };
 
             if info.model_context_window.is_none() {
                 info.model_context_window = turn_context.model_context_window();
             }
 
-            state.set_token_info(Some(info));
+            let covered_item_count = state.history.raw_items().len();
+            state
+                .history
+                .set_token_info_with_boundary(Some(info), covered_item_count);
             state.set_server_reasoning_included(true);
         }
         self.persist_token_usage_context().await;
@@ -2506,7 +2462,7 @@ impl Session {
         }
         changed |= trim_incomplete_continuation_tail(&mut items);
         if changed {
-            state.replace_history(items);
+            state.history.replace_for_continuation(items);
         }
     }
 

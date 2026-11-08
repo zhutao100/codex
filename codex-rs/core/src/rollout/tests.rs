@@ -411,6 +411,7 @@ async fn clean_for_continue_removes_abort_custom_and_dangling_records() -> Resul
         .unwrap(),
         request_context_tokens: 5_000,
         server_reasoning_included: true,
+        last_usage_item_count: None,
     };
     let lines = [
         rollout_json_line(RolloutItem::SessionMeta(SessionMetaLine {

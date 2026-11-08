@@ -88,8 +88,17 @@ fn assistant_message(text: &str) -> ResponseItem {
     }
 }
 
-#[test]
-fn request_context_usage_replays_atomic_prefixes_and_duplicate_token_events() {
+#[tokio::test]
+async fn request_context_usage_replays_atomic_prefixes_and_duplicate_token_events() {
+    let (session, context) = make_session_and_context().await;
+    let expected = |info, request_context_tokens, server_reasoning_included| {
+        Some(rollout_reconstruction::ReconstructedTokenUsage {
+            info,
+            request_context_tokens,
+            server_reasoning_included,
+            last_usage_item_count: 0,
+        })
+    };
     let info = TokenUsageInfo::new_or_append(
         &None,
         &Some(TokenUsage {
@@ -110,6 +119,7 @@ fn request_context_usage_replays_atomic_prefixes_and_duplicate_token_events() {
             info: info.clone(),
             request_context_tokens: 5_000,
             server_reasoning_included: true,
+            last_usage_item_count: None,
         },
         event.clone(),
         event.clone(),
@@ -117,6 +127,7 @@ fn request_context_usage_replays_atomic_prefixes_and_duplicate_token_events() {
             info: info.clone(),
             request_context_tokens: 0,
             server_reasoning_included: false,
+            last_usage_item_count: None,
         },
         event,
     ];
@@ -129,8 +140,11 @@ fn request_context_usage_replays_atomic_prefixes_and_duplicate_token_events() {
         (6, 0, false),
     ] {
         assert_eq!(
-            Session::last_token_usage_context_from_rollout(&records[..prefix]),
-            Some((info.clone(), context_tokens, reasoning_included)),
+            session
+                .reconstruct_history_from_rollout(&context, &records[..prefix])
+                .await
+                .token_usage,
+            expected(info.clone(), context_tokens, reasoning_included),
             "prefix {prefix}"
         );
     }
@@ -141,8 +155,11 @@ fn request_context_usage_replays_atomic_prefixes_and_duplicate_token_events() {
         .remove("server_reasoning_included");
     let legacy = serde_json::from_value(legacy).unwrap();
     assert_eq!(
-        Session::last_token_usage_context_from_rollout(&[legacy]),
-        Some((info.clone(), 5_000, false))
+        session
+            .reconstruct_history_from_rollout(&context, &[legacy])
+            .await
+            .token_usage,
+        expected(info.clone(), 5_000, false)
     );
     let records = [
         records[1].clone(),
@@ -152,8 +169,11 @@ fn request_context_usage_replays_atomic_prefixes_and_duplicate_token_events() {
         }),
     ];
     assert_eq!(
-        Session::last_token_usage_context_from_rollout(&records),
-        Some((info.clone(), 0, true))
+        session
+            .reconstruct_history_from_rollout(&context, &records)
+            .await
+            .token_usage,
+        expected(info.clone(), 0, true)
     );
     let mut changed = info.clone();
     changed.last_token_usage.total_tokens += 1;
@@ -162,6 +182,7 @@ fn request_context_usage_replays_atomic_prefixes_and_duplicate_token_events() {
             info,
             request_context_tokens: 5_000,
             server_reasoning_included: true,
+            last_usage_item_count: None,
         },
         RolloutItem::EventMsg(EventMsg::TokenCount(TokenCountEvent {
             info: Some(changed.clone()),
@@ -169,8 +190,11 @@ fn request_context_usage_replays_atomic_prefixes_and_duplicate_token_events() {
         })),
     ];
     assert_eq!(
-        Session::last_token_usage_context_from_rollout(&records),
-        Some((changed, 0, false))
+        session
+            .reconstruct_history_from_rollout(&context, &records)
+            .await
+            .token_usage,
+        expected(changed, 0, false)
     );
 }
 
@@ -182,19 +206,22 @@ async fn reasoning_accounting_changes_only_with_a_completed_usage_baseline() {
         total_tokens: 11_200,
         ..Default::default()
     };
+    let zero_usage = TokenUsage::default();
     for (reported, frame_tokens, reasoning_included, expected) in [
-        (true, 5_000, true, (5_000, true)),
-        (false, 0, false, (5_000, true)),
-        (true, 0, false, (0, false)),
-        (false, 5_000, true, (0, false)),
+        (Some(&usage), 5_000, true, (5_000, true)),
+        (None, 0, false, (5_000, true)),
+        (Some(&zero_usage), 0, false, (5_000, true)),
+        (Some(&usage), 0, false, (0, false)),
+        (None, 5_000, true, (0, false)),
     ] {
         let before = session.state.lock().await.token_info();
         session
             .update_token_usage_info_with_request_context(
                 &context,
-                reported.then_some(&usage),
+                reported,
                 frame_tokens,
                 reasoning_included,
+                0,
             )
             .await;
         let state = session.state.lock().await;
@@ -205,10 +232,82 @@ async fn reasoning_accounting_changes_only_with_a_completed_usage_baseline() {
             ),
             expected
         );
-        if !reported {
+        if reported.is_none_or(|usage| usage.total_tokens == 0) {
             assert_eq!(state.token_info(), before);
         }
     }
+}
+
+#[test_case::test_case(false, false; "legacy token event")]
+#[test_case::test_case(true, false; "legacy context")]
+#[test_case::test_case(true, true; "explicit empty output boundary")]
+#[tokio::test]
+async fn usage_boundary_replays_unreported_output(context_record: bool, explicit_boundary: bool) {
+    let (session, context) = make_session_and_context().await;
+    let info = TokenUsageInfo::new_or_append(
+        &None,
+        &Some(TokenUsage {
+            total_tokens: 100,
+            ..Default::default()
+        }),
+        None,
+    )
+    .unwrap();
+    let history = [
+        user_message("first request"),
+        assistant_message("covered answer"),
+        user_message("input to an empty successful response"),
+        ResponseItem::Reasoning {
+            id: "unreported".into(),
+            summary: vec![],
+            content: None,
+            encrypted_content: Some("x".repeat(2_000)),
+        },
+        user_message("later user boundary"),
+    ];
+    let event = RolloutItem::EventMsg(EventMsg::TokenCount(TokenCountEvent {
+        info: Some(info.clone()),
+        rate_limits: None,
+    }));
+    let mut records = history[..3]
+        .iter()
+        .cloned()
+        .map(RolloutItem::ResponseItem)
+        .collect::<Vec<_>>();
+    if context_record {
+        records.push(RolloutItem::TokenUsageContext {
+            info: info.clone(),
+            request_context_tokens: 10,
+            server_reasoning_included: true,
+            last_usage_item_count: explicit_boundary.then_some(3),
+        });
+    }
+    records.push(event.clone());
+    records.extend(history[3..].iter().cloned().map(RolloutItem::ResponseItem));
+    records.push(event);
+    let reconstructed = session
+        .reconstruct_history_from_rollout(&context, &records)
+        .await;
+    let covered_item_count = if explicit_boundary { 3 } else { 2 };
+    assert_eq!(
+        reconstructed.token_usage,
+        Some(rollout_reconstruction::ReconstructedTokenUsage {
+            info,
+            request_context_tokens: if context_record { 10 } else { 0 },
+            server_reasoning_included: context_record,
+            last_usage_item_count: covered_item_count,
+        })
+    );
+    session
+        .replace_with_reconstructed_rollout(reconstructed)
+        .await;
+    assert_eq!(
+        session.get_total_token_usage().await,
+        100 + history[covered_item_count..]
+            .iter()
+            .map(crate::context_manager::estimate_item_token_count)
+            .sum::<i64>()
+    );
 }
 
 fn review_rollout_user_message(text: &str) -> ResponseItem {
@@ -401,6 +500,7 @@ async fn rollout_reconstruction_restores_reference_context_item_after_regular_tu
     assert_eq!(
         reconstructed,
         ReconstructedRollout {
+            token_usage: None,
             completion_review: None,
             history,
             reference_context_item: Some(context_item.clone()),
@@ -425,6 +525,7 @@ async fn rollout_reconstruction_does_not_commit_bare_context() {
     assert_eq!(
         reconstructed,
         ReconstructedRollout {
+            token_usage: None,
             completion_review: None,
             history: Vec::new(),
             reference_context_item: None,
@@ -451,6 +552,7 @@ async fn rollout_reconstruction_does_not_commit_contextual_user_message() {
     assert_eq!(
         reconstructed,
         ReconstructedRollout {
+            token_usage: None,
             completion_review: None,
             history: vec![work_notes],
             reference_context_item: None,
@@ -504,6 +606,7 @@ async fn rollout_reconstruction_review_output_does_not_commit_previous_settings(
     assert_eq!(
         reconstructed,
         ReconstructedRollout {
+            token_usage: None,
             completion_review: None,
             history: expected_history,
             reference_context_item: Some(review_context),
@@ -538,6 +641,7 @@ async fn rollout_reconstruction_clears_reference_context_item_after_legacy_compa
     assert_eq!(
         reconstructed,
         ReconstructedRollout {
+            token_usage: None,
             completion_review: None,
             history: expected_history,
             reference_context_item: None,
@@ -574,6 +678,7 @@ async fn rollout_reconstruction_ignores_adjacent_context_after_legacy_compaction
     assert_eq!(
         reconstructed,
         ReconstructedRollout {
+            token_usage: None,
             completion_review: None,
             history: expected_history,
             reference_context_item: None,
@@ -609,6 +714,7 @@ async fn rollout_reconstruction_restores_reference_context_item_after_replacemen
     assert_eq!(
         reconstructed,
         ReconstructedRollout {
+            token_usage: None,
             completion_review: None,
             history: replacement_history,
             reference_context_item: Some(compacted_context.clone()),
@@ -648,6 +754,7 @@ async fn rollout_reconstruction_suppresses_standalone_compaction_continuation() 
     assert_eq!(
         reconstructed,
         ReconstructedRollout {
+            token_usage: None,
             completion_review: None,
             history: replacement_history,
             reference_context_item: None,
@@ -685,6 +792,7 @@ async fn rollout_reconstruction_thread_rollback_recomputes_reference_context_ite
     assert_eq!(
         reconstructed,
         ReconstructedRollout {
+            token_usage: None,
             completion_review: None,
             history: surviving_history,
             reference_context_item: Some(first_context.clone()),
@@ -718,6 +826,7 @@ async fn rollout_reconstruction_thread_rollback_ignores_bare_context() {
     assert_eq!(
         reconstructed,
         ReconstructedRollout {
+            token_usage: None,
             completion_review: None,
             history: Vec::new(),
             reference_context_item: None,
@@ -764,6 +873,7 @@ async fn rollout_reconstruction_thread_rollback_restores_compaction_epoch_metada
     assert_eq!(
         reconstructed,
         ReconstructedRollout {
+            token_usage: None,
             completion_review: None,
             history: replacement_history,
             reference_context_item: None,
@@ -812,6 +922,7 @@ async fn rollout_reconstruction_thread_rollback_crossing_compaction_clears_metad
     assert_eq!(
         reconstructed,
         ReconstructedRollout {
+            token_usage: None,
             completion_review: None,
             history: Vec::new(),
             reference_context_item: None,

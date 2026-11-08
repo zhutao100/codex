@@ -1947,6 +1947,10 @@ pub enum RolloutItem {
         request_context_tokens: i64,
         #[serde(default)]
         server_reasoning_included: bool,
+        /// History prefix covered by this baseline; absent in legacy records.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional, type = "number")]
+        last_usage_item_count: Option<usize>,
     },
     EventMsg(EventMsg),
 }

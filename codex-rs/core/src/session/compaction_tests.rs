@@ -231,6 +231,7 @@ async fn compaction_usage_counts_preserved_notes_once_after_installation_and_res
             }),
             5_000,
             false,
+            0,
         )
         .await;
     let notes = compact::preserved_work_notes_message(&"long exact notes\n".repeat(2_000));
@@ -274,6 +275,7 @@ async fn compaction_usage_counts_preserved_notes_once_after_installation_and_res
                     info: info.clone(),
                     request_context_tokens: 0,
                     server_reasoning_included: true,
+                    last_usage_item_count: Some(replacement.len()),
                 },
                 RolloutItem::EventMsg(EventMsg::TokenCount(TokenCountEvent {
                     info: Some(info),
@@ -351,6 +353,7 @@ async fn encrypted_only_replay_uses_inline_provenance_and_completion_tail() {
                 assert_eq!(
                     reconstructed,
                     ReconstructedRollout {
+                        token_usage: None,
                         completion_review: None,
                         history,
                         reference_context_item: inline.then(|| baseline.clone()),
