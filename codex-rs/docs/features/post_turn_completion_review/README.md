@@ -1,108 +1,56 @@
-# Post-Turn Completion Review
+# Completion review
 
-Independent read-only review of current work and the exact latest main answer. [State and decisions](design.md). [Verification](validation.md). [Budget accounting and upstream comparison](budget_accounting.md).
+Independent review of completed work and the exact latest main answer. Read this before changing `/review-completed-turn`, automatic review, or a review-derived continuation.
 
-## Invocation
+|Need|Read|
+|---|---|
+|Capture, tickets, persistence and recovery|[State and decisions](design.md)|
+|Request ordering and WebSocket continuation|[Request prefix](request_prefix.md)|
+|Usage ledger, exact snapshots and overflow|[Budget accounting](budget_accounting.md)|
+|Regression tests and live evaluation|[Validation](validation.md)|
 
-- Manual: `/review-completed-turn` after a completed main task.
+## Invocation and output
+
+- Manual: `/review-completed-turn` after completed main work.
 - Automatic: `[features].auto_post_turn_completion_review = true`; disabled by default.
-- Uses `review_model` and `review_model_provider`, with the same provider selection as `/review`.
-- Always uses a fresh `InitialHistory::New` delegate, read-only policy, no approval escalation, disabled web search and disabled collaboration.
-- Reviewer delegates retain their ordinary transcripts but do not track completion-review input revisions, candidates or recovery snapshots. The parent owns the review ticket and recovery checkpoint; continuing an interrupted review starts a fresh delegate.
+- `review_model` and `review_model_provider` use the same resolution as ordinary `/review`.
+- Each reviewer starts a fresh thread in the candidate's completed-task directory, with a read-only sandbox, no approval escalation, disabled web search and disabled collaboration.
+- The public result is `{ "evaluation": "...", "fix_actions_advised": true }`: evaluation must be nonempty and the advice flag must be a boolean.
 
-```toml
-[features]
-auto_post_turn_completion_review = true
-```
+Positive findings become advisory developer input to main work. They do not create a user request. The latest main answer remains streamed and copyable; review status is separate, and a clean verdict does not produce another synthesis answer.
 
-## Persistence
+An episode allows three automatic attempts. Positive advice on the final attempt remains visible but does not start another automatic continuation. Manual review can still hand off advice without resetting the automatic allowance. Pause/resume keeps the same ticket and allowance.
 
-The parent records changed recovery states only, while still flushing ordinary transcript writes. Initial input and its known task owner share a checkpoint; consumed input needs no separate `Recorded` snapshot; completion and automatic-review reservation share a checkpoint. A clean automatic episode normally writes five state records. Manual reservations, handoffs and resumed-owner changes retain their separate recovery boundaries.
+## Exact context and replacement answers
 
-Completion-review recovery payloads are unchanged. `token_usage_context` rollout records preserve the covered-history boundary, request-only frame accounting and historical-reasoning inclusion alongside a complete usage baseline; these are host metadata, not model input or UI events. Existing rollouts are not rewritten. Readers that predate the metadata retain their earlier accounting behavior. See [durability and replay rules](design.md#durable-metadata).
+The reviewer receives a frozen consumed request, including known prior user rounds and their terminal answers; the episode's initial answer as an optional historical reference; and the exact latest completed answer as the mandatory candidate. The current episode contributes at most two answer texts, deduplicated when identical. Intermediate answer revisions, earlier verdicts, reasoning and tools are excluded. Quoted user content stays exact, including text that resembles review markup.
 
-## Context Contract
+The initial reference can be wrong or superseded. It cannot compensate for omissions in the candidate. The reviewer inspects current artifacts to distinguish missing work from incomplete communication.
 
-An episode contains one consumed user-request basis and its review-derived main continuations. The review context contains:
-
-1. Frozen genuine user context, including consumed steering and earlier known user rounds with their terminal answers.
-2. The episode's initial answer as a historical, unverified reference.
-3. The exact latest completed main answer as `candidate_final_answer`.
-
-The current episode contributes at most two answer texts. Identical initial/candidate text is serialized once. Older candidate revisions, reviewer evaluations, hidden reasoning, tool transcript and intermediate assistant messages are not appended. Text quoting review material remains exact data; it is not scrubbed.
-
-Review packets use `<completed_turn_review_context>`. The JSON result contains only `evaluation` and `fix_actions_advised`; storage metadata remains host-only.
-
-The historical reference may be incorrect or superseded. It must not compensate for an incomplete current candidate. Independent inspection distinguishes missing implementation from incomplete communication.
-
-## Replacement Answers
-
-Every review-derived main continuation receives a host-owned complete-answer contract, including after pause, restart and compaction. It must answer the active user request at the requested level of detail, preserve still-valid results, incorporate material corrections, remove superseded claims, and accurately state verification and limitations. This applies when all findings are rejected or no files change.
-
-The request-only contract and exact snapshots stay at the latest instruction/compaction boundary, before follow-up reasoning and tools. Ordinary tool rounds therefore preserve the preceding request prefix and remain eligible for incremental WebSocket continuation. See the [request-prefix contract and regression history](request_prefix.md); transport eligibility is not a guarantee of server cache hits.
-
-Main follow-ups remain bound to the candidate's project directory when claimed or resumed, including after restart. A different current working directory produces a recoverable error before task startup and leaves the continuation intact. Return to the completed task's directory to continue, or submit a new request for the new directory. Each replacement candidate records its actual completed-task directory, which the independent reviewer uses.
-
-The latest main answer remains streamed and copyable. Review evaluation/status stays separate; a clean review does not generate another synthesis answer or rewrite previous waterfall entries.
-
-## Outcomes And Limits
-
-- Public output remains `{ evaluation, fix_actions_advised }`, with a nonempty evaluation and a strict boolean.
-- Positive findings are advisory developer input, never a fabricated user request.
-- Invalid/empty output, delegate failure, lost coverage or mandatory context overflow produces no structured clean verdict.
-- Three automatic attempts are allowed per episode. Positive advice on the last attempt remains visible and stops automatic continuation; it is not approval.
-- Manual review retains one advisory handoff after that allowance is exhausted and does not reset it. Pause/resume reuses the same ticket and allowance.
-- Payload budgeting uses the resolved review model's effective window, counts instructions and static tool schemas, reserves additional capacity for tools/output/inspection, and omits the optional historical reference first. Mandatory user scope and candidate text are never truncated.
-- Main follow-up budgeting uses the session's token-usage baseline plus all items after its covered-history boundary, charging only the replacement delta for the injected review frame already represented in that baseline. The boundary, frame accounting and reasoning-inclusion semantics survive restart; compaction and local recomputation establish a new baseline. Without a positive usage baseline it falls back to the full prompt's byte estimate. Overflow diagnostics include the estimated count and available budget.
-- Missing/zero usage and failed streams do not advance that boundary: retained model output remains charged, including after `/continue` and restart. Successful empty responses cover their submitted input; unreported reasoning is not charged twice. See the [boundary contract and regression evidence](budget_accounting.md#usable-usage-boundary).
-- If a delegate starts compaction, coverage becomes unavailable rather than accepting a verdict against rewritten context. Main continuations similarly retain exact mandatory snapshots or stop with a recoverable budget diagnostic.
-- A budget-stopped follow-up retains `/continue` ownership. Standalone `/compact` preserves that checkpoint; selecting a larger main model updates the durable recovery destination even when steering has invalidated the advisory handoff. Neither recovery route changes exact request scope or the separate compaction source. Compaction cannot help when mandatory snapshots alone exceed the model's budget.
+Every review-derived main continuation must produce a complete replacement answer, even if it rejects all findings or changes no files. It preserves still-valid results, incorporates corrections, removes superseded claims, and reports actual verification and remaining limitations. This host-owned contract survives custom prompts, pause, restart and compaction. Its request-only placement and accounting are described in the linked contracts.
 
 ## Configuration
 
-Optional prompt overrides remain supported:
-
-```toml
-review_prompt_file = "~/.codex/prompts/review.md"
-post_turn_completion_review_prompt_file = "~/.codex/prompts/post-turn-review.md"
-
-host_agents_filename = "AGENTS.md"
-review_agents_filename = "AGENTS.review.md"
-post_turn_completion_review_agents_filename = "AGENTS.post-turn-review.md"
-```
-
-Post-turn host instructions prefer the post-turn filename, then the generic review filename, then the host filename. Filenames resolve under `CODEX_HOME`; project instructions remain available. A configured post-turn prompt cannot remove host-owned candidate/reference semantics or the parent's replacement-answer contract.
-
-## Provenance Limits
-
-### Unavailable Review
-
-Manual reservation distinguishes the following conditions under the task lifecycle and snapshot installation locks:
-
-|Condition|Recovery|
+|Setting|Purpose|
 |---|---|
-|Another task is running|Wait for it to finish before reviewing.|
-|No completed candidate|Submit a normal request and wait for its terminal answer.|
-|Pending or unconsumed input|Continue main work and wait for completion.|
-|Missing or invalidated request provenance|Reloading or completing another prompt cannot restore missing requirements. Start a new session with the complete request, or recover the request basis from verified host-owned metadata.|
-|Failed checkpoint persistence|Repair storage and reload the last durable rollout. The command reports a storage error, not a missing-turn diagnostic.|
+|`post_turn_completion_review_prompt_file`|Override the reviewer prompt without removing host-owned context semantics.|
+|`review_prompt_file`|Configure the separate ordinary-review prompt.|
+|`post_turn_completion_review_agents_filename`|Preferred host instruction filename; default `AGENTS.post-turn-review.md`.|
+|`review_agents_filename`|Host instruction fallback; default `AGENTS.review.md`.|
+|`host_agents_filename`|Final host instruction fallback; default `AGENTS.md`.|
 
-A syntactically valid rollout can still have unavailable provenance after a metadata-format transition. Unsupported record tags are not usable checkpoints; forks copy recognized records, so the original ancestor may contain evidence no longer present in its descendants. New candidates inherit unavailable request scope rather than silently treating a later referential request as complete.
+Host instruction filenames resolve under `CODEX_HOME`; project instructions are loaded for the candidate directory. Native model prompt overrides use `model_instructions_file`; `Config.base_instructions` is a programmatic field, not a top-level TOML option.
 
-Offline recovery requires the original request and terminal-completion checkpoints, every intervening consumed amendment, and verified fork boundaries. Preserve exact user data and candidate identity, account for rollback and clarification ownership, back up the original, and validate the reconstructed state through the production loader and resume path before appending a replacement checkpoint. Do not simply flip `exact`, infer a completion from assistant-role text, or promote compaction summaries into user requirements. No automatic legacy-format migration is provided; absent sufficient evidence, retain unavailable coverage.
+## Limits and recovery
 
-### Durable Scope
+|Condition|Behavior or next step|
+|---|---|
+|Another task is running, no completed candidate, or unconsumed input|Wait for the relevant main work to complete; pending input must be consumed.|
+|Unknown or invalidated request provenance|Full review is unavailable. Start a new session with the complete request, or recover only from verified host-owned checkpoints. Another prompt or reload cannot restore missing requirements.|
+|Nontext input or `request_user_input` clarification answers|Main work continues normally, but the current text projection cannot claim complete review coverage.|
+|Reviewer compaction, malformed/empty output, delegate failure or mandatory-packet overflow|No structured clean verdict is accepted. Mandatory scope and candidate are never truncated.|
+|Main follow-up budget overflow|The continuation remains available. `/compact` or explicitly select a larger main model, then `/continue`; compaction cannot help if mandatory snapshots alone exceed capacity.|
+|Candidate-directory mismatch|Restore the completed task's directory before continuing. Rejection preserves the pending continuation.|
+|Checkpoint I/O failure|Repair storage and reload the last durable rollout. Preserve the storage error instead of reporting a missing candidate.|
 
-Host-owned rollout metadata restores exact snapshots without relying on nonpersisted `TurnComplete` events. Prepared handoffs are recoverably queued; started handoffs resume as interrupted main work, not a fresh advisory action. Interrupt/shutdown invalidates unstarted review scheduling but retains already-started main lineage and its replacement contract.
-
-Acknowledged user input retains its original payload until installation is durable. Revision-specific installing/recorded markers recover both a missing message and a message written immediately before a crash, without deduplicating distinct identical amendments. Stop, pause, shutdown and manual review join terminal finalization even after its active-task entry has been removed. Manual review reserves the candidate snapshot and its ticket together; delegate entry validates that pair against current ownership.
-
-A recognized amendment body retains the prior candidate as its directory owner across the body-written/Recorded-snapshot gap. That old candidate is not review-eligible; completing the amended request establishes the next candidate. Recorder flush/shutdown errors reach their callers; failed reservation, claim or resumed-main owner persistence stops before model sampling. Missing mandatory snapshots are an error, not permission to omit their injection or budget check. The continuation and durable recovery prefix remain available; repair storage and reload the last durable rollout before retrying an invalidated in-memory context.
-
-Only an explicit `model` or collaboration-mode selection changes a saved recovery destination. It remains durable after steering removes the advisory handoff, through pause or budget failure and restart with a different configured default. CWD, approval, reasoning-effort and other unrelated overrides preserve it. Completion, a new root request or a fork clears the old recovery selection.
-
-Histories without trusted request snapshots, or discarded histories whose request basis cannot be established, are unavailable for full review. Empty or encrypted-only prompt history does not establish exact provenance, and later referential input cannot restore missing requirements. Trusted snapshots preserve known scope independently of compaction. Arbitrary assistant-role text is never promoted to a known completion. Start a new session with the complete request when that provenance is unavailable. Nontext user input also produces an explicit coverage limitation rather than a claimed full text-only review.
-
-Human clarification answers delivered through `request_user_input` are not currently captured as an exact question/answer frame. They continue to reach the main model normally, but explicitly disable full completion-review coverage for that request, including full-history forks. Fork recovery cannot restore coverage by selecting an older pre-clarification candidate. A warning explains the limitation; neither automatic nor manual review can declare that incomplete projection fully reviewed.
-
-The harness enforces identity, isolation, revision bounds and scheduling ownership. Natural-language completeness remains a model requirement and an independent review judgment, not a deterministic certification. Current repository files are inspected at review time; tickets do not provide filesystem snapshot isolation.
+Tickets enforce identity and scheduling ownership, not a filesystem snapshot or exactly-once tool effects. Current artifacts are inspected at review time. Semantic completeness remains a model judgment; a valid review result does not certify every claim in an answer.

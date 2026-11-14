@@ -1,196 +1,46 @@
-Overview of Protocol defined in [protocol.rs](../protocol/src/protocol.rs) and [agent.rs](../core/src/agent.rs).
+# Core submissions and events
 
-The goal of this document is to define terminology used in the system and explain the expected behavior of the system.
+Read when changing a core client, task lifecycle or event mapping. This is the internal queue protocol used by `CodexThread`; the [MCP server](codex_mcp_interface.md) and [app-server](../app-server/README.md) adapt it to separate public interfaces.
 
-NOTE: The code might not completely match this spec. There are a few minor changes that need to be made after this spec has been reviewed, which will not alter the existing TUI's functionality.
+## Vocabulary and ownership
 
-## Entities
+|Term|Meaning|
+|---|---|
+|Thread/session|Conversation state, configuration, history and runtime services owned by one core instance|
+|Submission|A client operation with an ID, sent to the submission queue|
+|Task|An executing workflow, such as regular work, review or compaction|
+|User turn|Work rooted in accepted user input; it may include many inference/tool cycles|
+|Model response|One Responses API inference stream; completion does not by itself finish a user turn|
+|Event|Core output correlated with a submission; multiple events can have the same ID|
 
-These are entities exit on the codex backend. The intent of this section is to establish vocabulary and construct a shared mental model for the `Codex` core system.
+Initialization uses `Codex::spawn` and emits `SessionConfigured`. There is no `Op::ConfigureSession`. Configuration updates use `OverrideTurnContext` or the context supplied with `UserTurn`; a context-only override does not itself enqueue user input. See [session construction](../core/src/session/mod.rs) and [submission dispatch](../core/src/session/handlers.rs).
 
-0. `Model`
-   - In our case, this is the Responses REST API
-1. `Codex`
-   - The core engine of codex
-   - Runs locally, either in a background thread or separate process
-   - Communicated to via a queue pair – SQ (Submission Queue) / EQ (Event Queue)
-   - Takes user input, makes requests to the `Model`, executes commands and applies patches.
-2. `Session`
-   - The `Codex`'s current configuration and state
-   - `Codex` starts with no `Session`, and it is initialized by `Op::ConfigureSession`, which should be the first message sent by the UI.
-   - The current `Session` can be reconfigured with additional `Op::ConfigureSession` calls.
-   - Any running execution is aborted when the session is reconfigured.
-3. `Task`
-   - A `Task` is `Codex` executing work in response to user input.
-   - `Session` has at most one `Task` running at a time.
-   - Receiving `Op::UserTurn` starts a `Task` (`Op::UserInput` is legacy)
-   - Consists of a series of `Turn`s
-   - The `Task` executes to until:
-     - The `Model` completes the task and there is no output to feed into an additional `Turn`
-     - Additional user-turn input aborts the current task and starts a new one
-     - UI interrupts with `Op::Interrupt`
-     - Fatal errors are encountered, eg. `Model` connection exceeding retry limits
-     - Blocked by user approval (executing a command or patch)
-4. `Turn`
-   - One cycle of iteration in a `Task`, consists of:
-     - A request to the `Model` - (initially) prompt + (optional) `last_response_id`, or (in loop) previous turn output
-     - The `Model` streams responses back in an SSE, which are collected until "completed" message and the SSE terminates
-     - `Codex` then executes command(s), applies patch(es), and outputs message(s) returned by the `Model`
-     - Pauses to request approval when necessary
-   - The output of one `Turn` is the input to the next `Turn`
-   - A `Turn` yielding no output terminates the `Task`
+Regular work is serialized within a session; child/delegate threads have separate sessions. Pending user input can be accepted while work is running. Do not infer task replacement or consumption from the mere arrival of an operation.
 
-The term "UI" is used to refer to the application driving `Codex`. This may be the CLI / TUI chat-like interface that users operate, or it may be a GUI interface like a VSCode extension. The UI is external to `Codex`, as `Codex` is intended to be operated by arbitrary UI implementations.
+## Operations and lifecycle
 
-When a `Turn` completes, the `response_id` from the `Model`'s final `response.completed` message is stored in the `Session` state to resume the thread given the next user turn. The `response_id` is also returned in the `EventMsg::TurnComplete` to the UI, which can be used to fork the thread from an earlier point by providing it in a future user turn.
+|Operation|Contract|
+|---|---|
+|`UserTurn`|Supplies user items and turn context, including model, cwd and execution policies|
+|`UserInput`|Legacy input using persistent session defaults|
+|`SteerInput`|Adds input to an expected active turn without changing its settings; see [steering and queue](features/steering-and-queue.md)|
+|`OverrideTurnContext`|Updates persistent defaults without creating a user message|
+|`Pause` / `Continue`|Stops and continues eligible work without a synthetic user turn; see [pause/continue](features/pause-continue.md)|
+|`Interrupt`|Cancels current work and emits `TurnAborted`|
+|`ExecApproval` / `PatchApproval` / `UserInputAnswer`|Resolves a pending interaction; waiting for an answer is not successful turn completion|
+|`ReviewCompletedTurn`|Reserves an eligible completed answer for [completion review](features/post_turn_completion_review/README.md)|
 
-Since only 1 `Task` can be run at a time, for parallel tasks it is recommended that a single `Codex` be run for each thread of work.
+`Submission` contains `id` and `op`; `Event` contains `id` and `msg`. Follow [protocol types](../protocol/src/protocol.rs) for field spelling, optionality, variants and correlation. Keep adapters forward-compatible with the variants they can receive instead of maintaining a second handwritten schema.
 
-## Interface
+- `TurnStarted` begins the visible lifecycle. Assistant/tool deltas and completed items can arrive before the task ends.
+- `TurnComplete` carries `last_agent_message`; it has no response-ID bookmark. Its v1 serialized tag is `task_complete`, with `turn_complete` accepted on input; `TurnStarted` likewise writes `task_started` and accepts `turn_started`.
+- `TurnPaused` and `TurnAborted` are distinct terminal outcomes. An `Error` is an operation error; use lifecycle events and error context rather than treating every error as successful or final completion.
+- `TokenCount` and runtime-context events update presentation/accounting; they do not establish which user amendments were consumed or which answer is reviewable.
 
-- `Codex`
-  - Communicates with UI via a `SQ` (Submission Queue) and `EQ` (Event Queue).
-- `Submission`
-  - These are messages sent on the `SQ` (UI -> `Codex`)
-  - Has an string ID provided by the UI, referred to as `sub_id`
-  - `Op` refers to the enum of all possible `Submission` payloads
-    - This enum is `non_exhaustive`; variants can be added at future dates
-- `Event`
-  - These are messages sent on the `EQ` (`Codex` -> UI)
-  - Each `Event` has a non-unique ID, matching the `sub_id` from the user-turn op that started the current task.
-  - `EventMsg` refers to the enum of all possible `Event` payloads
-    - This enum is `non_exhaustive`; variants can be added at future dates
-    - It should be expected that new `EventMsg` variants will be added over time to expose more detailed information about the model's actions.
+## Model context and persistence
 
-For complete documentation of the `Op` and `EventMsg` variants, refer to [protocol.rs](../protocol/src/protocol.rs). Some example payload types:
+[User input types](../protocol/src/user_input.rs) include text, images, explicit skills and mentions. Preserve structured content through client adapters. Prompt construction and transport are separate from this submission/event API.
 
-- `Op`
-  - `Op::UserTurn` – Any input from the user to kick off a `Turn`
-  - `Op::UserInput` – Legacy form of user input
-  - `Op::Interrupt` – Interrupts a running turn
-  - `Op::ExecApproval` – Approve or deny code execution
-  - `Op::UserInputAnswer` – Provide answers for a `request_user_input` tool call
-  - `Op::ListSkills` – Request skills for one or more cwd values (optionally `force_reload`)
-  - `Op::UserTurn` and `Op::OverrideTurnContext` accept an optional `personality` override that updates the model’s communication style
+The local rollout records selected events, response items and host metadata under an explicit [persistence policy](../core/src/rollout/policy.rs). The UI event stream is not a replay log: pause/continue UI events are not persisted, and host recovery checkpoints are not model instructions. Use [history replay](features/history-replay.md) for replacement-history, rollback and resume rules.
 
-Valid `personality` values are `friendly`, `pragmatic`, and `none`. When `none` is selected, the personality placeholder is replaced with an empty string.
-
-- `EventMsg`
-  - `EventMsg::AgentMessage` – Messages from the `Model`
-  - `EventMsg::AgentMessageContentDelta` – Streaming assistant text
-  - `EventMsg::PlanDelta` – Streaming proposed plan text when the model emits a `<proposed_plan>` block in plan mode
-  - `EventMsg::ExecApprovalRequest` – Request approval from user to execute a command
-  - `EventMsg::RequestUserInput` – Request user input for a tool call (questions can include options plus `isOther` to add a free-form choice)
-  - `EventMsg::TurnStarted` – Turn start metadata including `model_context_window` and `collaboration_mode_kind`
-  - `EventMsg::TurnComplete` – A turn completed successfully
-  - `EventMsg::Error` – A turn stopped with an error
-  - `EventMsg::Warning` – A non-fatal warning that the client should surface to the user
-  - `EventMsg::TurnComplete` – Contains a `response_id` bookmark for last `response_id` executed by the turn. This can be used to continue the turn at a later point in time, perhaps with additional user input.
-  - `EventMsg::ListSkillsResponse` – Response payload with per-cwd skill entries (`cwd`, `skills`, `errors`)
-
-### UserInput items
-
-`Op::UserTurn` content items can include:
-
-- `text` – Plain text plus optional UI text elements.
-- `image` / `local_image` – Image inputs.
-- `skill` – Explicit skill selection (`name`, `path` to `SKILL.md`).
-- `mention` – Explicit app/connector selection (`name`, `path` in `app://{connector_id}` form).
-
-Note: For v1 wire compatibility, `EventMsg::TurnStarted` and `EventMsg::TurnComplete` serialize as `task_started` / `task_complete`. The deserializer accepts both `task_*` and `turn_*` tags.
-
-The `response_id` returned from each turn matches the OpenAI `response_id` stored in the API's `/responses` endpoint. It can be stored and used in future `Sessions` to resume threads of work.
-
-## Transport
-
-Can operate over any transport that supports bi-directional streaming. - cross-thread channels - IPC channels - stdin/stdout - TCP - HTTP2 - gRPC
-
-Non-framed transports, such as stdin/stdout and TCP, should use newline-delimited JSON in sending messages.
-
-## Example Flows
-
-Sequence diagram examples of common interactions. In each diagram, some unimportant events may be eliminated for simplicity.
-
-### Basic UI Flow
-
-A single user input, followed by a 2-turn task
-
-```mermaid
-sequenceDiagram
-    box UI
-    participant user as User
-    end
-    box Daemon
-    participant codex as Codex
-    participant session as Session
-    participant task as Task
-    end
-    box Rest API
-    participant agent as Model
-    end
-    user->>codex: Op::ConfigureSession
-    codex-->>session: create session
-    codex->>user: Event::SessionConfigured
-    user->>session: Op::UserTurn
-    session-->>+task: start task
-    task->>user: Event::TurnStarted
-    task->>agent: prompt
-    agent->>task: response (exec)
-    task->>-user: Event::ExecApprovalRequest
-    user->>+task: Op::ExecApproval::Allow
-    task->>user: Event::ExecStart
-    task->>task: exec
-    task->>user: Event::ExecStop
-    task->>user: Event::TurnComplete
-    task->>agent: stdout
-    agent->>task: response (patch)
-    task->>task: apply patch (auto-approved)
-    task->>agent: success
-    agent->>task: response<br/>(msg + completed)
-    task->>user: Event::AgentMessage
-    task->>user: Event::TurnComplete
-    task->>-user: Event::TurnComplete
-```
-
-### Task Interrupt
-
-Interrupting a task and continuing with additional user input.
-
-```mermaid
-sequenceDiagram
-    box UI
-    participant user as User
-    end
-    box Daemon
-    participant session as Session
-    participant task1 as Task1
-    participant task2 as Task2
-    end
-    box Rest API
-    participant agent as Model
-    end
-    user->>session: Op::UserTurn
-    session-->>+task1: start task
-    task1->>user: Event::TurnStarted
-    task1->>agent: prompt
-    agent->>task1: response (exec)
-    task1->>task1: exec (auto-approved)
-    task1->>user: Event::TurnComplete
-    task1->>agent: stdout
-    task1->>agent: response (exec)
-    task1->>task1: exec (auto-approved)
-    user->>task1: Op::Interrupt
-    task1->>-user: Event::Error("interrupted")
-    user->>session: Op::UserTurn w/ response bookmark
-    session-->>+task2: start task
-    task2->>user: Event::TurnStarted
-    task2->>agent: prompt + Task1 last_response_id
-    agent->>task2: response (exec)
-    task2->>task2: exec (auto-approve)
-    task2->>user: Event::TurnComplete
-    task2->>agent: stdout
-    agent->>task2: msg + completed
-    task2->>user: Event::AgentMessage
-    task2->>user: Event::TurnComplete
-    task2->>-user: Event::TurnComplete
-```
+`previous_response_id` belongs to [WebSocket transport](features/responses-websocket.md). Resume/fork uses local thread history and checkpoints, not a response ID returned by `TurnComplete`. Preserve that separation when adding adapters or changing cancellation.

@@ -1,93 +1,58 @@
-# Local Plugins Backport
+# Local plugins
 
-## Contract
+## Scope
 
-- Scope: local `.agents/plugins/marketplace.json` directories, local plugin sources, `.codex-plugin/plugin.json`, packaged skills/supporting files, and stdio/HTTP MCP servers.
-- No app-server migration or new extension framework. The CLI manages bundles; the existing core skills/MCP runtimes consume enabled installations in both exec and the direct-core TUI.
-- Prerequisite: qualified skill mentions (`$plugin:skill`), including dotted plugin namespaces. Ordinary `$skill.suffix` parsing retains its previous behavior.
-- Not included: remote/Git/npm catalogs or downloads, marketplace policy synchronization, portable root `plugin.json`, bundled apps/hooks/legacy commands, plugin-level mention routing, plugin RPCs, or an interactive plugin-management dialog.
-- Unsupported declared apps/hooks/commands and unsupported source/transport types fail explicitly. Presentation metadata is not an authorization policy.
-- Installation honors availability but does not implement marketplace authentication flows or automatic default installation. MCP authentication remains an existing server-configuration concern.
+Local marketplaces provide packaged skills and stdio/HTTP MCP servers. The CLI installs bundles; the existing core skills/MCP runtimes load enabled installations in exec and the direct-core TUI. Installation copies files and does not build or execute package code.
 
-## Workflow
+|Supported|Outside the implemented scope|
+|---|---|
+|Local `.agents/plugins/marketplace.json` catalogs and local sources|Remote/Git/npm downloads or marketplace authentication|
+|`.codex-plugin/plugin.json`, skills/supporting assets and MCP configuration|Portable root `plugin.json`, bundled apps, hooks or legacy commands|
+|CLI lifecycle commands, qualified skill mentions and `/plugins` diagnostics|Plugin-level mention routing, plugin RPCs or an interactive management dialog|
 
-Build any package executables before installation. For Curl Safari, run these commands from its project directory:
+Unsupported declared capabilities and source/transport types fail explicitly. Presentation metadata does not grant execution privileges. MCP authentication and requirements remain owned by the existing MCP runtime.
+
+## Lifecycle
+
+Build/package executable assets before installing. For a local catalog named `local-tools` containing a plugin named `example`:
 
 ```bash
-./build.sh
-codex plugin marketplace add "$PWD"
-codex plugin add curl-safari@curl-safari-local
+codex plugin marketplace add /absolute/path/to/catalog
+codex plugin add example@local-tools
 codex plugin list --json
+codex plugin disable example@local-tools
+codex plugin enable example@local-tools
+codex plugin remove example@local-tools
+codex plugin marketplace remove local-tools
 ```
 
-Start a new Codex process, then select `$curl-safari:curl-safari` or use the existing skills picker. `/plugins` displays the session's configured installations; `/skills` retains its existing behavior. The skill locates its executable and helper relative to its installed `SKILL.md`.
+- Restart Codex after bundle or activation changes. Existing sessions and MCP connections do not hot-reload installations.
+- Repeating `add` replaces the installed copy, including rebuilt binaries with an unchanged manifest version. Source directories are never deleted.
+- Marketplace removal requires removing its installed plugins first. Lifecycle commands also accept `PLUGIN --marketplace MARKETPLACE` and `--json`.
+- Select a packaged skill with `$example:skill-name` or the skills picker. `/plugins` shows configured installations.
+- A session override such as `codex -c 'plugins.example@local-tools.enabled=false'` changes effective loading without modifying the stored installation.
 
-```bash
-codex plugin disable curl-safari@curl-safari-local
-codex plugin enable curl-safari@curl-safari-local
-codex plugin remove curl-safari@curl-safari-local
-codex plugin marketplace remove curl-safari-local
-```
+## State and configuration decisions
 
-- A session-only override does not change the stored installation: `codex -c 'plugins.curl-safari@curl-safari-local.enabled=false'`. Startup's forced skill listing and later turns retain this choice.
-- `add`, `remove`, `enable`, and `disable` also accept `PLUGIN --marketplace MARKETPLACE` and `--json`.
-- Marketplace registration stores a canonical local directory. Installation reads its current manifest and copies the complete bundle, excluding `.git` and root build caches `.build`/`target`; it does not build or execute package code.
-- Repeating `add` replaces the installed copy, including rebuilt binaries with unchanged manifest versions. Build/package before adding, and restart Codex after bundle or activation mutations. Activation is session-scoped, and established MCP connections are not hot-reloaded.
-- Marketplace removal requires removing its installed plugins first. Package source directories are never removed.
-- Curl Safari still requires its local helper and macOS cookie-access permissions. Installation does not grant Full Disk Access or start the helper.
+[Plugin storage](../../core/src/plugins/store.rs) keeps a single local installation under `$CODEX_HOME/plugins/cache/MARKETPLACE/PLUGIN/local`. Manifest versions are display metadata. Registration stores a canonical local catalog directory; copying excludes `.git` and root build caches `.build`/`target` while preserving executable permissions and valid internal symlinks. Escaping/absolute symlinks and special files are rejected.
 
-## State And Loading
+CLI mutations use the atomic TOML writer, preserve unrelated settings/comments and serialize package operations with a lock. A staged bundle is validated before publication; publication/config failures restore the previous copy. Runtime loading uses effective trusted configuration. An invalid installation produces a diagnostic without hiding unrelated skills.
 
-```toml
-[marketplaces.curl-safari-local]
-source_type = "local"
-source = "/absolute/path/to/codex-plugin-curl-safari"
+[Skill loading](../../core/src/skills/manager.rs) caches only non-plugin skills by cwd. Each lookup applies the caller's plugin configuration, including forced listings and cache refreshes. Never cache one session's plugin activation in the shared cwd cache.
 
-[plugins."curl-safari@curl-safari-local"]
-enabled = true
-```
+- Skills default to `./skills`, or use manifest-selected directories. Their existing parser and per-path disabling rules still apply; they retain user scope.
+- Qualified names are `PLUGIN:SKILL`, including dotted namespaces. Equal plugin names from different marketplaces can be ambiguous; explicit links to the installed `SKILL.md` disambiguate. A structured skill input alone does not change the core's existing injection trigger rules.
+- The manifest accepts inline `mcpServers`, a declared JSON file or default `.mcp.json`; both a server map and an `mcpServers` wrapper work. `${CODEX_PLUGIN_ROOT}` and `${CLAUDE_PLUGIN_ROOT}` expand within JSON strings; arbitrary environment interpolation is not added.
+- Stdio defaults cwd to the installed bundle. HTTP `headers` maps to `http_headers`. Explicit `[mcp_servers]` settings win over plugin declarations; colliding plugin server names use sorted plugin-ID order and produce a warning.
+- Plugin MCP entries pass through the existing requirements filter. Enabling a package does not bypass MCP restrictions, approvals or shell sandboxing.
 
-- State lives under `CODEX_HOME`, including `$CODEX_HOME/plugins/cache/MARKETPLACE/PLUGIN/local`. This backport keeps one active local copy, not upstream's version-selection/migration logic. Manifest versions remain display metadata.
-- CLI mutations edit the user config with the existing atomic TOML writer and preserve unrelated settings/comments. A package-operation lock serializes concurrent plugin commands. A staged copy is validated before publication; publication/config failures restore the previous copy.
-- Runtime loading uses the effective trusted config stack. Missing or invalid bundles do not hide unrelated skills; skill-load errors and `/plugins` diagnostics identify invalid installations.
-- The cwd cache contains only non-plugin skills. Every lookup applies the requesting session's effective plugin configuration, including after forced listings or cache invalidation, so shared managers cannot mix activation choices between sessions. Refreshes still reload ordinary skill files and per-skill disable settings from disk.
-- Skills default to `./skills`, or use a manifest `skills` string/list of directories. The existing skill parser supplies metadata, instructions, dependencies, and per-path skill disabling. Plugin skills retain user scope; no protocol-enum change is needed.
-- Plugin skill names are `PLUGIN:SKILL`. Equal plugin names from different marketplaces remain ambiguous for plain-name selection; explicit `[$PLUGIN:SKILL](/installed/path/SKILL.md)` links disambiguate them. The old core's rule that structured skill inputs alone do not trigger injection is unchanged.
-- MCP configuration comes from inline `mcpServers`, a declared `./file.json`, or default `.mcp.json`. Both a server map and an `mcpServers` wrapper are accepted. `${CODEX_PLUGIN_ROOT}` and `${CLAUDE_PLUGIN_ROOT}` expand inside JSON string values; no arbitrary environment-variable expansion is added.
-- Stdio defaults its working directory to the installed package root. HTTP `headers` maps to the existing `http_headers` field. Servers retain their declared names. Explicit `[mcp_servers]` entries win; duplicate plugin server names use the first plugin in sorted ID order and produce a warning.
-- Plugin MCP servers enter the existing requirements filter before startup. Enabling a plugin does not bypass MCP requirements, command approvals, or shell sandbox settings.
-- Package identities and paths are validated at the external input boundary. Escaping/absolute symlinks and special files are rejected; internal relative symlinks and executable permissions are preserved.
+## Validation entry points
 
-## Verification
+|Concern|Source/tests|
+|---|---|
+|Manifest, lifecycle, copy/rollback and MCP merge|[Plugin implementation and unit tests](../../core/src/plugins/mod.rs)|
+|Catalog, explicit injection and session overrides|[Core integration tests](../../core/tests/suite/plugins.rs)|
+|CLI installation/toggle/removal|[CLI integration tests](../../cli/tests/plugins.rs)|
+|Qualified selections and diagnostics|[TUI plugin handling](../../tui/src/chatwidget/plugins.rs)|
 
-Focused coverage:
-
-- `core::plugins`: lifecycle, config preservation, copied executables/symlinks, rejected inputs, replacement failure, skill namespacing/toggles, MCP config precedence and root expansion.
-- `core/tests/suite/plugins.rs`: installed skill catalog and explicit instruction injection into a captured Responses request; forced and cached listing followed by injection with CLI overrides opposing the disk configuration.
-- `cli/tests/plugins.rs`: marketplace/install/list/toggle/remove command round trip and invalid selections.
-- TUI tests: qualified selection-to-path mapping and `/plugins` dispatch.
-
-VM-only release check:
-
-```bash
-python3 scripts/verify-local-plugins.py \
-  --codex /guest/path/codex \
-  --plugin-source /guest/path/codex-plugin-curl-safari \
-  --safari-cli /guest/path/macos-safari-browser-use/scripts/safari \
-  --artifacts /guest/path/artifacts
-```
-
-Prerequisites: disposable Apple Silicon macOS VM, Python 3.13+, Safari automation permissions, built Curl Safari app/client, and cookie access for the helper's execution context. Use the GhostVM safe-testing workflow with read-only host inputs and writable artifact export; stop the VM and restore its config afterward.
-
-The probe establishes a synthetic localhost login in guest Safari, runs the installed unmodified helper/client through a real Codex shell tool call, and checks the authenticated result in the next model request. It also verifies absence after disable/removal, re-enabling, and a separate bundled MCP tool call plus disable. TUI PTY cases override both enabled and disabled disk settings, exercise startup's forced skill listing before the first prompt, and check that `/plugins`, the catalog, and instruction injection agree. Responses are deterministic fixtures, not a hosted-model decision-quality test. Only structural evidence is exported, not model request bodies or Safari cookie contents.
-
-### Verified Results
-
-Verified on October 7, 2026:
-
-- Production build: `cargo-local build --release --bin codex`, published to `target/release/codex`; SHA-256 `053385f6acab5ea909dfcc17133ff9cd9a5f9dc64ecb86b7401102c3d013c902` matched the guest copy.
-- macOS 15.6.1 GhostVM, reverted from `automation-ready`: built the unmodified Curl Safari Go client and Swift helper, then verified all eight release-binary probe cases, including a fresh Safari cookie authenticated fetch, a real MCP call, and two TUI override cases. Ten Responses requests were checked.
-- The original release reproduced the override regression: `/plugins` and the initial catalog reflected a CLI disable, but the startup forced listing re-enabled instruction injection. The corrected release preserves both disabling an enabled installation and enabling a disabled installation through forced listing, the catalog, `/plugins`, and the next model request.
-- Rust checks: 1,192 core unit tests, two focused core HTTP integration tests, and 42 app-server unit tests passed; 927 TUI unit tests and nine TUI integration tests passed; all 58 CLI tests passed in the VM, with subprocess tests using the release binary. Seven existing tests remained ignored across these scopes.
-- `just-local fmt`, scoped Clippy, and config-schema validation passed. The full workspace `--all-features` test suite was not run.
-- The helper ran under the guest's pre-authorized automation context. This verifies real Safari cookie access and the client/helper/curl chain, not fresh Full Disk Access onboarding or a hosted model's autonomous tool selection.
+For release integration with Curl Safari, use [verify-local-plugins.py](../../scripts/verify-local-plugins.py) only in a disposable macOS VM with the built package, helper access and Safari automation configured. Its `--codex`, `--plugin-source`, `--safari-cli` and `--artifacts` arguments identify guest paths. It checks authenticated localhost fetches, skill/MCP lifecycle and TUI overrides through deterministic Responses fixtures; it does not establish fresh permission onboarding or a hosted model's autonomous tool-selection quality.

@@ -1,123 +1,90 @@
-# State And Decisions
+# Completion-review state and decisions
 
-## Ownership
+## Code entry points
 
-|Surface|Responsibility|
+|Responsibility|Source|
 |---|---|
-|[Completion state](../../../core/src/completion_review.rs)|Host-owned request frame, accepted/consumed input revisions, initial/latest answer slots, attempt allowance and tickets.|
-|[Session transitions](../../../core/src/session/completion_review.rs)|Durable capture, prepared/started claims, private scheduling, advisory installation and main-request framing.|
-|[Task lifecycle](../../../core/src/tasks/mod.rs)|Keep completion handles alive through finalization; serialize finalization with registration and stopping; retain acknowledged late input without treating it as consumed.|
-|[Review task](../../../core/src/tasks/post_turn_completion_review.rs)|Fresh delegate configuration, packet rendering/budgets, strict result handling and advisory output contract.|
-|[Replay](../../../core/src/session/rollout_reconstruction.rs)|Restore explicit state independently of prompt history and infer the appropriate interrupted task target.|
-|[Recorder](../../../core/src/rollout/recorder.rs)|Suppress unchanged snapshots without skipping transcript flushes; preserve metadata during loading and continuation cleanup, including after dangling calls and interrupt markers.|
+|Frozen scope, answer slots, revisions and tickets|[Completion state](../../../core/src/completion_review.rs)|
+|Durable transitions, claims and request framing|[Session review](../../../core/src/session/completion_review.rs)|
+|Finalization and task-stop ordering|[Task lifecycle](../../../core/src/tasks/mod.rs)|
+|Delegate setup, context packets and verdicts|[Review task](../../../core/src/tasks/post_turn_completion_review.rs)|
+|Recovery from durable records|[Rollout reconstruction](../../../core/src/session/rollout_reconstruction.rs)|
+|Flush errors, snapshot suppression and cleanup|[Recorder](../../../core/src/rollout/recorder.rs)|
 
-## Completion Boundaries
+## Capture and ownership
 
-- Capture only the successful main task's returned nonempty `last_agent_message`, never the last assistant-role history item.
-- Capture the actual completed task's CWD on every candidate, including replacements within an existing episode. A configuration-only directory change does not retarget the candidate.
-- A main task has an explicit owner ID. A late callback cannot install its answer under a newer task's request frame.
-- Accepted input immediately invalidates an outstanding ticket. Only input consumed by subsequent main work joins the request frame.
-- Original input and consumed steering belong together; assistant progress between them does not create a completed prior round.
-- A genuinely new user task preserves earlier known user context and terminal answers. Review continuations replace only the candidate slot.
-- Incomplete work-notes capture remains continuation work and cannot produce a candidate.
+Capture only the successful main task's returned nonempty `last_agent_message`, never an arbitrary last assistant-role history item. Record that task's actual CWD on every candidate, including replacements. Explicit main-task ownership prevents a late callback from attaching its answer to a newer request. Unfinished work-notes capture cannot produce a candidate.
 
-## Durable Metadata
+Accepted input immediately invalidates old review tickets. Only consumed input joins the frozen request. Original input and consumed steering belong to one request; intervening assistant progress does not create a completed prior round. A new user task preserves known earlier user rounds and terminal answers; a review continuation replaces the current candidate while retaining the initial reference.
 
-Completion-review tracking is disabled for `SessionSource::SubAgent(SubAgentSource::Review)`, shared by ordinary `/review` and post-turn review delegates. Their input follows the ordinary transcript path without review revisions, main-task ownership or candidate capture. Completion, pause and shutdown do not append `PostTurnCompletionReviewState` records to their rollouts. Other session sources retain existing tracking.
+A ticket binds episode, request revision, history generation, candidate completion and attempt. Validate it at dispatch, delegate entry, result acceptance, handoff preparation and main-task claim. Manual reservation joins finalization, then reserves the ticket and clones its candidate under the same state lock; persist the pair before returning it. Never combine an older snapshot with a ticket reserved after a newer completion.
 
-The parent owns recovery through its snapshots, ticket, allowance and prepared/started handoffs. Resuming a paused reviewer uses the parent's saved candidate to create a fresh delegate, not the child's rollout. A reviewer rollout remains a readable transcript, not an independent completion-review recovery checkpoint. This runtime policy adds no storage or configuration fields; existing inline metadata remains readable and is not removed.
+Review delegates use `SubAgentSource::Review` and leave completion-review recovery to the parent. They record ordinary transcripts but no accepted-input revisions, candidates or completion-review snapshots. Resuming a paused reviewer creates a fresh delegate from the parent's saved candidate. Other session sources retain tracking; automatic review scheduling is suppressed for subagent sessions.
 
-`RolloutItem::PostTurnCompletionReviewState` carries host-only JSON recovery metadata whose typed implementation is internal to core. Its format checks do not appear in model-facing packets, prompts or review results. This avoids expanding the review result or app-server RPC payloads. The record contains:
+## Durable metadata
 
-- Generation and accepted/consumed request revisions.
-- Frozen known user context, original pending input payloads, client IDs, exact model-facing message bodies and their installation phases.
-- Initial historical reference, exact candidate, completion ID, actual completed-task CWD and automatic-attempt count.
-- Current review ticket and optional prepared/started handoff with advisory text.
-- Main-task ownership, independent recovery destination, advisory-installation state and replacement-answer requirement.
+`PostTurnCompletionReviewState` is host-owned rollout metadata, separate from `ResponseItem` history, model packets and UI output. It stores exact scope and pending input, candidate/reference slots, tickets, handoffs, task ownership, the replacement-answer requirement and the recovery model. Storage-format checks remain internal; model-facing packet scaffolding and result fields are unversioned. Unsupported or incomplete records cannot establish exact provenance.
 
-The optional `recovery_model` belongs to review-derived main work, not its advisory ticket. Claiming a handoff establishes it; explicit recovery-time selection retargets it even after steering clears the handoff. Steering preserves it, while successful completion, a new root request and fork initialization clear it. Metadata without that field uses the handoff/turn-settings fallback; a selection never persisted cannot be inferred.
+`TokenUsageContext` separately persists usage coverage, request-only frame credit and reasoning semantics. Keep it out of model history and preserve it during cleanup; see [budget accounting](budget_accounting.md).
 
-It is not a `ResponseItem`, model summary, assistant output or UI cell. Unsupported or incomplete metadata is unavailable, not reconstructed from model-produced XML.
+### Write ordering
 
-`RolloutItem::TokenUsageContext` separately records the complete usage baseline, its `last_usage_item_count` covered-history boundary, the estimated request-only frame tokens already included in it, and whether historical reasoning was included. Every positive completed usage report records this tuple, including when frame credit is zero and reasoning is excluded. A single record restores all fields even when its following UI token event was not written. Replay applies baselines in history order; matching repeated UI events cannot cover later unreported output. A legacy record without a boundary uses the last model item at that record's position, not at the end of the rollout. A different unannotated baseline has no known frame credit or server reasoning-inclusion guarantee. The reasoning flag describes the stored baseline, not a new task or an in-progress response: capture transport headers privately and commit their semantics only with positive completed usage. Missing/zero usage, failed streams and cancellation retain the preceding baseline and boundary. Compaction, local recomputation and full-window replacement reset frame credit; local/full-window baselines cover the entire installed history, including retained reasoning and notes. Continuation cleanup preserves the covered unchanged prefix. These host-only records do not alter completion-review checkpoints, public token events or model history. Missing reasoning flags deserialize conservatively as false. Legacy records remain readable without inferred frame credit; a near-limit legacy continuation may need compaction or a larger model once before a successful request establishes complete accounting.
+1. Persist accepted original input with its known initial task owner. Keep its original payload until installation is durable.
+2. Persist a revision-specific `Installing` marker before the model-facing body. Flush the body before consumption. Immediately consumed input needs no intermediate `Recorded` snapshot; retained unconsumed input does.
+3. Persist a completed candidate and any automatic-review reservation together. Scheduling uses that existing ticket; it cannot recreate a ticket invalidated by stop.
+4. Persist a `Prepared` handoff before enqueueing and its `Started` claim before main work. A full or closed operation queue leaves recoverable work rather than blocking the finalizer.
+5. Persist every resumed main task's new owner before cleanup, context injection or sampling, including an already-Started handoff.
 
-Only a genuinely new root session or trusted metadata establishes exact request provenance. Resume, fork and history replacement without that evidence retain unknown scope, even when prompt history is empty or contains only encrypted compaction. Missing visible user boundaries do not prove missing requirements never existed. Subsequent genuine input remains tracked but cannot restore unknown prior scope by itself.
+Replay matches a body to its revision-specific installing marker using the exact host-owned message. It repairs both acknowledged-but-unwritten input and body-written/state-not-written gaps. It never deduplicates distinct identical amendments by searching for matching text elsewhere. Missing bodies are reinstalled after pending notes recovery and before ordinary sampling.
 
-Snapshot writes and handoff transitions use a serialized persistence boundary. Finalization persists a completed candidate and any automatic-review reservation in one snapshot; later scheduling only enqueues that current ticket. Manual reservation remains a separate acknowledged transition. Persist a prepared handoff before enqueue and the started claim before main work. Failed writes disable review eligibility and surface a diagnostic. A full/closed operation queue preserves recoverable work instead of waiting while task finalization holds its lifecycle guard.
+Recognizing an amendment body preserves the prior, now-ineligible candidate as the directory owner until amended work completes. Do not discard recovery ownership merely because the body arrived before its installation/consumption checkpoint. An unrecognized user boundary instead invalidates exact provenance.
 
-Recorder flush/shutdown acknowledgements carry the underlying I/O result, not just notification that the writer processed the command. A buffered write failure must reach the reservation or claim caller before task startup. Failure leaves the existing durable prefix intact and prevents the in-memory transition from authorizing new review work.
+### Cancellation and I/O
 
-Each recorder writer suppresses a review snapshot equal to its latest written snapshot, including pending buffered writes. Pending state takes precedence over the flushed baseline, preserving transitions such as `A -> B -> A` before one flush. Only a successful flush advances the acknowledged baseline. Recorder clones share that writer; reopening or replacing a recorder starts without a cached baseline, even at the same path. Ordinary transcript records and flush/shutdown commands are never suppressed. Continuation cleanup preserves metadata, so its rewrite does not invalidate the latest retained snapshot.
+Short input/advisory installation transactions survive caller cancellation; task-stop joins their guard before publishing stopped state. Keep task handles alive through terminal persistence. Registration and externally requested pause/interrupt/shutdown must join finalization even after the active-task entry disappears; only then may shutdown detach the recorder.
 
-Known initial main-task ownership shares the accepted-input snapshot. A resumed or otherwise newly assigned owner still requires an acknowledged checkpoint before sampling. These changes preserve the existing JSONL record shape and exact recovery payloads; they do not rewrite historical rollouts or improve how older readers recognize unknown record types. Flush acknowledgement means buffered writes completed, not an `fsync` power-loss guarantee.
+Flush and shutdown acknowledgements carry the writer's I/O result. A failed reservation, claim or resumed-owner checkpoint prevents model startup and preserves the last durable prefix. Missing mandatory snapshots are an error, not an ordinary no-review task. Continue preflight must retain the pending checkpoint even after writer repair, so invalid in-memory state cannot overwrite good recovery data. Flush completion is not an `fsync` or power-loss atomicity guarantee.
 
-Every resumed review-tracked main task must also persist its new owner before sampling, even when the handoff was already Started. Owner-write failure stops before history cleanup, snapshot injection or a model request; finalization retains interrupted continuation ownership. Missing mandatory context is an explicit error, distinct from an ordinary task that requires no review context. Continue preflight preserves the checkpoint on that error, including after the writer is repaired, so an invalidated in-memory snapshot cannot overwrite the last good recovery prefix.
+Suppress unchanged review snapshots only inside the recorder writer. Compare against pending state before the flushed baseline, preserving `A -> B -> A` within one flush. Advance the acknowledged baseline only after a successful flush and reset it when replacing the writer. Never suppress transcript writes, flush/error delivery or newly assigned ownership because review metadata is unchanged.
 
-Advisory preparation and installation finish their short durable transaction even if their caller is cancelled; task-stop joins that boundary before recording its stopped state. Pausing a reviewer clears an unconsumed prepared handoff and preserves its ticket for re-review. Pausing main work preserves started lineage and its output contract.
+Continuation cleanup shares the installation boundary and preserves host metadata and acknowledged input. `ResponseItem::Message.id` is not serialized; advisory recovery compares the exact durable developer item, not an assumed persistent message ID. Reinsert advice only when compaction removed it, while always restoring the replacement contract and exact request/candidate frame.
 
-Continuation cleanup and acknowledgement of unconsumed input use the same boundary. A cleanup rewrite cannot discard metadata or acknowledged input written concurrently, and stopping a task cannot leave those writes racing the published pause state.
+## Recovery transitions
 
-Input installation persists an `Installing` marker for a specific accepted revision before recording its user message. For immediate consumption, it flushes the body before consuming the revision into the request frame and persists the consumed state without an intermediate `Recorded` snapshot. Retained, unconsumed input still persists `Recorded` with its body. Replay recognizes a body after its installing marker using the exact host-owned message; it never deduplicates by text found anywhere in history. Accepted inputs without a body are reinstalled before ordinary sampling, after pending notes recovery. Acknowledgement before main-task startup also establishes recoverable continuation work. Pending notes retain the resume-selected destination model while compaction resolves its separate source.
-
-Recognizing that installation preserves the prior, now-ineligible candidate and its CWD. The accepted revision already invalidates review eligibility, while an unfinished review-derived main task still needs that directory owner to resume. An unrecognized user boundary continues to discard the candidate and disable exact provenance. Do not erase known recovery ownership merely because the matching body arrived before installation or consumption was checkpointed.
-
-Once input installation starts, its short owned transaction survives caller cancellation and task-stop joins it. A consumed amendment therefore cannot be persisted ahead of its model-facing message. Metadata without durable input-installation ownership cannot establish these guarantees and stays unavailable rather than being upgraded by inference.
-
-Task-stop also joins the task lifecycle guard, including when finalization already removed the active-task entry. Only afterward may shutdown detach the recorder. Explicit pause/interrupt invalidate any private automatic-review ticket queued by the finalizer, so joining completion cannot accidentally start new review work after the stop. A started handoff instead belongs to interrupted main work; stop/shutdown retains its ticket, snapshots, selected destination and replacement contract rather than clearing that lineage as unstarted reviewer scheduling.
-
-`ResponseItem::Message.id` is not serialized. Restart deduplication compares the exact host-owned developer item associated with the durable handoff, not an assumed persistent message ID. The main request only reinserts the advisory when compaction removed that item; it always re-establishes the replacement contract and exact request/candidate frame.
-
-That request-only frame is inserted after the last system/developer/user message or encrypted compaction item, before subsequent assistant reasoning and tools; an input without those boundaries uses index zero. Placement is derived from the prepared history, so replay and compaction need no additional anchor metadata. Appending the frame to the current tail on every tool round changes the preceding request instead of extending it and disables incremental WebSocket continuation. See the [prefix contract and historical regression](request_prefix.md).
-
-The active snapshot and review packet have bounded answer revisions. A clean automatic-review episode without steering or handoffs normally records five states: accepted input with owner, installing input, consumed input, completed candidate with automatic ticket, and finished review. Additional meaningful transitions remain recorded. The append-only rollout still grows with actual work; unchanged-snapshot suppression does not bound session storage or cumulative cost.
-
-## Tickets And Recovery
-
-A ticket identifies episode, request revision, history generation, exact candidate completion and attempt. Private operations associate the ticket with an opaque submission ID; public manual commands resolve the latest eligible completion. Dispatch, delegate entry, result acceptance, handoff preparation and main-task claim all validate ownership.
-
-Manual reservation joins the task lifecycle before selecting work, including the interval after the active-task entry is removed but finalization is still installing a newer answer. Under the installation guard, one state lock reserves the ticket and clones its candidate snapshot; persistence completes before either is returned. The delegate checks both the supplied snapshot's ticket identity and the ticket's live ownership. A snapshot read before finalization must never be paired with a ticket reserved afterward.
-
-Reservation failures retain their cause through the command handler: running task, missing candidate, pending input, unavailable provenance or failed persistence. Diagnose unavailable provenance before suggesting that pending input can restore eligibility. A new prompt can resolve missing work but cannot establish the requirements of an unknown prior scope. Storage failures remain storage errors rather than being collapsed into a generic missing-turn message. These internal errors add no wire or rollout fields.
-
-|Transition|Behavior|
+|Transition|Contract|
 |---|---|
-|Prepared, before or after enqueue|Resume requeues the ticket. A duplicate claim cannot start another main task. `/continue` can claim a prepared handoff if enqueue was unavailable.|
-|Started, before completion|Resume offers interrupted main continuation with the same request snapshot and output contract; it does not repeat the advisory handoff.|
-|Paused reviewer|Continue the same reviewer/candidate/ticket without another automatic-attempt reservation.|
-|Paused review-derived main|Continue main work, preserving its replacement-answer requirement.|
-|New user input|Invalidate old advice immediately, track pending versus consumed input, and establish a new episode only after main completion.|
-|Compaction|Keep explicit host snapshots outside rewritten prompt history. Standalone compaction completion preserves the existing continuation checkpoint, including paused/interrupted main ownership. Reinsert mandatory context and the output contract for main follow-ups.|
-|Explicit model change during recovery|Retarget pending regular work and its independent durable recovery destination, synchronizing a surviving Started handoff. Steering may invalidate that handoff without discarding model ownership. Preserve intent from the submitted `model` or collaboration-mode field, not a full mode synthesized for other overrides. Keep request/candidate snapshots, paused reviewer ownership and the notes capture's source model unchanged; CWD, approval and effort-only updates must not replace the saved model with a resumed session's default.|
-|Rollback/history replacement|Invalidate uncertain provenance and pending operations; never retain a future candidate.|
-|Fork|Recover only eligible metadata before the selected surviving user boundary; renew generation and clear delegate/main scheduling state. Explicit loss of exact provenance is a backward-scan barrier even within the same generation and without a new user message. Do not skip that invalidation to recover an older candidate. Metadata for an excluded next user must still not retarget the fork.|
-|CWD change|Review the latest candidate's actual task directory. Enforce the same CWD when preparing, claiming or resuming review-derived main work, including pause, budget recovery and restart. Reject a mismatched resume before consuming its checkpoint or starting a task; returning to the original directory permits retry. Ordinary non-review continuation is not restricted by this review-specific rule.|
+|Prepared handoff|Resume requeues it; `/continue` can claim it if enqueue failed. A duplicate claim cannot start another main task.|
+|Started handoff|Resume interrupted main work with its exact snapshots and replacement contract; do not repeat the advisory action.|
+|Paused reviewer|Keep the ticket/candidate/allowance, clear unconsumed prepared advice, and start a fresh reviewer on continue.|
+|Explicit pause, interrupt or shutdown|Invalidate queued unstarted automatic work after joining finalization. Retain already-started main lineage and recovery selection.|
+|New steering|Invalidate old advice immediately; keep pending versus consumed ownership and any unfinished main recovery destination.|
+|Compaction|Preserve explicit review snapshots outside rewritten history. Standalone compaction does not complete or consume paused/interrupted main ownership.|
+|Explicit model selection|Persist the pending regular-work destination independently of the advisory handoff; synchronize a surviving Started handoff. Honor submitted selection even if session settings already name that model.|
+|CWD, approval or effort-only update|Do not retarget the saved model from a synthesized full mode or a resumed session's default.|
+|CWD mismatch|Reject review-derived preparation, claim or resume before taking its checkpoint or starting a task. Ordinary continuation is not subject to this review-specific restriction.|
+|Successful completion or new root request|Clear the old recovery model. Capture each replacement's actual completed-task directory.|
+|Rollback or uncertain history replacement|Invalidate uncertain provenance and pending operations; never retain a future candidate.|
+|Fork|Use eligible metadata inside the surviving boundary, renew the generation and clear scheduling/main ownership. Exact-provenance invalidation is a backward-scan barrier; do not recover an older candidate across it.|
 
-These are scheduling/ownership guarantees, not exactly-once tool or model side effects across process failures.
+Explicit recovery selection does not change exact request/candidate snapshots, a paused reviewer's ownership or a pending compaction capture's source model. Metadata without an independent recovery model retains its existing handoff/turn-settings fallback; a never-persisted selection cannot be inferred.
 
-## Context And Answer Decisions
+## Provenance and failure policy
 
-|Alternative|Decision|
+Only a new root session or trusted host metadata establishes exact request scope. Empty, summary-only or encrypted-only history does not prove that no requirements were lost. Later referential input cannot repair unknown scope. A fork must distinguish excluded-next-user metadata from an explicit provenance invalidation inside the surviving generation.
+
+Human clarification currently invalidates complete review coverage before its answer reaches the main task. Preserve that invalidation through restart and full-history forks; arbitrary tool-output JSON is not a trusted question/answer frame. Nontext input likewise cannot become a claimed complete text-only projection.
+
+Keep reservation causes distinct: running task, missing candidate, pending input, unavailable provenance and persistence failure have different recovery paths. Unsupported records can disappear from a fork's recognized-record copy; offline repair must inspect original ancestors, back up the rollout, reconstruct exact scope only from verified request/completion/consumption checkpoints, and validate through production replay before appending a corrected checkpoint. No automatic legacy migration exists. Do not flip an exactness flag, treat an assistant message as a completion, or promote a summary to user requirements.
+
+## Design choices
+
+|Choice|Reason|
 |---|---|
-|Full parent transcript|Rejected: includes reasoning/tools/verdicts and defeats independent review.|
-|Every compact review exchange|Rejected: answer revisions and prior findings accumulate.|
-|Last `K` revisions|Rejected: the original comprehensive answer eventually disappears.|
-|Latest answer only|Smaller but loses the reference when the model again writes a delta.|
-|Initial reference plus latest delta, without a replacement contract|Insufficient: omitted intermediate corrections cannot be recovered.|
-|Generated rolling summary or separate final writer|Deferred: adds latency, drift and a second text that may differ from the user's answer.|
-|Frozen frame plus initial reference and exact latest replacement|Implemented: bounded revisions, independent reviewer and no extra synthesis call.|
+|Frozen request plus initial reference and exact latest candidate|Bounds answer revisions while retaining a reference that can expose dropped content.|
+|Complete replacement answer on every continuation|Intermediate corrections must survive in the latest answer itself; a reference cannot complete a delta-only candidate.|
+|Exclude the parent transcript and previous verdicts|Preserves independent review and avoids growing reasoning/tool/review context.|
+|No extra final synthesis call|Keeps the reviewed candidate identical to the user's streamed answer.|
+|Optional reference omitted before mandatory overflow|Preserves exact scope/candidate; incomplete coverage cannot become a clean verdict.|
+|Finite automatic allowance|Bounds execution independently of the two-answer context bound; manual review does not reset it.|
 
-The reference helps detect dropped content but is not authoritative. Cumulative corrections must survive in the latest replacement answer itself. No length threshold, prompt or boolean can prove arbitrary semantic completeness.
-
-## Budget And Failure Policy
-
-Use the resolved review model, not the parent's capacity. Deduplicate initial/latest text, omit the optional reference if necessary, and refuse a full review when mandatory material does not fit. Approximate token counts and explicit reserves are conservative planning tools, not exact tokenizer guarantees.
-
-Main follow-ups use the same token-usage ledger as automatic compaction: the last positive usage baseline plus all items after its covered-history boundary, including unreported model output. Successful empty responses cover their input; missing-usage/failed output does not advance the boundary. Historical reasoning before the boundary is estimated only when the baseline excludes it; reasoning after it is already in the tail estimate. Charge only `next_request_frame_tokens - baseline_request_frame_tokens` for the replacement contract and exact review frame, including a negative delta when the replacement shrinks. The preceding frame is already included in reported usage even though it is not stored in prompt history. Record its cost only when usage is updated for the request that actually sent it; failed or cancelled requests cannot replace that accounting. Retain the 8,192-token reserve and omit the optional reference before rejecting mandatory overflow. Without a positive baseline, use the full prompt's byte estimate; missing/zero usage preserves any preceding usable baseline instead of erasing it. Reconstructed compaction baselines remain usable without frame credit. A whole-transcript byte estimate must not override usable usage accounting: accumulated reasoning and text estimates can drift far above model-reported tokens and stop a healthy long-running continuation before automatic compaction is due. Overflow diagnostics report estimated tokens and the available budget.
-
-Unexpected context pressure must not turn into a clean verdict: compaction during the delegate ends full-review coverage; malformed output, missing output, execution failure and unrepresentable nontext context stay unavailable. Main follow-ups also refuse to send truncated request/candidate snapshots.
-
-A budget-stopped main follow-up remains resumable without reclaiming its already-started handoff. `/compact` reduces ordinary history without consuming that continuation; an explicit main-model selection updates the pending destination rather than letting `/continue` restore the insufficient model. Honor that selection even when session settings already name it but a restored checkpoint still names the old model. Persist the destination independently of advisory validity so steering, pause and restart cannot undo it. Replay prefers that destination for pending input and interrupted main work without changing the notes capture's source model. If mandatory snapshots alone do not fit, compaction still cannot authorize truncation.
-
-`request_user_input` clarification answers are outside the currently captured request frame. Until structured question/answer ownership is implemented, receiving an answer marks coverage unavailable before delivering it to the waiting main task. That persisted invalidation also blocks recovery of a pre-clarification candidate when forking the completed follow-up's full history. Do not reconstruct human scope from arbitrary function-output JSON.
-
-The three-attempt automatic default is a finite execution policy, separate from the two-answer context bound. It is not an empirically optimized count. A manual handoff after exhaustion does not enable another automatic attempt.
+These contracts do not guarantee semantic completeness, filesystem snapshot isolation or exactly-once model/tool side effects across process failure.

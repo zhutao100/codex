@@ -1,59 +1,49 @@
 # Streaming remote compaction
 
-Streaming Responses compaction. [Design and backport decisions](design.md). [Validation and deployment evidence](validation.md).
+Compaction over the ordinary Responses transport. Read this before changing compaction dispatch, retained history, work-notes recovery or continuation after compaction.
+
+|Need|Read|
+|---|---|
+|Retention, source/destination contexts and durable installation|[Design](design.md)|
+|Collector, transport and recovery regressions|[Validation](validation.md)|
+|Optional deployed-endpoint check|[Native acceptance](native_acceptance.md)|
 
 ## Selection
 
-|Configured provider|`remote_compaction`|`remote_compaction_v2`|Implementation|
+|Provider eligibility|`remote_compaction`|`remote_compaction_v2`|Implementation|
 |---|---|---|---|
-|OpenAI|true|true (default)|Normal Responses stream ending in `{"type":"compaction_trigger"}`.|
-|OpenAI|true|false|Legacy unary `responses/compact`.|
+|`provider.is_openai()`|true|true|Ordinary Responses stream with a final `compaction_trigger` input item.|
+|`provider.is_openai()`|true|false|Legacy unary `responses/compact`.|
 |Any|false|Either|Local summarization.|
-|Other provider name|Either|Either|Local summarization.|
+|Not OpenAI|Either|Either|Local summarization.|
 
-OpenAI eligibility retains the branch's existing provider-name check; it does not test the authentication mode or rewrite configured URLs. Both ChatGPT and API-key requests use the selected provider's ordinary Responses client. With the ChatGPT backend base, v2 uses `responses` instead of the failing `responses/compact` route. WebSockets use the same Responses connection.
+Both flags default to true. Eligibility uses the existing provider-name check, not authentication mode. V2 uses the selected provider's ordinary client and URL, including ChatGPT or API-key authentication and configured WebSockets. It does not rewrite the legacy endpoint.
 
-Explicit local fallback:
+To select local summarization explicitly:
 
 ```toml
 [features]
 remote_compaction = false
 ```
 
-Disabling only `remote_compaction_v2` selects the legacy endpoint and can reproduce the reported 404. There is no automatic v2-to-legacy or v2-to-local fallback.
+Disabling only `remote_compaction_v2` selects the legacy route. There is no automatic v2-to-legacy or v2-to-local semantic fallback; normal WebSocket-to-HTTP transport fallback remains available.
 
-## Request and replacement contract
+## Core contracts
 
-- Advertise the stable `remote_compaction_v2` key in `x-codex-beta-features`.
-- Reuse normal authentication, provider URLs, tools/order, reasoning, service tier, cache key, formatting and transport behavior. The compact request omits the final-output schema; subsequent sampling restores it.
-- Append exactly one trigger after history projection. Never record, persist, retain or replay a trigger.
-- Buffer stream output privately. Install only after `Completed` with exactly one encrypted `Compaction` item. Ignore other output items without executing tools or recording assistant work.
-- Retain recent eligible user messages and existing plaintext summaries, then append the new encrypted summary. Older typed compactions, assistant/tool history and stale context are summarized rather than retained verbatim.
-- Retain at most 64,000 approximate tokens, including image costs and message overhead. Further reduce retention against the effective context window and auto-compaction threshold after reserving summary, notes, canonical instructions and tool costs.
-- Keep work notes exact and outside the truncatable retention budget. Reject installation if fixed content alone exceeds the context target.
+- Advertise `remote_compaction_v2` in `x-codex-beta-features`. Preserve ordinary authentication, tools/order, reasoning, service tier, cache key and transport behavior; omit the final-output schema only for compaction.
+- Append one trigger after history projection. Never persist it or replay it as conversation history.
+- Collect privately until `Completed` contains exactly one completed encrypted compaction item. Other output items do not execute tools or enter history. Incomplete/invalid results never install a replacement.
+- Retain recent eligible user messages and plaintext summaries within an approximate budget capped at 64,000 tokens. Reserve encrypted summary, exact notes, instructions, canonical context and tools before choosing the retention allowance.
+- Keep work notes exact and outside truncatable retention. Fixed content that exceeds the destination limit rejects installation.
+- Preserve undo snapshots and the exact replacement/reference checkpoint across cancellation. Installation and background snapshot writes share a guard.
+- Reset logical WebSocket continuation after replacement; only a healthy completed physical connection may be reused.
 
-## Branch lifecycle
+## Lifecycle constraints
 
-- Manual compaction preserves existing notes without requesting new notes.
-- Standalone compaction completion preserves paused/interrupted continuation ownership. An explicit regular-model change retargets recovery's destination, not an outstanding notes capture's source model.
-- Pre-turn and model-downshift compaction share bounded notes capture. Preserve the source model with the request so failed/paused capture retries use its provider and instructions even after notes report low usage. Replacement budgets, tools, canonical context and reference context use the destination model.
-- Mid-turn compaction borrows the active client and preserves deferred-input ordering.
-- Recover an outstanding notes transaction before ordinary work or incoming user input is appended. Recognize completed notes and abort markers from durable history. A later real user message ends the capture segment; preserve it and subsequent work in the retry source. Reject ambiguous work inside the capture segment.
-- Failed compaction keeps continuation available immediately and after restart. Queued steering acknowledged when the failed turn finishes is persisted outside the capture segment; notes are never treated as the final user answer.
-- Local fallback keeps summarizer output private until the attempt completes. Failed attempts cannot append uncommitted summaries after a notes capture and block recovery.
-- Matching tool rejections can follow completed notes because tool futures drain after the stream. Continuation cleanup preserves notes captures whose rejected outputs were not recorded before interruption.
-- Concatenate assistant output-text parts exactly for both live capture and recovery, including split sentinels and multiline plan blocks. Output handlers share sampling's capture-specific decision to bypass plan rendering.
-- Live capture and recovery use the same history scanner. Completed notes may be followed by reasoning and empty/whitespace-only output-text assistant messages without another capture attempt. Preserve the entire notes message, including text after its closing tag; continue rejecting nonempty later messages, non-text content and unmatched tool activity.
-- Preserve undo snapshots, including snapshots arriving during notes capture, the compaction stream or interrupted tool work. Snapshot recording and replacement installation share a guard. Snapshots remain absent from model requests.
-- Install canonical context before the last real user, then the last plaintext summary, then the encrypted summary, or append it if none exists. Image-only input is a real user anchor.
-- Append notes after the encrypted summary and snapshots after notes. Persist exactly this vector plus the appropriate adjacent reference context.
-- Recomputed usage covers the entire installed history, including notes, and persists that covered-item count with the baseline. Live accounting and replay add only later unreported items.
-- Cancellation before installation preserves live history. Once installation starts, task-stop waits for its memory/persistence/completion boundary.
-- Clear logical WebSocket continuation after installation; reuse only healthy physical connections. Unfinished requests remain marked unfinished on failure or cancellation.
-- Replay uses inline-compaction provenance to infer pending work even when retention removes all real users. Pending captures keep the resume-selected destination; installed inline replacements use their persisted reference model. Later completion and rollback suppress continuation inference.
+Manual compaction preserves existing notes without requesting fresh notes. Automatic/pre-turn and model-downshift paths recover a bounded notes transaction before ordinary work. Notes are never a completed answer to the user's task; failed compaction retains continuation and acknowledged later input.
 
-## Maintenance
+Source and destination contexts have different roles: the notes/compaction request uses the source model's provider and effective instructions; retention and subsequent work use the selected destination. Persist the source in the capture request so low notes usage, pause or restart cannot erase a pending downshift. Explicit recovery model selection changes the destination only.
 
-The backport uses existing branch types and persistence rather than upstream history envelopes, step contexts, provider traits or window IDs. Keep the legacy endpoint for explicit configuration; do not rename it to implement v2.
+Standalone compaction preserves paused/interrupted main ownership. Inline replacement uses its adjacent reference context to support replay even when no real user message remains. Review-derived work additionally retains its [exact snapshots and budget contract](../post_turn_completion_review/budget_accounting.md).
 
-When changing retention or notes handling, exercise collector, transport, pause/restart, replay, output-rewrite and full-context budget tests together. Loopback fixtures must use the existing loopback-aware test guard under `cargo-local`; a network-disabled early return is not transport coverage.
+Follow the [design contracts](design.md) before modifying notes parsing, installation or replay. [Source selection](../../../core/src/compact.rs), [streaming implementation](../../../core/src/compact_remote_v2.rs) and [retention](../../../core/src/compact_remote_v2_history.rs) define the implemented behavior.

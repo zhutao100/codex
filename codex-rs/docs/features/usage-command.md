@@ -1,44 +1,29 @@
-# `/usage` Backport
-
-Status: Supported on `custom-0.98.0`
+# Account token activity
 
 ## Behavior
 
-- `/usage` and `/usage daily` show daily account token activity.
-- `/usage weekly` and `/usage cumulative` switch chart aggregation.
-- Unsupported arguments report `Usage: /usage [daily|weekly|cumulative]`.
-- Sessions without ChatGPT authentication report `Sign in with ChatGPT to use /usage.`
-- `/status` remains the rate-limit and credits surface.
+|Command|Result|
+|---|---|
+|`/usage` or `/usage daily`|Daily account token activity|
+|`/usage weekly`|Weekly aggregation|
+|`/usage cumulative`|Cumulative aggregation|
+|Unsupported argument|`Usage: /usage [daily\|weekly\|cumulative]`|
 
-## Design
+ChatGPT authentication is required; API-key sessions receive `Sign in with ChatGPT to use /usage.` `/status` remains the rate-limit and credits surface.
 
-Reference: upstream `c884536d8 feat(tui): reland token activity command (#27925)`.
+## Rendering and ordering contract
 
-- Fetch `/api/codex/profiles/me` or `/wham/profiles/me` directly through `codex-backend-client`.
-- Do not port app-server `account/usage/read`; the older TUI already owns direct backend account reads.
-- Render the loading card above the composer without mutating transcript history.
-- Commit a settled card directly into history when no active cell or answer/plan stream can be reordered.
-- Treat agent and MCP task indicators as presentation state, not insertion barriers.
-- Drain ready core events before committing settled output and hold their app-event history behind explicit barriers.
-- Treat deferred exec, MCP, approval, and input events as insertion barriers until their queue is flushed.
-- Queue terminal error, interruption, and pause history before retrying settled output insertion.
-- Include loading and blocked-settled cards in the transcript overlay live tail.
-- Allocate transient activity as flexible content so a short viewport preserves the composer.
-- Use process-wide request IDs so responses from replaced widgets cannot complete a newer request.
-- Pack summary fields to the visible graph width.
+The direct-core TUI fetches `/api/codex/profiles/me` or `/wham/profiles/me` through [the backend client](../../backend-client/src/client.rs). The loading card is transient UI content above the composer; it must not rewrite the model conversation.
 
-## Deferred Scope
+- Commit a settled card to visible history only when active cells, answer/plan streams and queued exec/MCP/approval/input events cannot be reordered. Drain ready core events and respect explicit app-event barriers.
+- Task indicators alone are not insertion barriers. Queue terminal error, interruption and pause history before retrying insertion.
+- Include loading and blocked settled cards in the transcript overlay's live tail. Keep the composer visible in a short viewport and fit summary fields to graph width.
+- Use process-wide request IDs so a late response for a replaced widget cannot complete a newer request.
 
-- Reset-credit redemption from `f8f5a6e78` and `5c0fbf349`.
-- App-server protocol and generated schema support for `account/usage/read`.
-- Runtime auth-aware slash-command completion filtering.
-- Newer terminal palette and resize-reflow infrastructure.
+[Widget state](../../tui/src/chatwidget/tokens.rs) owns transient/settled cards; [app integration](../../tui/src/app.rs) owns queued-history ordering. Preserve this division when changing presentation.
 
-## Verification
+## Scope and tests
 
-- `CODEX_SANDBOX_NETWORK_DISABLED=1 cargo-local test -p codex-backend-client`
-- `CODEX_SANDBOX_NETWORK_DISABLED=1 cargo-local test -p codex-tui`
-- Authenticated `/usage` success path uses a localhost-backed profile response.
-- App-level lifecycle coverage commits `TokenActivityLoaded` after queued core history and before later events.
-- `CODEX_SANDBOX_NETWORK_DISABLED=1 just-local fix -p codex-backend-client`
-- `CODEX_SANDBOX_NETWORK_DISABLED=1 just-local fix -p codex-tui`
+The feature does not add an app-server `account/usage/read` RPC or reset-credit redemption. Do not assume those surfaces exist because another client supports them.
+
+Use the backend-client URL/response tests, [token-card tests](../../tui/src/chatwidget/tokens_tests.rs), chatwidget tests and `token_activity_app_event_commits_after_queued_active_thread_history` in the app tests. Localhost fixture success covers the deterministic authenticated response path, not a live account service call. See [scoped validation](../development.md#scoped-validation).

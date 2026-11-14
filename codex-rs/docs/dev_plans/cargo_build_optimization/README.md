@@ -1,38 +1,26 @@
-# Cargo Build Optimization
+# Build optimization
 
-## Status
+Status: partially implemented. Developer profiles, native-async adapters and hidden proxy sidecars are implemented; broader CLI dependency-closure changes remain unimplemented and require measurements before choosing a split.
 
-Consolidated proposal. Partially implemented in this branch.
+## Preserve the implemented decisions
 
-Implemented inputs already present in this branch:
+- Keep concrete tool/task handlers native-async and box only at object-safe storage boundaries: [tool registry](../../../core/src/tools/registry.rs), [tasks](../../../core/src/tasks/mod.rs).
+- Use `release-fast` for release-like local work; preserve the production release profile. See [development](../../development.md).
+- `responses-api-proxy` and `stdio-to-uds` already use sidecar dispatch. Preserve arguments, exit status, missing-binary diagnostics and packaging support; do not plan this split again.
 
-- native async `ToolHandler` with a private object-safe `AnyToolHandler` adapter;
-- native async `SessionTask` with a private object-safe `AnySessionTask` adapter;
-- local dev profiles in the workspace root `Cargo.toml`;
-- production release `split-debuginfo = "off"`;
-- a `release-fast` profile for release-like developer builds.
-- a repeatable measurement script, `measure.sh`, that uses the repo-local Cargo
-  wrapper and writes absolute-path-heavy captures outside the repository.
-- hidden `responses-api-proxy` and `stdio-to-uds` commands dispatch to sidecar
-  binaries instead of linking their libraries into the primary `codex` binary.
+## Remaining work
 
-Remaining scope is the larger `cargo build --release --bin codex` latency problem caused by the final `codex` binary's dependency closure and production release profile, especially still-linked public or semi-public command surfaces such as MCP, app-server tooling, cloud tasks, and OSS provider helpers.
+1. Measure the selected CLI binary's dependency graph and release/release-fast package-clean rebuilds with [measure.sh](measure.sh). This cleans only `codex-cli`; dependencies remain warm, so it is not a cold-workspace benchmark. Capture compiler/toolchain, target and profile alongside timings outside the repository.
+2. Identify a material cost before changing architecture. [CLI dependencies](../../../cli/Cargo.toml) still include MCP server, app-server tooling and cloud tasks; [shared CLI helpers](../../../common/Cargo.toml) still depend on OSS-provider helpers. A package in Cargo's compile output is not evidence that its standalone binary is being built.
+3. If a cold command is worth splitting, change one dispatch/dependency boundary and its packaging together. Preserve CLI argument handling, exit status and missing-sidecar behavior, then compare dependency closure and timings.
+4. Evaluate a separate OSS helper crate or optional feature only if callers and feature unification actually remove dependencies from the measured target. Moving files alone does not reduce the graph.
+5. Investigate build-script invalidation or compiler hot spots only when timing/attribution points there. Avoid speculative derive removal or additional mandatory cache services.
 
-## Target Base
+## Completion criteria
 
-This proposal targets this project's customized branch shape. The upstream project is used only as a reference for design direction and low-risk optimization patterns.
+The selected change preserves command and provider behavior, demonstrates a measured improvement under a described build condition, and leaves production packaging intact. Move the retained implementation decision to [development](../../development.md) and remove this plan when no accepted work remains.
 
-## Purpose
-
-The earlier compile-time optimization work reduced `codex-core` rebuild cost. The release build pain point is broader: `cargo build --release --bin codex` must compile and link the `codex-cli` binary, whose entrypoint directly includes interactive TUI, non-interactive exec/review, MCP server, app-server tooling, codexd management, cloud tasks, sandbox helpers, hidden proxy helpers, and feature tooling.
-
-This directory separates the two problem classes:
-
-1. compiler hot spots inside high-fanout crates, especially `codex-core`;
-2. final binary dependency-closure and link-time cost for the multipurpose `codex` executable.
-
-## Documents
-
-- `problem_statement.md`: consolidated problem statements, source validation, and corrected interpretation of the observed build output.
-- `design_proposal.md`: proposed optimization strategy, including already-landed items and remaining work.
-- `implementation_plan.md`: sequencing, commands, acceptance criteria, and rollback notes.
+```bash
+CODEX_SANDBOX_NETWORK_DISABLED=1 bash docs/dev_plans/cargo_build_optimization/measure.sh --skip-builds
+CODEX_SANDBOX_NETWORK_DISABLED=1 bash docs/dev_plans/cargo_build_optimization/measure.sh
+```

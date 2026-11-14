@@ -1,37 +1,25 @@
-# Context Harness Improvements
+# Context acquisition improvements
 
-## Status
+Status: proposed runtime work. Existing work-note carryover and streaming remote compaction are implemented features; preserve them. This plan addresses output lost before it reaches history and disposable exploration evidence that needlessly enlarges the parent's context.
 
-Research complete; runtime changes proposed, not implemented. The instruction corrections described in [instruction audit](instruction_audit.md) are applied separately from the proposed runtime work.
+|Plan|Current gap|Next step|
+|---|---|---|
+|[Recoverable tool output](recoverable_tool_output.md)|Capture/preview truncation has no durable address for all omitted bytes.|Add bounded storage at the original byte reader and prove retrieval without rerunning the command.|
+|[Bounded exploration](bounded_exploration.md)|The opt-in explorer has a model profile but no dedicated bounded-report or enforced read-only contract.|Specialize the existing role and verify effective capability and fresh-thread behavior.|
+|[Evaluation](evaluation_plan.md)|Source inspection does not establish live quality or total-cost gains.|Create small known-answer fixtures and measure parent and aggregate resource use separately.|
 
-## Assessment
+## Decisions
 
-The article's useful result is that independent exploration contexts can reduce parent-history growth. It does not establish a general model ranking, a universal compaction cause, or lower total cost. This fork already has exact work-note carryover and streaming remote compaction; those mechanisms should be preserved, not proposed again.
+- Improve acquisition before raising context limits or adding a new compaction mechanism. Notes preserve working conclusions; they cannot recreate discarded raw bytes.
+- Keep existing tool/result and rollout boundaries. No app-server migration, new history envelope or newer multi-agent API is required for the initial changes.
+- Preserve applicable instructions, exact notes, review provenance, pending input, cancellation ownership and WebSocket reset semantics. Use [feature docs](../../features/README.md) for those contracts.
+- Keep collaboration opt-in. Existing runtime schemas determine which arguments and tools are valid; this backend uses fresh children and `wait`, without `fork_turns` or `fork_context`.
+- Parent-context reduction, total usage, elapsed time and correctness are separate outcomes. Do not promote defaults based solely on fewer parent tokens or compactions.
 
-The remaining opportunities are complementary: acquire less disposable output, keep omitted evidence addressable, and give exploratory workers bounded responsibilities and verifiable reports.
+## Work sequence
 
-## Read Next
-
-|Document|Purpose|
-|---|---|
-|[Source audit](source_audit.md)|Revision-qualified verification of the article and supplied prior assessment, including differences between the primary fork and reference snapshots.|
-|[Recoverable tool output](recoverable_tool_output.md)|First runtime candidate: bounded output artifacts captured before destructive buffering, with stable retrieval after compaction and restart.|
-|[Bounded exploration](bounded_exploration.md)|Second runtime candidate: specialize the existing opt-in explorer without importing a newer multi-agent backend.|
-|[Evaluation plan](evaluation_plan.md)|Shared correctness, coverage, acquisition, recovery, latency and aggregate-cost gates; separates scripted fixtures from live model evaluations.|
-|[Instruction audit](instruction_audit.md)|Observed navigation failures, canonical instruction fixes and verification evidence.|
-
-## Sequence
-
-1. Establish the evaluation manifest and small synthetic fixtures before modifying runtime behavior.
-2. Implement recoverable output for unified execution, then the legacy shell path using the same storage contract. Keep each path disabled until its failure and retrieval checks pass.
-3. Specialize the opt-in explorer and pilot bounded acquisition guidance. Do not enable collaboration globally as part of this work.
-4. Run the acquisition/delegation factorial evaluation, then add output artifacts as a separate ablation.
-5. Promote defaults only after correctness and resource gates pass; retain negative and inconclusive results.
-
-## Constraints
-
-- Keep drop-in patches on existing branch types, tool results and rollout boundaries. No app-server migration, history-envelope port, new compaction implementation or multi-agent-v2 backport.
-- Preserve exact notes, review provenance, pending input, cancellation ownership, reference context and WebSocket reset behavior.
-- Do not silently remove applicable project instructions from workers or claim read-only behavior from a prompt alone.
-- Bound parent output and worker output independently. Lower parent occupancy is not lower aggregate usage, and zero compactions is not an answer-quality metric.
-- Prefer the existing shell/file access and optional exploration tools over introducing a second general search framework.
+1. Capture baseline behavior with the small fixtures in the evaluation plan.
+2. Implement output storage for unified execution, then legacy shell, using one bounded storage contract. Keep exposure opt-in until failure and retrieval checks pass.
+3. Implement the explorer specialization independently; retain a direct path for simple lookups.
+4. Compare acquisition guidance and delegation independently, then add output storage as a separate ablation.
+5. Record the supported contract and any measured tradeoffs. Move implemented behavior into feature docs and remove completed plan sections; retain only unresolved decisions here.
