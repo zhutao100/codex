@@ -1,5 +1,4 @@
 use super::*;
-use crate::completion_review::AUTOMATIC_REVIEW_LIMIT;
 use crate::completion_review::CompletionReviewReservationError;
 use crate::completion_review::CompletionReviewState;
 use crate::completion_review::InternalReviewOperation;
@@ -490,14 +489,7 @@ impl Session {
             .eligible_episode()
             .is_some_and(|episode| episode.cwd == state.session_configuration.cwd);
         let review = &mut state.completion_review;
-        if !cwd_matches
-            || !review.ticket_is_current(ticket)
-            || review.handoff.is_some()
-            || (ticket.automatic
-                && review.episode.as_ref().is_some_and(|episode| {
-                    episode.automatic_reviews_started >= AUTOMATIC_REVIEW_LIMIT
-                }))
-        {
+        if !cwd_matches || !review.ticket_is_current(ticket) || review.handoff.is_some() {
             return false;
         }
         review.handoff = Some(ReviewHandoff {
@@ -511,31 +503,61 @@ impl Session {
         self.persist_completion_review_locked().await
     }
 
+    pub(super) async fn offer_completion_review_advice(
+        &self,
+    ) -> Result<Option<String>, CompletionReviewReservationError> {
+        let _guard = self.completion_review_installation.lock().await;
+        let mut state = self.state.lock().await;
+        let review = &mut state.completion_review;
+        let Some(handoff) = review.unstarted_handoff() else {
+            return Ok(None);
+        };
+        let attempt_id = handoff.ticket.attempt_id.clone();
+        if handoff.disposition == ReviewHandoffDisposition::Prepared {
+            review.defer_handoff();
+            drop(state);
+            if !self.persist_completion_review_locked().await {
+                return Err(CompletionReviewReservationError::Persistence);
+            }
+        }
+        Ok(Some(attempt_id))
+    }
+
     pub(crate) async fn claim_completion_review_handoff(
         &self,
-        ticket: &ReviewTicket,
+        attempt_id: &str,
         turn_id: &str,
+        confirmed: bool,
     ) -> Option<PendingContinuation> {
         let _guard = self.completion_review_installation.lock().await;
         let mut state = self.state.lock().await;
+        if state.pending_continuation.is_some() {
+            return None;
+        }
         let cwd_matches = state
             .completion_review
             .eligible_episode()
             .is_some_and(|episode| episode.cwd == state.session_configuration.cwd);
         let review = &mut state.completion_review;
-        if !cwd_matches || !review.ticket_is_current(ticket) {
+        let handoff = review.unstarted_handoff()?;
+        let expected = if confirmed {
+            ReviewHandoffDisposition::Deferred
+        } else {
+            ReviewHandoffDisposition::Prepared
+        };
+        if !cwd_matches
+            || handoff.ticket.attempt_id != attempt_id
+            || handoff.disposition != expected
+        {
             return None;
         }
         let handoff = review.handoff.as_mut()?;
-        if handoff.ticket != *ticket || handoff.disposition != ReviewHandoffDisposition::Prepared {
-            return None;
-        }
         handoff.disposition = ReviewHandoffDisposition::Started {
             turn_id: turn_id.to_string(),
         };
         let checkpoint = PendingContinuation {
             source: TurnContinuationSource::PostTurnCompletionReview,
-            continued_from_turn_id: Some(ticket.candidate_completion_id.clone()),
+            continued_from_turn_id: Some(handoff.ticket.candidate_completion_id.clone()),
             model: Some(handoff.model.clone()),
             pause_reason: None,
             target: PendingContinuationTarget::Regular,
@@ -573,24 +595,42 @@ impl Session {
                 .await
                 .internal_review_operations
                 .remove(&id);
-            if let Some(InternalReviewOperation::Review(ticket)) = operation
-                && self.completion_review_ticket_is_current(&ticket).await
-            {
-                self.set_pending_continuation(Some(PendingContinuation {
-                    source: TurnContinuationSource::Interrupted,
-                    continued_from_turn_id: Some(ticket.candidate_completion_id),
-                    model: None,
-                    pause_reason: None,
-                    target: PendingContinuationTarget::PostTurnCompletionReview,
-                }))
-                .await;
-            }
+            let message = match operation {
+                Some(InternalReviewOperation::Review(ticket))
+                    if self.completion_review_ticket_is_current(&ticket).await =>
+                {
+                    self.set_pending_continuation(Some(PendingContinuation {
+                        source: TurnContinuationSource::Interrupted,
+                        continued_from_turn_id: Some(ticket.candidate_completion_id),
+                        model: None,
+                        pause_reason: None,
+                        target: PendingContinuationTarget::PostTurnCompletionReview,
+                    }))
+                    .await;
+                    "Completion review could not be queued. Use /continue to retry the review."
+                }
+                Some(InternalReviewOperation::Continue(ticket)) => {
+                    let _guard = self.completion_review_installation.lock().await;
+                    let mut state = self.state.lock().await;
+                    let review = &mut state.completion_review;
+                    if !review.ticket_is_current(&ticket) || !review.defer_handoff() {
+                        return;
+                    }
+                    drop(state);
+                    if !self.persist_completion_review_locked().await {
+                        return;
+                    }
+                    "Review advice could not be queued. Use /continue to apply the saved advice."
+                }
+                Some(InternalReviewOperation::Review(_)) | None => return,
+            };
             self.send_event_raw(Event {
                 id,
                 msg: EventMsg::Warning(WarningEvent {
-                    message: "Completion review work could not be queued. Recover it with /continue or resume; no clean verdict is implied.".into(),
+                    message: message.into(),
                 }),
-            }).await;
+            })
+            .await;
         }
     }
 
@@ -608,14 +648,13 @@ impl Session {
     pub(crate) async fn queue_prepared_completion_review_handoff(&self) {
         let ticket = {
             let state = self.state.lock().await;
+            if state.pending_continuation.is_some() {
+                return;
+            }
             state
                 .completion_review
-                .handoff
-                .as_ref()
-                .filter(|handoff| {
-                    handoff.disposition == ReviewHandoffDisposition::Prepared
-                        && state.completion_review.ticket_is_current(&handoff.ticket)
-                })
+                .unstarted_handoff()
+                .filter(|handoff| handoff.disposition == ReviewHandoffDisposition::Prepared)
                 .map(|handoff| handoff.ticket.clone())
         };
         if let Some(ticket) = ticket {
@@ -724,8 +763,8 @@ impl Session {
                     ReviewHandoffDisposition::Started { .. }
                 )
             });
-        // A started handoff is resumable main work, not queued reviewer work.
-        if !started_main {
+        // Stop scheduling without discarding a completed review's unapplied advice.
+        if !started_main && !state.completion_review.defer_handoff() {
             state.completion_review.clear_operations();
         }
         if state.pending_continuation.as_ref().is_some_and(|pending| {

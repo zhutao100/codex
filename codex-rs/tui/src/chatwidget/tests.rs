@@ -6013,6 +6013,45 @@ async fn continue_sets_pending_start_without_rendering_user_prompt() {
 }
 
 #[tokio::test]
+async fn continue_offers_saved_review_advice_without_submitting_input() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(None).await;
+    chat.thread_id = Some(ThreadId::new());
+    for apply in [false, true] {
+        chat.dispatch_command(SlashCommand::Continue);
+        assert!(matches!(op_rx.try_recv(), Ok(Op::Continue)));
+        chat.handle_codex_event(Event {
+            id: "continue".into(),
+            msg: EventMsg::CompletionReviewAdviceAvailable(
+                codex_core::protocol::CompletionReviewAdviceAvailableEvent {
+                    attempt_id: "saved-review".into(),
+                },
+            ),
+        });
+        assert!(!chat.user_turn_pending_start);
+        assert!(op_rx.try_recv().is_err());
+        assert!(drain_insert_history(&mut rx).is_empty());
+        if apply {
+            chat.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        }
+        chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let selection = std::iter::from_fn(|| rx.try_recv().ok()).find_map(|event| match event {
+            AppEvent::CodexOp(op) => Some(op),
+            _ => None,
+        });
+        if apply {
+            let op = selection.expect("apply advice submits a control operation");
+            chat.submit_op(op);
+            assert!(chat.user_turn_pending_start);
+            assert!(
+                matches!(op_rx.try_recv(), Ok(Op::ApplyCompletionReviewAdvice { attempt_id }) if attempt_id == "saved-review")
+            );
+        } else {
+            assert!(selection.is_none());
+        }
+    }
+}
+
+#[tokio::test]
 async fn approvals_popup_shows_disabled_presets() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
 

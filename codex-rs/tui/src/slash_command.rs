@@ -78,7 +78,7 @@ impl SlashCommand {
                 "review the last completed turn for missed follow-ups"
             }
             SlashCommand::Pause => "pause the current turn so it can be continued later",
-            SlashCommand::Continue => "continue the paused or interrupted turn",
+            SlashCommand::Continue => "resume paused work or apply saved review advice",
             SlashCommand::Rename => "rename the current thread",
             SlashCommand::Export => "export this chat",
             SlashCommand::Resume => "resume a saved chat",

@@ -9,8 +9,6 @@ use serde::Deserialize;
 use serde::Serialize;
 use uuid::Uuid;
 
-pub(crate) const AUTOMATIC_REVIEW_LIMIT: u32 = 3;
-
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum CompletionReviewReservationError {
     #[error("Cannot review a completed turn while another task is running.")]
@@ -57,7 +55,6 @@ pub(crate) struct CompletedTurnForReview {
     pub(crate) request_frame: ReviewRequestFrame,
     pub(crate) initial_answer_reference: Option<String>,
     pub(crate) final_agent_message: String,
-    pub(crate) automatic_reviews_started: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,6 +79,7 @@ impl ReviewTicket {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum ReviewHandoffDisposition {
     Prepared,
+    Deferred,
     Started { turn_id: String },
 }
 
@@ -172,6 +170,25 @@ impl CompletionReviewState {
             && self
                 .eligible_episode()
                 .is_some_and(|episode| ticket.matches(episode))
+    }
+
+    pub(crate) fn unstarted_handoff(&self) -> Option<&ReviewHandoff> {
+        self.handoff.as_ref().filter(|handoff| {
+            matches!(
+                handoff.disposition,
+                ReviewHandoffDisposition::Prepared | ReviewHandoffDisposition::Deferred
+            ) && self.ticket_is_current(&handoff.ticket)
+        })
+    }
+
+    pub(crate) fn defer_handoff(&mut self) -> bool {
+        if self.unstarted_handoff().is_none() {
+            return false;
+        }
+        if let Some(handoff) = self.handoff.as_mut() {
+            handoff.disposition = ReviewHandoffDisposition::Deferred;
+        }
+        true
     }
 
     pub(crate) fn accept_input(
@@ -274,7 +291,6 @@ impl CompletionReviewState {
                 request_frame: self.request_frame.clone(),
                 initial_answer_reference: Some(text.clone()),
                 final_agent_message: text,
-                automatic_reviews_started: 0,
             });
         }
         self.attempt = None;
@@ -286,9 +302,6 @@ impl CompletionReviewState {
 
     pub(crate) fn begin_review(&mut self, automatic: bool) -> Option<ReviewTicket> {
         let episode = self.eligible_episode()?;
-        if automatic && episode.automatic_reviews_started >= AUTOMATIC_REVIEW_LIMIT {
-            return None;
-        }
         let ticket = ReviewTicket {
             episode_id: episode.episode_id.clone(),
             request_revision: episode.request_revision,
@@ -297,9 +310,6 @@ impl CompletionReviewState {
             attempt_id: Uuid::new_v4().to_string(),
             automatic,
         };
-        if automatic {
-            self.episode.as_mut()?.automatic_reviews_started += 1;
-        }
         self.attempt = Some(ticket.clone());
         self.handoff = None;
         Some(ticket)

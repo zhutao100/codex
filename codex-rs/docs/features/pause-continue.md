@@ -8,10 +8,10 @@ Read this when changing task stopping, continuation, restart recovery, or the TU
 |---|---|
 |`/pause` or bare Esc during supported active work|Cancel active execution and retain a continuation checkpoint without adding a user instruction. Popup/modal Esc handling takes precedence.|
 |Ctrl+C during active work|Interrupt and record the contextual `<turn_aborted>` guidance; regular work can subsequently be continued.|
-|`/continue`|Start from a pending checkpoint with empty explicit input; do not synthesize a user message.|
+|`/continue`|Resume a paused or interrupted checkpoint first, with no new user message. Otherwise, offer any current saved [completion-review advice](post_turn_completion_review/README.md) for explicit confirmation.|
 |New ordinary prompt|Start normal input handling and supersede the old regular checkpoint.|
 |Pause during review, standalone compaction, or standalone user-shell work|Warn that pause is unavailable; leave that task running. Post-turn completion review has its own supported continuation target.|
-|Continue while running or without a checkpoint|Return a control error without starting a model request.|
+|Continue while running or with neither a checkpoint nor saved advice|Return a control error without starting a model request.|
 
 The TUI dispatches `Op::Pause` and `Op::Continue` directly. The app-server recognizes paused status in event handling, but its request enum does not expose dedicated `turn/pause` or `turn/continue` methods.
 

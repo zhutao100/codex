@@ -3000,6 +3000,27 @@
           "type": "object"
         },
         {
+          "description": "A response to [`Op::Continue`] that requires confirmation before starting work.",
+          "properties": {
+            "attempt_id": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "completion_review_advice_available"
+              ],
+              "title": "CompletionReviewAdviceAvailableEventMsgType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "attempt_id",
+            "type"
+          ],
+          "title": "CompletionReviewAdviceAvailableEventMsg",
+          "type": "object"
+        },
+        {
           "description": "Notification that the agent is shutting down.",
           "properties": {
             "type": {

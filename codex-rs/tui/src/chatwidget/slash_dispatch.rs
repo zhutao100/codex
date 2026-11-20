@@ -401,7 +401,6 @@ impl ChatWidget {
                         Some("Pause or interrupt it before continuing another turn.".to_string()),
                     );
                 } else {
-                    self.user_turn_pending_start = true;
                     self.submit_op(Op::Continue);
                 }
             }

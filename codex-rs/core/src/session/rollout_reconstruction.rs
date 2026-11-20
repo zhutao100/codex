@@ -1,6 +1,8 @@
 use super::*;
 use crate::completion_review::CompletionReviewState;
+use crate::completion_review::ReviewHandoff;
 use crate::completion_review::ReviewHandoffDisposition;
+use crate::tasks::post_turn_completion_review::render_advisory_developer_message;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ReconstructedRollout {
@@ -114,7 +116,7 @@ impl Session {
         let mut checkpoint_after_latest_compaction = false;
         let mut completion_review: Option<CompletionReviewState> = None;
 
-        for item in rollout_items {
+        for (index, item) in rollout_items.iter().enumerate() {
             match item {
                 RolloutItem::ResponseItem(response_item) => {
                     awaiting_adjacent_post_compaction_context = false;
@@ -200,6 +202,17 @@ impl Session {
                 }
                 RolloutItem::PostTurnCompletionReviewState(value) => {
                     completion_review = CompletionReviewState::from_rollout(value);
+                    if value["episode"]["automatic_reviews_started"].as_u64() == Some(3)
+                        && let Some(review) = completion_review.as_mut()
+                        && let Some(handoff) = legacy_capped_handoff(
+                            &rollout_items[..index],
+                            review,
+                            &turn_context.model_info.slug,
+                        )
+                    {
+                        review.attempt = Some(handoff.ticket.clone());
+                        review.handoff = Some(handoff);
+                    }
                 }
                 RolloutItem::TokenUsageContext {
                     info,
@@ -325,9 +338,7 @@ impl Session {
             && review.ticket_is_current(ticket)
         {
             match review.handoff.as_ref().map(|handoff| &handoff.disposition) {
-                Some(ReviewHandoffDisposition::Prepared) => {
-                    pending_continuation = None;
-                }
+                Some(ReviewHandoffDisposition::Prepared | ReviewHandoffDisposition::Deferred) => {}
                 Some(ReviewHandoffDisposition::Started { turn_id }) => {
                     pending_continuation = Some(PendingContinuation {
                         source: TurnContinuationSource::Interrupted,
@@ -360,4 +371,48 @@ impl Session {
             completion_review,
         }
     }
+}
+
+// The old cap wrote an actionable exit followed by an otherwise unchanged
+// checkpoint with the reservation cleared. Do not infer advice from a verdict
+// without both of those checkpoints, or from a stopped or already applied handoff.
+fn legacy_capped_handoff(
+    prefix: &[RolloutItem],
+    finished: &CompletionReviewState,
+    model: &str,
+) -> Option<ReviewHandoff> {
+    let [
+        ..,
+        RolloutItem::PostTurnCompletionReviewState(reserved),
+        RolloutItem::EventMsg(EventMsg::EnteredReviewMode(_)),
+        RolloutItem::EventMsg(EventMsg::ExitedReviewMode(exit)),
+    ] = prefix
+    else {
+        return None;
+    };
+    let output = exit.post_turn_completion_review_output.as_ref()?;
+    if !output.fix_actions_advised
+        || output.evaluation.trim().is_empty()
+        || reserved["episode"]["automatic_reviews_started"].as_u64() != Some(3)
+    {
+        return None;
+    }
+    let mut reserved = CompletionReviewState::from_rollout(reserved)?;
+    let ticket = reserved.attempt.clone()?;
+    if !ticket.automatic
+        || !reserved.ticket_is_current(&ticket)
+        || reserved.handoff.is_some()
+        || reserved.main_task_id.is_some()
+        || reserved.replacement_answer_required
+    {
+        return None;
+    }
+    reserved.clear_operations();
+    (reserved == *finished).then(|| ReviewHandoff {
+        ticket,
+        advisory: render_advisory_developer_message(output),
+        model: model.to_string(),
+        disposition: ReviewHandoffDisposition::Deferred,
+        advisory_recorded: false,
+    })
 }

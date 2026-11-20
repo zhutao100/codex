@@ -917,6 +917,9 @@ impl ChatWidget {
     pub(crate) fn submit_op(&mut self, op: Op) {
         // Record outbound operation for session replay fidelity.
         crate::session_log::log_outbound_op(&op);
+        if matches!(&op, Op::Continue | Op::ApplyCompletionReviewAdvice { .. }) {
+            self.user_turn_pending_start = true;
+        }
         if matches!(&op, Op::Review { .. } | Op::ReviewCompletedTurn)
             && !self.bottom_pane.is_task_running()
         {

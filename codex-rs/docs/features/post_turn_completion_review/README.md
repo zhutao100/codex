@@ -19,7 +19,9 @@ Independent review of completed work and the exact latest main answer. Read this
 
 Positive findings become advisory developer input to main work. They do not create a user request. The latest main answer remains streamed and copyable; review status is separate, and a clean verdict does not produce another synthesis answer.
 
-An episode allows three automatic attempts. Positive advice on the final attempt remains visible but does not start another automatic continuation. Manual review can still hand off advice without resetting the automatic allowance. Pause/resume keeps the same ticket and allowance.
+When automatic review is enabled, actionable verdicts can trigger another main follow-up and review in the same request without a round limit. A clean or unavailable verdict ends the review chain; explicit stop controls still stop work. Per-review context stays bounded, but total time and model usage are not bounded by a review count.
+
+`/continue` resumes paused or interrupted work first. If none exists and unapplied advice is saved for the current candidate, it offers **Apply advice** or **Cancel**. Confirming applies the saved verdict without rerunning the reviewer first or adding a user message. The offer is also available after reopening a rollout with a verified stop at the former three-review cap; opening it does not start work.
 
 ## Exact context and replacement answers
 

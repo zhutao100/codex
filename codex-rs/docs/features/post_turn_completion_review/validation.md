@@ -6,10 +6,11 @@ Use focused tests for the contract being changed. This page indexes regression l
 
 |Contract|Source and cases to preserve|
 |---|---|
-|Bounded episodes and tickets|[State tests](../../../core/src/completion_review_tests.rs): initial/latest slots, consumed steering, actual candidate CWD, exactness, attempt allowance, stale tickets and recovery selection.|
-|Durable transitions and provenance|[Session tests](../../../core/src/session/completion_review_tests.rs): accepted/installing/body/consumed prefixes, identical amendments, prepared/started claims, fork barriers, clarification invalidation and directory ownership.|
+|Bounded context and tickets|[State tests](../../../core/src/completion_review_tests.rs): initial/latest slots across repeated reviews, consumed steering, actual candidate CWD, exactness, stale tickets and recovery selection.|
+|Durable transitions and provenance|[Session tests](../../../core/src/session/completion_review_tests.rs): accepted/installing/body/consumed prefixes, identical amendments, prepared/deferred/started claims, pause priority, fork barriers, clarification invalidation and directory ownership.|
 |Packet and output semantics|[Review task tests](../../../core/src/tasks/post_turn_completion_review.rs): exact text/CDATA, unversioned framing, optional reference omission, mandatory overflow, custom-prompt contracts and ticket/candidate mismatch.|
-|Main/reviewer integration|[HTTP suite](../../../core/tests/suite/completion_review.rs): exact initial/latest packets, finite automation, parent-owned reviewer recovery, unavailable coverage, real continue/compact/model-selection paths and cause-specific errors.|
+|Main/reviewer integration|[HTTP suite](../../../core/tests/suite/completion_review.rs): more than three automatic reviews with bounded packets, confirmation of saved advice from a capped rollout, parent-owned reviewer recovery, unavailable coverage and continue/compact/model selection.|
+|TUI confirmation|[Chat widget tests](../../../tui/src/chatwidget/tests.rs): Cancel emits no operation; Apply submits the offered attempt ID without adding user input.|
 |Request prefix|[WebSocket suite](../../../core/tests/suite/client_websockets.rs) and [prefix contract](request_prefix.md): repeated follow-up tool rounds keep `previous_response_id` chaining; HTTP replay preserves full prefixes.|
 |Usage and replay|[History tests](../../../core/src/context_manager/history_tests.rs), HTTP suite and session tests: covered history, frame credit, reasoning inclusion, missing usage/failed streams, empty responses and local baselines.|
 |Persistence and stop races|Session/HTTP suites and [recorder tests](../../../core/src/rollout/tests.rs): real buffered-write failures, pending/flushed deduplication, recorder replacement, finalization joins and resumed-owner failures before sampling.|

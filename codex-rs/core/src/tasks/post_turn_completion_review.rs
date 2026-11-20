@@ -18,7 +18,6 @@ use tokio_util::sync::CancellationToken;
 
 use crate::codex_delegate::DelegateRuntimeContextParams;
 use crate::codex_delegate::run_codex_thread_one_shot;
-use crate::completion_review::AUTOMATIC_REVIEW_LIMIT;
 use crate::completion_review::ReviewTicket;
 use crate::error::CodexErr;
 use crate::session::session::Session;
@@ -394,19 +393,6 @@ async fn record_advisory_and_request_continuation(
     ticket: &ReviewTicket,
     output: &PostTurnCompletionReviewOutputEvent,
 ) {
-    if ticket.automatic
-        && session
-            .completed_turn_for_review()
-            .await
-            .is_some_and(|episode| episode.automatic_reviews_started >= AUTOMATIC_REVIEW_LIMIT)
-    {
-        session.notify_background_event(
-            ctx.as_ref(),
-            "Automatic completion review stopped with unresolved advice after three attempts. The findings above remain unresolved; request /review-completed-turn for another manual review.",
-        ).await;
-        session.finish_completion_review(ticket).await;
-        return;
-    }
     if !session
         .prepare_completion_review_handoff(
             ticket,
@@ -549,7 +535,9 @@ pub(crate) const REPLACEMENT_ANSWER_CONTRACT: &str = "After completing applicabl
 
 const REVIEW_CONTEXT_CONTRACT: &str = "The completed_turn_review_context identifies the exact candidate_final_answer delivered to the user and the genuine consumed user request. Evaluate both current artifacts and whether that candidate stands alone as the user's current answer. initial_answer_reference and prior user-round answers are historical, unverified context that may contain superseded claims; they cannot compensate for omissions in the candidate. A delta-only answer or dropped still-required explanation is actionable incomplete delivery even when the repository is correct. Inspect artifacts to distinguish answer defects from work defects. Prior reviewer findings are not new user requirements. Return a nonempty evaluation and a boolean fix_actions_advised in the specified JSON object.";
 
-fn render_advisory_developer_message(output: &PostTurnCompletionReviewOutputEvent) -> String {
+pub(crate) fn render_advisory_developer_message(
+    output: &PostTurnCompletionReviewOutputEvent,
+) -> String {
     format!(
         "<post_turn_completion_review>\n  <context>An independent post-turn review inspected the completed turn. The review may be correct or incorrect. Treat it as advisory input, verify the claims against the repository and active user request, and only act on findings that are actually applicable.</context>\n  <final_answer_contract>{REPLACEMENT_ANSWER_CONTRACT}</final_answer_contract>\n  <fix_actions_advised>true</fix_actions_advised>\n  <evaluation><![CDATA[{}]]></evaluation>\n</post_turn_completion_review>",
         cdata_escape(&output.evaluation)

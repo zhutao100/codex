@@ -43,6 +43,37 @@ pub(crate) fn show_review_commit_picker_with_entries(
 }
 
 impl ChatWidget {
+    pub(super) fn offer_completion_review_advice(&mut self, attempt_id: String) {
+        self.user_turn_pending_start = false;
+        if self.bottom_pane.is_task_running() {
+            return;
+        }
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            title: Some("Apply saved review advice?".into()),
+            footer_hint: Some(standard_popup_hint_line()),
+            initial_selected_idx: Some(1),
+            items: vec![
+                SelectionItem {
+                    name: "Apply advice".into(),
+                    actions: vec![Box::new(move |tx| {
+                        tx.send(AppEvent::CodexOp(Op::ApplyCompletionReviewAdvice {
+                            attempt_id: attempt_id.clone(),
+                        }));
+                    })],
+                    dismiss_on_select: true,
+                    ..Default::default()
+                },
+                SelectionItem {
+                    name: "Cancel".into(),
+                    dismiss_on_select: true,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+        self.request_redraw();
+    }
+
     pub(crate) fn open_review_popup(&mut self) {
         let mut items: Vec<SelectionItem> = Vec::new();
 

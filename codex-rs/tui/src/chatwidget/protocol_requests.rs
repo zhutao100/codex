@@ -227,6 +227,11 @@ impl ChatWidget {
                 self.on_entered_review_mode(review_request, from_replay)
             }
             EventMsg::ExitedReviewMode(review) => self.on_exited_review_mode(review),
+            EventMsg::CompletionReviewAdviceAvailable(offer) => {
+                if !from_replay {
+                    self.offer_completion_review_advice(offer.attempt_id);
+                }
+            }
             EventMsg::ContextCompacted(_) => {
                 self.on_agent_message("Context compacted".to_owned(), from_replay)
             }

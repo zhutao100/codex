@@ -97,8 +97,11 @@ pub enum Op {
     Pause,
 
     /// Continue the most recent paused or interrupted task without recording a
-    /// new user input message.
+    /// new user input message. If none exists, offer saved completion-review advice.
     Continue,
+
+    /// Apply the saved completion-review advice identified by an offer from [`Op::Continue`].
+    ApplyCompletionReviewAdvice { attempt_id: String },
 
     /// Review the most recent completed regular Codex turn.
     ReviewCompletedTurn,
@@ -918,6 +921,9 @@ pub enum EventMsg {
     TurnPaused(TurnPausedEvent),
 
     TurnContinued(TurnContinuedEvent),
+
+    /// A response to [`Op::Continue`] that requires confirmation before starting work.
+    CompletionReviewAdviceAvailable(CompletionReviewAdviceAvailableEvent),
 
     /// Notification that the agent is shutting down.
     ShutdownComplete,
@@ -2083,6 +2089,11 @@ pub struct ReviewOutputEvent {
 pub struct PostTurnCompletionReviewOutputEvent {
     pub evaluation: String,
     pub fix_actions_advised: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+pub struct CompletionReviewAdviceAvailableEvent {
+    pub attempt_id: String,
 }
 
 impl Default for ReviewOutputEvent {

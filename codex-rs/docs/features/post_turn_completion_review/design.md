@@ -53,10 +53,12 @@ Continuation cleanup shares the installation boundary and preserves host metadat
 
 |Transition|Contract|
 |---|---|
-|Prepared handoff|Resume requeues it; `/continue` can claim it if enqueue failed. A duplicate claim cannot start another main task.|
+|Prepared handoff|Resume requeues it if there is no pending continuation. If `/continue` reaches unclaimed advice first, it defers it before offering confirmation.|
+|Deferred handoff|Never starts on session open. An idle `/continue` offers it only after checking for pending work. Confirmation must match the current attempt and candidate directory; it claims the same handoff once.|
 |Started handoff|Resume interrupted main work with its exact snapshots and replacement contract; do not repeat the advisory action.|
-|Paused reviewer|Keep the ticket/candidate/allowance, clear unconsumed prepared advice, and start a fresh reviewer on continue.|
-|Explicit pause, interrupt or shutdown|Invalidate queued unstarted automatic work after joining finalization. Retain already-started main lineage and recovery selection.|
+|Paused reviewer|Keep the ticket and candidate; start a fresh reviewer on continue.|
+|Explicit pause, interrupt or shutdown|Invalidate queued reviewer work after joining finalization. Defer completed but unclaimed advice and retain already-started main lineage and recovery selection.|
+|Handoff enqueue failure|Defer saved advice so `/continue` can offer it without retrying the reviewer.|
 |New steering|Invalidate old advice immediately; keep pending versus consumed ownership and any unfinished main recovery destination.|
 |Compaction|Preserve explicit review snapshots outside rewritten history. Standalone compaction does not complete or consume paused/interrupted main ownership.|
 |Explicit model selection|Persist the pending regular-work destination independently of the advisory handoff; synchronize a surviving Started handoff. Honor submitted selection even if session settings already name that model.|
@@ -74,7 +76,7 @@ Only a new root session or trusted host metadata establishes exact request scope
 
 Human clarification currently invalidates complete review coverage before its answer reaches the main task. Preserve that invalidation through restart and full-history forks; arbitrary tool-output JSON is not a trusted question/answer frame. Nontext input likewise cannot become a claimed complete text-only projection.
 
-Keep reservation causes distinct: running task, missing candidate, pending input, unavailable provenance and persistence failure have different recovery paths. Unsupported records can disappear from a fork's recognized-record copy; offline repair must inspect original ancestors, back up the rollout, reconstruct exact scope only from verified request/completion/consumption checkpoints, and validate through production replay before appending a corrected checkpoint. No automatic legacy migration exists. Do not flip an exactness flag, treat an assistant message as a completion, or promote a summary to user requirements.
+Keep reservation causes distinct: running task, missing candidate, pending input, unavailable provenance and write failure have different recovery paths. Replay recognizes the former cap only when an automatic reservation, review entry, actionable exit and matching cleared checkpoint appear together. It restores that advisory as Deferred using the resume-selected main model; it does not infer exact scope from a verdict or from assistant history. Rollback, superseding input and uncertain provenance still invalidate advice.
 
 ## Design choices
 
@@ -85,6 +87,6 @@ Keep reservation causes distinct: running task, missing candidate, pending input
 |Exclude the parent transcript and previous verdicts|Preserves independent review and avoids growing reasoning/tool/review context.|
 |No extra final synthesis call|Keeps the reviewed candidate identical to the user's streamed answer.|
 |Optional reference omitted before mandatory overflow|Preserves exact scope/candidate; incomplete coverage cannot become a clean verdict.|
-|Finite automatic allowance|Bounds execution independently of the two-answer context bound; manual review does not reset it.|
+|Uncapped automatic follow-up|A review count is not a context budget. Stop on clean or unavailable review, invalidated work, or explicit control; keep the same per-review payload budget at every round.|
 
 These contracts do not guarantee semantic completeness, filesystem snapshot isolation or exactly-once model/tool side effects across process failure.

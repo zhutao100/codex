@@ -373,13 +373,13 @@ async fn completion_review_handoff_is_claimed_once_and_survives_compaction() {
     );
     assert!(
         session
-            .claim_completion_review_handoff(&ticket, "main-followup")
+            .claim_completion_review_handoff(&ticket.attempt_id, "main-followup", false)
             .await
             .is_some()
     );
     assert!(
         session
-            .claim_completion_review_handoff(&ticket, "duplicate")
+            .claim_completion_review_handoff(&ticket.attempt_id, "duplicate", true)
             .await
             .is_none()
     );
@@ -421,6 +421,73 @@ async fn completion_review_handoff_is_claimed_once_and_survives_compaction() {
 }
 
 #[tokio::test]
+async fn stopped_review_advice_survives_replay_but_cannot_take_a_paused_checkpoint() {
+    let (session, context, events) = make_session_and_context_with_rx().await;
+    let (_home, path) = attach_recorder(&session, &context).await;
+    complete_new_request(&session, &context, "original request", "completed answer").await;
+    session
+        .record_conversation_items(&context, &[assistant_message("completed answer")])
+        .await;
+    let ticket = session.begin_completion_review(true).await.unwrap();
+    assert!(
+        session
+            .prepare_completion_review_handoff(
+                &ticket,
+                "saved advice".into(),
+                context.model_info.slug.clone(),
+            )
+            .await
+    );
+    super::super::handlers::pause(&session).await;
+    let (items, _, errors) = RolloutRecorder::load_rollout_items(&path).await.unwrap();
+    assert_eq!(errors, 0);
+    let replay = session
+        .reconstruct_history_from_rollout(&context, &items)
+        .await;
+    assert!(replay.pending_continuation.is_none());
+    let resumed = replay.completion_review.unwrap();
+    assert_eq!(
+        resumed.unstarted_handoff().unwrap().disposition,
+        ReviewHandoffDisposition::Deferred
+    );
+    assert_eq!(resumed.unstarted_handoff().unwrap().ticket, ticket);
+    assert!(
+        session
+            .claim_completion_review_handoff(&ticket.attempt_id, "queued-automatic", false)
+            .await
+            .is_none()
+    );
+    let checkpoint = PendingContinuation {
+        source: TurnContinuationSource::Paused,
+        continued_from_turn_id: Some("existing-work".into()),
+        model: Some(context.model_info.slug.clone()),
+        pause_reason: Some(TurnPauseReason::UserRequested),
+        target: PendingContinuationTarget::Regular,
+    };
+    session
+        .set_pending_continuation(Some(checkpoint.clone()))
+        .await;
+    assert!(
+        session
+            .claim_completion_review_handoff(&ticket.attempt_id, "confirmed", true)
+            .await
+            .is_none()
+    );
+    assert_eq!(
+        session.take_pending_continuation().await.unwrap(),
+        Some(checkpoint)
+    );
+    super::super::handlers::continue_last(&session, "offer".into()).await;
+    let offer = std::iter::from_fn(|| events.try_recv().ok())
+        .find_map(|event| match event.msg {
+            EventMsg::CompletionReviewAdviceAvailable(offer) => Some(offer),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(offer.attempt_id, ticket.attempt_id);
+}
+
+#[tokio::test]
 async fn completion_review_persistence_failure_prevents_reviewer_and_main_startup() {
     for followup_main in [false, true] {
         let (session, context, events) = make_session_and_context_with_rx().await;
@@ -443,7 +510,13 @@ async fn completion_review_persistence_failure_prevents_reviewer_and_main_startu
             Some(RolloutRecorder::read_only_for_test(&path).await.unwrap());
         while events.try_recv().is_ok() {}
         if followup_main {
-            super::super::handlers::continue_last(&session, "failed-main".into()).await;
+            let ticket = session.current_completion_review_ticket().await.unwrap();
+            assert!(
+                session
+                    .claim_completion_review_handoff(&ticket.attempt_id, "failed-main", false)
+                    .await
+                    .is_none()
+            );
         } else {
             super::super::handlers::review_completed_turn(&session, "failed-review".into()).await;
         }
@@ -505,7 +578,6 @@ async fn completion_review_automatic_capture_failure_cannot_authorize_review() {
         .await;
     let state = session.state.lock().await.completion_review.clone();
     assert!(state.attempt.as_ref().unwrap().automatic);
-    assert_eq!(state.episode.unwrap().automatic_reviews_started, 1);
     assert!(!state.request_frame.exact);
     assert!(session.current_completion_review_ticket().await.is_none());
     assert!(session.completed_turn_for_review().await.is_none());
@@ -534,7 +606,7 @@ async fn completion_review_started_resumes_stop_before_sampling_on_failed_owner_
                 .await
         );
         let checkpoint = session
-            .claim_completion_review_handoff(&ticket, &context.sub_id)
+            .claim_completion_review_handoff(&ticket.attempt_id, &context.sub_id, false)
             .await
             .unwrap();
         session.set_pending_continuation(Some(checkpoint)).await;
@@ -657,7 +729,7 @@ async fn completion_review_directory_rejection_preserves_the_pending_checkpoint(
                     .await
             );
             session
-                .claim_completion_review_handoff(&ticket, "main-followup")
+                .claim_completion_review_handoff(&ticket.attempt_id, "main-followup", false)
                 .await
                 .unwrap()
         } else {
@@ -748,7 +820,7 @@ async fn completion_review_model_override_retargets_only_pending_main_work_durab
                     .await
             );
             session
-                .claim_completion_review_handoff(&ticket, "main-followup")
+                .claim_completion_review_handoff(&ticket.attempt_id, "main-followup", false)
                 .await
                 .unwrap()
         } else {
@@ -855,7 +927,7 @@ async fn completion_review_replay_distinguishes_prepared_started_and_reviewer() 
     assert_eq!(replay.completion_review, Some(prepared));
     assert!(replay.pending_continuation.is_none());
     session
-        .claim_completion_review_handoff(&ticket, "started-main")
+        .claim_completion_review_handoff(&ticket.attempt_id, "started-main", false)
         .await
         .unwrap();
     let started = session.state.lock().await.completion_review.clone();
@@ -1075,7 +1147,7 @@ async fn completion_review_stale_tickets_cannot_prepare_or_claim_advice() {
     );
     assert!(
         session
-            .claim_completion_review_handoff(&old, "stale-main")
+            .claim_completion_review_handoff(&old.attempt_id, "stale-main", true)
             .await
             .is_none()
     );
@@ -1169,7 +1241,7 @@ async fn completion_review_real_pause_persists_the_correct_review_or_main_target
                     .await
             );
             session
-                .claim_completion_review_handoff(&ticket, &context.sub_id)
+                .claim_completion_review_handoff(&ticket.attempt_id, &context.sub_id, false)
                 .await
                 .unwrap();
         }
@@ -1268,7 +1340,7 @@ async fn completion_review_pause_joins_inflight_installation_before_durable_stop
                     .await
             );
             session
-                .claim_completion_review_handoff(&ticket, &context.sub_id)
+                .claim_completion_review_handoff(&ticket.attempt_id, &context.sub_id, false)
                 .await
                 .unwrap();
         }

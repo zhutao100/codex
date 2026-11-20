@@ -187,9 +187,14 @@ fn repeated_identical_user_text_still_invalidates_ticket() {
 }
 
 #[test]
-fn automatic_allowance_survives_replacement_manual_review_and_replay() {
+fn automatic_reviews_remain_eligible_across_replacements_and_replay() {
     let mut state = completed_state();
-    for index in 1..=AUTOMATIC_REVIEW_LIMIT {
+    let initial = state
+        .eligible_episode()
+        .unwrap()
+        .initial_answer_reference
+        .clone();
+    for index in 1..=5 {
         let ticket = state.begin_review(true).unwrap();
         let encoded = serde_json::to_value(&state).unwrap();
         state = CompletionReviewState::from_rollout(&encoded).unwrap();
@@ -200,28 +205,9 @@ fn automatic_allowance_survives_replacement_manual_review_and_replay() {
             "replacement".into(),
         );
     }
-    assert!(state.begin_review(true).is_none());
-    assert!(state.begin_review(false).is_some());
-    assert_eq!(
-        state.episode.as_ref().unwrap().automatic_reviews_started,
-        AUTOMATIC_REVIEW_LIMIT
-    );
-    state.capture(
-        "manual-followup".into(),
-        PathBuf::new(),
-        "manual replacement".into(),
-    );
-    assert!(state.begin_review(true).is_none());
-}
-
-#[test]
-fn new_request_gets_a_new_allowance() {
-    let mut state = completed_state();
-    state.episode.as_mut().unwrap().automatic_reviews_started = AUTOMATIC_REVIEW_LIMIT;
-    let revision = state.accept_input(true, text_input("next request"), None);
-    consume(&mut state, revision);
-    state.capture("next".into(), PathBuf::new(), "next answer".into());
-    assert!(state.begin_review(true).is_some());
+    let episode = state.eligible_episode().unwrap();
+    assert_eq!(episode.turn_id, "main-5");
+    assert_eq!(episode.initial_answer_reference, initial);
 }
 
 #[test]

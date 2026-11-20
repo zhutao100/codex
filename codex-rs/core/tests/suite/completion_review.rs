@@ -143,7 +143,7 @@ async fn append_crash_fixture(path: &std::path::Path, items: Vec<RolloutItem>) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn same_request_three_reviews_keep_initial_and_exact_latest_without_prior_verdicts() {
+async fn automatic_review_continues_past_three_with_only_initial_and_latest_answers() {
     skip_if_no_network_unless_localhost!();
     let server = MockServer::start().await;
     let requests = mount_sse_sequence(
@@ -154,7 +154,9 @@ async fn same_request_three_reviews_keep_initial_and_exact_latest_without_prior_
             answer("A1: current corrected X and original Y"),
             verdict("R2: correct Y", true),
             answer("A2: current corrected X and corrected Y; verification complete"),
-            verdict("R3: no actionable follow-up advised", false),
+            verdict("R3: finish verification", true),
+            answer("A3: current corrected X and Y with verified results"),
+            verdict("R4: no actionable follow-up advised", false),
         ],
     )
     .await;
@@ -174,23 +176,23 @@ async fn same_request_three_reviews_keep_initial_and_exact_latest_without_prior_
         matches!(terminal, EventMsg::TurnComplete(event) if event.last_agent_message.is_none())
     );
     let requests = requests.requests();
-    assert_eq!(requests.len(), 6);
+    assert_eq!(requests.len(), 8);
     let first = packet(&requests[1]);
     assert_eq!(
         first.matches("A0: initial comprehensive X and Y").count(),
         1
     );
-    for (index, current, absent) in [
-        (3, "A1: current", "A2: current"),
-        (5, "A2: current", "A1: current"),
-    ] {
+    for (index, current) in [(3, "A1: current"), (5, "A2: current"), (7, "A3: current")] {
         let context = packet(&requests[index]);
         assert!(context.contains("U1: implement X and explain Y"));
         assert!(context.contains("A0: initial comprehensive X and Y"));
         assert!(context.contains(current));
-        assert!(!context.contains(absent));
+        for other in ["A1: current", "A2: current", "A3: current"] {
+            assert_eq!(context.contains(other), other == current);
+        }
         assert!(!context.contains("R1:"));
         assert!(!context.contains("R2:"));
+        assert!(!context.contains("R3:"));
         assert!(context.contains("historical_unverified"));
         let instructions = requests[index].body_json()["instructions"]
             .as_str()
@@ -199,7 +201,7 @@ async fn same_request_three_reviews_keep_initial_and_exact_latest_without_prior_
         assert!(instructions.contains("custom reviewer prompt"));
         assert!(instructions.contains("cannot compensate for omissions"));
     }
-    for index in [2, 4] {
+    for index in [2, 4, 6] {
         let input = serde_json::to_string(&requests[index].input()).unwrap();
         assert!(input.contains("self-contained final answer"));
         assert!(input.contains("when you reject every finding or make no file changes"));
@@ -220,9 +222,8 @@ async fn same_request_three_reviews_keep_initial_and_exact_latest_without_prior_
     );
     assert_eq!(
         state["episode"]["final_agent_message"],
-        "A2: current corrected X and corrected Y; verification complete"
+        "A3: current corrected X and Y with verified results"
     );
-    assert_eq!(state["episode"]["automatic_reviews_started"], 3);
     assert!(state["attempt"].is_null());
     assert!(
         !rollout
@@ -308,14 +309,12 @@ async fn automatic_clean_review_persists_five_recoverable_checkpoints() {
             final_state["episode"]["request_frame"]["current_user_messages"],
             final_state["episode"]["initial_answer_reference"],
             final_state["episode"]["final_agent_message"],
-            final_state["episode"]["automatic_reviews_started"],
             final_state["handoff"],
         ]),
         serde_json::json!([
             ["complete request"],
             "complete answer",
             "complete answer",
-            1,
             null
         ])
     );
@@ -406,58 +405,117 @@ async fn reviewer_transcript_omits_completion_state_without_losing_parent_handof
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn automatic_cap_keeps_unresolved_findings_and_manual_handoff_does_not_reset_it() {
+async fn continue_offers_legacy_capped_advice_and_applies_it_only_on_confirmation() {
     skip_if_no_network_unless_localhost!();
     let server = MockServer::start().await;
     let requests = mount_sse_sequence(
         &server,
-        vec![
-            answer("initial answer"),
-            verdict("first correction", true),
-            answer("replacement one"),
-            verdict("second correction", true),
-            answer("replacement two"),
-            verdict("unresolved third correction", true),
-            verdict("manual follow-up requested", true),
-            answer("manual replacement"),
-        ],
+        vec![answer("completed answer"), answer("corrected answer")],
     )
     .await;
     let home = Arc::new(TempDir::new().unwrap());
-    let codex = new_conversation_for_server(&server, home.clone(), |config| {
-        config
-            .features
-            .enable(Feature::AutoPostTurnCompletionReview);
-    })
-    .await;
-    submit_request(&codex, "finish the complete request").await;
-    wait_for_event(&codex, |event| {
-        matches!(event, EventMsg::BackgroundEvent(event)
-        if event.message.contains("stopped with unresolved advice"))
-    })
-    .await;
+    let codex = new_conversation_for_server(&server, home.clone(), |_| {}).await;
+    submit_request(&codex, "original user request").await;
     wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
-    assert_eq!(requests.requests().len(), 6);
-    codex.submit(Op::ReviewCompletedTurn).await.unwrap();
-    wait_for_event(&codex, |event| {
-        matches!(event, EventMsg::TurnComplete(event)
-        if event.last_agent_message.as_deref() == Some("manual replacement"))
+    let path = codex.rollout_path().unwrap();
+    codex.submit(Op::Shutdown).await.unwrap();
+    wait_for_event(&codex, |event| matches!(event, EventMsg::ShutdownComplete)).await;
+    let mut finished = completion_state(&path).unwrap();
+    finished["episode"]["automatic_reviews_started"] = 3.into();
+    let episode = &finished["episode"];
+    let attempt_id = "old-third-review";
+    let mut reserved = finished.clone();
+    reserved["attempt"] = serde_json::json!({
+        "episode_id": episode["episode_id"],
+        "request_revision": episode["request_revision"],
+        "history_generation": episode["history_generation"],
+        "candidate_completion_id": episode["turn_id"],
+        "attempt_id": attempt_id,
+        "automatic": true,
+    });
+    let old_turn: RolloutItem = serde_json::from_value(serde_json::json!({
+        "type": "event_msg",
+        "payload": {
+            "type": "entered_review_mode",
+            "target": {"type": "custom", "instructions": "completed turn"},
+            "user_facing_hint": "completed turn",
+        }
+    }))
+    .unwrap();
+    let review_result: RolloutItem = serde_json::from_value(serde_json::json!({
+        "type": "event_msg",
+        "payload": {
+            "type": "exited_review_mode",
+            "review_output": null,
+            "post_turn_completion_review_output": {
+                "evaluation": "saved unresolved third correction",
+                "fix_actions_advised": true,
+            }
+        }
+    }))
+    .unwrap();
+    append_crash_fixture(
+        &path,
+        vec![
+            RolloutItem::PostTurnCompletionReviewState(reserved),
+            old_turn,
+            review_result,
+            RolloutItem::PostTurnCompletionReviewState(finished),
+        ],
+    )
+    .await;
+
+    let resumed = resume_conversation_for_server(&server, home.clone(), path.clone(), |_| {}).await;
+    resumed.submit(Op::Continue).await.unwrap();
+    let offer = wait_for_event(&resumed, |event| {
+        matches!(event, EventMsg::CompletionReviewAdviceAvailable(_))
     })
     .await;
-    assert_eq!(requests.requests().len(), 8);
-    let lines = read_rollout_lines(&codex.rollout_path().unwrap());
-    let state = lines
-        .iter()
-        .rev()
-        .find_map(|line| match &line.item {
-            RolloutItem::PostTurnCompletionReviewState(state) => Some(state),
-            _ => None,
+    assert!(
+        matches!(offer, EventMsg::CompletionReviewAdviceAvailable(offer) if offer.attempt_id == attempt_id)
+    );
+    assert_eq!(requests.requests().len(), 1);
+    // Dismissing the offer does not reserve or consume it.
+    resumed.submit(Op::Continue).await.unwrap();
+    wait_for_event(&resumed, |event| {
+        matches!(event, EventMsg::CompletionReviewAdviceAvailable(_))
+    })
+    .await;
+    resumed
+        .submit(Op::ApplyCompletionReviewAdvice {
+            attempt_id: attempt_id.into(),
         })
+        .await
         .unwrap();
-    assert_eq!(state["episode"]["automatic_reviews_started"], 3);
+    wait_for_event(&resumed, |event| {
+        matches!(event, EventMsg::TurnComplete(event)
+        if event.last_agent_message.as_deref() == Some("corrected answer"))
+    })
+    .await;
+    resumed
+        .submit(Op::ApplyCompletionReviewAdvice {
+            attempt_id: attempt_id.into(),
+        })
+        .await
+        .unwrap();
+    wait_for_event(&resumed, |event| {
+        matches!(event, EventMsg::Error(error) if error.message.contains("Cannot apply that review advice"))
+    }).await;
+    let recorded = requests.requests();
+    assert_eq!(recorded.len(), 2);
+    let input = serde_json::to_string(&recorded[1].input()).unwrap();
     assert_eq!(
-        state["episode"]["final_agent_message"],
-        "manual replacement"
+        input.matches("saved unresolved third correction").count(),
+        1
+    );
+    assert!(input.contains("original user request"));
+    assert!(input.contains("completed answer"));
+    assert_eq!(
+        read_rollout_lines(&path)
+            .into_iter()
+            .filter(|line| { matches!(line.item, RolloutItem::EventMsg(EventMsg::UserMessage(_))) })
+            .count(),
+        1
     );
     server.verify().await;
 }

@@ -32,13 +32,12 @@ pub(super) async fn submission_loop(
                     }
                 }
                 InternalReviewOperation::Continue(ticket) => {
-                    if sess.active_turn.lock().await.is_none()
-                        && let Some(checkpoint) =
-                            sess.claim_completion_review_handoff(&ticket, &sub.id).await
-                    {
-                        sess.set_pending_continuation(Some(checkpoint)).await;
-                        continue_last(&sess, sub.id).await;
-                    }
+                    continue_with(
+                        &sess,
+                        sub.id,
+                        ContinueRequest::Automatic(&ticket.attempt_id),
+                    )
+                    .await;
                 }
             }
             continue;
@@ -52,6 +51,9 @@ pub(super) async fn submission_loop(
             }
             Op::Continue => {
                 continue_last(&sess, sub.id.clone()).await;
+            }
+            Op::ApplyCompletionReviewAdvice { attempt_id } => {
+                continue_with(&sess, sub.id, ContinueRequest::Confirm(&attempt_id)).await;
             }
             Op::OverrideTurnContext {
                 cwd,
@@ -253,59 +255,96 @@ pub async fn pause(sess: &Arc<Session>) {
 }
 
 pub async fn continue_last(sess: &Arc<Session>, sub_id: String) {
+    continue_with(sess, sub_id, ContinueRequest::Resume).await;
+}
+
+enum ContinueRequest<'a> {
+    Resume,
+    Automatic(&'a str),
+    Confirm(&'a str),
+}
+
+async fn continue_with(sess: &Arc<Session>, sub_id: String, request: ContinueRequest<'_>) {
+    let lifecycle = sess.task_lifecycle.lock().await;
     if sess.active_turn.lock().await.is_some() {
-        sess.send_event_raw(Event {
-            id: sub_id,
-            msg: EventMsg::Error(ErrorEvent {
-                message: "Cannot continue while a task is already running.".to_string(),
-                codex_error_info: Some(CodexErrorInfo::BadRequest),
-                client_user_message_id: None,
-            }),
-        })
-        .await;
+        if !matches!(request, ContinueRequest::Automatic(_)) {
+            send_continue_error(
+                sess,
+                sub_id,
+                "Cannot continue while a task is already running.",
+            )
+            .await;
+        }
         return;
     }
 
-    let prepared = {
-        let state = sess.state.lock().await;
-        state
-            .completion_review
-            .handoff
-            .as_ref()
-            .filter(|handoff| {
-                handoff.disposition == crate::completion_review::ReviewHandoffDisposition::Prepared
-                    && state.completion_review.ticket_is_current(&handoff.ticket)
-            })
-            .map(|handoff| handoff.ticket.clone())
-    };
-    if let Some(ticket) = prepared
-        && let Some(checkpoint) = sess.claim_completion_review_handoff(&ticket, &sub_id).await
-    {
-        sess.set_pending_continuation(Some(checkpoint)).await;
-    }
-    let checkpoint = match sess.take_pending_continuation().await {
-        Ok(checkpoint) => checkpoint,
-        Err(error) => {
-            sess.send_event_raw(Event {
-                id: sub_id,
-                msg: EventMsg::Error(error.to_error_event(None)),
-            })
-            .await;
-            return;
+    let checkpoint = match request {
+        ContinueRequest::Resume => match sess.take_pending_continuation().await {
+            Ok(Some(checkpoint)) => checkpoint,
+            Ok(None) => {
+                match sess.offer_completion_review_advice().await {
+                    Ok(Some(attempt_id)) => {
+                        sess.send_event_raw(Event {
+                            id: sub_id,
+                            msg: EventMsg::CompletionReviewAdviceAvailable(
+                                codex_protocol::protocol::CompletionReviewAdviceAvailableEvent {
+                                    attempt_id,
+                                },
+                            ),
+                        })
+                        .await;
+                    }
+                    Ok(None) => {
+                        send_continue_error(
+                            sess,
+                            sub_id,
+                            "There is no paused or interrupted turn to continue.",
+                        )
+                        .await;
+                    }
+                    Err(error) => {
+                        sess.send_event_raw(Event {
+                            id: sub_id,
+                            msg: EventMsg::Error(ErrorEvent {
+                                message: error.to_string(),
+                                codex_error_info: Some(CodexErrorInfo::Other),
+                                client_user_message_id: None,
+                            }),
+                        })
+                        .await;
+                    }
+                }
+                return;
+            }
+            Err(error) => {
+                sess.send_event_raw(Event {
+                    id: sub_id,
+                    msg: EventMsg::Error(error.to_error_event(None)),
+                })
+                .await;
+                return;
+            }
+        },
+        ContinueRequest::Automatic(attempt_id) | ContinueRequest::Confirm(attempt_id) => {
+            let confirmed = matches!(request, ContinueRequest::Confirm(_));
+            let Some(checkpoint) = sess
+                .claim_completion_review_handoff(attempt_id, &sub_id, confirmed)
+                .await
+            else {
+                if confirmed {
+                    send_continue_error(
+                        sess,
+                        sub_id,
+                        "Cannot apply that review advice. Use /continue from the reviewed working directory to see what is still available.",
+                    )
+                    .await;
+                }
+                return;
+            };
+            checkpoint
         }
     };
-    let Some(checkpoint) = checkpoint else {
-        sess.send_event_raw(Event {
-            id: sub_id,
-            msg: EventMsg::Error(ErrorEvent {
-                message: "There is no paused or interrupted turn to continue.".to_string(),
-                codex_error_info: Some(CodexErrorInfo::BadRequest),
-                client_user_message_id: None,
-            }),
-        })
-        .await;
-        return;
-    };
+    drop(lifecycle);
 
     if checkpoint.target == PendingContinuationTarget::Regular
         && let Err(error) = sess.completion_review_main_instructions(true).await
@@ -382,6 +421,18 @@ pub async fn continue_last(sess: &Arc<Session>, sub_id: String) {
             .await;
         }
     }
+}
+
+async fn send_continue_error(sess: &Session, sub_id: String, message: &str) {
+    sess.send_event_raw(Event {
+        id: sub_id,
+        msg: EventMsg::Error(ErrorEvent {
+            message: message.to_string(),
+            codex_error_info: Some(CodexErrorInfo::BadRequest),
+            client_user_message_id: None,
+        }),
+    })
+    .await;
 }
 
 pub async fn override_turn_context(
