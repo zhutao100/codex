@@ -229,6 +229,7 @@ impl ModelsManager {
         Self::find_model_by_longest_prefix(suffix, candidates)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     fn construct_model_info_from_candidates(
         model: &str,
         candidates: &[ModelInfo],

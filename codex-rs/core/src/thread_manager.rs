@@ -435,9 +435,7 @@ impl ThreadManagerState {
         dynamic_tools: Vec<codex_protocol::dynamic_tools::DynamicToolSpec>,
     ) -> CodexResult<NewThread> {
         self.file_watcher.register_config(&config);
-        let CodexSpawnOk {
-            codex, thread_id, ..
-        } = Codex::spawn(
+        let CodexSpawnOk { codex, thread_id } = Codex::spawn(
             config,
             auth_manager,
             Arc::clone(&self.models_manager),
