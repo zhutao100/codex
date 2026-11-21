@@ -1,6 +1,7 @@
 #![cfg(not(target_os = "windows"))]
 #![allow(clippy::expect_used)]
 // unified exec is not supported on Windows OS
+use core_test_support::responses::base_instructions_text;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -407,7 +408,7 @@ async fn remote_models_apply_remote_base_instructions() -> Result<()> {
     wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
 
     let body = response_mock.single_request().body_json();
-    let instructions = body["instructions"].as_str().unwrap();
+    let instructions = base_instructions_text(&body);
     assert_eq!(instructions, remote_base);
 
     Ok(())

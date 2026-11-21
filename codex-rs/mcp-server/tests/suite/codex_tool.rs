@@ -21,7 +21,7 @@ use tempfile::TempDir;
 use tokio::time::timeout;
 use wiremock::MockServer;
 
-use core_test_support::skip_if_no_network;
+use core_test_support::skip_if_no_network_unless_localhost;
 use mcp_test_support::McpProcess;
 use mcp_test_support::create_apply_patch_sse_response;
 use mcp_test_support::create_final_assistant_message_sse_response;
@@ -336,7 +336,7 @@ async fn patch_approval_triggers_elicitation() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_codex_tool_passes_base_instructions() {
-    skip_if_no_network!();
+    skip_if_no_network_unless_localhost!();
 
     // Apparently `#[tokio::test]` must return `()`, so we create a helper
     // function that returns `Result` so we can use `?` in favor of `unwrap`.
@@ -398,9 +398,7 @@ async fn codex_tool_passes_base_instructions() -> anyhow::Result<()> {
 
     let requests = server.received_requests().await.unwrap();
     let request = requests[0].body_json::<serde_json::Value>()?;
-    let instructions = request["instructions"]
-        .as_str()
-        .expect("responses request should include instructions");
+    let instructions = core_test_support::responses::base_instructions_text(&request);
     assert!(instructions.starts_with("You are a helpful assistant."));
 
     let developer_messages: Vec<&serde_json::Value> = request["input"]

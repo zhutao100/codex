@@ -161,9 +161,13 @@ async fn manual_uses_responses_and_preserves_settings_and_exact_replay() -> Resu
         let compact = requests[1].body_json();
         assert_compact_request(&compact);
         let first = requests[0].body_json();
+        assert_eq!(
+            requests[1].instructions_text(),
+            requests[0].instructions_text()
+        );
+        assert_eq!(compact["input"][0], first["input"][0]);
         for field in [
             "tools",
-            "instructions",
             "model",
             "reasoning",
             "parallel_tool_calls",
@@ -283,7 +287,8 @@ async fn mid_turn_notes_are_carried_exactly_and_transient_suffix_is_excluded() -
     })
     .await;
     let replacements = replacement_history(&rollout);
-    assert_eq!(serde_json::to_value(&replacements[0])?, followup["input"]);
+    assert_eq!(input[0], compact["input"][0]);
+    assert_eq!(serde_json::to_value(&replacements[0])?, json!(&input[1..]));
     Ok(())
 }
 

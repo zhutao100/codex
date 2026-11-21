@@ -1,5 +1,6 @@
 use crate::common::Reasoning;
 use crate::common::ResponsesApiRequest;
+use crate::common::ResponsesInput;
 use crate::common::TextControls;
 use crate::error::ApiError;
 use crate::provider::Provider;
@@ -28,8 +29,7 @@ pub struct ResponsesRequest {
 #[derive(Default)]
 pub struct ResponsesRequestBuilder<'a> {
     model: Option<&'a str>,
-    instructions: Option<&'a str>,
-    input: Option<&'a [ResponseItem]>,
+    input: Option<&'a ResponsesInput>,
     tools: Option<&'a [Value]>,
     parallel_tool_calls: bool,
     reasoning: Option<Reasoning>,
@@ -45,10 +45,9 @@ pub struct ResponsesRequestBuilder<'a> {
 }
 
 impl<'a> ResponsesRequestBuilder<'a> {
-    pub fn new(model: &'a str, instructions: &'a str, input: &'a [ResponseItem]) -> Self {
+    pub fn new(model: &'a str, input: &'a ResponsesInput) -> Self {
         Self {
             model: Some(model),
-            instructions: Some(instructions),
             input: Some(input),
             ..Default::default()
         }
@@ -118,9 +117,6 @@ impl<'a> ResponsesRequestBuilder<'a> {
         let model = self
             .model
             .ok_or_else(|| ApiError::Stream("missing model for responses request".into()))?;
-        let instructions = self
-            .instructions
-            .ok_or_else(|| ApiError::Stream("missing instructions for responses request".into()))?;
         let input = self
             .input
             .ok_or_else(|| ApiError::Stream("missing input for responses request".into()))?;
@@ -132,7 +128,6 @@ impl<'a> ResponsesRequestBuilder<'a> {
 
         let req = ResponsesApiRequest {
             model,
-            instructions,
             input,
             tools,
             tool_choice: "auto",
@@ -167,7 +162,7 @@ impl<'a> ResponsesRequestBuilder<'a> {
     }
 }
 
-fn attach_item_ids(payload_json: &mut Value, original_items: &[ResponseItem]) {
+fn attach_item_ids(payload_json: &mut Value, input: &ResponsesInput) {
     let Some(input_value) = payload_json.get_mut("input") else {
         return;
     };
@@ -175,7 +170,11 @@ fn attach_item_ids(payload_json: &mut Value, original_items: &[ResponseItem]) {
         return;
     };
 
-    for (value, item) in items.iter_mut().zip(original_items.iter()) {
+    for (value, item) in items
+        .iter_mut()
+        .skip(usize::from(input.base.is_some()))
+        .zip(&input.items)
+    {
         if let ResponseItem::Reasoning { id, .. }
         | ResponseItem::Message { id: Some(id), .. }
         | ResponseItem::WebSearchCall { id: Some(id), .. }
@@ -244,7 +243,14 @@ mod tests {
             },
         ];
 
-        let request = ResponsesRequestBuilder::new("gpt-test", "inst", &input)
+        let input = ResponsesInput {
+            base: Some(crate::common::BaseInstructionsMessage::new(
+                "msg_base".into(),
+                "instructions",
+            )),
+            items: input,
+        };
+        let request = ResponsesRequestBuilder::new("gpt-test", &input)
             .conversation(Some("conv-1".into()))
             .session_source(Some(SessionSource::SubAgent(SubAgentSource::Review)))
             .build(&provider)
@@ -260,7 +266,10 @@ mod tests {
             .flatten()
             .map(|item| item.get("id").and_then(|v| v.as_str().map(str::to_string)))
             .collect();
-        assert_eq!(ids, vec![Some("m1".to_string()), None]);
+        assert_eq!(
+            ids,
+            vec![Some("msg_base".to_string()), Some("m1".to_string()), None]
+        );
 
         assert_eq!(
             request.headers.get("session_id"),
@@ -275,9 +284,9 @@ mod tests {
     #[test]
     fn responses_request_serializes_service_tier_when_set() {
         let provider = provider("openai", "https://api.openai.com/v1");
-        let input = Vec::new();
+        let input = ResponsesInput::default();
 
-        let request = ResponsesRequestBuilder::new("gpt-test", "inst", &input)
+        let request = ResponsesRequestBuilder::new("gpt-test", &input)
             .service_tier(Some("priority".to_string()))
             .build(&provider)
             .expect("request");

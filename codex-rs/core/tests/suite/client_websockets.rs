@@ -469,12 +469,16 @@ async fn responses_websocket_uses_incremental_create_on_prefix() {
 
     let harness = websocket_harness(&server).await;
     let mut client_session = harness.client.new_session();
-    let prompt_one = prompt_with_input(vec![message_item("hello")]);
-    let prompt_two = prompt_with_input(vec![
-        message_item("hello"),
-        assistant_message_item("msg-1", "assistant output"),
-        message_item("second"),
-    ]);
+    let prompt_one =
+        prompt_with_input_and_instructions(vec![message_item("hello")], "stable instructions");
+    let prompt_two = prompt_with_input_and_instructions(
+        vec![
+            message_item("hello"),
+            assistant_message_item("msg-1", "assistant output"),
+            message_item("second"),
+        ],
+        "stable instructions",
+    );
 
     stream_until_complete(&mut client_session, &harness, &prompt_one).await;
     stream_until_complete(&mut client_session, &harness, &prompt_two).await;
@@ -487,7 +491,12 @@ async fn responses_websocket_uses_incremental_create_on_prefix() {
     assert_eq!(first["type"].as_str(), Some("response.create"));
     assert_eq!(first["model"].as_str(), Some(MODEL));
     assert_eq!(first["stream"], serde_json::Value::Bool(true));
-    assert_eq!(first["input"].as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        core_test_support::responses::base_instructions_text(&first),
+        "stable instructions"
+    );
+    assert_eq!(first["input"].as_array().map(Vec::len), Some(2));
+    assert!(second.get("instructions").is_none());
     assert_eq!(second["type"].as_str(), Some("response.create"));
     assert_eq!(second["previous_response_id"].as_str(), Some("resp-1"));
     assert_eq!(
@@ -1130,7 +1139,7 @@ async fn responses_websocket_v2_creates_with_previous_response_id_on_prefix() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn responses_websocket_v2_creates_without_previous_response_id_when_non_input_fields_change()
+async fn responses_websocket_v2_creates_without_previous_response_id_when_base_instructions_change()
 {
     skip_if_no_network_unless_localhost!();
 
@@ -1154,13 +1163,22 @@ async fn responses_websocket_v2_creates_without_previous_response_id_when_non_in
 
     let connection = server.single_connection();
     assert_eq!(connection.len(), 2);
-    let second = connection.get(1).expect("missing request").body_json();
+    let first = connection[0].body_json();
+    let second = connection[1].body_json();
 
     assert_eq!(second["type"].as_str(), Some("response.create"));
     assert_eq!(second["previous_response_id"], serde_json::Value::Null);
     assert_eq!(
-        second["input"],
-        serde_json::to_value(&prompt_two.input).unwrap()
+        core_test_support::responses::base_instructions_text(&second),
+        "base instructions two"
+    );
+    assert_ne!(first["input"][0]["id"], second["input"][0]["id"]);
+    assert_eq!(
+        &second["input"].as_array().unwrap()[1..],
+        serde_json::to_value(&prompt_two.input)
+            .unwrap()
+            .as_array()
+            .unwrap()
     );
 
     server.shutdown().await;
@@ -1302,15 +1320,14 @@ fn ev_turn_state_metadata(header_name: &str, value: serde_json::Value) -> serde_
 }
 
 fn prompt_with_input(input: Vec<ResponseItem>) -> Prompt {
-    let mut prompt = Prompt::default();
-    prompt.input = input;
-    prompt
+    prompt_with_input_and_instructions(input, "")
 }
 
 fn prompt_with_input_and_instructions(input: Vec<ResponseItem>, instructions: &str) -> Prompt {
-    let mut prompt = prompt_with_input(input);
+    let mut prompt = Prompt::default();
+    prompt.input = input;
     prompt.base_instructions = BaseInstructions {
-        text: instructions.to_string(),
+        text: instructions.to_owned(),
     };
     prompt
 }

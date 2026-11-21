@@ -18,6 +18,7 @@ use codex_core::protocol::WarningEvent;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::items::TurnItem;
 use codex_protocol::user_input::UserInput;
+use core_test_support::responses::base_instructions_text;
 use core_test_support::responses::ev_local_shell_call;
 use core_test_support::responses::ev_reasoning_item;
 use core_test_support::skip_if_no_network_unless_localhost as skip_if_no_network;
@@ -193,8 +194,8 @@ async fn summarize_context_three_requests_and_instructions() {
     let body3 = requests[2].body_json();
 
     // Manual compact should keep the baseline developer instructions.
-    let instr1 = body1.get("instructions").and_then(|v| v.as_str()).unwrap();
-    let instr2 = body2.get("instructions").and_then(|v| v.as_str()).unwrap();
+    let instr1 = base_instructions_text(&body1);
+    let instr2 = base_instructions_text(&body2);
     assert_eq!(
         instr1, instr2,
         "manual compact should keep the standard developer instructions"
@@ -708,7 +709,8 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
             .collect()
     }
 
-    let initial_input = normalize_inputs(input);
+    let base = &input[0];
+    let initial_input = normalize_inputs(&input[1..]);
     let environment_message = initial_input[0]["content"][0]["text"].as_str().unwrap();
 
     // test 1: after compaction, we should have one environment message, one user message, and one user message with summary prefix
@@ -726,7 +728,7 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
                 .as_str()
                 .is_some_and(|text| text.ends_with(WORK_NOTES_TEXT))
         }));
-        let input = normalize_inputs(input);
+        let input = normalize_inputs(&input[1..]);
         assert_eq!(input.len(), 3);
         let received_environment = input[0]["content"][0]["text"].as_str().unwrap();
         let user_message_received = input[1]["content"][0]["text"].as_str().unwrap();
@@ -1090,7 +1092,11 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
         let body = request.body_json();
         let input = body.get("input").and_then(|v| v.as_array()).unwrap();
         let expected_input = expected_requests_inputs[i].as_array().unwrap();
-        assert_eq!(normalize_inputs(input), normalize_inputs(expected_input));
+        assert_eq!(&input[0], base);
+        assert_eq!(
+            normalize_inputs(&input[1..]),
+            normalize_inputs(expected_input)
+        );
     }
 
     // test 3: the number of requests should be 7
@@ -1222,15 +1228,8 @@ async fn auto_compact_runs_after_token_limit_hit() {
     let body_first = requests[0].body_json();
     let body_auto = requests[auto_compact_index].body_json();
     let body_follow_up = requests[follow_up_index].body_json();
-    let instructions = body_auto
-        .get("instructions")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
-    let baseline_instructions = body_first
-        .get("instructions")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
+    let instructions = base_instructions_text(&body_auto);
+    let baseline_instructions = base_instructions_text(&body_first).to_string();
     assert_eq!(
         instructions, baseline_instructions,
         "auto compact should keep the standard developer instructions",
@@ -1876,14 +1875,15 @@ async fn manual_compact_retries_after_context_window_error() {
         compact_input.len(),
         retry_input.len()
     );
-    if let (Some(first_before), Some(first_after)) = (compact_input.first(), retry_input.first()) {
-        assert_ne!(
-            first_before, first_after,
-            "retry should drop the oldest conversation item"
-        );
-    } else {
-        panic!("expected non-empty compact inputs");
-    }
+    assert_eq!(
+        retry_input[0], compact_input[0],
+        "base instructions survive retry"
+    );
+    assert_eq!(
+        &retry_input[1..],
+        &compact_input[2..],
+        "retry drops the oldest history item"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2053,6 +2053,10 @@ async fn manual_compact_twice_preserves_latest_user_messages() {
 
     // Context is seeded when the next turn starts, after the standalone
     // replacement. Compare user history independently of that placement.
+    assert_eq!(
+        final_output.pop_front().as_ref(),
+        Some(&first_turn_input[0])
+    );
     final_output.retain(|item| {
         !item["content"][0]["text"].as_str().is_some_and(|text| {
             text.starts_with("<permissions instructions>")

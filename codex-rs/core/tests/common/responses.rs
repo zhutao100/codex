@@ -97,6 +97,19 @@ fn decode_body_bytes(body: &[u8], content_encoding: Option<&str>) -> Vec<u8> {
     }
 }
 
+pub fn base_instructions_text(body: &Value) -> &str {
+    assert!(
+        body.get("instructions").is_none(),
+        "unexpected top-level instructions"
+    );
+    let base = &body["input"][0];
+    assert_eq!(base["role"], "developer");
+    assert!(base["id"].as_str().is_some_and(|id| id.starts_with("msg_")));
+    base["content"][0]["text"]
+        .as_str()
+        .expect("base instruction text")
+}
+
 impl ResponsesRequest {
     pub fn body_json(&self) -> Value {
         let body = decode_body_bytes(
@@ -114,10 +127,14 @@ impl ResponsesRequest {
     }
 
     pub fn instructions_text(&self) -> String {
-        self.body_json()["instructions"]
-            .as_str()
-            .unwrap()
-            .to_string()
+        let body = self.body_json();
+        if self.path().ends_with("/responses/compact") {
+            return body["instructions"]
+                .as_str()
+                .expect("legacy compact instructions")
+                .to_owned();
+        }
+        base_instructions_text(&body).to_owned()
     }
 
     /// Returns all `input_text` spans from `message` inputs for the provided role.

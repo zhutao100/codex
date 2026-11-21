@@ -8,13 +8,15 @@ WebSockets require a Responses provider with `supports_websockets` and either `f
 
 The outbound operation is `response.create`. Requests are serialized directly to the wire string; there is no `response.append` or `response.processed` path. Complete local history remains available for full requests and HTTP fallback.
 
+Both HTTP and WebSocket full requests put nonempty base instructions in the first `input` item, a `developer` message, not in top-level `instructions`. Its `msg_` ID is derived from the thread and exact text: retry and resume reproduce it; a fork or changed text gets a different ID. This makes reusable instructions [eligible for prompt caching](https://developers.openai.com/api/docs/guides/prompt-caching), not a guaranteed hit. The prefix is request-only: do not append it to history, count it twice in budgets, or send it in a continuation delta. Streaming compaction uses the same prefix; the separate legacy `responses/compact` endpoint retains its own `instructions` field.
+
 ## Incremental requests
 
 A completed response permits the next request in the same `ModelClientSession` to send `previous_response_id` plus only new input when all of these conditions hold:
 
 - The prior response ID is nonempty and the stream mapper supplied a completed response.
 - The current full input begins with the prior full request input followed by the exact output items returned by that response.
-- The compared request properties match: model, instructions, tools, tool choice, parallel-tool setting, reasoning, storage, streaming, included fields, service tier, prompt cache key, and text/output-schema settings.
+- The base instruction prefix and request properties match: model, tools, tool choice, parallel-tool setting, reasoning, storage, streaming, included fields, service tier, prompt cache key, and text/output-schema settings.
 
 The comparison walks the borrowed prior input and output, then clones only the suffix for the delta. An empty delta is allowed. `client_metadata` and `generate` are excluded from the property comparison; ordinary generation leaves `generate` unset. See [output replay](responses-output-replay.md) for full-request fidelity and continuation/removal diagnostics.
 

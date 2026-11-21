@@ -113,6 +113,13 @@ async fn output_token_replay_respects_provider_and_preserves_history(
 
     let requests = mock.requests();
     assert_eq!(requests.len(), 3);
+    let prefix = &requests[0].input()[0];
+    assert_eq!(
+        requests[0].instructions_text(),
+        requests[2].instructions_text()
+    );
+    assert_eq!(&requests[1].input()[0], prefix);
+    assert_eq!(&requests[2].input()[0], prefix);
     let expected_include = if enabled && openai_provider {
         json!(["reasoning.encrypted_content", "output.encrypted_content"])
     } else {

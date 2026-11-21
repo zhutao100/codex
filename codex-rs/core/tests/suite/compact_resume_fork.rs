@@ -195,25 +195,21 @@ async fn compact_resume_and_fork_preserve_model_history_view() {
         compact_arr.len() <= fork_arr.len(),
         "after-fork input should have at least as many items as after-compact",
     );
-    assert_eq!(
-        &compact_arr.as_slice()[..compact_arr.len()],
-        &fork_arr[..compact_arr.len()]
-    );
+    assert_eq!(&compact_arr[1..], &fork_arr[1..compact_arr.len()]);
 
+    assert_ne!(compact_arr[0]["id"], fork_arr[0]["id"]);
+    assert_eq!(compact_arr[0]["content"], fork_arr[0]["content"]);
     let expected_model = requests[0]["model"]
         .as_str()
         .unwrap_or_default()
         .to_string();
-    let prompt = requests[0]["instructions"]
+    let base_message = requests[0]["input"][0].clone();
+    let permissions_message = requests[0]["input"][1].clone();
+    let user_instructions = requests[0]["input"][2]["content"][0]["text"]
         .as_str()
         .unwrap_or_default()
         .to_string();
-    let permissions_message = requests[0]["input"][0].clone();
-    let user_instructions = requests[0]["input"][1]["content"][0]["text"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
-    let environment_context = requests[0]["input"][2]["content"][0]["text"]
+    let environment_context = requests[0]["input"][3]["content"][0]["text"]
         .as_str()
         .unwrap_or_default()
         .to_string();
@@ -232,8 +228,8 @@ async fn compact_resume_and_fork_preserve_model_history_view() {
     let user_turn_1 = json!(
     {
       "model": expected_model,
-      "instructions": prompt,
       "input": [
+        base_message,
         permissions_message,
         {
           "type": "message",
@@ -283,8 +279,8 @@ async fn compact_resume_and_fork_preserve_model_history_view() {
     let compact_1 = json!(
     {
       "model": expected_model,
-      "instructions": prompt,
       "input": [
+        base_message,
         permissions_message,
         {
           "type": "message",
@@ -354,8 +350,8 @@ async fn compact_resume_and_fork_preserve_model_history_view() {
     let user_turn_2_after_compact = json!(
     {
       "model": expected_model,
-      "instructions": prompt,
       "input": [
+        base_message,
         permissions_message,
         {
           "type": "message",
@@ -416,8 +412,8 @@ async fn compact_resume_and_fork_preserve_model_history_view() {
     let usert_turn_3_after_resume = json!(
     {
       "model": expected_model,
-      "instructions": prompt,
       "input": [
+        base_message,
         permissions_message,
         {
           "type": "message",
@@ -519,8 +515,8 @@ async fn compact_resume_and_fork_preserve_model_history_view() {
     let user_turn_3_after_fork = json!(
     {
       "model": expected_model,
-      "instructions": prompt,
       "input": [
+        fork_arr[0],
         permissions_message,
         {
           "type": "message",
@@ -726,16 +722,13 @@ async fn compact_resume_after_second_compaction_preserves_history() {
         &resume_filtered[..compact_filtered.len()]
     );
     // hard coded test
-    let prompt = requests[0]["instructions"]
+    let base_message = compact_input_array[0].clone();
+    let permissions_message = requests[0]["input"][1].clone();
+    let user_instructions = requests[0]["input"][2]["content"][0]["text"]
         .as_str()
         .unwrap_or_default()
         .to_string();
-    let permissions_message = requests[0]["input"][0].clone();
-    let user_instructions = requests[0]["input"][1]["content"][0]["text"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
-    let environment_instructions = requests[0]["input"][2]["content"][0]["text"]
+    let environment_instructions = requests[0]["input"][3]["content"][0]["text"]
         .as_str()
         .unwrap_or_default()
         .to_string();
@@ -747,8 +740,8 @@ async fn compact_resume_after_second_compaction_preserves_history() {
 
     let mut expected = json!([
       {
-        "instructions": prompt,
         "input": [
+          base_message,
           permissions_message,
           {
             "type": "message",
@@ -827,7 +820,6 @@ async fn compact_resume_after_second_compaction_preserves_history() {
     ]);
     normalize_line_endings(&mut expected);
     let mut last_request_after_2_compacts = json!([{
-        "instructions": requests[requests.len() -1]["instructions"],
         "input": requests[requests.len() -1]["input"],
     }]);
     if let Some(arr) = expected.as_array_mut() {

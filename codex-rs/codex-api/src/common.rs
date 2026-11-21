@@ -1,6 +1,7 @@
 use crate::error::ApiError;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::config_types::Verbosity as VerbosityConfig;
+use codex_protocol::models::DeveloperInstructions;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::protocol::ModelVerification;
@@ -9,6 +10,8 @@ use codex_protocol::protocol::TokenUsage;
 use futures::Stream;
 use serde::Deserialize;
 use serde::Serialize;
+use serde::Serializer;
+use serde::ser::SerializeSeq;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -19,10 +22,7 @@ use tokio::sync::mpsc;
 /// Canonical prompt input for Responses endpoints.
 #[derive(Debug, Clone)]
 pub struct Prompt {
-    /// Fully-resolved system instructions for this turn.
-    pub instructions: String,
-    /// Conversation history and user/tool messages.
-    pub input: Vec<ResponseItem>,
+    pub input: ResponsesInput,
     /// JSON-encoded tool definitions compatible with the target API.
     // TODO(jif) have a proper type here
     pub tools: Vec<Value>,
@@ -30,6 +30,49 @@ pub struct Prompt {
     pub parallel_tool_calls: bool,
     /// Optional output schema used to build the `text.format` controls.
     pub output_schema: Option<Value>,
+}
+
+/// A request-only prefix, never a second copy of the instructions in history.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct BaseInstructionsMessage {
+    id: String,
+    #[serde(flatten)]
+    message: ResponseItem,
+}
+
+impl BaseInstructionsMessage {
+    pub fn new(id: String, text: &str) -> Self {
+        Self {
+            id,
+            message: DeveloperInstructions::new(text).into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ResponsesInput {
+    pub base: Option<BaseInstructionsMessage>,
+    pub items: Vec<ResponseItem>,
+}
+
+impl From<Vec<ResponseItem>> for ResponsesInput {
+    fn from(items: Vec<ResponseItem>) -> Self {
+        Self { base: None, items }
+    }
+}
+
+impl Serialize for ResponsesInput {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut seq =
+            serializer.serialize_seq(Some(self.items.len() + usize::from(self.base.is_some())))?;
+        if let Some(base) = &self.base {
+            seq.serialize_element(base)?;
+        }
+        for item in &self.items {
+            seq.serialize_element(item)?;
+        }
+        seq.end()
+    }
 }
 
 /// Canonical input payload for the compaction endpoint.
@@ -202,8 +245,7 @@ impl From<VerbosityConfig> for OpenAiVerbosity {
 #[derive(Debug, Serialize)]
 pub struct ResponsesApiRequest<'a> {
     pub model: &'a str,
-    pub instructions: &'a str,
-    pub input: &'a [ResponseItem],
+    pub input: &'a ResponsesInput,
     pub tools: &'a [serde_json::Value],
     pub tool_choice: &'static str,
     pub parallel_tool_calls: bool,
@@ -222,11 +264,9 @@ pub struct ResponsesApiRequest<'a> {
 #[derive(Debug, Serialize, Clone, PartialEq)]
 pub struct ResponseCreateWsRequest {
     pub model: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub instructions: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub previous_response_id: Option<String>,
-    pub input: Vec<ResponseItem>,
+    pub input: ResponsesInput,
     pub tools: Vec<Value>,
     pub tool_choice: String,
     pub parallel_tool_calls: bool,

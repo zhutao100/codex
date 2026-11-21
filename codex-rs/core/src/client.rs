@@ -42,7 +42,9 @@ use codex_api::SseTelemetry;
 use codex_api::TransportError;
 use codex_api::WebsocketTelemetry;
 use codex_api::build_conversation_headers;
+use codex_api::common::BaseInstructionsMessage;
 use codex_api::common::Reasoning;
+use codex_api::common::ResponsesInput;
 use codex_api::common::ResponsesWsRequest;
 use codex_api::create_text_param_for_request;
 use codex_api::error::ApiError;
@@ -544,12 +546,23 @@ impl ModelClientSession {
     }
 
     fn build_responses_request(&self, prompt: &Prompt) -> Result<ApiPrompt> {
-        let instructions = prompt.base_instructions.text.clone();
+        let instructions = &prompt.base_instructions.text;
+        let base = (!instructions.is_empty()).then(|| {
+            // Match upstream's thread- and content-scoped identity, including after resume.
+            let thread = uuid::Uuid::new_v5(
+                &uuid::Uuid::NAMESPACE_OID,
+                self.client.state.conversation_id.to_string().as_bytes(),
+            );
+            let id = uuid::Uuid::new_v5(&thread, instructions.as_bytes());
+            BaseInstructionsMessage::new(format!("msg_{id}"), instructions)
+        });
         let tools_json: Vec<Value> = create_tools_json_for_responses_api(&prompt.tools)?;
         Ok(ApiPrompt {
-            instructions,
-            input: project_provider_input(prompt.get_formatted_input().into(), &self.provider)
-                .into_owned(),
+            input: ResponsesInput {
+                base,
+                items: project_provider_input(prompt.get_formatted_input().into(), &self.provider)
+                    .into_owned(),
+            },
             tools: tools_json,
             parallel_tool_calls: prompt.parallel_tool_calls,
             output_schema: prompt.output_schema.clone(),
@@ -644,8 +657,8 @@ impl ModelClientSession {
         if let Some(reason) = response_create_properties_mismatch(previous, request) {
             return Err(NonIncrementalReason::RequestPropertyChanged { reason });
         }
-        let previous_items = previous.input.iter().chain(previous_output);
-        let mut current_items = request.input.iter();
+        let previous_items = previous.input.items.iter().chain(previous_output);
+        let mut current_items = request.input.items.iter();
         for previous in previous_items {
             let Some(current) = current_items.next() else {
                 return Err(NonIncrementalReason::InputShortened {
@@ -703,7 +716,6 @@ impl ModelClientSession {
 
         let payload = ResponseCreateWsRequest {
             model: model_slug.to_string(),
-            instructions: api_prompt.instructions.clone(),
             previous_response_id: None,
             input: api_prompt.input.clone(),
             tools: api_prompt.tools.clone(),
@@ -743,7 +755,7 @@ impl ModelClientSession {
         (
             ResponsesWsRequest::ResponseCreate(ResponseCreateWsRequest {
                 previous_response_id: Some(response_id),
-                input: incremental_items,
+                input: incremental_items.into(),
                 ..payload.clone()
             }),
             payload,
@@ -1191,9 +1203,8 @@ fn response_create_properties_mismatch(
 ) -> Option<&'static str> {
     let ResponseCreateWsRequest {
         model: previous_model,
-        instructions: previous_instructions,
         previous_response_id: _,
-        input: _,
+        input: previous_input,
         tools: previous_tools,
         tool_choice: previous_tool_choice,
         parallel_tool_calls: previous_parallel_tool_calls,
@@ -1210,9 +1221,8 @@ fn response_create_properties_mismatch(
 
     let ResponseCreateWsRequest {
         model: current_model,
-        instructions: current_instructions,
         previous_response_id: _,
-        input: _,
+        input: current_input,
         tools: current_tools,
         tool_choice: current_tool_choice,
         parallel_tool_calls: current_parallel_tool_calls,
@@ -1230,7 +1240,7 @@ fn response_create_properties_mismatch(
     if previous_model != current_model {
         return Some("model_changed");
     }
-    if previous_instructions != current_instructions {
+    if previous_input.base != current_input.base {
         return Some("instructions_changed");
     }
     if previous_tools != current_tools {
@@ -1874,7 +1884,10 @@ mod tests {
         let cases: Vec<(&str, RequestMutation)> = vec![
             ("model", |request| request.model = "other-model".to_string()),
             ("instructions", |request| {
-                request.instructions = "changed instructions".to_string();
+                request.input.base = Some(BaseInstructionsMessage::new(
+                    "msg_test".into(),
+                    "changed instructions",
+                ));
             }),
             ("tools", |request| {
                 request.tools = vec![json!({
@@ -1970,9 +1983,8 @@ mod tests {
     fn ws_request(input: Vec<ResponseItem>) -> ResponseCreateWsRequest {
         ResponseCreateWsRequest {
             model: "test-model".to_string(),
-            instructions: "test instructions".to_string(),
             previous_response_id: None,
-            input,
+            input: input.into(),
             tools: Vec::new(),
             tool_choice: "auto".to_string(),
             parallel_tool_calls: false,

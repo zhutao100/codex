@@ -5,6 +5,7 @@ use codex_core::protocol::GitInfo;
 use codex_utils_cargo_bin::find_resource;
 use core_test_support::fs_wait;
 use core_test_support::responses;
+use core_test_support::responses::base_instructions_text;
 use core_test_support::skip_if_no_network;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -149,11 +150,7 @@ async fn exec_cli_applies_model_instructions_file() {
     // included in the `instructions` field.
     let request = resp_mock.single_request();
     let body = request.body_json();
-    let instructions = body
-        .get("instructions")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
+    let instructions = base_instructions_text(&body).to_string();
     assert!(
         instructions.contains(marker),
         "instructions did not contain custom marker; got: {instructions}"

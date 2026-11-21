@@ -4,6 +4,7 @@ use codex_core::protocol::Op;
 use codex_protocol::user_input::ByteRange;
 use codex_protocol::user_input::TextElement;
 use codex_protocol::user_input::UserInput;
+use core_test_support::responses::base_instructions_text;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_reasoning_item;
@@ -177,11 +178,7 @@ async fn resume_switches_models_preserves_base_instructions() -> Result<()> {
     wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
 
     let initial_body = initial_mock.single_request().body_json();
-    let initial_instructions = initial_body
-        .get("instructions")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
+    let initial_instructions = base_instructions_text(&initial_body).to_string();
 
     let resumed_mock = mount_sse_sequence(
         &server,

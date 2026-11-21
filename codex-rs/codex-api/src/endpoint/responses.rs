@@ -97,7 +97,7 @@ impl<T: HttpTransport, A: AuthProvider> ResponsesClient<T, A> {
             turn_state,
         } = options;
 
-        let request = ResponsesRequestBuilder::new(model, &prompt.instructions, &prompt.input)
+        let request = ResponsesRequestBuilder::new(model, &prompt.input)
             .tools(&prompt.tools)
             .parallel_tool_calls(prompt.parallel_tool_calls)
             .reasoning(reasoning)

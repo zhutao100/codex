@@ -2,6 +2,7 @@ use super::*;
 use codex_core::models_manager::overlay::ModelInfoPatch;
 use codex_core::models_manager::overlay::ModelOverlay;
 use codex_core::models_manager::overlay::ModelOverlayEntry;
+use core_test_support::responses::base_instructions_text;
 use core_test_support::streaming_sse::StreamingSseChunk;
 use core_test_support::streaming_sse::StreamingSseServer;
 use core_test_support::streaming_sse::start_streaming_sse_server;
@@ -660,7 +661,7 @@ async fn assert_previous_model_instructions(final_override: bool) -> Result<()> 
     for request in &old {
         assert_eq!(request.body_json()["model"], "previous-provider-model");
         assert_eq!(
-            request.body_json()["instructions"],
+            request.instructions_text(),
             if final_override {
                 "Previous model final override."
             } else {
@@ -685,7 +686,7 @@ async fn assert_previous_model_instructions(final_override: bool) -> Result<()> 
     let new = new_request.single_request().body_json();
     assert_eq!(new["model"], "destination-provider-model");
     assert_eq!(
-        new["instructions"],
+        base_instructions_text(&new),
         if final_override {
             "Destination model final override."
         } else {

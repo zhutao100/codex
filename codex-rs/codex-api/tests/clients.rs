@@ -254,7 +254,6 @@ async fn streaming_client_retries_on_transport_error() -> Result<()> {
     let client = ResponsesClient::new(transport.clone(), provider, NoAuth);
 
     let prompt = codex_api::Prompt {
-        instructions: "Say hi".to_string(),
         input: vec![ResponseItem::Message {
             encrypted_content: None,
             status: None,
@@ -265,7 +264,8 @@ async fn streaming_client_retries_on_transport_error() -> Result<()> {
             }],
             end_turn: None,
             phase: None,
-        }],
+        }]
+        .into(),
         tools: Vec::<Value>::new(),
         parallel_tool_calls: false,
         output_schema: None,

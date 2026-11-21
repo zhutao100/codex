@@ -259,15 +259,12 @@ mod tests {
     use codex_api::create_text_param_for_request;
     use pretty_assertions::assert_eq;
 
-    use super::*;
-
     #[test]
     fn serializes_text_verbosity_when_set() {
-        let input: Vec<ResponseItem> = vec![];
+        let input = codex_api::common::ResponsesInput::default();
         let tools: Vec<serde_json::Value> = vec![];
         let req = ResponsesApiRequest {
             model: "gpt-5.1",
-            instructions: "i",
             input: &input,
             tools: &tools,
             tool_choice: "auto",
@@ -295,7 +292,7 @@ mod tests {
 
     #[test]
     fn serializes_text_schema_with_strict_format() {
-        let input: Vec<ResponseItem> = vec![];
+        let input = codex_api::common::ResponsesInput::default();
         let tools: Vec<serde_json::Value> = vec![];
         let schema = serde_json::json!({
             "type": "object",
@@ -309,7 +306,6 @@ mod tests {
 
         let req = ResponsesApiRequest {
             model: "gpt-5.1",
-            instructions: "i",
             input: &input,
             tools: &tools,
             tool_choice: "auto",
@@ -342,11 +338,10 @@ mod tests {
 
     #[test]
     fn omits_text_when_not_set() {
-        let input: Vec<ResponseItem> = vec![];
+        let input = codex_api::common::ResponsesInput::default();
         let tools: Vec<serde_json::Value> = vec![];
         let req = ResponsesApiRequest {
             model: "gpt-5.1",
-            instructions: "i",
             input: &input,
             tools: &tools,
             tool_choice: "auto",

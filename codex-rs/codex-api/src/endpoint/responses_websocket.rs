@@ -667,7 +667,6 @@ mod tests {
     fn direct_serialization_preserves_websocket_request_payload() {
         let request = ResponsesWsRequest::ResponseCreate(ResponseCreateWsRequest {
             model: "gpt-test".to_string(),
-            instructions: "Use the available tools.".to_string(),
             previous_response_id: Some("resp-1".to_string()),
             input: vec![ResponseItem::Message {
                 encrypted_content: None,
@@ -679,7 +678,8 @@ mod tests {
                 }],
                 end_turn: None,
                 phase: None,
-            }],
+            }]
+            .into(),
             tools: vec![json!({
                 "type": "function",
                 "name": "lookup",

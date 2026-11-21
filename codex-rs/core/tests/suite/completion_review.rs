@@ -239,10 +239,7 @@ async fn automatic_review_continues_past_three_with_only_initial_and_latest_answ
         assert!(!context.contains("R2:"));
         assert!(!context.contains("R3:"));
         assert!(context.contains("historical_unverified"));
-        let instructions = requests[index].body_json()["instructions"]
-            .as_str()
-            .unwrap()
-            .to_string();
+        let instructions = requests[index].instructions_text();
         assert!(instructions.contains("custom reviewer prompt"));
         assert!(instructions.contains("cannot compensate for omissions"));
     }

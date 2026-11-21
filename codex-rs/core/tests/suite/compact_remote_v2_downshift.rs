@@ -1,4 +1,5 @@
 use super::*;
+use core_test_support::responses::base_instructions_text;
 use pretty_assertions::assert_eq;
 
 pub(super) fn configure_providers(
@@ -207,7 +208,10 @@ async fn model_downshift_recovery_preserves_source_and_destination(
         .collect();
     for body in &bodies {
         assert_eq!(body["model"], "previous-provider-model");
-        assert_eq!(body["instructions"], "Previous model final override.");
+        assert_eq!(
+            base_instructions_text(body),
+            "Previous model final override."
+        );
     }
     assert!(
         bodies[1]
@@ -221,7 +225,7 @@ async fn model_downshift_recovery_preserves_source_and_destination(
     }
     let body = followup.single_request().body_json();
     assert_eq!(body["model"], destination);
-    assert_eq!(body["instructions"], instructions);
+    assert_eq!(base_instructions_text(&body), instructions);
     assert!(!body.to_string().contains("discarded"));
     assert!(!body.to_string().contains("compaction_trigger"));
     assert_eq!(
@@ -242,7 +246,7 @@ async fn model_downshift_recovery_preserves_source_and_destination(
     assert_eq!(replacement.len(), 1);
     // This also catches accidentally applying the source model's 64K retention
     // budget instead of the selected destination's auto-compaction ceiling.
-    let request_tokens: usize = ["input", "instructions", "tools"]
+    let request_tokens: usize = ["input", "tools"]
         .iter()
         .map(|key| body[key].to_string().chars().count().div_ceil(4))
         .sum();

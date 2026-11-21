@@ -36,6 +36,7 @@ use codex_protocol::models::WebSearchAction;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::user_input::UserInput;
 use core_test_support::load_default_config_for_test;
+use core_test_support::responses::base_instructions_text;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_completed_with_tokens;
 use core_test_support::responses::ev_response_created;
@@ -430,7 +431,7 @@ async fn includes_conversation_id_and_model_headers_in_request() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn includes_base_instructions_override_in_request() {
-    skip_if_no_network!();
+    skip_if_no_network_unless_localhost!();
     // Mock server
     let server = MockServer::start().await;
     let resp_mock = mount_sse_once(
@@ -466,12 +467,7 @@ async fn includes_base_instructions_override_in_request() {
     let request = resp_mock.single_request();
     let request_body = request.body_json();
 
-    assert!(
-        request_body["instructions"]
-            .as_str()
-            .unwrap()
-            .contains("test instructions")
-    );
+    assert!(base_instructions_text(&request_body).contains("test instructions"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -613,7 +609,7 @@ async fn prefers_apikey_when_config_prefers_apikey_even_with_chatgpt_tokens() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn includes_user_instructions_message_in_request() {
-    skip_if_no_network!();
+    skip_if_no_network_unless_localhost!();
     let server = MockServer::start().await;
 
     let resp_mock = mount_sse_once(
@@ -649,14 +645,9 @@ async fn includes_user_instructions_message_in_request() {
     let request = resp_mock.single_request();
     let request_body = request.body_json();
 
-    assert!(
-        !request_body["instructions"]
-            .as_str()
-            .unwrap()
-            .contains("be nice")
-    );
-    assert_message_role(&request_body["input"][0], "developer");
-    let permissions_text = request_body["input"][0]["content"][0]["text"]
+    assert!(!base_instructions_text(&request_body).contains("be nice"));
+    assert_message_role(&request_body["input"][1], "developer");
+    let permissions_text = request_body["input"][1]["content"][0]["text"]
         .as_str()
         .expect("invalid permissions message content");
     assert!(
@@ -664,22 +655,22 @@ async fn includes_user_instructions_message_in_request() {
         "expected permissions message to mention sandbox_mode, got {permissions_text:?}"
     );
 
-    assert_message_role(&request_body["input"][1], "user");
-    assert_message_starts_with(&request_body["input"][1], "# AGENTS.md instructions for ");
-    assert_message_ends_with(&request_body["input"][1], "</INSTRUCTIONS>");
-    let ui_text = request_body["input"][1]["content"][0]["text"]
+    assert_message_role(&request_body["input"][2], "user");
+    assert_message_starts_with(&request_body["input"][2], "# AGENTS.md instructions for ");
+    assert_message_ends_with(&request_body["input"][2], "</INSTRUCTIONS>");
+    let ui_text = request_body["input"][2]["content"][0]["text"]
         .as_str()
         .expect("invalid message content");
     assert!(ui_text.contains("<INSTRUCTIONS>"));
     assert!(ui_text.contains("be nice"));
-    assert_message_role(&request_body["input"][2], "user");
-    assert_message_starts_with(&request_body["input"][2], "<environment_context>");
-    assert_message_ends_with(&request_body["input"][2], "</environment_context>");
+    assert_message_role(&request_body["input"][3], "user");
+    assert_message_starts_with(&request_body["input"][3], "<environment_context>");
+    assert_message_ends_with(&request_body["input"][3], "</environment_context>");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn skills_append_to_instructions() {
-    skip_if_no_network!();
+    skip_if_no_network_unless_localhost!();
     let server = MockServer::start().await;
 
     let resp_mock = mount_sse_once(
@@ -726,10 +717,10 @@ async fn skills_append_to_instructions() {
     let request = resp_mock.single_request();
     let request_body = request.body_json();
 
-    assert_message_role(&request_body["input"][0], "developer");
+    assert_message_role(&request_body["input"][1], "developer");
 
-    assert_message_role(&request_body["input"][1], "user");
-    let instructions_text = request_body["input"][1]["content"][0]["text"]
+    assert_message_role(&request_body["input"][2], "user");
+    let instructions_text = request_body["input"][2]["content"][0]["text"]
         .as_str()
         .expect("instructions text");
     assert!(
@@ -1156,7 +1147,7 @@ async fn configured_verbosity_is_sent() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn includes_developer_instructions_message_in_request() {
-    skip_if_no_network!();
+    skip_if_no_network_unless_localhost!();
     let server = MockServer::start().await;
 
     let resp_mock = mount_sse_once(
@@ -1192,40 +1183,35 @@ async fn includes_developer_instructions_message_in_request() {
     let request = resp_mock.single_request();
     let request_body = request.body_json();
 
-    let permissions_text = request_body["input"][0]["content"][0]["text"]
+    let permissions_text = request_body["input"][1]["content"][0]["text"]
         .as_str()
         .expect("invalid permissions message content");
 
-    assert!(
-        !request_body["instructions"]
-            .as_str()
-            .unwrap()
-            .contains("be nice")
-    );
-    assert_message_role(&request_body["input"][0], "developer");
+    assert!(!base_instructions_text(&request_body).contains("be nice"));
+    assert_message_role(&request_body["input"][1], "developer");
     assert!(
         permissions_text.contains("`sandbox_mode`"),
         "expected permissions message to mention sandbox_mode, got {permissions_text:?}"
     );
 
-    assert_message_role(&request_body["input"][1], "developer");
-    assert_message_equals(&request_body["input"][1], "be useful");
-    assert_message_role(&request_body["input"][2], "user");
-    assert_message_starts_with(&request_body["input"][2], "# AGENTS.md instructions for ");
-    assert_message_ends_with(&request_body["input"][2], "</INSTRUCTIONS>");
-    let ui_text = request_body["input"][2]["content"][0]["text"]
+    assert_message_role(&request_body["input"][2], "developer");
+    assert_message_equals(&request_body["input"][2], "be useful");
+    assert_message_role(&request_body["input"][3], "user");
+    assert_message_starts_with(&request_body["input"][3], "# AGENTS.md instructions for ");
+    assert_message_ends_with(&request_body["input"][3], "</INSTRUCTIONS>");
+    let ui_text = request_body["input"][3]["content"][0]["text"]
         .as_str()
         .expect("invalid message content");
     assert!(ui_text.contains("<INSTRUCTIONS>"));
     assert!(ui_text.contains("be nice"));
-    assert_message_role(&request_body["input"][3], "user");
-    assert_message_starts_with(&request_body["input"][3], "<environment_context>");
-    assert_message_ends_with(&request_body["input"][3], "</environment_context>");
+    assert_message_role(&request_body["input"][4], "user");
+    assert_message_starts_with(&request_body["input"][4], "<environment_context>");
+    assert_message_ends_with(&request_body["input"][4], "</environment_context>");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn azure_responses_request_includes_store_and_reasoning_ids() {
-    skip_if_no_network!();
+    skip_if_no_network_unless_localhost!();
 
     let server = MockServer::start().await;
 
@@ -1385,21 +1371,22 @@ async fn azure_responses_request_includes_store_and_reasoning_ids() {
     assert_eq!(request.path(), "/openai/responses");
     let body = request.body_json();
 
+    assert_eq!(base_instructions_text(&body), prompt.base_instructions.text);
     assert_eq!(body["store"], serde_json::Value::Bool(true));
     assert_eq!(body["stream"], serde_json::Value::Bool(true));
-    assert_eq!(body["input"].as_array().map(Vec::len), Some(8));
-    assert_eq!(body["input"][0]["id"].as_str(), Some("reasoning-id"));
-    assert_eq!(body["input"][1]["id"].as_str(), Some("message-id"));
-    assert_eq!(body["input"][2]["id"].as_str(), Some("web-search-id"));
-    assert_eq!(body["input"][3]["id"].as_str(), Some("function-id"));
+    assert_eq!(body["input"].as_array().map(Vec::len), Some(9));
+    assert_eq!(body["input"][1]["id"].as_str(), Some("reasoning-id"));
+    assert_eq!(body["input"][2]["id"].as_str(), Some("message-id"));
+    assert_eq!(body["input"][3]["id"].as_str(), Some("web-search-id"));
+    assert_eq!(body["input"][4]["id"].as_str(), Some("function-id"));
     assert_eq!(
-        body["input"][4]["call_id"].as_str(),
+        body["input"][5]["call_id"].as_str(),
         Some("function-call-id")
     );
-    assert_eq!(body["input"][5]["id"].as_str(), Some("local-shell-id"));
-    assert_eq!(body["input"][6]["id"].as_str(), Some("custom-tool-id"));
+    assert_eq!(body["input"][6]["id"].as_str(), Some("local-shell-id"));
+    assert_eq!(body["input"][7]["id"].as_str(), Some("custom-tool-id"));
     assert_eq!(
-        body["input"][7]["call_id"].as_str(),
+        body["input"][8]["call_id"].as_str(),
         Some("custom-tool-call-id")
     );
 }
