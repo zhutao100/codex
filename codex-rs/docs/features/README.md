@@ -33,8 +33,9 @@ Choose the feature being changed. Each page states current behavior, non-obvious
 
 |Change|Read|
 |---|---|
+|Collect evidence, retrieve retained output, delegate exploration or wait for a command|[Context harness](context-harness.md)|
 |Install local skills/MCP bundles or change activation|[Local plugins](local_plugins.md)|
 |Grant dedicated temp writes in read-only sessions|[Read-only temporary directories](read-only-temp.md)|
 |Fetch and display account token activity|[Usage command](usage-command.md)|
 
-For core operations or client integration, return to the [documentation index](../README.md). Proposed output-storage and explorer changes remain in [active plans](../dev_plans/README.md).
+For core operations or client integration, return to the [documentation index](../README.md). Unfinished features remain in [active plans](../dev_plans/README.md).

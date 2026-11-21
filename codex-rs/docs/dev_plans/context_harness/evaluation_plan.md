@@ -1,6 +1,6 @@
 # Evaluation for context harness changes
 
-Status: planned. Source inspection establishes implementation paths; deterministic fixtures establish exercised contracts; live runs establish observed model behavior. This documentation revision does not claim runtime tests or performance improvements.
+Status: see [the implemented contract](../../features/context-harness.md#validation) for deterministic storage, process, sandbox, recorder and request evidence. The controlled pilots have not run. Scripted request counts and recovered bytes do not measure model quality, provider usage, cost or cache behavior.
 
 ## Controlled comparisons
 

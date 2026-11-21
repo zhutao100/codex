@@ -50,8 +50,6 @@ impl HeadTailBuffer {
         self.head_bytes.saturating_add(self.tail_bytes)
     }
 
-    // Used for tests.
-    #[allow(dead_code)]
     /// Total bytes that were dropped from the middle due to the size cap.
     pub(crate) fn omitted_bytes(&self) -> usize {
         self.omitted_bytes
@@ -116,17 +114,23 @@ impl HeadTailBuffer {
         out
     }
 
-    /// Drain all retained chunks from the buffer and reset its state.
-    ///
-    /// The drained chunks are returned in head-then-tail order. Omitted bytes
-    /// are discarded along with the retained content.
-    pub(crate) fn drain_chunks(&mut self) -> Vec<Vec<u8>> {
-        let mut out: Vec<Vec<u8>> = self.head.drain(..).collect();
-        out.extend(self.tail.drain(..));
-        self.head_bytes = 0;
-        self.tail_bytes = 0;
-        self.omitted_bytes = 0;
-        out
+    pub(crate) fn into_preview(mut self) -> Vec<u8> {
+        if self.omitted_bytes > 0 {
+            let omitted = self.omitted_bytes;
+            self.head
+                .push_back(format!("\n[... {omitted} middle bytes omitted ...]\n").into_bytes());
+        }
+        self.to_bytes()
+    }
+
+    /// Merge a later snapshot with the same budget. If that snapshot already
+    /// has a gap, its head and tail both filled their budgets before the gap.
+    pub(crate) fn append(&mut self, later: Self) {
+        debug_assert_eq!(self.max_bytes, later.max_bytes);
+        for chunk in later.head.into_iter().chain(later.tail) {
+            self.push_chunk(chunk);
+        }
+        self.omitted_bytes = self.omitted_bytes.saturating_add(later.omitted_bytes);
     }
 
     fn push_to_tail(&mut self, chunk: Vec<u8>) {
@@ -222,17 +226,17 @@ mod tests {
     }
 
     #[test]
-    fn draining_resets_state() {
+    fn appending_snapshots_preserves_head_tail_and_accounts_for_both_gaps() {
         let mut buf = HeadTailBuffer::new(10);
-        buf.push_chunk(b"0123456789".to_vec());
-        buf.push_chunk(b"ab".to_vec());
+        let mut later = HeadTailBuffer::new(10);
+        buf.push_chunk(b"0123456789ab".to_vec());
+        later.push_chunk(b"ABCDEFGHIJKL".to_vec());
+        buf.append(later);
 
-        let drained = buf.drain_chunks();
-        assert!(!drained.is_empty());
-
-        assert_eq!(buf.retained_bytes(), 0);
-        assert_eq!(buf.omitted_bytes(), 0);
-        assert_eq!(buf.to_bytes(), b"".to_vec());
+        assert_eq!(
+            (buf.to_bytes(), buf.omitted_bytes()),
+            (b"01234HIJKL".to_vec(), 14)
+        );
     }
 
     #[test]

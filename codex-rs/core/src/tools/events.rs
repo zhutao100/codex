@@ -279,12 +279,19 @@ impl ToolEmitter {
         &self,
         output: &ExecToolCallOutput,
         ctx: ToolEventCtx<'_>,
+        receipt: Option<&str>,
     ) -> String {
         match self {
-            Self::Shell { freeform: true, .. } => {
-                super::format_exec_output_for_model_freeform(output, ctx.turn.truncation_policy)
-            }
-            _ => super::format_exec_output_for_model_structured(output, ctx.turn.truncation_policy),
+            Self::Shell { freeform: true, .. } => super::format_exec_output_for_model_freeform(
+                output,
+                ctx.turn.truncation_policy,
+                receipt,
+            ),
+            _ => super::format_exec_output_for_model_structured(
+                output,
+                ctx.turn.truncation_policy,
+                receipt,
+            ),
         }
     }
 
@@ -292,10 +299,11 @@ impl ToolEmitter {
         &self,
         ctx: ToolEventCtx<'_>,
         out: Result<ExecToolCallOutput, ToolError>,
+        receipt: Option<&str>,
     ) -> Result<String, FunctionCallError> {
         let (event, result) = match out {
             Ok(output) => {
-                let content = self.format_exec_output_for_model(&output, ctx);
+                let content = self.format_exec_output_for_model(&output, ctx, receipt);
                 let exit_code = output.exit_code;
                 let event = ToolEventStage::Success(output);
                 let result = if exit_code == 0 {
@@ -307,7 +315,7 @@ impl ToolEmitter {
             }
             Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Timeout { output })))
             | Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Denied { output }))) => {
-                let response = self.format_exec_output_for_model(&output, ctx);
+                let response = self.format_exec_output_for_model(&output, ctx, receipt);
                 let event = ToolEventStage::Failure(ToolEventFailure::Output(*output));
                 let result = Err(FunctionCallError::RespondToModel(response));
                 (event, result)
@@ -315,7 +323,14 @@ impl ToolEmitter {
             Err(ToolError::Codex(err)) => {
                 let message = format!("execution error: {err:?}");
                 let event = ToolEventStage::Failure(ToolEventFailure::Message(message.clone()));
-                let result = Err(FunctionCallError::RespondToModel(message));
+                let result = Err(FunctionCallError::RespondToModel(match receipt {
+                    Some(receipt) => crate::truncate::fit_result(
+                        receipt,
+                        &message,
+                        ctx.turn.truncation_policy.byte_budget(),
+                    ),
+                    None => message,
+                }));
                 (event, result)
             }
             Err(ToolError::Rejected(msg)) => {
@@ -332,7 +347,14 @@ impl ToolEmitter {
                     msg
                 };
                 let event = ToolEventStage::Failure(ToolEventFailure::Message(normalized.clone()));
-                let result = Err(FunctionCallError::RespondToModel(normalized));
+                let result = Err(FunctionCallError::RespondToModel(match receipt {
+                    Some(receipt) => crate::truncate::fit_result(
+                        receipt,
+                        &normalized,
+                        ctx.turn.truncation_policy.byte_budget(),
+                    ),
+                    None => normalized,
+                }));
                 (event, result)
             }
         };

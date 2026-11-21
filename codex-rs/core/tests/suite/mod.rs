@@ -71,6 +71,7 @@ mod compact;
 mod compact_remote;
 mod compact_remote_v2;
 mod compact_resume_fork;
+mod context_harness;
 mod deprecation_notice;
 mod exec;
 mod exec_policy;

@@ -9,7 +9,7 @@ Read [project principles](docs/principles.md) before changing the agent loop, co
 - The harness owns task scheduling, tool execution, approvals, context and recovery. Keep model requests, UI events and durable host metadata distinct.
 - Preserve ordered history, tool-call/result pairing and exact opaque reasoning/compaction items. Keep stable request prefixes and deterministic tool ordering; validate context replacement and transport continuation together.
 - Accepted input, consumed input and a completed answer have different owners and lifetimes. Changes to pause, steering, compaction or review must preserve those distinctions through cancellation and replay.
-- Local history and durable checkpoints must support recovery when an API connection disappears. A WebSocket continuation ID is an optimization, not a persisted session checkpoint.
+- Local history and durable checkpoints must support recovery when an API connection disappears. A WebSocket continuation ID is not a session checkpoint; see the [context harness contract](docs/features/context-harness.md) for local evidence retained outside history.
 - Use checked-in implementation and tests to establish behavior. Upstream articles explain design principles; a newer schema or tool description does not establish support here. Keep custom changes focused and compatible with their current owner; refresh or rebase upstream only when requested.
 
 ## Development
@@ -18,7 +18,7 @@ Use `cargo-local` for local Cargo build/check/test/run commands and `just-local`
 
 Set `CODEX_SANDBOX_NETWORK_DISABLED=1` for tests. Use the existing localhost-aware guard for mock transport tests and let the wrapper declare that capability. Do not count a skipped network test as transport coverage. Capture noisy output outside the repository and report the relevant result and limitations.
 
-Use the affected feature's tests and schemas. Persistence changes need actual recorder/replay coverage; transport changes need captured requests/events; model-behavior claims need a separate live evaluation. Documentation-only edits need link, format and source-consistency checks, not a workspace rebuild.
+Match the check to the contract: recorder/replay for durable history, captured requests/events for transport, a disposable child-process probe for sandbox policy, and live evaluation for model behavior. Documentation-only edits need link, format and source-consistency checks, not a workspace rebuild.
 
 ## Documentation maintenance
 

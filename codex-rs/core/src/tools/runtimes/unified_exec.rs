@@ -53,6 +53,7 @@ pub struct UnifiedExecApprovalKey {
 
 pub struct UnifiedExecRuntime<'a> {
     manager: &'a UnifiedExecProcessManager,
+    pub(crate) capture: crate::exec_output::OutputCapture,
 }
 
 impl UnifiedExecRequest {
@@ -79,7 +80,10 @@ impl UnifiedExecRequest {
 
 impl<'a> UnifiedExecRuntime<'a> {
     pub fn new(manager: &'a UnifiedExecProcessManager) -> Self {
-        Self { manager }
+        Self {
+            manager,
+            capture: Default::default(),
+        }
     }
 }
 
@@ -193,8 +197,9 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecProcess> for UnifiedExecRunt
         let exec_env = attempt
             .env_for(spec)
             .map_err(|err| ToolError::Codex(err.into()))?;
+        self.capture = crate::exec_output::OutputCapture::open(ctx, req.tty).await;
         self.manager
-            .open_session_with_exec_env(&exec_env, req.tty)
+            .open_session_with_exec_env(&exec_env, req.tty, &mut self.capture)
             .await
             .map_err(|err| match err {
                 UnifiedExecError::SandboxDenied { output, .. } => {

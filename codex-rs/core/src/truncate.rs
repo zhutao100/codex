@@ -85,6 +85,30 @@ pub(crate) fn formatted_truncate_text(content: &str, policy: TruncationPolicy) -
     format!("Total output lines: {total_lines}\n\n{result}")
 }
 
+/// Fit a complete status/locator and an optional head/tail preview before
+/// history insertion. Never send a misleading partial locator.
+pub(crate) fn fit_result(header: &str, preview: &str, budget: usize) -> String {
+    use codex_utils_string::take_bytes_at_char_boundary;
+
+    if header.len() > budget {
+        return take_bytes_at_char_boundary("Result metadata exceeds the output budget.", budget)
+            .to_string();
+    }
+    let available = budget.saturating_sub(header.len() + 1);
+    if preview.is_empty() || available == 0 {
+        return header.to_string();
+    }
+    if preview.len() <= available {
+        return format!("{header}\n{preview}");
+    }
+    const MARKER: &str = "\n[preview omitted]\n";
+    let Some(remaining) = available.checked_sub(MARKER.len()) else {
+        return header.to_string();
+    };
+    let (_, left, right) = split_string(preview, remaining / 2, remaining - remaining / 2);
+    format!("{header}\n{left}{MARKER}{right}")
+}
+
 pub(crate) fn truncate_text(content: &str, policy: TruncationPolicy) -> String {
     match policy {
         TruncationPolicy::Bytes(_) => truncate_with_byte_estimate(content, policy),
@@ -306,9 +330,9 @@ pub(crate) fn approx_tokens_from_byte_count(bytes: usize) -> u64 {
 
 #[cfg(test)]
 mod tests {
-
     use super::TruncationPolicy;
     use super::approx_token_count;
+    use super::fit_result;
     use super::formatted_truncate_text;
     use super::split_string;
     use super::truncate_function_output_items_with_policy;
@@ -528,5 +552,18 @@ mod tests {
             other => panic!("unexpected summary item: {other:?}"),
         };
         assert!(summary_text.contains("omitted 2 text items"));
+    }
+
+    #[test]
+    fn fit_result_keeps_recovery_metadata_whole() {
+        let header = "Artifact locator; stdout 0..25";
+        let preview = "abcdefghijklmnopqrstuvwxyz0123456789";
+        let result = fit_result(header, preview, header.len() + 24);
+        assert!(result.starts_with(header));
+        assert!(result.contains("[preview omitted]"));
+        assert!(result.ends_with("89"));
+        assert!(result.len() <= header.len() + 24);
+        assert_eq!(fit_result(header, preview, header.len()), header);
+        assert_eq!(fit_result(header, preview, 3), "Res");
     }
 }

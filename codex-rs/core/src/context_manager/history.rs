@@ -1,6 +1,6 @@
 use crate::context_manager::normalize;
-use crate::event_mapping::is_contextual_dev_message_content;
 use crate::event_mapping::is_contextual_user_message_content;
+use crate::event_mapping::is_pre_turn_dev_message_content;
 use crate::session::turn_context::TurnContext;
 use crate::truncate::TruncationPolicy;
 use crate::truncate::approx_token_count;
@@ -363,7 +363,7 @@ impl ContextManager {
         while cut_idx > first_user_turn_idx {
             match &self.items[cut_idx - 1] {
                 ResponseItem::Message { role, content, .. }
-                    if role == "developer" && is_contextual_dev_message_content(content) =>
+                    if role == "developer" && is_pre_turn_dev_message_content(content) =>
                 {
                     cut_idx -= 1;
                 }

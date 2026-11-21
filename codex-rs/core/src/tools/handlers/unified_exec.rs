@@ -25,6 +25,42 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 pub struct UnifiedExecHandler;
+pub(crate) struct ExecJobStatusHandler;
+
+impl ToolHandler for ExecJobStatusHandler {
+    fn kind(&self) -> ToolKind {
+        ToolKind::Function
+    }
+
+    async fn handle(&self, invocation: ToolInvocation) -> Result<ToolOutput, FunctionCallError> {
+        #[derive(Deserialize)]
+        struct Args {
+            job_id: uuid::Uuid,
+        }
+        let ToolPayload::Function { arguments } = invocation.payload else {
+            return Err(FunctionCallError::RespondToModel(
+                "expected a job ID".into(),
+            ));
+        };
+        let Args { job_id } = parse_arguments(&arguments)?;
+        let report =
+            crate::unified_exec::jobs::status(&invocation.session, &invocation.turn, job_id)
+                .await
+                .map_err(|err| {
+                    FunctionCallError::RespondToModel(format!(
+                        "Job {job_id} status unavailable: {err}"
+                    ))
+                })?;
+        Ok(ToolOutput::Function {
+            body: FunctionCallOutputBody::Text(crate::truncate::fit_result(
+                &report,
+                "",
+                invocation.turn.truncation_policy.byte_budget(),
+            )),
+            success: Some(report.len() <= invocation.turn.truncation_policy.byte_budget()),
+        })
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct ExecCommandArgs {
@@ -47,6 +83,8 @@ struct ExecCommandArgs {
     justification: Option<String>,
     #[serde(default)]
     prefix_rule: Option<Vec<String>>,
+    #[serde(default)]
+    wait_for_completion: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -124,11 +162,16 @@ impl ToolHandler for UnifiedExecHandler {
 
         let manager: &UnifiedExecProcessManager = &session.services.unified_exec_manager;
         let context = UnifiedExecContext::new(session.clone(), turn.clone(), call_id.clone());
+        // Validate before allocating, launching, intercepting a patch or writing stdin.
+        if turn.truncation_policy.byte_budget() < "Process running with session ID 99999".len() {
+            return Err(FunctionCallError::RespondToModel(
+                "Output budget too small; command not executed.".into(),
+            ));
+        }
 
         let response = match tool_name.as_str() {
             "exec_command" => {
                 let args: ExecCommandArgs = parse_arguments(&arguments)?;
-                let process_id = manager.allocate_process_id().await;
                 let command = get_command(&args, session.user_shell());
 
                 let ExecCommandArgs {
@@ -139,6 +182,7 @@ impl ToolHandler for UnifiedExecHandler {
                     sandbox_permissions,
                     justification,
                     prefix_rule,
+                    wait_for_completion,
                     ..
                 } = args;
 
@@ -157,12 +201,20 @@ impl ToolHandler for UnifiedExecHandler {
                     )
                 {
                     let approval_policy = context.turn.approval_policy;
-                    manager.release_process_id(&process_id).await;
                     return Err(FunctionCallError::RespondToModel(format!(
                         "approval policy is {approval_policy:?}; reject command — you cannot ask for escalated permissions if the approval policy is {approval_policy:?}"
                     )));
                 }
 
+                if wait_for_completion
+                    && (!turn.tools_config.exec_job_completion
+                        || tty
+                        || turn.truncation_policy.byte_budget() < 1024)
+                {
+                    return Err(FunctionCallError::RespondToModel(
+                        "wait_for_completion requires enabled job completion, a noninteractive pipe, and room for its acknowledgment.".into()
+                    ));
+                }
                 let workdir = workdir.filter(|value| !value.is_empty());
 
                 let workdir = workdir.map(|dir| context.turn.resolve_path(Some(dir)));
@@ -180,15 +232,28 @@ impl ToolHandler for UnifiedExecHandler {
                 )
                 .await?
                 {
-                    manager.release_process_id(&process_id).await;
                     return Ok(output);
                 }
+
+                let background_job = if wait_for_completion {
+                    Some(
+                        crate::unified_exec::jobs::register(&context)
+                            .await
+                            .map_err(|err| {
+                                FunctionCallError::RespondToModel(format!(
+                                    "Command not launched: could not register its completion: {err}"
+                                ))
+                            })?,
+                    )
+                } else {
+                    None
+                };
 
                 manager
                     .exec_command(
                         ExecCommandRequest {
                             command,
-                            process_id,
+                            process_id: manager.allocate_process_id().await,
                             yield_time_ms,
                             max_output_tokens,
                             workdir,
@@ -196,6 +261,7 @@ impl ToolHandler for UnifiedExecHandler {
                             sandbox_permissions,
                             justification,
                             prefix_rule,
+                            background_job,
                         },
                         &context,
                     )
@@ -257,7 +323,7 @@ impl ToolHandler for UnifiedExecHandler {
             }
         };
 
-        let content = format_response(&response);
+        let content = format_response(&response, turn.truncation_policy.byte_budget());
 
         Ok(ToolOutput::Function {
             body: FunctionCallOutputBody::Text(content),
@@ -278,7 +344,7 @@ fn get_command(args: &ExecCommandArgs, session_shell: Arc<Shell>) -> Vec<String>
     shell.derive_exec_args(&args.cmd, args.login)
 }
 
-fn format_response(response: &UnifiedExecResponse) -> String {
+fn format_response(response: &UnifiedExecResponse, budget: usize) -> String {
     let mut sections = Vec::new();
 
     if !response.chunk_id.is_empty() {
@@ -295,16 +361,45 @@ fn format_response(response: &UnifiedExecResponse) -> String {
     if let Some(process_id) = &response.process_id {
         // Training still uses "session ID".
         sections.push(format!("Process running with session ID {process_id}"));
+    } else if response.exit_code.is_none() {
+        sections.push("Process ended; exit code unavailable".into());
     }
 
     if let Some(original_token_count) = response.original_token_count {
         sections.push(format!("Original token count: {original_token_count}"));
     }
+    if response.omitted_preview_bytes > 0 {
+        let omitted = response.omitted_preview_bytes;
+        sections.push(format!("Output preview omitted {omitted} middle bytes."));
+    }
 
+    if let Some(receipt) = &response.capture_receipt {
+        sections.push(receipt.clone());
+    }
+    if let Some(acknowledgment) = &response.job_acknowledgment {
+        sections.push(acknowledgment.clone());
+    }
     sections.push("Output:".to_string());
-    sections.push(response.output.clone());
-
-    sections.join("\n")
+    let mut header = sections.join("\n");
+    if header.len() > budget {
+        // Status/ownership precedes the optional receipt, telemetry and preview.
+        header = if let Some(ack) = &response.job_acknowledgment {
+            ack.clone()
+        } else if let Some(id) = &response.process_id {
+            format!("Process running with session ID {id}")
+        } else if let Some(code) = response.exit_code {
+            format!("Process exited with code {code}")
+        } else {
+            "Process ended; exit code unavailable".into()
+        };
+        if let Some(receipt) = &response.capture_receipt
+            && header.len() + 1 + receipt.len() <= budget
+        {
+            header.push('\n');
+            header.push_str(receipt);
+        }
+    }
+    crate::truncate::fit_result(&header, &response.output, budget)
 }
 
 #[cfg(test)]

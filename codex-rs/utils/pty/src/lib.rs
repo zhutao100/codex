@@ -1,3 +1,4 @@
+mod output;
 pub mod pipe;
 mod process;
 pub mod process_group;
@@ -7,6 +8,10 @@ mod tests;
 #[cfg(windows)]
 mod win;
 
+pub use output::OutputEnd;
+pub use output::OutputReader;
+pub use output::OutputSink;
+pub use output::OutputStream;
 /// Spawn a non-interactive process using regular pipes for stdin/stdout/stderr.
 pub use pipe::spawn_process as spawn_pipe_process;
 /// Spawn a non-interactive process using regular pipes, but close stdin immediately.

@@ -2052,6 +2052,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         mcp_connection_manager: Arc::new(RwLock::new(McpConnectionManager::default())),
         mcp_startup_cancellation_token: Mutex::new(CancellationToken::new()),
         unified_exec_manager: UnifiedExecProcessManager::default(),
+        output_store: Default::default(),
         analytics_events_client: AnalyticsEventsClient::new(
             Arc::clone(&config),
             Arc::clone(&auth_manager),
@@ -2194,6 +2195,7 @@ pub(crate) async fn make_session_and_context_with_rx() -> (
         mcp_connection_manager: Arc::new(RwLock::new(McpConnectionManager::default())),
         mcp_startup_cancellation_token: Mutex::new(CancellationToken::new()),
         unified_exec_manager: UnifiedExecProcessManager::default(),
+        output_store: Default::default(),
         analytics_events_client: AnalyticsEventsClient::new(
             Arc::clone(&config),
             Arc::clone(&auth_manager),
@@ -2302,7 +2304,7 @@ async fn refresh_mcp_servers_is_deferred_until_next_turn() {
 }
 
 #[tokio::test]
-async fn record_model_warning_appends_user_message() {
+async fn record_model_warning_does_not_start_a_user_turn() {
     let (mut session, turn_context) = make_session_and_context().await;
     let features = Features::with_defaults();
     session.features = features;
@@ -2314,10 +2316,11 @@ async fn record_model_warning_appends_user_message() {
     let history = session.clone_history().await;
     let history_items = history.raw_items();
     let last = history_items.last().expect("warning recorded");
+    assert!(!crate::context_manager::is_user_turn_boundary(last));
 
     match last {
         ResponseItem::Message { role, content, .. } => {
-            assert_eq!(role, "user");
+            assert_eq!(role, "developer");
             assert_eq!(
                 content,
                 &vec![ContentItem::InputText {
@@ -2325,8 +2328,212 @@ async fn record_model_warning_appends_user_message() {
                 }]
             );
         }
-        other => panic!("expected user message, got {other:?}"),
+        other => panic!("expected a contextual warning, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn exploration_deadline_records_the_result_for_an_in_flight_call() -> anyhow::Result<()> {
+    use crate::ThreadManager;
+    use crate::agent::AgentRole;
+    use crate::agent::role::EXPLORER_DEADLINE;
+    use crate::agent::role::EXPLORER_REPORT_RESERVE;
+    use core_test_support::responses::ev_assistant_message;
+    use core_test_support::responses::ev_completed;
+    use core_test_support::responses::ev_function_call;
+    use core_test_support::responses::ev_response_created;
+    use core_test_support::responses::sse;
+    use core_test_support::skip_if_no_network_unless_localhost;
+    use core_test_support::streaming_sse::StreamingSseChunk;
+    use core_test_support::streaming_sse::start_streaming_sse_server;
+
+    skip_if_no_network_unless_localhost!(Ok(()));
+    let home = tempfile::tempdir()?;
+    let mut config = build_test_config(home.path()).await;
+    config.cwd = home.path().to_owned();
+    AgentRole::Explorer
+        .apply_to_config(&mut config)
+        .map_err(anyhow::Error::msg)?;
+    let (_hold, gate) = tokio::sync::oneshot::channel::<()>();
+    let (server, _) = start_streaming_sse_server(vec![
+        vec![
+            StreamingSseChunk {
+                gate: None,
+                body: sse(vec![
+                    ev_response_created("research"),
+                    ev_function_call("pending-read", "read_file", "{}"),
+                ]),
+            },
+            StreamingSseChunk {
+                gate: Some(gate),
+                body: sse(vec![ev_completed("research")]),
+            },
+        ],
+        vec![StreamingSseChunk {
+            gate: None,
+            body: sse(vec![
+                ev_assistant_message("report", "Partial findings; file not read."),
+                ev_completed("report"),
+            ]),
+        }],
+    ])
+    .await;
+    config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
+    config.model_provider.stream_idle_timeout_ms = Some(240_000);
+    let manager = ThreadManager::with_models_provider_and_home(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.clone(),
+    );
+    let thread = manager.start_thread(config).await?.thread;
+    thread
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "Read the evidence.".into(),
+                text_elements: vec![],
+            }],
+            final_output_json_schema: None,
+        })
+        .await?;
+    tokio::time::timeout(Duration::from_secs(4), async {
+        while !matches!(thread.next_event().await?,
+            Event { msg: EventMsg::RawResponseItem(RawResponseItemEvent {
+                item: ResponseItem::FunctionCall { call_id, .. },
+            }), .. } if call_id == "pending-read")
+        {}
+        Ok::<_, CodexErr>(())
+    })
+    .await??;
+    tokio::time::pause();
+    tokio::time::advance(EXPLORER_DEADLINE - EXPLORER_REPORT_RESERVE).await;
+    tokio::time::resume();
+    let report = tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            if let EventMsg::TurnComplete(completed) = thread.next_event().await?.msg {
+                return Ok::<_, CodexErr>(completed.last_agent_message);
+            }
+        }
+    })
+    .await??
+    .expect("explorer report");
+    assert!(report.starts_with("Exploration partial;"), "{report}");
+    let path = thread.rollout_path().expect("test rollout");
+    let (items, _, _) = RolloutRecorder::load_rollout_items(&path).await?;
+    let call_and_result = items
+        .iter()
+        .filter_map(|item| match item {
+            RolloutItem::ResponseItem(ResponseItem::FunctionCall { call_id, .. })
+                if call_id == "pending-read" =>
+            {
+                Some("call")
+            }
+            RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput { call_id, .. })
+                if call_id == "pending-read" =>
+            {
+                Some("result")
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(call_and_result, vec!["call", "result"]);
+    assert_eq!(server.requests().await.len(), 2);
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn explorer_budget_exhaustion_does_not_publish_compaction_notes_as_a_report()
+-> anyhow::Result<()> {
+    use crate::ThreadManager;
+    use crate::agent::AgentRole;
+    use crate::agent::role::EXPLORER_MAX_ACQUISITIONS;
+    use core_test_support::responses;
+    use core_test_support::skip_if_no_network_unless_localhost;
+    use serde_json::json;
+
+    skip_if_no_network_unless_localhost!(Ok(()));
+    let server = responses::start_mock_server().await;
+    let home = tempfile::tempdir()?;
+    let mut config = build_test_config(home.path()).await;
+    config.cwd = home.path().to_owned();
+    config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
+    AgentRole::Explorer
+        .apply_to_config(&mut config)
+        .map_err(anyhow::Error::msg)?;
+    let manager = ThreadManager::with_models_provider_and_home(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.clone(),
+    );
+    let thread = manager.start_thread(config).await?.thread;
+    let evidence = home.path().join("evidence.txt");
+    std::fs::write(&evidence, "evidence")?;
+    let mut batch = vec![responses::ev_response_created("evidence")];
+    for index in 0..EXPLORER_MAX_ACQUISITIONS {
+        batch.push(responses::ev_function_call(
+            &format!("read-{index}"),
+            "read_file",
+            &json!({"file_path": evidence}).to_string(),
+        ));
+    }
+    batch.push(responses::ev_completed_with_tokens("evidence", 1_000_000));
+    let mock = responses::mount_sse_sequence(&server, vec![
+        responses::sse(batch),
+        responses::sse(vec![
+            responses::ev_assistant_message("notes", "<AUTO_COMPACT_WORK_NOTES>\nObjective: collect evidence\nValidated findings: INTERNAL-NOTES\nNext: report"),
+            responses::ev_completed("notes"),
+        ]),
+        responses::sse(vec![
+            json!({"type":"response.output_item.done","item":{"type":"compaction","encrypted_content":"retained"}}),
+            responses::ev_completed("compact"),
+        ]),
+        responses::sse(vec![
+            responses::ev_assistant_message("done", "Evidence found; further reading was not performed."),
+            responses::ev_completed("done"),
+        ]),
+    ]).await;
+    thread
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "Read the evidence.".into(),
+                text_elements: vec![],
+            }],
+            final_output_json_schema: None,
+        })
+        .await?;
+    let report = tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            if let EventMsg::TurnComplete(completed) = thread.next_event().await?.msg {
+                return Ok::<_, CodexErr>(completed.last_agent_message);
+            }
+        }
+    })
+    .await??
+    .expect("explorer report");
+    assert!(report.starts_with("Exploration partial;"), "{report}");
+    assert!(
+        report.ends_with("Evidence found; further reading was not performed."),
+        "{report}"
+    );
+    assert!(!report.contains("INTERNAL-NOTES"), "{report}");
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 4);
+    let capture = requests[1].message_input_texts("developer").join("\n");
+    assert!(capture.contains("AUTO_COMPACT_WORK_NOTES"));
+    assert!(!capture.contains("Exploration budget reached"));
+    assert!(
+        requests[2]
+            .input()
+            .iter()
+            .any(|item| item["type"] == "compaction_trigger")
+    );
+    assert!(
+        requests[3]
+            .message_input_texts("developer")
+            .join("\n")
+            .contains("Exploration budget reached")
+    );
+    Ok(())
 }
 
 #[derive(Clone, Copy)]

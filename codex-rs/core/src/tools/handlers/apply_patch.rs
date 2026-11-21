@@ -151,7 +151,7 @@ impl ToolHandler for ApplyPatchHandler {
                             &call_id,
                             Some(&tracker),
                         );
-                        let content = emitter.finish(event_ctx, out).await?;
+                        let content = emitter.finish(event_ctx, out, None).await?;
                         Ok(ToolOutput::Function {
                             body: FunctionCallOutputBody::Text(content),
                             success: Some(true),
@@ -236,7 +236,7 @@ pub(crate) async fn intercept_apply_patch(
                         .await;
                     let event_ctx =
                         ToolEventCtx::new(session, turn, call_id, tracker.as_ref().copied());
-                    let content = emitter.finish(event_ctx, out).await?;
+                    let content = emitter.finish(event_ctx, out, None).await?;
                     Ok(Some(ToolOutput::Function {
                         body: FunctionCallOutputBody::Text(content),
                         success: Some(true),

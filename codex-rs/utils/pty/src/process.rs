@@ -3,6 +3,7 @@ use std::io;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::time::Duration;
 
 use portable_pty::MasterPty;
 use portable_pty::SlavePty;
@@ -101,14 +102,32 @@ impl ProcessHandle {
         self.exit_code.lock().ok().and_then(|guard| *guard)
     }
 
-    /// Attempts to kill the child and abort helper tasks.
-    pub fn terminate(&self) {
+    /// Stop the child without aborting the readers; they can still reach EOF.
+    pub fn stop_child(&self) {
         if let Ok(mut killer_opt) = self.killer.lock() {
             if let Some(mut killer) = killer_opt.take() {
                 let _ = killer.kill();
             }
         }
+    }
 
+    pub async fn drain_output(&self, grace: Duration) {
+        let Some(mut reader) = self
+            .reader_handle
+            .lock()
+            .ok()
+            .and_then(|mut handle| handle.take())
+        else {
+            return;
+        };
+        if tokio::time::timeout(grace, &mut reader).await.is_err() {
+            reader.abort();
+        }
+    }
+
+    /// Attempts to kill the child and abort helper tasks.
+    pub fn terminate(&self) {
+        self.stop_child();
         if let Ok(mut h) = self.reader_handle.lock() {
             if let Some(handle) = h.take() {
                 handle.abort();

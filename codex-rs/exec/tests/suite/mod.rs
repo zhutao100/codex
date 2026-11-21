@@ -2,6 +2,7 @@
 mod add_dir;
 mod apply_patch;
 mod auth_env;
+mod background_completion;
 mod ephemeral;
 mod originator;
 mod output_schema;

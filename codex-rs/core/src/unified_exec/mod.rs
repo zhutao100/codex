@@ -38,6 +38,7 @@ use crate::session::turn_context::TurnContext;
 mod async_watcher;
 mod errors;
 mod head_tail_buffer;
+pub(crate) mod jobs;
 mod process;
 mod process_manager;
 
@@ -48,6 +49,7 @@ pub(crate) const MIN_YIELD_TIME_MS: u64 = 250;
 // Minimum yield time for an empty `write_stdin`.
 pub(crate) const MIN_EMPTY_YIELD_TIME_MS: u64 = 5_000;
 pub(crate) const MAX_YIELD_TIME_MS: u64 = 30_000;
+pub(crate) const MAX_EMPTY_YIELD_TIME_MS: u64 = 300_000;
 pub(crate) const DEFAULT_MAX_OUTPUT_TOKENS: usize = 10_000;
 pub(crate) const UNIFIED_EXEC_OUTPUT_MAX_BYTES: usize = 1024 * 1024; // 1 MiB
 pub(crate) const UNIFIED_EXEC_OUTPUT_MAX_TOKENS: usize = UNIFIED_EXEC_OUTPUT_MAX_BYTES / 4;
@@ -83,6 +85,7 @@ pub(crate) struct ExecCommandRequest {
     pub sandbox_permissions: SandboxPermissions,
     pub justification: Option<String>,
     pub prefix_rule: Option<Vec<String>>,
+    pub background_job: Option<Arc<jobs::BackgroundJob>>,
 }
 
 #[derive(Debug)]
@@ -99,8 +102,11 @@ pub(crate) struct UnifiedExecResponse {
     pub chunk_id: String,
     pub wall_time: Duration,
     pub output: String,
-    /// Raw bytes returned for this unified exec call before any truncation.
+    /// Bounded preview before token-based formatting, including any byte-gap marker.
     pub raw_output: Vec<u8>,
+    pub omitted_preview_bytes: usize,
+    pub capture_receipt: Option<String>,
+    pub job_acknowledgment: Option<String>,
     pub process_id: Option<String>,
     pub exit_code: Option<i32>,
     pub original_token_count: Option<usize>,
@@ -138,11 +144,20 @@ struct ProcessEntry {
     process_id: String,
     command: Vec<String>,
     tty: bool,
+    background_job: Option<Arc<jobs::BackgroundJob>>,
     last_used: tokio::time::Instant,
 }
 
 pub(crate) fn clamp_yield_time(yield_time_ms: u64) -> u64 {
     yield_time_ms.clamp(MIN_YIELD_TIME_MS, MAX_YIELD_TIME_MS)
+}
+
+fn clamp_stdin_yield_time(yield_time_ms: u64, empty: bool) -> u64 {
+    if empty {
+        yield_time_ms.clamp(MIN_EMPTY_YIELD_TIME_MS, MAX_EMPTY_YIELD_TIME_MS)
+    } else {
+        clamp_yield_time(yield_time_ms)
+    }
 }
 
 pub(crate) fn resolve_max_tokens(max_tokens: Option<usize>) -> usize {
@@ -207,6 +222,7 @@ mod tests {
                     sandbox_permissions: SandboxPermissions::UseDefault,
                     justification: None,
                     prefix_rule: None,
+                    background_job: None,
                 },
                 &context,
             )

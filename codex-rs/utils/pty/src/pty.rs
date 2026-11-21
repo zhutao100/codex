@@ -20,6 +20,10 @@ use crate::process::ChildTerminator;
 use crate::process::ProcessHandle;
 use crate::process::PtyHandles;
 use crate::process::SpawnedProcess;
+use crate::OutputEnd;
+use crate::OutputReader;
+use crate::OutputSink;
+use crate::OutputStream;
 
 /// Returns true when ConPTY support is available (Windows only).
 #[cfg(windows)]
@@ -63,6 +67,17 @@ pub async fn spawn_process(
     env: &HashMap<String, String>,
     arg0: &Option<String>,
 ) -> Result<SpawnedProcess> {
+    spawn_process_with_sink(program, args, cwd, env, arg0, None).await
+}
+
+pub async fn spawn_process_with_sink(
+    program: &str,
+    args: &[String],
+    cwd: &Path,
+    env: &HashMap<String, String>,
+    arg0: &Option<String>,
+    sink: Option<Arc<dyn OutputSink>>,
+) -> Result<SpawnedProcess> {
     if program.is_empty() {
         anyhow::bail!("missing program for PTY spawn");
     }
@@ -85,6 +100,9 @@ pub async fn spawn_process(
         command_builder.env(key, value);
     }
 
+    // No fallible reader/writer setup after launch: a spawn error means no child ran.
+    let mut reader = pair.master.try_clone_reader()?;
+    let writer = pair.master.take_writer()?;
     let mut child = pair.slave.spawn_command(command_builder)?;
     let killer = child.clone_killer();
 
@@ -92,14 +110,15 @@ pub async fn spawn_process(
     let (output_tx, _) = broadcast::channel::<Vec<u8>>(256);
     let initial_output_rx = output_tx.subscribe();
 
-    let mut reader = pair.master.try_clone_reader()?;
     let output_tx_clone = output_tx.clone();
+    let tap = OutputReader::new(sink, OutputStream::Terminal);
     let reader_handle: JoinHandle<()> = tokio::task::spawn_blocking(move || {
         let mut buf = [0u8; 8_192];
-        loop {
+        let end = loop {
             match reader.read(&mut buf) {
-                Ok(0) => break,
+                Ok(0) => break OutputEnd::Eof,
                 Ok(n) => {
+                    tap.observe(&buf[..n]);
                     let _ = output_tx_clone.send(buf[..n].to_vec());
                 }
                 Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
@@ -107,12 +126,14 @@ pub async fn spawn_process(
                     std::thread::sleep(Duration::from_millis(5));
                     continue;
                 }
-                Err(_) => break,
+                #[cfg(target_os = "linux")]
+                Err(ref e) if e.raw_os_error() == Some(libc::EIO) => break OutputEnd::Eof,
+                Err(_) => break OutputEnd::ReadError,
             }
-        }
+        };
+        tap.finish(end);
     });
 
-    let writer = pair.master.take_writer()?;
     let writer = Arc::new(tokio::sync::Mutex::new(writer));
     let writer_handle: JoinHandle<()> = tokio::spawn({
         let writer = Arc::clone(&writer);
@@ -136,10 +157,10 @@ pub async fn spawn_process(
             Ok(status) => status.exit_code() as i32,
             Err(_) => -1,
         };
-        wait_exit_status.store(true, std::sync::atomic::Ordering::SeqCst);
         if let Ok(mut guard) = wait_exit_code.lock() {
             *guard = Some(code);
         }
+        wait_exit_status.store(true, std::sync::atomic::Ordering::SeqCst);
         let _ = exit_tx.send(code);
     });
 

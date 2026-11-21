@@ -205,6 +205,21 @@ pub(crate) async fn execute_exec_env(
     sandbox_policy: &SandboxPolicy,
     stdout_stream: Option<StdoutStream>,
 ) -> Result<ExecToolCallOutput> {
+    execute_captured_exec_env(
+        env,
+        sandbox_policy,
+        stdout_stream,
+        &mut crate::exec_output::OutputCapture::Disabled,
+    )
+    .await
+}
+
+pub(crate) async fn execute_captured_exec_env(
+    env: ExecEnv,
+    sandbox_policy: &SandboxPolicy,
+    stdout_stream: Option<StdoutStream>,
+    capture: &mut crate::exec_output::OutputCapture,
+) -> Result<ExecToolCallOutput> {
     let ExecEnv {
         command,
         cwd,
@@ -229,7 +244,7 @@ pub(crate) async fn execute_exec_env(
     };
 
     let start = Instant::now();
-    let raw_output_result = exec(params, sandbox, sandbox_policy, stdout_stream).await;
+    let raw_output_result = exec(params, sandbox, sandbox_policy, stdout_stream, capture).await;
     let duration = start.elapsed();
     finalize_exec_result(raw_output_result, sandbox, duration)
 }
@@ -653,6 +668,7 @@ async fn exec(
     sandbox: SandboxType,
     sandbox_policy: &SandboxPolicy,
     stdout_stream: Option<StdoutStream>,
+    capture: &mut crate::exec_output::OutputCapture,
 ) -> Result<RawExecToolCallOutput> {
     #[cfg(target_os = "windows")]
     if sandbox == SandboxType::WindowsRestrictedToken
@@ -689,8 +705,9 @@ async fn exec(
         StdioPolicy::RedirectForShellTool,
         env,
     )
-    .await?;
-    consume_truncated_output(child, expiration, stdout_stream).await
+    .await;
+    let child = capture.after_spawn(child).await?;
+    consume_truncated_output(child, expiration, stdout_stream, capture.sink()).await
 }
 
 /// Consumes the output of a child process, truncating it so it is suitable for
@@ -699,6 +716,7 @@ async fn consume_truncated_output(
     mut child: Child,
     expiration: ExecExpiration,
     stdout_stream: Option<StdoutStream>,
+    sink: Option<std::sync::Arc<dyn codex_utils_pty::OutputSink>>,
 ) -> Result<RawExecToolCallOutput> {
     // Both stdout and stderr were configured with `Stdio::piped()`
     // above, therefore `take()` should normally return `Some`.  If it doesn't
@@ -719,11 +737,13 @@ async fn consume_truncated_output(
         BufReader::new(stdout_reader),
         stdout_stream.clone(),
         false,
+        sink.clone(),
     ));
     let stderr_handle = tokio::spawn(read_capped(
         BufReader::new(stderr_reader),
         stdout_stream.clone(),
         true,
+        sink,
     ));
 
     let (exit_status, timed_out) = tokio::select! {
@@ -804,16 +824,36 @@ async fn read_capped<R: AsyncRead + Unpin + Send + 'static>(
     mut reader: R,
     stream: Option<StdoutStream>,
     is_stderr: bool,
+    sink: Option<std::sync::Arc<dyn codex_utils_pty::OutputSink>>,
 ) -> io::Result<StreamOutput<Vec<u8>>> {
+    use codex_utils_pty::OutputEnd;
+    use codex_utils_pty::OutputReader;
+    use codex_utils_pty::OutputStream;
+
+    let tap = OutputReader::new(
+        sink,
+        if is_stderr {
+            OutputStream::Stderr
+        } else {
+            OutputStream::Stdout
+        },
+    );
     let mut buf = Vec::with_capacity(AGGREGATE_BUFFER_INITIAL_CAPACITY.min(EXEC_OUTPUT_MAX_BYTES));
     let mut tmp = [0u8; READ_CHUNK_SIZE];
     let mut emitted_deltas: usize = 0;
 
     loop {
-        let n = reader.read(&mut tmp).await?;
+        let n = match reader.read(&mut tmp).await {
+            Ok(n) => n,
+            Err(error) => {
+                tap.finish(OutputEnd::ReadError);
+                return Err(error);
+            }
+        };
         if n == 0 {
             break;
         }
+        tap.observe(&tmp[..n]);
 
         if let Some(stream) = &stream
             && emitted_deltas < MAX_EXEC_OUTPUT_DELTAS_PER_CALL
@@ -841,6 +881,7 @@ async fn read_capped<R: AsyncRead + Unpin + Send + 'static>(
         // Continue reading to EOF to avoid back-pressure
     }
 
+    tap.finish(OutputEnd::Eof);
     Ok(StreamOutput {
         text: buf,
         truncated_after_lines: None,
@@ -936,7 +977,7 @@ mod tests {
             writer.write_all(&bytes).await.expect("write");
         });
 
-        let out = read_capped(reader, None, false).await.expect("read");
+        let out = read_capped(reader, None, false, None).await.expect("read");
         assert_eq!(out.text.len(), EXEC_OUTPUT_MAX_BYTES);
     }
 
@@ -1061,6 +1102,7 @@ mod tests {
             SandboxType::None,
             &SandboxPolicy::new_read_only_policy(),
             None,
+            &mut crate::exec_output::OutputCapture::Disabled,
         )
         .await?;
         assert!(output.timed_out);

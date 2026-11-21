@@ -113,13 +113,25 @@ pub(crate) fn spawn_exit_watcher(
     process_id: String,
     transcript: Arc<Mutex<HeadTailBuffer>>,
     started_at: Instant,
+    job: Option<Arc<super::jobs::BackgroundJob>>,
 ) {
     let exit_token = process.cancellation_token();
     let output_drained = process.output_drained_notify();
 
     tokio::spawn(async move {
         exit_token.cancelled().await;
-        output_drained.notified().await;
+        // Artifact finalization must not wait for a blocked event consumer.
+        let _ = tokio::time::timeout(TRAILING_OUTPUT_GRACE, output_drained.notified()).await;
+        if let Some(job) = job {
+            job.complete(&process).await;
+            session_ref
+                .services
+                .unified_exec_manager
+                .release_finished_job(&process_id, &process)
+                .await;
+        } else {
+            process.capture.seal();
+        }
 
         let exit_code = process.exit_code().unwrap_or(-1);
         let duration = Instant::now().saturating_duration_since(started_at);

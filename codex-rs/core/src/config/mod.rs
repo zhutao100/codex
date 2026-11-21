@@ -127,6 +127,8 @@ pub(crate) fn test_config() -> Config {
 /// Application configuration loaded from disk and merged with overrides.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
+    /// Child-only host capability profile; not a persisted user setting.
+    pub(crate) bounded_explorer: bool,
     /// Provenance for how this [`Config`] was derived (merged layers + enforced
     /// requirements).
     pub config_layer_stack: ConfigLayerStack,
@@ -1848,6 +1850,7 @@ impl Config {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{e}")))?;
 
         let config = Self {
+            bounded_explorer: false,
             model,
             review_model,
             review_model_provider,
@@ -4758,6 +4761,7 @@ model_verbosity = "high"
         )?;
         assert_eq!(
             Config {
+                bounded_explorer: false,
                 model: Some("o3".to_string()),
                 review_model: None,
                 review_model_provider: None,
@@ -4863,6 +4867,7 @@ model_verbosity = "high"
             fixture.codex_home(),
         )?;
         let expected_gpt3_profile_config = Config {
+            bounded_explorer: false,
             model: Some("gpt-3.5-turbo".to_string()),
             review_model: None,
             review_model_provider: None,
@@ -4983,6 +4988,7 @@ model_verbosity = "high"
             fixture.codex_home(),
         )?;
         let expected_zdr_profile_config = Config {
+            bounded_explorer: false,
             model: Some("o3".to_string()),
             review_model: None,
             review_model_provider: None,
@@ -5089,6 +5095,7 @@ model_verbosity = "high"
             fixture.codex_home(),
         )?;
         let expected_gpt5_profile_config = Config {
+            bounded_explorer: false,
             model: Some("gpt-5.1".to_string()),
             review_model: None,
             review_model_provider: None,

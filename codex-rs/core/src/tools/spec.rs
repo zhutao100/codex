@@ -41,6 +41,9 @@ const PREFIX_RULE_DESCRIPTION: &str = concat!(
 
 #[derive(Debug, Clone)]
 pub(crate) struct ToolsConfig {
+    pub bounded_explorer: bool,
+    pub recoverable_exec_output: bool,
+    pub exec_job_completion: bool,
     pub shell_type: ConfigShellToolType,
     pub apply_patch_tool_type: Option<ApplyPatchToolType>,
     pub web_search_mode: Option<WebSearchMode>,
@@ -98,6 +101,9 @@ impl ToolsConfig {
         };
 
         Self {
+            bounded_explorer: false,
+            recoverable_exec_output: features.enabled(Feature::RecoverableExecOutput),
+            exec_job_completion: features.enabled(Feature::ExecJobCompletion),
             shell_type,
             apply_patch_tool_type,
             web_search_mode: *web_search_mode,
@@ -196,7 +202,7 @@ fn create_approval_parameters(include_prefix_rule: bool) -> BTreeMap<String, Jso
     properties
 }
 
-fn create_exec_command_tool(include_prefix_rule: bool) -> ToolSpec {
+fn create_exec_command_tool(include_prefix_rule: bool, include_job_completion: bool) -> ToolSpec {
     let mut properties = BTreeMap::from([
         (
             "cmd".to_string(),
@@ -255,6 +261,14 @@ fn create_exec_command_tool(include_prefix_rule: bool) -> ToolSpec {
         ),
     ]);
     properties.extend(create_approval_parameters(include_prefix_rule));
+    if include_job_completion {
+        properties.insert(
+            "wait_for_completion".into(),
+            JsonSchema::Boolean {
+                description: Some("Keep this turn waiting for completion after the initial tool result. Use for a noninteractive job whose outcome this turn needs. Do not poll it with write_stdin.".into()),
+            },
+        );
+    }
 
     ToolSpec::Function(ResponsesApiTool {
         name: "exec_command".to_string(),
@@ -288,7 +302,8 @@ fn create_write_stdin_tool() -> ToolSpec {
             "yield_time_ms".to_string(),
             JsonSchema::Number {
                 description: Some(
-                    "How long to wait (in milliseconds) for output before yielding.".to_string(),
+                    "Maximum wait in milliseconds: 5,000–300,000 with empty chars, 250–30,000 when writing stdin. Returns early on process exit."
+                        .to_string(),
                 ),
             },
         ),
@@ -792,8 +807,8 @@ fn create_grep_files_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: "grep_files".to_string(),
-        description: "Finds files whose contents match the pattern and lists them by modification \
-                      time."
+        description: "Finds candidate files by content. Reports search coverage before the paths \
+                      (one JSON string or pathBytesBase64 object per line). Narrow partial searches."
             .to_string(),
         strict: false,
         parameters: JsonSchema::Object {
@@ -860,6 +875,15 @@ fn create_read_file_tool() -> ToolSpec {
             },
         ),
         (
+            "byte_offset".to_string(),
+            JsonSchema::Number {
+                description: Some(
+                    "Zero-based byte offset for an exact range, returned as a JSON string or base64."
+                        .to_string(),
+                ),
+            },
+        ),
+        (
             "offset".to_string(),
             JsonSchema::Number {
                 description: Some(
@@ -870,7 +894,9 @@ fn create_read_file_tool() -> ToolSpec {
         (
             "limit".to_string(),
             JsonSchema::Number {
-                description: Some("The maximum number of lines to return.".to_string()),
+                description: Some(
+                    "The maximum number of lines to return, or bytes with byte_offset.".to_string(),
+                ),
             },
         ),
         (
@@ -896,12 +922,73 @@ fn create_read_file_tool() -> ToolSpec {
     ToolSpec::Function(ResponsesApiTool {
         name: "read_file".to_string(),
         description:
-            "Reads a local file with 1-indexed line numbers, supporting slice and indentation-aware block modes."
+            "Reads numbered lines or exact byte ranges of a local file. Use byte_offset to \
+             recover omitted bytes from a partial/lossy display line."
                 .to_string(),
         strict: false,
         parameters: JsonSchema::Object {
             properties,
             required: Some(vec!["file_path".to_string()]),
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
+fn create_read_exec_output_tool() -> ToolSpec {
+    let properties = BTreeMap::from([
+        (
+            "artifact".to_owned(),
+            JsonSchema::String {
+                description: Some(
+                    "Artifact locator from exec_command, write_stdin, or shell output.".into(),
+                ),
+            },
+        ),
+        (
+            "stream".to_owned(),
+            JsonSchema::String {
+                description: Some(
+                    "Select stdout, stderr, or terminal as reported by the artifact.".into(),
+                ),
+            },
+        ),
+        (
+            "offset".to_owned(),
+            JsonSchema::Number {
+                description: Some("Zero-based source byte offset (default 0).".into()),
+            },
+        ),
+        (
+            "limit".to_owned(),
+            JsonSchema::Number {
+                description: Some(
+                    "Maximum source bytes to return (default 4096, cap 8192).".into(),
+                ),
+            },
+        ),
+    ]);
+    ToolSpec::Function(ResponsesApiTool {
+        name: "read_exec_output".into(),
+        description: "Read a committed byte range of retained command output without running the command again. Returns a JSON string or a base64 object.".into(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: Some(vec!["artifact".into(), "stream".into()]),
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
+fn create_exec_job_status_tool() -> ToolSpec {
+    ToolSpec::Function(ResponsesApiTool {
+        name: "exec_job_status".into(),
+        description: "Inspect a registered shell job by its durable job ID. Does not wait, rerun, or consume the outcome.".into(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties: BTreeMap::from([("job_id".into(), JsonSchema::String {
+                description: Some("Job ID from the exec_command acknowledgment.".into()),
+            })]),
+            required: Some(vec!["job_id".into()]),
             additional_properties: Some(false.into()),
         },
     })
@@ -1274,6 +1361,27 @@ pub(crate) fn build_specs(
     use std::sync::Arc;
 
     let mut builder = ToolRegistryBuilder::new();
+    if config.bounded_explorer {
+        builder.push_spec_with_parallel_support(create_grep_files_tool(), true);
+        builder.register_handler("grep_files", Arc::new(GrepFilesHandler));
+        builder.push_spec_with_parallel_support(create_read_file_tool(), true);
+        builder.register_handler("read_file", Arc::new(ReadFileHandler));
+        return builder;
+    }
+    if config.recoverable_exec_output {
+        builder.push_spec_with_parallel_support(create_read_exec_output_tool(), true);
+        builder.register_handler(
+            "read_exec_output",
+            Arc::new(crate::tools::handlers::read_exec_output::ReadExecOutputHandler),
+        );
+    }
+    if config.exec_job_completion {
+        builder.push_spec_with_parallel_support(create_exec_job_status_tool(), true);
+        builder.register_handler(
+            "exec_job_status",
+            Arc::new(crate::tools::handlers::ExecJobStatusHandler),
+        );
+    }
 
     let shell_handler = Arc::new(ShellHandler);
     let unified_exec_handler = Arc::new(UnifiedExecHandler);
@@ -1299,7 +1407,7 @@ pub(crate) fn build_specs(
         }
         ConfigShellToolType::UnifiedExec => {
             builder.push_spec_with_parallel_support(
-                create_exec_command_tool(config.request_rule_enabled),
+                create_exec_command_tool(config.request_rule_enabled, config.exec_job_completion),
                 true,
             );
             builder.push_spec(create_write_stdin_tool());
@@ -1660,7 +1768,7 @@ mod tests {
         // Build expected from the same helpers used by the builder.
         let mut expected: BTreeMap<String, ToolSpec> = BTreeMap::from([]);
         for spec in [
-            create_exec_command_tool(true),
+            create_exec_command_tool(true, false),
             create_write_stdin_tool(),
             PLAN_TOOL.clone(),
             create_request_user_input_tool(),

@@ -8,6 +8,8 @@ pub(crate) enum UnifiedExecError {
     // The model is trained on `session_id`, but internally we track a `process_id`.
     #[error("Unknown process id {process_id}")]
     UnknownProcessId { process_id: String },
+    #[error("the process is registered for background completion; do not poll it")]
+    RegisteredJob,
     #[error("failed to write to stdin")]
     WriteToStdin,
     #[error(

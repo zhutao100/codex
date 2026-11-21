@@ -86,6 +86,7 @@ pub(crate) struct TurnState {
     pending_user_input: HashMap<String, oneshot::Sender<RequestUserInputResponse>>,
     pending_dynamic_tools: HashMap<String, oneshot::Sender<DynamicToolResponse>>,
     pending_input: Vec<TurnInput>,
+    input_changed: Arc<Notify>,
 }
 
 impl TurnState {
@@ -143,6 +144,11 @@ impl TurnState {
 
     pub(crate) fn push_pending_input(&mut self, input: TurnInput) {
         self.pending_input.push(input);
+        self.input_changed.notify_waiters();
+    }
+
+    pub(crate) fn input_changed(&self) -> Arc<Notify> {
+        Arc::clone(&self.input_changed)
     }
 
     pub(crate) fn take_pending_input(&mut self) -> Vec<TurnInput> {

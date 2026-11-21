@@ -35,6 +35,7 @@ mod environment_context;
 pub mod error;
 pub mod exec;
 pub mod exec_env;
+mod exec_output;
 mod exec_policy;
 pub mod features;
 mod file_watcher;

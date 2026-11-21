@@ -108,6 +108,20 @@ impl ToolRegistry {
         invocation: ToolInvocation,
     ) -> Result<ResponseInputItem, FunctionCallError> {
         let tool_name = invocation.tool_name.clone();
+        if invocation.turn.config.bounded_explorer {
+            if !crate::agent::role::explorer_tool_allowed(&tool_name)
+                || !matches!(invocation.payload, ToolPayload::Function { .. })
+            {
+                return Err(FunctionCallError::RespondToModel(format!(
+                    "tool {tool_name} is outside the explorer capability profile"
+                )));
+            }
+            if !invocation.turn.exploration.admit() {
+                return Err(FunctionCallError::RespondToModel(
+                    "Exploration evidence budget exhausted. Report partial coverage.".into(),
+                ));
+            }
+        }
         let call_id_owned = invocation.call_id.clone();
         let otel = invocation.turn.otel_manager.clone();
         let payload_for_response = invocation.payload.clone();
@@ -160,6 +174,11 @@ impl ToolRegistry {
                             invocation.turn.tool_call_gate.wait_ready().await;
                             tracing::trace!("tool gate released");
                         }
+                        let explorer = invocation
+                            .turn
+                            .config
+                            .bounded_explorer
+                            .then(|| Arc::clone(&invocation.turn));
                         match handler.handle_any(invocation).await {
                             Ok(output) => {
                                 let preview = output.log_preview();
@@ -168,7 +187,12 @@ impl ToolRegistry {
                                 *guard = Some(output);
                                 Ok((preview, success))
                             }
-                            Err(err) => Err(err),
+                            Err(err) => {
+                                if let Some(turn) = explorer {
+                                    turn.exploration.observe(true, None);
+                                }
+                                Err(err)
+                            }
                         }
                     }
                 },

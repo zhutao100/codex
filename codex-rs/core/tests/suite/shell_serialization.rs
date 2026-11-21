@@ -1,8 +1,13 @@
 #![cfg(not(target_os = "windows"))]
 #![allow(clippy::expect_used)]
 
+use anyhow::Context;
 use anyhow::Result;
+use codex_core::features::Feature;
+use codex_core::models_manager::overlay::ModelOverlay;
 use codex_core::protocol::SandboxPolicy;
+use codex_protocol::openai_models::ApplyPatchToolType;
+use codex_protocol::openai_models::ConfigShellToolType;
 use core_test_support::assert_regex_match;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -13,6 +18,7 @@ use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
+use core_test_support::skip_if_no_network_unless_localhost;
 use core_test_support::test_codex::ApplyPatchModelOutput;
 use core_test_support::test_codex::ShellModelOutput;
 use core_test_support::test_codex::TestCodexBuilder;
@@ -101,31 +107,41 @@ fn shell_responses(
 fn configure_shell_model(
     builder: TestCodexBuilder,
     output_type: ShellModelOutput,
-    include_apply_patch_tool: bool,
+    freeform_apply_patch: bool,
 ) -> TestCodexBuilder {
-    let builder = match (output_type, include_apply_patch_tool) {
-        (ShellModelOutput::ShellCommand, _) => builder.with_model("test-gpt-5-codex"),
-        (ShellModelOutput::LocalShell, true) => builder.with_model("gpt-5.1-codex"),
-        (ShellModelOutput::Shell, true) => builder.with_model("gpt-5.1-codex"),
-        (ShellModelOutput::LocalShell, false) => builder.with_model("codex-mini-latest"),
-        (ShellModelOutput::Shell, false) => builder.with_model("gpt-5"),
-    };
-
     builder.with_config(move |config| {
-        config.include_apply_patch_tool = include_apply_patch_tool;
+        config.features.disable(Feature::UnifiedExec);
+        config.features.disable(Feature::ApplyPatchFreeform);
+        let mut overlay = ModelOverlay::default();
+        overlay.cross_model.shell_type = Some(match output_type {
+            ShellModelOutput::Shell => ConfigShellToolType::Default,
+            ShellModelOutput::ShellCommand => ConfigShellToolType::ShellCommand,
+            ShellModelOutput::LocalShell => ConfigShellToolType::Local,
+        });
+        overlay.cross_model.apply_patch_tool_type =
+            Some(freeform_apply_patch.then_some(ApplyPatchToolType::Freeform));
+        config.model_overlay = Some(overlay);
     })
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[test_case(ShellModelOutput::Shell)]
-#[test_case(ShellModelOutput::LocalShell)]
+#[test_case(ShellModelOutput::Shell, false)]
+#[test_case(ShellModelOutput::LocalShell, false)]
+#[test_case(ShellModelOutput::Shell, true)]
+#[test_case(ShellModelOutput::LocalShell, true)]
 async fn shell_output_stays_json_without_freeform_apply_patch(
     output_type: ShellModelOutput,
+    retain: bool,
 ) -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    skip_if_no_network_unless_localhost!(Ok(()));
 
     let server = start_mock_server().await;
-    let mut builder = configure_shell_model(test_codex(), output_type, false);
+    let mut builder =
+        configure_shell_model(test_codex(), output_type, false).with_config(move |config| {
+            if retain {
+                config.features.enable(Feature::RecoverableExecOutput);
+            }
+        });
     let test = builder.build(&server).await?;
 
     let call_id = "shell-json";
@@ -145,7 +161,8 @@ async fn shell_output_stays_json_without_freeform_apply_patch(
         .and_then(Value::as_str)
         .expect("shell output string");
 
-    let mut parsed: Value = serde_json::from_str(output)?;
+    let mut parsed: Value = serde_json::from_str(output)
+        .with_context(|| format!("expected structured shell JSON, got {output:?}"))?;
     if let Some(metadata) = parsed.get_mut("metadata").and_then(Value::as_object_mut) {
         let _ = metadata.remove("duration_seconds");
     }
@@ -158,6 +175,14 @@ async fn shell_output_stays_json_without_freeform_apply_patch(
         Some(0),
         "expected zero exit code in unformatted JSON output",
     );
+    let receipt = parsed["metadata"]["output_artifact"].as_str();
+    assert_eq!(receipt.is_some(), retain);
+    if let Some(receipt) = receipt {
+        assert!(
+            receipt.contains("(complete; read_exec_output)"),
+            "{receipt}"
+        );
+    }
     let stdout = parsed
         .get("output")
         .and_then(Value::as_str)
@@ -167,17 +192,73 @@ async fn shell_output_stays_json_without_freeform_apply_patch(
     Ok(())
 }
 
+#[test_case(96, true)]
+#[test_case(24, false)]
+#[test_case(3, false)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[test_case(ShellModelOutput::Shell)]
-#[test_case(ShellModelOutput::ShellCommand)]
-#[test_case(ShellModelOutput::LocalShell)]
-async fn shell_output_is_structured_with_freeform_apply_patch(
-    output_type: ShellModelOutput,
+async fn retained_shell_json_fits_budget_without_cutting_exit_status_or_locator(
+    token_limit: usize,
+    expects_receipt: bool,
 ) -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    skip_if_no_network_unless_localhost!(Ok(()));
 
     let server = start_mock_server().await;
-    let mut builder = configure_shell_model(test_codex(), output_type, true);
+    let output_type = ShellModelOutput::Shell;
+    let mut builder =
+        configure_shell_model(test_codex(), output_type, false).with_config(move |config| {
+            config.features.enable(Feature::RecoverableExecOutput);
+            config.tool_output_token_limit = Some(token_limit);
+        });
+    let test = builder.build(&server).await?;
+    let call_id = "shell-bounded-json";
+    let command = vec![
+        "/bin/sh",
+        "-c",
+        r#"touch launched; for i in $(seq 256); do printf '\033"\\\n'; done; exit 23"#,
+    ];
+    let mock = mount_sse_sequence(&server, shell_responses(call_id, command, output_type)?).await;
+
+    test.submit_turn_with_policy("produce escaped output", SandboxPolicy::DangerFullAccess)
+        .await?;
+
+    let req = mock.last_request().context("shell result request")?;
+    let item = req.function_call_output(call_id);
+    let output = item["output"].as_str().context("text shell result")?;
+    if token_limit == 3 {
+        assert!(!test.cwd.path().join("launched").exists());
+        assert!(!test.home.path().join("exec-outputs").exists());
+        return Ok(());
+    }
+    assert!(output.len() <= token_limit * 4, "{output:?}");
+    let parsed: Value = serde_json::from_str(output)?;
+    assert_eq!(parsed["metadata"]["exit_code"], json!(23));
+    let receipt = parsed["metadata"]["output_artifact"].as_str();
+    assert_eq!(receipt.is_some(), expects_receipt);
+    if let Some(receipt) = receipt {
+        assert!(receipt.contains("(complete; read_exec_output)"));
+        assert!(receipt.contains("stdout 0..1024 of 1024 observed"));
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[test_case(ShellModelOutput::Shell, true)]
+#[test_case(ShellModelOutput::ShellCommand, true)]
+#[test_case(ShellModelOutput::LocalShell, true)]
+#[test_case(ShellModelOutput::Shell, false)]
+async fn shell_output_is_structured_with_freeform_apply_patch(
+    output_type: ShellModelOutput,
+    retain: bool,
+) -> Result<()> {
+    skip_if_no_network_unless_localhost!(Ok(()));
+
+    let server = start_mock_server().await;
+    let mut builder =
+        configure_shell_model(test_codex(), output_type, true).with_config(move |config| {
+            if retain {
+                config.features.enable(Feature::RecoverableExecOutput);
+            }
+        });
     let test = builder.build(&server).await?;
 
     let call_id = "shell-structured";
@@ -203,12 +284,15 @@ async fn shell_output_is_structured_with_freeform_apply_patch(
         serde_json::from_str::<Value>(output).is_err(),
         "expected structured shell output to be plain text",
     );
-    let expected_pattern = r"(?s)^Exit code: 0
-Wall time: [0-9]+(?:\.[0-9]+)? seconds
-Output:
-freeform shell
-?$";
-    assert_regex_match(expected_pattern, output);
+    let receipt_pattern = if retain {
+        r"Output artifact [^\n]+ \(complete; read_exec_output\): [^\n]+\n"
+    } else {
+        ""
+    };
+    let expected_pattern = format!(
+        r"(?s)^Exit code: 0\nWall time: [0-9]+(?:\.[0-9]+)? seconds\n{receipt_pattern}Output:\nfreeform shell\n?$"
+    );
+    assert_regex_match(&expected_pattern, output);
 
     Ok(())
 }

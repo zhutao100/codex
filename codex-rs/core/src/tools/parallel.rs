@@ -91,12 +91,10 @@ impl ToolCallRuntime {
 
         let handle: AbortOnDropHandle<Result<ResponseInputItem, FunctionCallError>> =
             AbortOnDropHandle::new(tokio::spawn(async move {
-                tokio::select! {
-                    _ = cancellation_token.cancelled() => {
-                        let secs = started.elapsed().as_secs_f32().max(0.1);
-                        dispatch_span.record("aborted", true);
-                        Ok(Self::aborted_response(&call, secs))
-                    },
+                let capture_turn = Arc::clone(&turn);
+                let result = tokio::select! {
+                    biased;
+                    _ = cancellation_token.cancelled() => None,
                     res = async {
                         let _guard = if supports_parallel {
                             Either::Left(lock.read().await)
@@ -108,8 +106,36 @@ impl ToolCallRuntime {
                             .dispatch_tool_call(session, turn, tracker, call.clone())
                             .instrument(dispatch_span.clone())
                             .await
-                    } => res,
+                    } => Some(res),
+                };
+                let locator = if capture_turn.tools_config.recoverable_exec_output {
+                    capture_turn
+                        .exec_capture_locators
+                        .lock()
+                        .await
+                        .remove(&call.call_id)
+                } else {
+                    None
+                };
+                if let Some(result) = result {
+                    return result;
                 }
+                let secs = started.elapsed().as_secs_f32().max(0.1);
+                dispatch_span.record("aborted", true);
+                let mut response = Self::aborted_response(&call, secs);
+                if let Some(locator) = locator
+                    && let ResponseInputItem::FunctionCallOutput { output, .. } = &mut response
+                {
+                    let header = format!(
+                        "Output artifact {locator}: use read_exec_output for committed ranges."
+                    );
+                    let aborted = Self::abort_message(&call, secs);
+                    let budget = capture_turn.truncation_policy.byte_budget();
+                    if header.len() + 1 + aborted.len() <= budget {
+                        output.body = FunctionCallOutputBody::Text(format!("{header}\n{aborted}"));
+                    }
+                }
+                Ok(response)
             }));
 
         match handle.await {
@@ -144,7 +170,7 @@ impl ToolCallRuntime {
         }
     }
 
-    fn rejected_response(call: &ToolCall, reason: &str) -> ResponseInputItem {
+    pub(crate) fn rejected_response(call: &ToolCall, reason: &str) -> ResponseInputItem {
         match &call.payload {
             ToolPayload::Custom { .. } => ResponseInputItem::CustomToolCallOutput {
                 call_id: call.call_id.clone(),

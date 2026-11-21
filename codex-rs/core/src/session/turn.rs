@@ -321,6 +321,15 @@ async fn run_turn_inner(
     continuation: Option<PendingContinuation>,
     cancellation_token: CancellationToken,
 ) -> Option<String> {
+    use crate::agent::role::EXPLORER_DEADLINE;
+    use crate::agent::role::EXPLORER_MAX_ACQUISITIONS;
+    use crate::agent::role::EXPLORER_REPORT_RESERVE;
+    use tokio::time::Instant;
+
+    let explorer_deadline = turn_context
+        .config
+        .bounded_explorer
+        .then(|| Instant::now() + EXPLORER_DEADLINE);
     let model_info = turn_context.model_info.clone();
     if !sess
         .start_completion_review_main_task(&turn_context.sub_id)
@@ -596,7 +605,32 @@ async fn run_turn_inner(
 
     let mut pre_compact_notes_state = PreCompactNotesState::Idle;
     let mut pre_compact_notes_attempts: u8 = 0;
+    let mut explorer_rounds = 0;
+    let mut explorer_limited = false;
 
+    if turn_context.tools_config.exec_job_completion
+        && continuation.is_some()
+        && let Some(state) = turn_state.as_ref()
+        && !cancellation_token.is_cancelled()
+        && crate::unified_exec::jobs::reconcile(&sess, &turn_context, state, &cancellation_token)
+            .await
+        && sess.get_total_token_usage().await >= auto_compact_limit
+    {
+        match begin_follow_up_compaction(
+            &sess,
+            &turn_context,
+            &mut client_session,
+            &cancellation_token,
+        )
+        .await
+        {
+            Ok(state) => pre_compact_notes_state = state,
+            Err(error) => {
+                info!("Auto-compaction failed after reconciling a waiting job: {error:#}");
+                return None;
+            }
+        }
+    }
     loop {
         // Note that pending_input would be something like a message the user
         // submitted through the UI while the model was running. Though the UI
@@ -630,12 +664,32 @@ async fn run_turn_inner(
         }
 
         // Construct the input that we will send to the model.
-        let mut sampling_request_input: Vec<ResponseItem> =
-            if matches!(pre_compact_notes_state, PreCompactNotesState::AwaitingNotes) {
-                sampling_input_for_pre_compact_work_notes(&sess, &turn_context).await
-            } else {
-                sess.prompt_history(turn_context.as_ref()).await
-            };
+        let capturing_notes =
+            matches!(pre_compact_notes_state, PreCompactNotesState::AwaitingNotes);
+        let mut sampling_request_input = if capturing_notes {
+            sampling_input_for_pre_compact_work_notes(&sess, &turn_context).await
+        } else {
+            sess.prompt_history(turn_context.as_ref()).await
+        };
+        if let Some(deadline) = explorer_deadline
+            && !capturing_notes
+        {
+            if Instant::now() >= deadline {
+                explorer_limited = true;
+                break;
+            }
+            explorer_rounds += 1;
+            explorer_limited = explorer_rounds > EXPLORER_MAX_ACQUISITIONS
+                || turn_context.exploration.exhausted()
+                || Instant::now() + EXPLORER_REPORT_RESERVE >= deadline;
+            if explorer_limited {
+                sampling_request_input.push(
+                    DeveloperInstructions::new(
+                        "Exploration budget reached. Do not call tools. Report partial findings, source locators, and unchecked scope now.".to_string(),
+                    ).into(),
+                );
+            }
+        }
         let review_instructions = if matches!(pre_compact_notes_state, PreCompactNotesState::Idle) {
             match sess.completion_review_main_instructions(true).await {
                 Ok(instructions) => instructions,
@@ -721,12 +775,16 @@ async fn run_turn_inner(
             skill_name_counts_lower: &skill_name_counts_lower,
         };
         let tool_execution_mode = match pre_compact_notes_state {
+            PreCompactNotesState::Idle if explorer_limited => ToolCallExecutionMode::RejectAll {
+                reason: "Exploration evidence budget exhausted; report partial coverage.",
+            },
             PreCompactNotesState::Idle => ToolCallExecutionMode::Normal,
             PreCompactNotesState::AwaitingNotes => ToolCallExecutionMode::RejectAll {
                 reason: AUTO_COMPACT_WORK_NOTES_TOOL_REJECT_REASON,
             },
         };
-        match run_sampling_request(
+        let sampling_cancel = cancellation_token.child_token();
+        let sampling = run_sampling_request(
             Arc::clone(&sess),
             Arc::clone(&turn_context),
             turn_state.clone(),
@@ -737,17 +795,66 @@ async fn run_turn_inner(
             request_context_tokens,
             tool_selection,
             tool_execution_mode,
-            cancellation_token.child_token(),
-        )
-        .await
-        {
+            sampling_cancel.clone(),
+        );
+        let result = if let Some(deadline) = explorer_deadline {
+            let cutoff = if explorer_limited && !capturing_notes {
+                deadline
+            } else {
+                deadline - EXPLORER_REPORT_RESERVE
+            };
+            tokio::pin!(sampling);
+            tokio::select! {
+                result = &mut sampling => result,
+                _ = tokio::time::sleep_until(cutoff) => {
+                    // Keep polling the request after canceling it so recorded calls
+                    // still receive their aborted results before the child reports.
+                    sampling_cancel.cancel();
+                    let _ = sampling.await;
+                    if cancellation_token.is_cancelled() {
+                        break;
+                    }
+                    if capturing_notes {
+                        Err(CodexErr::Stream("Explorer work-notes deadline reached".into(), None))
+                    } else if explorer_limited {
+                        explorer_limited = true;
+                        break;
+                    } else {
+                        continue;
+                    }
+                }
+            }
+        } else {
+            sampling.await
+        };
+        match result {
             Ok(sampling_request_output) => {
                 let SamplingRequestResult {
                     needs_follow_up,
                     model_needs_follow_up,
                     last_agent_message: sampling_request_last_agent_message,
                 } = sampling_request_output;
+                if explorer_limited && !capturing_notes {
+                    last_agent_message = sampling_request_last_agent_message;
+                    break;
+                }
                 can_drain_pending_input = true;
+                if needs_follow_up
+                    && matches!(pre_compact_notes_state, PreCompactNotesState::Idle)
+                    && turn_context.tools_config.exec_job_completion
+                    && let Some(state) = turn_state.as_ref()
+                {
+                    crate::unified_exec::jobs::await_after_tools(
+                        &sess,
+                        &turn_context,
+                        state,
+                        &cancellation_token,
+                    )
+                    .await;
+                    if cancellation_token.is_cancelled() {
+                        break;
+                    }
+                }
                 let total_usage_tokens = sess.get_total_token_usage().await;
                 let token_limit_reached = total_usage_tokens >= auto_compact_limit;
 
@@ -832,31 +939,25 @@ async fn run_turn_inner(
                 // as long as compaction works well in getting us way below the token limit, we
                 // shouldn't worry about being in an infinite loop.
                 if token_limit_reached && needs_follow_up {
-                    if turn_context.final_output_json_schema.is_some() {
-                        match run_auto_compact(
-                            &sess,
-                            CompactionContext::new(&turn_context),
-                            None,
-                            InitialContextInjection::BeforeLastUserMessage,
-                            Some(&mut client_session),
-                            CompactionReason::TokenLimit,
-                            &cancellation_token,
-                        )
-                        .await
-                        {
-                            Ok(_) => {}
-                            Err(e) => {
-                                info!("Auto-compaction failed during follow-up: {e:#}");
-                                return None;
-                            }
+                    match begin_follow_up_compaction(
+                        &sess,
+                        &turn_context,
+                        &mut client_session,
+                        &cancellation_token,
+                    )
+                    .await
+                    {
+                        Ok(state) => pre_compact_notes_state = state,
+                        Err(error) => {
+                            info!("Auto-compaction failed during follow-up: {error:#}");
+                            return None;
                         }
-                        can_drain_pending_input = !model_needs_follow_up;
-                        continue;
                     }
-
-                    inject_pre_compact_work_notes_request(&sess, &turn_context).await;
-                    pre_compact_notes_state = PreCompactNotesState::AwaitingNotes;
-                    pre_compact_notes_attempts = 0;
+                    if matches!(pre_compact_notes_state, PreCompactNotesState::AwaitingNotes) {
+                        pre_compact_notes_attempts = 0;
+                    } else {
+                        can_drain_pending_input = !model_needs_follow_up;
+                    }
                     continue;
                 }
 
@@ -938,7 +1039,38 @@ async fn run_turn_inner(
         }
     }
 
-    last_agent_message
+    if turn_context.config.bounded_explorer {
+        Some(
+            turn_context
+                .exploration
+                .report(last_agent_message, explorer_limited),
+        )
+    } else {
+        last_agent_message
+    }
+}
+
+async fn begin_follow_up_compaction(
+    sess: &Arc<Session>,
+    turn_context: &Arc<TurnContext>,
+    client_session: &mut ModelClientSession,
+    cancellation_token: &CancellationToken,
+) -> CodexResult<PreCompactNotesState> {
+    if turn_context.final_output_json_schema.is_none() {
+        inject_pre_compact_work_notes_request(sess, turn_context).await;
+        return Ok(PreCompactNotesState::AwaitingNotes);
+    }
+    run_auto_compact(
+        sess,
+        CompactionContext::new(turn_context),
+        None,
+        InitialContextInjection::BeforeLastUserMessage,
+        Some(client_session),
+        CompactionReason::TokenLimit,
+        cancellation_token,
+    )
+    .await?;
+    Ok(PreCompactNotesState::Idle)
 }
 
 async fn work_notes_request_context(
@@ -1484,7 +1616,7 @@ async fn run_sampling_request(
     tool_execution_mode: ToolCallExecutionMode,
     cancellation_token: CancellationToken,
 ) -> CodexResult<SamplingRequestResult> {
-    let input_item_count = sess.state.lock().await.history.raw_items().len();
+    let mut input_item_count = sess.state.lock().await.history.raw_items().len();
     let router = sampling_tool_router(
         &sess,
         &turn_context,
@@ -1500,7 +1632,7 @@ async fn run_sampling_request(
 
     let base_instructions = sess.get_base_instructions_for_turn(&turn_context).await;
 
-    let prompt = Prompt {
+    let mut prompt = Prompt {
         input,
         tools,
         parallel_tool_calls: model_supports_parallel,
@@ -1548,6 +1680,24 @@ async fn run_sampling_request(
             return Err(err);
         }
 
+        // Keep the existing request prefix, including request-only review
+        // instructions. A failed response may have recorded rejected call/result
+        // pairs; retry with those items rather than pretending they do not exist.
+        let history = sess.clone_history().await;
+        let items = history.raw_items();
+        if let Some(suffix) = items.get(input_item_count..) {
+            prompt
+                .input
+                .extend(ContextManager::prepare_items_for_prompt_with_modalities(
+                    suffix.to_vec(),
+                    &turn_context.model_info.input_modalities,
+                ));
+            input_item_count = items.len();
+        }
+        if matches!(err, CodexErr::Stream(..)) {
+            client_session.drop_websocket_connection();
+        }
+
         // Use the configured provider-specific stream retry budget.
         let max_retries = turn_context.provider.stream_max_retries();
         if retries >= max_retries
@@ -1585,7 +1735,9 @@ async fn run_sampling_request(
             )
             .await;
 
-            tokio::time::sleep(delay).await;
+            tokio::time::sleep(delay)
+                .or_cancel(&cancellation_token)
+                .await?;
         } else {
             return Err(err);
         }
@@ -2242,8 +2394,7 @@ async fn try_run_sampling_request(
         Arc::clone(&turn_diff_tracker),
     )
     .with_execution_mode(tool_execution_mode);
-    let mut in_flight: FuturesOrdered<BoxFuture<'static, CodexResult<ResponseInputItem>>> =
-        FuturesOrdered::new();
+    let mut queued_calls = Vec::new();
     let mut needs_follow_up = false;
     let mut model_needs_follow_up = false;
     let mut last_agent_message: Option<String> = None;
@@ -2275,7 +2426,8 @@ async fn try_run_sampling_request(
         };
 
         let event = match event {
-            Some(res) => res?,
+            Some(Ok(event)) => event,
+            Some(Err(err)) => break Err(err),
             None => {
                 break Err(CodexErr::Stream(
                     "stream closed before response.completed".into(),
@@ -2335,19 +2487,22 @@ async fn try_run_sampling_request(
                 let mut ctx = HandleOutputCtx {
                     sess: sess.clone(),
                     turn_context: turn_context.clone(),
-                    tool_runtime: tool_runtime.clone(),
-                    cancellation_token: cancellation_token.child_token(),
                     plan_mode,
                 };
 
-                let output_result = handle_output_item_done(&mut ctx, item, previously_active_item)
-                    .instrument(handle_responses)
-                    .await?;
-                if let Some(tool_future) = output_result.tool_future {
+                let output_result =
+                    match handle_output_item_done(&mut ctx, item, previously_active_item)
+                        .instrument(handle_responses)
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(err) => break Err(err),
+                    };
+                if let Some(tool_call) = output_result.tool_call {
                     progress_trace_state
                         .mark_work_seen(&sess, &turn_context)
                         .await;
-                    in_flight.push_back(tool_future);
+                    queued_calls.push(tool_call);
                 }
                 if let Some(agent_message) = output_result.last_agent_message {
                     last_agent_message = Some(agent_message);
@@ -2549,7 +2704,29 @@ async fn try_run_sampling_request(
     };
 
     progress_trace_state.finalize(&sess, &turn_context).await;
-    drain_in_flight(&mut in_flight, sess.clone(), turn_context.clone()).await?;
+    if outcome.is_ok() {
+        let mut in_flight = queued_calls
+            .into_iter()
+            .map(|call| {
+                let future: BoxFuture<'static, CodexResult<ResponseInputItem>> = Box::pin(
+                    tool_runtime
+                        .clone()
+                        .handle_tool_call(call, cancellation_token.child_token()),
+                );
+                future
+            })
+            .collect::<FuturesOrdered<_>>();
+        drain_in_flight(&mut in_flight, sess.clone(), turn_context.clone()).await?;
+    } else {
+        for call in queued_calls {
+            let rejected = ToolCallRuntime::rejected_response(
+                &call,
+                "The response ended before the tool batch was accepted. This call was not executed.",
+            );
+            sess.record_conversation_items(&turn_context, &[rejected.into()])
+                .await;
+        }
+    }
 
     if should_emit_turn_diff {
         let unified_diff = {

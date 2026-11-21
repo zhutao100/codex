@@ -484,7 +484,7 @@ impl ModelClientSession {
         self.websocket_last_response_rx = None;
     }
 
-    fn drop_websocket_connection(&mut self) {
+    pub(crate) fn drop_websocket_connection(&mut self) {
         self.connection = None;
         self.connection_auth_mode = None;
         self.clear_websocket_continuation();

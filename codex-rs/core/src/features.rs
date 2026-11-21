@@ -84,6 +84,10 @@ pub enum Feature {
     AutoPostTurnCompletionReview,
     /// Use the single unified PTY-backed exec tool.
     UnifiedExec,
+    /// Retain bounded reader-observed command output for range retrieval.
+    RecoverableExecOutput,
+    /// Let a turn explicitly await terminal unified-exec outcomes.
+    ExecJobCompletion,
     /// Include the freeform apply_patch tool.
     ApplyPatchFreeform,
     /// Allow the model to request web searches that fetch live content.
@@ -435,6 +439,18 @@ pub const FEATURES: &[FeatureSpec] = &[
         key: "unified_exec",
         stage: Stage::Stable,
         default_enabled: !cfg!(windows),
+    },
+    FeatureSpec {
+        id: Feature::RecoverableExecOutput,
+        key: "recoverable_exec_output",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::ExecJobCompletion,
+        key: "exec_job_completion",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
     },
     FeatureSpec {
         id: Feature::WebSearchRequest,

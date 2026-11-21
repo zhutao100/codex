@@ -7,6 +7,7 @@ mod list_dir;
 mod mcp;
 mod mcp_resource;
 mod plan;
+pub(crate) mod read_exec_output;
 mod read_file;
 mod request_user_input;
 mod shell;
@@ -33,8 +34,20 @@ pub(crate) use request_user_input::request_user_input_tool_description;
 pub use shell::ShellCommandHandler;
 pub use shell::ShellHandler;
 pub use test_sync::TestSyncHandler;
+pub(crate) use unified_exec::ExecJobStatusHandler;
 pub use unified_exec::UnifiedExecHandler;
 pub use view_image::ViewImageHandler;
+
+fn encode_byte_range(bytes: Vec<u8>) -> String {
+    use base64::Engine;
+    match String::from_utf8(bytes) {
+        Ok(text) => serde_json::Value::String(text).to_string(),
+        Err(err) => {
+            let encoded = base64::engine::general_purpose::STANDARD.encode(err.as_bytes());
+            serde_json::json!({"base64": encoded}).to_string()
+        }
+    }
+}
 
 fn parse_arguments<T>(arguments: &str) -> Result<T, FunctionCallError>
 where

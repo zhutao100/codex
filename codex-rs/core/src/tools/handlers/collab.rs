@@ -436,6 +436,12 @@ mod wait {
         let content = serde_json::to_string(&result).map_err(|err| {
             FunctionCallError::Fatal(format!("failed to serialize wait result: {err}"))
         })?;
+        if content.len() > turn.truncation_policy.byte_budget() {
+            return Err(FunctionCallError::RespondToModel(
+                "Agent status batch exceeds the result budget. Retry fewer IDs or ask for a focused report."
+                    .to_string(),
+            ));
+        }
 
         Ok(ToolOutput::Function {
             body: FunctionCallOutputBody::Text(content),

@@ -45,11 +45,12 @@ pub(super) async fn spawn_review_thread(
         .models_manager
         .get_model_info(&model, &per_turn_config)
         .await;
-    let tools_config = ToolsConfig::new(&ToolsConfigParams {
+    let mut tools_config = ToolsConfig::new(&ToolsConfigParams {
         model_info: &review_model_info,
         features: &review_features,
         web_search_mode: Some(review_web_search_mode),
     });
+    tools_config.exec_job_completion = false;
 
     let review_prompt = resolved.prompt.clone();
     let model_provider_id = per_turn_config.model_provider_id.clone();
@@ -105,6 +106,9 @@ pub(super) async fn spawn_review_thread(
         turn_metadata_header: parent_turn_context.turn_metadata_header.clone(),
         server_model_warning_emitted: AtomicBool::new(false),
         model_verification_emitted: AtomicBool::new(false),
+        exploration: Default::default(),
+        background_jobs: Default::default(),
+        exec_capture_locators: Default::default(),
     };
 
     // Seed the child task with the review prompt as the initial user message.

@@ -236,6 +236,17 @@ impl ShellHandler {
             freeform,
         } = args;
 
+        // Reserve the largest exit code and room for the serialized duration.
+        let minimum = if freeform {
+            "Exit code: -2147483648".len()
+        } else {
+            96
+        };
+        if turn.truncation_policy.byte_budget() < minimum {
+            return Err(FunctionCallError::RespondToModel(
+                "Output budget too small; command not executed.".into(),
+            ));
+        }
         let features = session.features();
         let request_rule_enabled = features.enabled(crate::features::Feature::RequestRule);
         let prefix_rule = if request_rule_enabled {
@@ -325,7 +336,9 @@ impl ShellHandler {
             .run(&mut runtime, &req, &tool_ctx, &turn, turn.approval_policy)
             .await;
         let event_ctx = ToolEventCtx::new(session.as_ref(), turn.as_ref(), &call_id, None);
-        let content = emitter.finish(event_ctx, out).await?;
+        runtime.capture.seal();
+        let receipt = runtime.capture.receipt().await;
+        let content = emitter.finish(event_ctx, out, receipt.as_deref()).await?;
         Ok(ToolOutput::Function {
             body: FunctionCallOutputBody::Text(content),
             success: Some(true),

@@ -40,6 +40,9 @@ pub(crate) struct TurnContext {
     pub(super) turn_metadata_header: OnceCell<Option<String>>,
     pub(crate) server_model_warning_emitted: AtomicBool,
     pub(crate) model_verification_emitted: AtomicBool,
+    pub(crate) exploration: crate::agent::role::ExplorationBudget,
+    pub(crate) background_jobs: Mutex<Vec<Arc<crate::unified_exec::jobs::BackgroundJob>>>,
+    pub(crate) exec_capture_locators: Mutex<HashMap<String, String>>,
 }
 impl TurnContext {
     pub(crate) fn to_turn_context_item(&self) -> TurnContextItem {
@@ -168,11 +171,16 @@ impl Session {
         let otel_manager_for_context = otel_manager;
         let per_turn_config = Arc::new(per_turn_config);
 
-        let tools_config = ToolsConfig::new(&ToolsConfigParams {
+        let mut tools_config = ToolsConfig::new(&ToolsConfigParams {
             model_info: &model_info,
             features: &per_turn_config.features,
             web_search_mode: per_turn_config.web_search_mode,
         });
+        tools_config.bounded_explorer = per_turn_config.bounded_explorer;
+        if per_turn_config.ephemeral {
+            tools_config.recoverable_exec_output = false;
+            tools_config.exec_job_completion = false;
+        }
 
         let cwd = session_configuration.cwd.clone();
         TurnContext {
@@ -209,6 +217,9 @@ impl Session {
             turn_metadata_header: OnceCell::new(),
             server_model_warning_emitted: AtomicBool::new(false),
             model_verification_emitted: AtomicBool::new(false),
+            exploration: Default::default(),
+            background_jobs: Default::default(),
+            exec_capture_locators: Default::default(),
         }
     }
 

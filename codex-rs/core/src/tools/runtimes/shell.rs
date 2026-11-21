@@ -5,10 +5,11 @@ Executes shell requests under the orchestrator: asks for approval when needed,
 builds a CommandSpec, and runs it under the current SandboxAttempt.
 */
 use crate::exec::ExecToolCallOutput;
+use crate::exec::execute_captured_exec_env;
+use crate::exec_output::OutputCapture;
 use crate::features::Feature;
 use crate::powershell::prefix_powershell_script_with_utf8;
 use crate::sandboxing::SandboxPermissions;
-use crate::sandboxing::execute_env;
 use crate::shell::ShellType;
 use crate::tools::runtimes::build_command_spec;
 use crate::tools::runtimes::maybe_wrap_shell_lc_with_snapshot;
@@ -39,7 +40,9 @@ pub struct ShellRequest {
 }
 
 #[derive(Default)]
-pub struct ShellRuntime;
+pub struct ShellRuntime {
+    pub(crate) capture: OutputCapture,
+}
 
 #[derive(serde::Serialize, Clone, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct ApprovalKey {
@@ -50,7 +53,7 @@ pub(crate) struct ApprovalKey {
 
 impl ShellRuntime {
     pub fn new() -> Self {
-        Self
+        Self::default()
     }
 
     fn stdout_stream(ctx: &ToolCtx<'_>) -> Option<crate::exec::StdoutStream> {
@@ -166,9 +169,22 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
         let env = attempt
             .env_for(spec)
             .map_err(|err| ToolError::Codex(err.into()))?;
-        let out = execute_env(env, attempt.policy, Self::stdout_stream(ctx))
-            .await
-            .map_err(ToolError::Codex)?;
+        self.capture = if ctx.turn.tools_config.recoverable_exec_output
+            && cfg!(windows)
+            && env.sandbox == crate::exec::SandboxType::WindowsRestrictedToken
+        {
+            OutputCapture::Unavailable("Windows restricted-token capture is already capped")
+        } else {
+            OutputCapture::open(ctx, false).await
+        };
+        let out = execute_captured_exec_env(
+            env,
+            attempt.policy,
+            Self::stdout_stream(ctx),
+            &mut self.capture,
+        )
+        .await
+        .map_err(ToolError::Codex)?;
         Ok(out)
     }
 }

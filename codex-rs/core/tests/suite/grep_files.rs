@@ -1,16 +1,15 @@
 #![cfg(not(target_os = "windows"))]
 
 use anyhow::Result;
+use codex_core::models_manager::overlay::ModelOverlay;
 use core_test_support::responses::mount_function_call_agent_response;
 use core_test_support::responses::start_mock_server;
-use core_test_support::skip_if_no_network;
+use core_test_support::skip_if_no_network_unless_localhost;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
 use std::collections::HashSet;
 use std::path::Path;
 use std::process::Command as StdCommand;
-
-const MODEL_WITH_TOOL: &str = "test-gpt-5.1-codex";
 
 fn ripgrep_available() -> bool {
     StdCommand::new("rg")
@@ -31,7 +30,7 @@ macro_rules! skip_if_ripgrep_missing {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn grep_files_tool_collects_matches() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    skip_if_no_network_unless_localhost!(Ok(()));
     skip_if_ripgrep_missing!(Ok(()));
 
     let server = start_mock_server().await;
@@ -89,7 +88,7 @@ async fn grep_files_tool_collects_matches() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn grep_files_tool_reports_empty_results() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    skip_if_no_network_unless_localhost!(Ok(()));
     skip_if_ripgrep_missing!(Ok(()));
 
     let server = start_mock_server().await;
@@ -116,28 +115,32 @@ async fn grep_files_tool_reports_empty_results() -> Result<()> {
         .function_call_output_content_and_success(call_id)
         .expect("tool output present");
     let content = content_opt.expect("content present");
-    if let Some(success) = success_opt {
-        assert!(!success, "expected success=false content={content}");
-    }
-    assert_eq!(content, "No matches found.");
+    assert!(success_opt.unwrap_or(true), "{content}");
+    assert_eq!(
+        content,
+        "Search complete within rg's scope: 0 matches. Working-tree snapshot not established."
+    );
 
     Ok(())
 }
 
 #[allow(clippy::expect_used)]
 async fn build_test_codex(server: &wiremock::MockServer) -> Result<TestCodex> {
-    let mut builder = test_codex().with_model(MODEL_WITH_TOOL);
+    let mut builder = test_codex().with_config(|config| {
+        let mut overlay = ModelOverlay::default();
+        overlay.cross_model.experimental_supported_tools = Some(vec!["grep_files".to_string()]);
+        config.model_overlay = Some(overlay);
+    });
     builder.build(server).await
 }
 
 fn collect_file_names(content: &str) -> HashSet<String> {
     content
         .lines()
+        .skip(1)
         .filter_map(|line| {
-            if line.trim().is_empty() {
-                return None;
-            }
-            Path::new(line)
+            let path = serde_json::from_str::<String>(line).ok()?;
+            Path::new(&path)
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
         })

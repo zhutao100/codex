@@ -188,6 +188,9 @@
             "enable_request_compression": {
               "type": "boolean"
             },
+            "exec_job_completion": {
+              "type": "boolean"
+            },
             "exec_policy": {
               "type": "boolean"
             },
@@ -210,6 +213,9 @@
               "type": "boolean"
             },
             "powershell_utf8": {
+              "type": "boolean"
+            },
+            "recoverable_exec_output": {
               "type": "boolean"
             },
             "remote_compaction": {
@@ -1816,6 +1822,9 @@
         "enable_request_compression": {
           "type": "boolean"
         },
+        "exec_job_completion": {
+          "type": "boolean"
+        },
         "exec_policy": {
           "type": "boolean"
         },
@@ -1838,6 +1847,9 @@
           "type": "boolean"
         },
         "powershell_utf8": {
+          "type": "boolean"
+        },
+        "recoverable_exec_output": {
           "type": "boolean"
         },
         "remote_compaction": {

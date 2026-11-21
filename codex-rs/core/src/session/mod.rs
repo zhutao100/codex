@@ -712,6 +712,39 @@ impl Session {
         }
     }
 
+    pub(crate) async fn flush_job_ledger(&self) -> bool {
+        let recorder = self.services.rollout.lock().await.clone();
+        if let Some(recorder) = recorder {
+            return recorder.flush().await.is_ok();
+        }
+        false
+    }
+
+    /// Admit contextual job outcomes only after the rollout has acknowledged
+    /// them, so replay can distinguish pending delivery from admitted input.
+    pub(crate) async fn record_job_outcomes(
+        &self,
+        turn: &TurnContext,
+        items: &[ResponseItem],
+    ) -> std::io::Result<()> {
+        let recorder = self
+            .services
+            .rollout
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| std::io::Error::other("rollout unavailable"))?;
+        let rollout_items = items
+            .iter()
+            .cloned()
+            .map(RolloutItem::ResponseItem)
+            .collect::<Vec<_>>();
+        recorder.record_items(&rollout_items).await?;
+        recorder.flush().await?;
+        self.record_into_history(items, turn).await;
+        Ok(())
+    }
+
     pub(crate) async fn load_current_rollout_items(&self) -> Option<Vec<RolloutItem>> {
         self.flush_rollout().await;
         let rollout_path = {
@@ -1712,7 +1745,7 @@ impl Session {
             .counter("codex.model_warning", 1, &[]);
         let item = ResponseItem::Message {
             id: None,
-            role: "user".to_string(),
+            role: "developer".to_string(),
             content: vec![ContentItem::InputText {
                 text: format!("Warning: {}", message.into()),
             }],

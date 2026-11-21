@@ -25,7 +25,7 @@ use crate::session_prefix::is_session_prefix;
 use crate::user_shell_command::is_user_shell_command_text;
 use crate::web_search::web_search_action_detail;
 
-const CONTEXTUAL_DEVELOPER_PREFIXES: &[&str] = &[
+const PRE_TURN_DEVELOPER_PREFIXES: &[&str] = &[
     "<permissions instructions>",
     "<model_switch>",
     COLLABORATION_MODE_OPEN_TAG,
@@ -39,7 +39,19 @@ pub(crate) fn is_contextual_user_message_content(message: &[ContentItem]) -> boo
 }
 
 pub(crate) fn is_contextual_dev_message_content(message: &[ContentItem]) -> bool {
-    message.iter().any(is_contextual_dev_fragment)
+    is_pre_turn_dev_message_content(message)
+        || has_dev_prefix(
+            message,
+            &[
+                "Warning: ",
+                "Background job outcome ",
+                "Background job not delivered ",
+            ],
+        )
+}
+
+pub(crate) fn is_pre_turn_dev_message_content(message: &[ContentItem]) -> bool {
+    has_dev_prefix(message, PRE_TURN_DEVELOPER_PREFIXES)
 }
 
 fn is_contextual_user_fragment(content_item: &ContentItem) -> bool {
@@ -56,16 +68,17 @@ fn is_contextual_user_fragment(content_item: &ContentItem) -> bool {
     }
 }
 
-fn is_contextual_dev_fragment(content_item: &ContentItem) -> bool {
-    let ContentItem::InputText { text } = content_item else {
-        return false;
-    };
-
-    let trimmed = text.trim_start();
-    CONTEXTUAL_DEVELOPER_PREFIXES.iter().any(|prefix| {
-        trimmed
-            .get(..prefix.len())
-            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix))
+fn has_dev_prefix(message: &[ContentItem], prefixes: &[&str]) -> bool {
+    message.iter().any(|item| {
+        let ContentItem::InputText { text } = item else {
+            return false;
+        };
+        let trimmed = text.trim_start();
+        prefixes.iter().any(|prefix| {
+            trimmed
+                .get(..prefix.len())
+                .is_some_and(|s| s.eq_ignore_ascii_case(prefix))
+        })
     })
 }
 

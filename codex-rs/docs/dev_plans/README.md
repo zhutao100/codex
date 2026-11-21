@@ -4,7 +4,7 @@ This index contains unfinished work only. A plan records current status, accepte
 
 |Plan|Status|Next decision|
 |---|---|---|
-|[Context acquisition](context_harness/README.md)|Proposed runtime changes; exact work notes and remote compaction already exist.|Define and implement bounded recoverable output and explorer contracts, then evaluate quality and aggregate cost.|
+|[Context harness](context_harness/README.md)|Experimental evidence and waiting contracts implemented.|Run controlled model comparisons before changing defaults; validate additional platform boundaries before extending support.|
 |[Build optimization](cargo_build_optimization/README.md)|Partially implemented; profiles, async adapters and hidden sidecars already exist.|Measure the remaining CLI dependency cost before selecting another split.|
 
 When work completes, move its durable contract and choices into the appropriate feature/development page, update links and remove the completed plan. Delete abandoned work instead of accumulating inactive proposals or repeated implementation histories.

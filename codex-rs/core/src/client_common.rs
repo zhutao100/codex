@@ -128,6 +128,7 @@ struct ExecOutputJson {
 struct ExecOutputMetadataJson {
     exit_code: i32,
     duration_seconds: f32,
+    output_artifact: Option<String>,
 }
 
 fn parse_structured_shell_output(raw: &str) -> Option<String> {
@@ -147,6 +148,9 @@ fn build_structured_output(parsed: &ExecOutputJson) -> String {
     if let Some((stripped, total_lines)) = strip_total_output_header(&parsed.output) {
         sections.push(format!("Total output lines: {total_lines}"));
         output = stripped.to_string();
+    }
+    if let Some(receipt) = &parsed.metadata.output_artifact {
+        sections.push(receipt.clone());
     }
 
     sections.push("Output:".to_string());

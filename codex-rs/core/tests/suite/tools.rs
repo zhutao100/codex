@@ -22,6 +22,7 @@ use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
+use core_test_support::skip_if_no_network_unless_localhost;
 use core_test_support::test_codex::test_codex;
 use regex_lite::Regex;
 use serde_json::Value;
@@ -507,10 +508,11 @@ time.sleep(60)
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shell_spawn_failure_truncates_exec_error() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    skip_if_no_network_unless_localhost!(Ok(()));
 
     let server = start_mock_server().await;
     let mut builder = test_codex().with_config(|cfg| {
+        cfg.features.enable(Feature::RecoverableExecOutput);
         cfg.sandbox_policy
             .set(SandboxPolicy::DangerFullAccess)
             .expect("set sandbox policy");
@@ -580,6 +582,13 @@ execution error: .*$"#;
         assert_regex_match(fallback_pattern, output);
     }
     assert!(output.len() <= 10 * 1024);
+    assert!(!output.contains("Output artifact"));
+    let catalog = test
+        .home
+        .path()
+        .join("exec-outputs")
+        .join(test.session_configured.session_id.to_string());
+    assert_eq!(std::fs::read_dir(catalog)?.count(), 0);
 
     Ok(())
 }

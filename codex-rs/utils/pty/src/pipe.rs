@@ -21,6 +21,10 @@ use tokio::task::JoinHandle;
 use crate::process::ChildTerminator;
 use crate::process::ProcessHandle;
 use crate::process::SpawnedProcess;
+use crate::OutputEnd;
+use crate::OutputReader;
+use crate::OutputSink;
+use crate::OutputStream;
 
 #[cfg(target_os = "linux")]
 use libc;
@@ -73,21 +77,26 @@ fn kill_process(pid: u32) -> io::Result<()> {
     }
 }
 
-async fn read_output_stream<R>(mut reader: R, output_tx: broadcast::Sender<Vec<u8>>)
-where
+async fn read_output_stream<R>(
+    mut reader: R,
+    output_tx: broadcast::Sender<Vec<u8>>,
+    tap: OutputReader,
+) where
     R: AsyncRead + Unpin,
 {
     let mut buf = vec![0u8; 8_192];
-    loop {
+    let end = loop {
         match reader.read(&mut buf).await {
-            Ok(0) => break,
+            Ok(0) => break OutputEnd::Eof,
             Ok(n) => {
+                tap.observe(&buf[..n]);
                 let _ = output_tx.send(buf[..n].to_vec());
             }
             Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
-            Err(_) => break,
+            Err(_) => break OutputEnd::ReadError,
         }
-    }
+    };
+    tap.finish(end);
 }
 
 #[derive(Clone, Copy)]
@@ -103,6 +112,7 @@ async fn spawn_process_with_stdin_mode(
     env: &HashMap<String, String>,
     arg0: &Option<String>,
     stdin_mode: PipeStdinMode,
+    sink: Option<Arc<dyn OutputSink>>,
 ) -> Result<SpawnedProcess> {
     if program.is_empty() {
         anyhow::bail!("missing program for pipe spawn");
@@ -176,14 +186,16 @@ async fn spawn_process_with_stdin_mode(
 
     let stdout_handle = stdout.map(|stdout| {
         let output_tx = output_tx.clone();
+        let tap = OutputReader::new(sink.clone(), OutputStream::Stdout);
         tokio::spawn(async move {
-            read_output_stream(BufReader::new(stdout), output_tx).await;
+            read_output_stream(BufReader::new(stdout), output_tx, tap).await;
         })
     });
     let stderr_handle = stderr.map(|stderr| {
         let output_tx = output_tx.clone();
+        let tap = OutputReader::new(sink, OutputStream::Stderr);
         tokio::spawn(async move {
-            read_output_stream(BufReader::new(stderr), output_tx).await;
+            read_output_stream(BufReader::new(stderr), output_tx, tap).await;
         })
     });
     let mut reader_abort_handles = Vec::new();
@@ -212,10 +224,10 @@ async fn spawn_process_with_stdin_mode(
             Ok(status) => status.code().unwrap_or(-1),
             Err(_) => -1,
         };
-        wait_exit_status.store(true, std::sync::atomic::Ordering::SeqCst);
         if let Ok(mut guard) = wait_exit_code.lock() {
             *guard = Some(code);
         }
+        wait_exit_status.store(true, std::sync::atomic::Ordering::SeqCst);
         let _ = exit_tx.send(code);
     });
 
@@ -253,7 +265,7 @@ pub async fn spawn_process(
     env: &HashMap<String, String>,
     arg0: &Option<String>,
 ) -> Result<SpawnedProcess> {
-    spawn_process_with_stdin_mode(program, args, cwd, env, arg0, PipeStdinMode::Piped).await
+    spawn_process_with_stdin_mode(program, args, cwd, env, arg0, PipeStdinMode::Piped, None).await
 }
 
 /// Spawn a process using regular pipes, but close stdin immediately.
@@ -264,5 +276,16 @@ pub async fn spawn_process_no_stdin(
     env: &HashMap<String, String>,
     arg0: &Option<String>,
 ) -> Result<SpawnedProcess> {
-    spawn_process_with_stdin_mode(program, args, cwd, env, arg0, PipeStdinMode::Null).await
+    spawn_process_no_stdin_with_sink(program, args, cwd, env, arg0, None).await
+}
+
+pub async fn spawn_process_no_stdin_with_sink(
+    program: &str,
+    args: &[String],
+    cwd: &Path,
+    env: &HashMap<String, String>,
+    arg0: &Option<String>,
+    sink: Option<Arc<dyn OutputSink>>,
+) -> Result<SpawnedProcess> {
+    spawn_process_with_stdin_mode(program, args, cwd, env, arg0, PipeStdinMode::Null, sink).await
 }

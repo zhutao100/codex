@@ -38,6 +38,8 @@ pub(crate) struct UnifiedExecProcess {
     output_drained: Arc<Notify>,
     output_task: JoinHandle<()>,
     sandbox_type: SandboxType,
+    pub(super) capture: crate::exec_output::OutputCapture,
+    stop_requested: std::sync::atomic::AtomicBool,
 }
 
 impl UnifiedExecProcess {
@@ -45,6 +47,7 @@ impl UnifiedExecProcess {
         process_handle: ExecCommandSession,
         initial_output_rx: tokio::sync::broadcast::Receiver<Vec<u8>>,
         sandbox_type: SandboxType,
+        capture: crate::exec_output::OutputCapture,
     ) -> Self {
         let output_buffer = Arc::new(Mutex::new(HeadTailBuffer::default()));
         let output_notify = Arc::new(Notify::new());
@@ -76,6 +79,8 @@ impl UnifiedExecProcess {
             output_drained,
             output_task,
             sandbox_type,
+            capture,
+            stop_requested: Default::default(),
         }
     }
 
@@ -112,9 +117,33 @@ impl UnifiedExecProcess {
     }
 
     pub(super) fn terminate(&self) {
+        self.note_stop();
         self.process_handle.terminate();
         self.cancellation_token.cancel();
         self.output_task.abort();
+        self.capture.seal();
+    }
+
+    pub(super) async fn terminate_and_drain(&self) {
+        self.note_stop();
+        self.process_handle.stop_child();
+        self.cancellation_token.cancel();
+        self.process_handle
+            .drain_output(super::async_watcher::TRAILING_OUTPUT_GRACE)
+            .await;
+        self.terminate();
+    }
+
+    fn note_stop(&self) {
+        if !self.has_exited() {
+            self.stop_requested
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    pub(super) fn stop_requested(&self) -> bool {
+        self.stop_requested
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     async fn snapshot_output(&self) -> Vec<Vec<u8>> {
@@ -176,13 +205,14 @@ impl UnifiedExecProcess {
     pub(super) async fn from_spawned(
         spawned: SpawnedPty,
         sandbox_type: SandboxType,
+        capture: crate::exec_output::OutputCapture,
     ) -> Result<Self, UnifiedExecError> {
         let SpawnedPty {
             session: process_handle,
             output_rx,
             mut exit_rx,
         } = spawned;
-        let managed = Self::new(process_handle, output_rx, sandbox_type);
+        let managed = Self::new(process_handle, output_rx, sandbox_type, capture);
 
         let exit_ready = matches!(exit_rx.try_recv(), Ok(_) | Err(TryRecvError::Closed));
 

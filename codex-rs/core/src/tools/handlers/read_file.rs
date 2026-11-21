@@ -1,9 +1,15 @@
-use codex_protocol::models::FunctionCallOutputBody;
 use std::collections::VecDeque;
+use std::io;
 use std::path::PathBuf;
+use std::time::Duration;
 
+use codex_protocol::models::FunctionCallOutputBody;
 use codex_utils_string::take_bytes_at_char_boundary;
 use serde::Deserialize;
+use tokio::io::AsyncBufRead;
+use tokio::io::AsyncBufReadExt;
+use tokio::io::AsyncReadExt;
+use tokio::io::AsyncSeekExt;
 
 use crate::function_tool::FunctionCallError;
 use crate::tools::context::ToolInvocation;
@@ -16,6 +22,11 @@ use crate::tools::registry::ToolKind;
 pub struct ReadFileHandler;
 
 const MAX_LINE_LENGTH: usize = 500;
+const MAX_RETURN_LINES: usize = 2_000;
+const MAX_INDENTATION_LINES: usize = 8_192;
+const MAX_RESULT_BYTES: usize = 24 * 1024;
+const METADATA_BUDGET: usize = 384;
+const READ_TIMEOUT: Duration = Duration::from_secs(10);
 const TAB_WIDTH: usize = 4;
 
 // TODO(jif) add support for block comments
@@ -38,6 +49,9 @@ struct ReadFileArgs {
     /// Optional indentation configuration used when `mode` is `Indentation`.
     #[serde(default)]
     indentation: Option<IndentationArgs>,
+    /// Exact zero-based byte range; `limit` counts bytes in this mode.
+    #[serde(default)]
+    byte_offset: Option<u64>,
 }
 
 #[derive(Deserialize, Default)]
@@ -97,7 +111,7 @@ impl ToolHandler for ReadFileHandler {
     }
 
     async fn handle(&self, invocation: ToolInvocation) -> Result<ToolOutput, FunctionCallError> {
-        let ToolInvocation { payload, .. } = invocation;
+        let ToolInvocation { payload, turn, .. } = invocation;
 
         let arguments = match payload {
             ToolPayload::Function { arguments } => arguments,
@@ -116,7 +130,14 @@ impl ToolHandler for ReadFileHandler {
             limit,
             mode,
             indentation,
+            byte_offset,
         } = args;
+
+        if !turn.sandbox_policy.has_full_disk_read_access() {
+            return Err(FunctionCallError::RespondToModel(
+                "read_file requires full read access; use a sandboxed tool instead".to_string(),
+            ));
+        }
 
         if offset == 0 {
             return Err(FunctionCallError::RespondToModel(
@@ -137,26 +158,178 @@ impl ToolHandler for ReadFileHandler {
             ));
         }
 
-        let collected = match mode {
-            ReadMode::Slice => slice::read(&path, offset, limit).await?,
-            ReadMode::Indentation => {
-                let indentation = indentation.unwrap_or_default();
-                indentation::read_block(&path, offset, limit, indentation).await?
+        let mut budget = turn.truncation_policy.byte_budget().min(MAX_RESULT_BYTES);
+        if turn.config.bounded_explorer {
+            budget = budget.min(crate::agent::role::EXPLORER_RESULT_BYTES);
+        }
+        let payload_budget = budget.saturating_sub(METADATA_BUDGET);
+        let before = file_revision(&path).await?;
+        let (description, preview) = tokio::time::timeout(READ_TIMEOUT, async {
+            if let Some(byte_offset) = byte_offset {
+                return read_byte_range(&path, byte_offset, limit.min(payload_budget / 6)).await;
             }
-        };
-        Ok(ToolOutput::Function {
-            body: FunctionCallOutputBody::Text(collected.join("\n")),
-            success: Some(true),
+            let line_limit = limit.min(MAX_RETURN_LINES);
+            let (collected, cutoff) = match mode {
+                ReadMode::Slice => {
+                    let lines = slice::read(&path, offset, line_limit).await?;
+                    let cutoff = (lines.len() == line_limit)
+                        .then_some(" Line limit reached; subsequent lines not checked.");
+                    (lines, cutoff)
+                }
+                ReadMode::Indentation => {
+                    let indentation = indentation.unwrap_or_default();
+                    let block =
+                        indentation::read_block(&path, offset, line_limit, indentation).await?;
+                    let cutoff = block.capped.then_some(
+                        " Indentation line limit reached; additional adjacent lines not checked.",
+                    );
+                    (block.lines, cutoff)
+                }
+            };
+            let mut preview = String::new();
+            let mut returned = 0;
+            for line in &collected {
+                if preview.len() + line.len() + 1 > payload_budget {
+                    break;
+                }
+                if !preview.is_empty() {
+                    preview.push('\n');
+                }
+                preview.push_str(line);
+                returned += 1;
+            }
+            let limited = if returned < collected.len() {
+                " Further selected lines omitted (byte budget); narrow the read."
+            } else {
+                cutoff.unwrap_or_default()
+            };
+            Ok((
+                format!("Source display: {returned} numbered lines.{limited}"),
+                preview,
+            ))
         })
+        .await
+        .map_err(|_| {
+            FunctionCallError::RespondToModel(
+                "read timed out; shorten the range or use byte_offset".to_string(),
+            )
+        })??;
+        let after = file_revision(&path).await?;
+        let header = if before == after {
+            format!("{description}\nFile revision: {before}")
+        } else {
+            format!("{description}\nFile changed during read; revision unresolved.")
+        };
+        if turn.config.bounded_explorer {
+            turn.exploration.observe(
+                before != after
+                    || header.len() > budget
+                    || preview.contains("[partial/lossy line;")
+                    || description.contains("omitted")
+                    || description.contains("not checked"),
+                (before == after).then_some(before.as_str()),
+            );
+        }
+        Ok(ToolOutput::Function {
+            body: FunctionCallOutputBody::Text(crate::truncate::fit_result(
+                &header, &preview, budget,
+            )),
+            success: Some(before == after && header.len() <= budget),
+        })
+    }
+}
+
+fn read_error(err: io::Error) -> FunctionCallError {
+    FunctionCallError::RespondToModel(format!("failed to read file: {err}"))
+}
+
+async fn file_revision(path: &std::path::Path) -> Result<String, FunctionCallError> {
+    let metadata = tokio::fs::metadata(path).await.map_err(read_error)?;
+    if !metadata.is_file() {
+        return Err(FunctionCallError::RespondToModel(
+            "expected a regular file".to_string(),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(format!(
+            "{}:{}:{}:{}:{}:{}:{}",
+            metadata.dev(),
+            metadata.ino(),
+            metadata.len(),
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+            metadata.ctime(),
+            metadata.ctime_nsec()
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        let modified = metadata.modified().map_err(read_error)?;
+        Ok(format!("{}:{modified:?}", metadata.len()))
+    }
+}
+
+async fn read_byte_range(
+    path: &std::path::Path,
+    offset: u64,
+    limit: usize,
+) -> Result<(String, String), FunctionCallError> {
+    let mut file = tokio::fs::File::open(path).await.map_err(read_error)?;
+    let length = file.metadata().await.map_err(read_error)?.len();
+    if offset > length {
+        return Err(FunctionCallError::RespondToModel(
+            "byte offset exceeds file length".to_string(),
+        ));
+    }
+    file.seek(io::SeekFrom::Start(offset))
+        .await
+        .map_err(read_error)?;
+    let mut bytes = Vec::new();
+    file.take(limit as u64)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(read_error)?;
+    let end = offset + bytes.len() as u64;
+    let preview = super::encode_byte_range(bytes);
+    Ok((
+        format!("Source bytes {offset}..{end} of {length} (exclusive end)."),
+        preview,
+    ))
+}
+
+/// Consume a source line in fixed-size reads, retaining only a display prefix.
+async fn read_bounded_line(
+    reader: &mut (impl AsyncBufRead + Unpin),
+    prefix: &mut Vec<u8>,
+) -> io::Result<usize> {
+    prefix.clear();
+    let mut total = 0;
+    loop {
+        let buf = reader.fill_buf().await?;
+        if buf.is_empty() {
+            return Ok(total);
+        }
+        let newline = buf.iter().position(|&byte| byte == b'\n');
+        let consumed = newline.map_or(buf.len(), |pos| pos + 1);
+        let keep = consumed.min(MAX_LINE_LENGTH.saturating_sub(prefix.len()));
+        prefix.extend_from_slice(&buf[..keep]);
+        reader.consume(consumed);
+        total += consumed;
+        if newline.is_some() {
+            return Ok(total);
+        }
     }
 }
 
 mod slice {
     use crate::function_tool::FunctionCallError;
     use crate::tools::handlers::read_file::format_line;
+    use crate::tools::handlers::read_file::read_bounded_line;
+    use crate::tools::handlers::read_file::read_error;
     use std::path::Path;
     use tokio::fs::File;
-    use tokio::io::AsyncBufReadExt;
     use tokio::io::BufReader;
 
     pub async fn read(
@@ -172,35 +345,26 @@ mod slice {
         let mut collected = Vec::new();
         let mut seen = 0usize;
         let mut buffer = Vec::new();
+        let mut end = 0;
 
         loop {
-            buffer.clear();
-            let bytes_read = reader.read_until(b'\n', &mut buffer).await.map_err(|err| {
-                FunctionCallError::RespondToModel(format!("failed to read file: {err}"))
-            })?;
+            let bytes_read = read_bounded_line(&mut reader, &mut buffer)
+                .await
+                .map_err(read_error)?;
 
             if bytes_read == 0 {
                 break;
             }
 
-            if buffer.last() == Some(&b'\n') {
-                buffer.pop();
-                if buffer.last() == Some(&b'\r') {
-                    buffer.pop();
-                }
-            }
-
+            let start = end;
+            end += bytes_read;
             seen += 1;
 
             if seen < offset {
                 continue;
             }
 
-            if collected.len() == limit {
-                break;
-            }
-
-            let formatted = format_line(&buffer);
+            let formatted = format_line(&buffer, start, bytes_read);
             collected.push(format!("L{seen}: {formatted}"));
 
             if collected.len() == limit {
@@ -222,21 +386,28 @@ mod indentation {
     use crate::function_tool::FunctionCallError;
     use crate::tools::handlers::read_file::IndentationArgs;
     use crate::tools::handlers::read_file::LineRecord;
+    use crate::tools::handlers::read_file::MAX_INDENTATION_LINES;
     use crate::tools::handlers::read_file::TAB_WIDTH;
     use crate::tools::handlers::read_file::format_line;
+    use crate::tools::handlers::read_file::read_bounded_line;
+    use crate::tools::handlers::read_file::read_error;
     use crate::tools::handlers::read_file::trim_empty_lines;
     use std::collections::VecDeque;
     use std::path::Path;
     use tokio::fs::File;
-    use tokio::io::AsyncBufReadExt;
     use tokio::io::BufReader;
+
+    pub(super) struct Block {
+        pub(super) lines: Vec<String>,
+        pub(super) capped: bool,
+    }
 
     pub async fn read_block(
         path: &Path,
         offset: usize,
         limit: usize,
         options: IndentationArgs,
-    ) -> Result<Vec<String>, FunctionCallError> {
+    ) -> Result<Block, FunctionCallError> {
         let anchor_line = options.anchor_line.unwrap_or(offset);
         if anchor_line == 0 {
             return Err(FunctionCallError::RespondToModel(
@@ -266,17 +437,20 @@ mod indentation {
         let min_indent = if options.max_levels == 0 {
             0
         } else {
-            anchor_indent.saturating_sub(options.max_levels * TAB_WIDTH)
+            anchor_indent.saturating_sub(options.max_levels.saturating_mul(TAB_WIDTH))
         };
 
         // Cap requested lines by guard_limit and file length
         let final_limit = limit.min(guard_limit).min(collected.len());
 
         if final_limit == 1 {
-            return Ok(vec![format!(
-                "L{}: {}",
-                collected[anchor_index].number, collected[anchor_index].display
-            )]);
+            return Ok(Block {
+                lines: vec![format!(
+                    "L{}: {}",
+                    collected[anchor_index].number, collected[anchor_index].display
+                )],
+                capped: collected.len() > final_limit,
+            });
         }
 
         // Cursors
@@ -285,7 +459,7 @@ mod indentation {
         let mut i_counter_min_indent = 0;
         let mut j_counter_min_indent = 0;
 
-        let mut out = VecDeque::with_capacity(limit);
+        let mut out = VecDeque::with_capacity(final_limit);
         out.push_back(&collected[anchor_index]);
 
         while out.len() < final_limit {
@@ -354,13 +528,15 @@ mod indentation {
             }
         }
 
-        // Trim empty lines
+        // Record the boundary before trimming the selected blank lines.
+        let capped = out.len() == final_limit && (i >= 0 || j < collected.len());
         trim_empty_lines(&mut out);
 
-        Ok(out
+        let lines = out
             .into_iter()
             .map(|record| format!("L{}: {}", record.number, record.display))
-            .collect())
+            .collect();
+        Ok(Block { lines, capped })
     }
 
     async fn collect_file_lines(path: &Path) -> Result<Vec<LineRecord>, FunctionCallError> {
@@ -371,31 +547,35 @@ mod indentation {
         let mut reader = BufReader::new(file);
         let mut buffer = Vec::new();
         let mut lines = Vec::new();
-        let mut number = 0usize;
+        let mut end = 0;
 
         loop {
-            buffer.clear();
-            let bytes_read = reader.read_until(b'\n', &mut buffer).await.map_err(|err| {
-                FunctionCallError::RespondToModel(format!("failed to read file: {err}"))
-            })?;
+            let bytes_read = read_bounded_line(&mut reader, &mut buffer)
+                .await
+                .map_err(read_error)?;
 
             if bytes_read == 0 {
                 break;
             }
-
-            if buffer.last() == Some(&b'\n') {
-                buffer.pop();
-                if buffer.last() == Some(&b'\r') {
-                    buffer.pop();
-                }
+            if lines.len() == MAX_INDENTATION_LINES {
+                return Err(FunctionCallError::RespondToModel(
+                    "indentation scan exceeded its line limit; use slice or byte_offset"
+                        .to_string(),
+                ));
             }
 
-            number += 1;
+            let display = format_line(&buffer, end, bytes_read);
+            end += bytes_read;
             let raw = String::from_utf8_lossy(&buffer).into_owned();
             let indent = measure_indent(&raw);
-            let display = format_line(&buffer);
+            if bytes_read > buffer.len() && raw.trim().is_empty() {
+                return Err(FunctionCallError::RespondToModel(
+                    "indentation unresolved on an oversized line; use slice or byte_offset"
+                        .to_string(),
+                ));
+            }
             lines.push(LineRecord {
-                number,
+                number: lines.len() + 1,
                 raw,
                 display,
                 indent,
@@ -427,12 +607,21 @@ mod indentation {
     }
 }
 
-fn format_line(bytes: &[u8]) -> String {
-    let decoded = String::from_utf8_lossy(bytes);
-    if decoded.len() > MAX_LINE_LENGTH {
-        take_bytes_at_char_boundary(&decoded, MAX_LINE_LENGTH).to_string()
+fn format_line(bytes: &[u8], start: usize, source_len: usize) -> String {
+    let display = bytes
+        .strip_suffix(b"\r\n")
+        .or_else(|| bytes.strip_suffix(b"\n"))
+        .unwrap_or(bytes);
+    let decoded = String::from_utf8_lossy(display);
+    let prefix = take_bytes_at_char_boundary(&decoded, MAX_LINE_LENGTH);
+    if source_len > bytes.len()
+        || decoded.len() != prefix.len()
+        || matches!(decoded, std::borrow::Cow::Owned(_))
+    {
+        let end = start + source_len;
+        format!("{prefix} [partial/lossy line; exact source bytes {start}..{end} via byte_offset]")
     } else {
-        decoded.into_owned()
+        prefix.to_string()
     }
 }
 
@@ -483,11 +672,21 @@ mod defaults {
 
 #[cfg(test)]
 mod tests {
-    use super::indentation::read_block;
     use super::slice::read;
     use super::*;
     use pretty_assertions::assert_eq;
     use tempfile::NamedTempFile;
+
+    async fn read_block(
+        path: &std::path::Path,
+        offset: usize,
+        limit: usize,
+        options: IndentationArgs,
+    ) -> Result<Vec<String>, FunctionCallError> {
+        Ok(indentation::read_block(path, offset, limit, options)
+            .await?
+            .lines)
+    }
 
     #[tokio::test]
     async fn reads_requested_range() -> anyhow::Result<()> {
@@ -529,8 +728,17 @@ gamma
         temp.as_file_mut().write_all(b"\xff\xfe\nplain\n")?;
 
         let lines = read(temp.path(), 1, 2).await?;
-        let expected_first = format!("L1: {}{}", '\u{FFFD}', '\u{FFFD}');
+        let expected_first =
+            "L1: \u{FFFD}\u{FFFD} [partial/lossy line; exact source bytes 0..3 via byte_offset]"
+                .to_string();
         assert_eq!(lines, vec![expected_first, "L2: plain".to_string()]);
+        assert_eq!(
+            read_byte_range(temp.path(), 0, 3).await?,
+            (
+                "Source bytes 0..3 of 9 (exclusive end).".into(),
+                r#"{"base64":"//4K"}"#.into(),
+            )
+        );
         Ok(())
     }
 
@@ -574,7 +782,19 @@ third
 
         let lines = read(temp.path(), 1, 1).await?;
         let expected = "x".repeat(MAX_LINE_LENGTH);
-        assert_eq!(lines, vec![format!("L1: {expected}")]);
+        assert_eq!(
+            lines,
+            vec![format!(
+                "L1: {expected} [partial/lossy line; exact source bytes 0..551 via byte_offset]"
+            )]
+        );
+        assert_eq!(
+            read_byte_range(temp.path(), 545, 6).await?,
+            (
+                "Source bytes 545..551 of 551 (exclusive end).".into(),
+                r#""xxxxx\n""#.into()
+            )
+        );
         Ok(())
     }
 
