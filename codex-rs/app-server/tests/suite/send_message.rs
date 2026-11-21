@@ -564,7 +564,7 @@ fn content_texts(content: &[ContentItem]) -> Vec<&str> {
     content
         .iter()
         .filter_map(|item| match item {
-            ContentItem::InputText { text, .. } | ContentItem::OutputText { text } => {
+            ContentItem::InputText { text, .. } | ContentItem::OutputText { text, .. } => {
                 Some(text.as_str())
             }
             _ => None,
@@ -593,6 +593,8 @@ fn append_rollout_turn_context(path: &Path, timestamp: &str, model: &str) -> std
     let user_line = RolloutLine {
         timestamp: timestamp.to_string(),
         item: RolloutItem::ResponseItem(ResponseItem::Message {
+            encrypted_content: None,
+            status: None,
             id: None,
             role: "user".to_string(),
             content: vec![ContentItem::InputText {

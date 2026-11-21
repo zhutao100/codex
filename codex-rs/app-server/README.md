@@ -85,6 +85,8 @@ Example (from OpenAI's official VSCode extension):
 
 ## API Overview
 
+Raw Responses items in resume payloads and raw item notifications can include optional sampled-output ciphertext, message/function status, and output-text annotations/logprobs. Preserve these fields when passing history back; display the visible content, not the ciphertext. The [output replay contract](../docs/features/responses-output-replay.md) explains provider filtering and the `output_token_replay` feature.
+
 - `thread/start` — create a new thread; emits `thread/started` and auto-subscribes you to turn/item events for that thread.
 - `thread/resume` — reopen an existing thread by id so subsequent `turn/start` calls append to it.
 - `thread/fork` — fork an existing thread into a new thread id by copying the stored history; emits `thread/started` and auto-subscribes you to turn/item events for the new thread.

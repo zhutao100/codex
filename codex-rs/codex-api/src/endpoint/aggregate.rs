@@ -43,7 +43,7 @@ impl Stream for AggregatedStream {
                         if this.cumulative.is_empty()
                             && let ResponseItem::Message { content, .. } = &item
                             && let Some(text) = content.iter().find_map(|c| match c {
-                                ContentItem::OutputText { text } => Some(text),
+                                ContentItem::OutputText { text, .. } => Some(text),
                                 _ => None,
                             })
                         {
@@ -67,6 +67,7 @@ impl Stream for AggregatedStream {
                     response_id,
                     token_usage,
                     end_turn,
+                    reasoning_removals,
                 }))) => {
                     let mut emitted_any = false;
 
@@ -86,9 +87,13 @@ impl Stream for AggregatedStream {
 
                     if !this.cumulative.is_empty() {
                         let aggregated_message = ResponseItem::Message {
+                            encrypted_content: None,
+                            status: None,
                             id: None,
                             role: "assistant".to_string(),
                             content: vec![ContentItem::OutputText {
+                                annotations: None,
+                                logprobs: None,
                                 text: std::mem::take(&mut this.cumulative),
                             }],
                             end_turn: None,
@@ -104,6 +109,7 @@ impl Stream for AggregatedStream {
                             response_id: response_id.clone(),
                             token_usage: token_usage.clone(),
                             end_turn,
+                            reasoning_removals: reasoning_removals.clone(),
                         });
                         if let Some(ev) = this.pending.pop_front() {
                             return Poll::Ready(Some(Ok(ev)));
@@ -114,6 +120,7 @@ impl Stream for AggregatedStream {
                         response_id,
                         token_usage,
                         end_turn,
+                        reasoning_removals,
                     })));
                 }
                 Poll::Ready(Some(Ok(ResponseEvent::Created))) => continue,

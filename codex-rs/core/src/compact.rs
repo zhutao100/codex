@@ -306,7 +306,7 @@ pub fn content_items_to_text(content: &[ContentItem]) -> Option<String> {
     let mut pieces = Vec::new();
     for item in content {
         match item {
-            ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+            ContentItem::InputText { text } | ContentItem::OutputText { text, .. } => {
                 if !text.is_empty() {
                     pieces.push(text.as_str());
                 }
@@ -370,6 +370,8 @@ pub(crate) fn is_preserved_work_notes_message(message: &str) -> bool {
 pub(crate) fn preserved_work_notes_message(work_notes: &str) -> ResponseItem {
     let text = format!("{PRESERVED_WORK_NOTES_MESSAGE_PREFIX}{work_notes}");
     ResponseItem::Message {
+        encrypted_content: None,
+        status: None,
         id: None,
         role: "user".to_string(),
         content: vec![ContentItem::InputText { text }],
@@ -456,6 +458,8 @@ fn build_compacted_history_with_limit(
 
     for message in &selected_messages {
         history.push(ResponseItem::Message {
+            encrypted_content: None,
+            status: None,
             id: None,
             role: "user".to_string(),
             content: vec![ContentItem::InputText {
@@ -473,6 +477,8 @@ fn build_compacted_history_with_limit(
     };
 
     history.push(ResponseItem::Message {
+        encrypted_content: None,
+        status: None,
         id: None,
         role: "user".to_string(),
         content: vec![ContentItem::InputText { text: summary_text }],
@@ -579,7 +585,7 @@ pub(crate) fn pending_work_notes(items: &[ResponseItem]) -> CodexResult<Option<P
                 ResponseItem::Reasoning { .. } => true,
                 ResponseItem::Message { role, content, .. } if role == "assistant" => {
                     content.iter().all(|part| {
-                        matches!(part, ContentItem::OutputText { text } if text.trim().is_empty())
+                        matches!(part, ContentItem::OutputText { text, .. } if text.trim().is_empty())
                     })
                 }
                 _ => false,
@@ -747,9 +753,13 @@ mod tests {
                 text: "hello".to_string(),
             },
             ContentItem::OutputText {
+                annotations: None,
+                logprobs: None,
                 text: String::new(),
             },
             ContentItem::OutputText {
+                annotations: None,
+                logprobs: None,
                 text: "world".to_string(),
             },
         ];
@@ -774,15 +784,21 @@ mod tests {
     fn collect_user_messages_extracts_user_text_only() {
         let items = vec![
             ResponseItem::Message {
+                encrypted_content: None,
+                status: None,
                 id: Some("assistant".to_string()),
                 role: "assistant".to_string(),
                 content: vec![ContentItem::OutputText {
+                    annotations: None,
+                    logprobs: None,
                     text: "ignored".to_string(),
                 }],
                 end_turn: None,
                 phase: None,
             },
             ResponseItem::Message {
+                encrypted_content: None,
+                status: None,
                 id: Some("user".to_string()),
                 role: "user".to_string(),
                 content: vec![ContentItem::InputText {
@@ -803,7 +819,7 @@ mod tests {
     fn collect_user_messages_filters_session_prefix_entries() {
         let items = vec![
             ResponseItem::Message {
-                id: None,
+                encrypted_content: None, status: None, id: None,
                 role: "user".to_string(),
                 content: vec![ContentItem::InputText {
                     text: "# AGENTS.md instructions for project\n\n<INSTRUCTIONS>\ndo things\n</INSTRUCTIONS>"
@@ -813,7 +829,7 @@ mod tests {
             phase: None,
             },
             ResponseItem::Message {
-                id: None,
+                encrypted_content: None, status: None, id: None,
                 role: "user".to_string(),
                 content: vec![ContentItem::InputText {
                     text: "<ENVIRONMENT_CONTEXT>cwd=/tmp</ENVIRONMENT_CONTEXT>".to_string(),
@@ -822,7 +838,7 @@ mod tests {
             phase: None,
             },
             ResponseItem::Message {
-                id: None,
+                encrypted_content: None, status: None, id: None,
                 role: "user".to_string(),
                 content: vec![ContentItem::InputText {
                     text: "real user message".to_string(),
@@ -840,6 +856,8 @@ mod tests {
     #[test]
     fn insert_initial_context_before_last_real_user_message_ignores_summary_and_work_notes() {
         let initial_context = vec![ResponseItem::Message {
+            encrypted_content: None,
+            status: None,
             id: None,
             role: "developer".to_string(),
             content: vec![ContentItem::InputText {
@@ -849,6 +867,8 @@ mod tests {
             phase: None,
         }];
         let first_user = ResponseItem::Message {
+            encrypted_content: None,
+            status: None,
             id: None,
             role: "user".to_string(),
             content: vec![ContentItem::InputText {
@@ -858,6 +878,8 @@ mod tests {
             phase: None,
         };
         let last_user = ResponseItem::Message {
+            encrypted_content: None,
+            status: None,
             id: None,
             role: "user".to_string(),
             content: vec![ContentItem::InputText {
@@ -867,6 +889,8 @@ mod tests {
             phase: None,
         };
         let summary = ResponseItem::Message {
+            encrypted_content: None,
+            status: None,
             id: None,
             role: "user".to_string(),
             content: vec![ContentItem::InputText {
@@ -968,6 +992,8 @@ mod tests {
         );
         let items = vec![
             ResponseItem::Message {
+                encrypted_content: None,
+                status: None,
                 id: None,
                 role: "user".to_string(),
                 content: vec![ContentItem::InputText {
@@ -977,6 +1003,8 @@ mod tests {
                 phase: None,
             },
             ResponseItem::Message {
+                encrypted_content: None,
+                status: None,
                 id: None,
                 role: "user".to_string(),
                 content: vec![ContentItem::InputText {
@@ -1006,6 +1034,8 @@ mod tests {
     fn collect_user_messages_filters_preserved_work_notes_messages() {
         let items = vec![
             ResponseItem::Message {
+                encrypted_content: None,
+                status: None,
                 id: None,
                 role: "user".to_string(),
                 content: vec![ContentItem::InputText {
@@ -1027,6 +1057,8 @@ mod tests {
         let mut history = ContextManager::new();
         history.replace(vec![
             ResponseItem::Message {
+                encrypted_content: None,
+                status: None,
                 id: None,
                 role: "user".to_string(),
                 content: vec![ContentItem::InputText {
@@ -1037,6 +1069,8 @@ mod tests {
             },
             preserved_work_notes_message("previous notes"),
             ResponseItem::Message {
+                encrypted_content: None,
+                status: None,
                 id: None,
                 role: "developer".to_string(),
                 content: vec![ContentItem::InputText {
@@ -1046,9 +1080,13 @@ mod tests {
                 phase: None,
             },
             ResponseItem::Message {
+                encrypted_content: None,
+                status: None,
                 id: None,
                 role: "assistant".to_string(),
                 content: vec![ContentItem::OutputText {
+                    annotations: None,
+                    logprobs: None,
                     text: "transient".to_string(),
                 }],
                 end_turn: None,

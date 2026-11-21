@@ -89,6 +89,37 @@ impl OtelManager {
     pub fn record_responses(&self, handle_responses_span: &Span, event: &ResponseEvent) {
         handle_responses_span.record("otel.name", OtelManager::responses_type(event));
 
+        if let ResponseEvent::Completed {
+            reasoning_removals, ..
+        } = event
+        {
+            use codex_api::ReasoningRemovalReason;
+            let report = match reasoning_removals {
+                None => "unavailable",
+                Some(counts) if counts.is_empty() => "no_removals_reported",
+                Some(counts) if counts.contains_key(&ReasoningRemovalReason::PrefixMismatch) => {
+                    "prefix_mismatch_reported"
+                }
+                Some(_) => "removals_reported",
+            };
+            tracing::debug!(parent: handle_responses_span, report, ?reasoning_removals, "reasoning replay report");
+            self.counter(
+                crate::metrics::names::REASONING_REPLAY_COUNT_METRIC,
+                1,
+                &[("report", report)],
+            );
+            if let Some(counts) = reasoning_removals {
+                for reason in ReasoningRemovalReason::ALL {
+                    self.histogram_with_boundaries(
+                        crate::metrics::names::REASONING_ITEMS_REMOVED_METRIC,
+                        counts.get(&reason).copied().unwrap_or_default(),
+                        &[0., 1., 2., 4., 8., 16., 32., 64., 128., 256.],
+                        &[("reason", reason.as_str())],
+                    );
+                }
+            }
+        }
+
         match event {
             ResponseEvent::OutputItemDone(item) => {
                 handle_responses_span.record("from", "output_item_done");
@@ -229,6 +260,34 @@ impl OtelManager {
             duration_ms = %duration.as_millis(),
             success = success_str,
             error.message = error,
+        );
+    }
+
+    pub fn record_websocket_continuation(
+        &self,
+        mode: &'static str,
+        reason: &'static str,
+        previous: &'static str,
+        current: &'static str,
+    ) {
+        let tags = [
+            ("mode", mode),
+            ("reason", reason),
+            ("phase", "generation"),
+            ("previous_item_type", previous),
+            ("current_item_type", current),
+        ];
+        self.counter(
+            crate::metrics::names::WEBSOCKET_CONTINUATION_COUNT_METRIC,
+            1,
+            &tags,
+        );
+        tracing::debug!(
+            mode,
+            reason,
+            previous_item_type = previous,
+            current_item_type = current,
+            "websocket continuation"
         );
     }
 
@@ -698,19 +757,10 @@ impl OtelManager {
     }
 
     fn responses_item_type(item: &ResponseItem) -> String {
-        match item {
-            ResponseItem::Message { role, .. } => format!("message_from_{role}"),
-            ResponseItem::Reasoning { .. } => "reasoning".into(),
-            ResponseItem::LocalShellCall { .. } => "local_shell_call".into(),
-            ResponseItem::FunctionCall { .. } => "function_call".into(),
-            ResponseItem::FunctionCallOutput { .. } => "function_call_output".into(),
-            ResponseItem::CustomToolCall { .. } => "custom_tool_call".into(),
-            ResponseItem::CustomToolCallOutput { .. } => "custom_tool_call_output".into(),
-            ResponseItem::WebSearchCall { .. } => "web_search_call".into(),
-            ResponseItem::GhostSnapshot { .. } => "ghost_snapshot".into(),
-            ResponseItem::Compaction { .. } => "compaction".into(),
-            ResponseItem::CompactionTrigger {} => "compaction_trigger".into(),
-            ResponseItem::Other => "other".into(),
+        if let ResponseItem::Message { role, .. } = item {
+            format!("message_from_{role}")
+        } else {
+            item.item_type().to_string()
         }
     }
 }

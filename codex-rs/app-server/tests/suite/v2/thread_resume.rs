@@ -334,6 +334,8 @@ async fn thread_resume_supports_history_and_overrides() -> Result<()> {
 
     let history_text = "Hello from history";
     let history = vec![ResponseItem::Message {
+        encrypted_content: None,
+        status: None,
         id: None,
         role: "user".to_string(),
         content: vec![ContentItem::InputText {

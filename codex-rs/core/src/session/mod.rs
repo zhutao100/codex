@@ -1744,6 +1744,8 @@ impl Session {
             .otel_manager
             .counter("codex.model_warning", 1, &[]);
         let item = ResponseItem::Message {
+            encrypted_content: None,
+            status: None,
             id: None,
             role: "developer".to_string(),
             content: vec![ContentItem::InputText {

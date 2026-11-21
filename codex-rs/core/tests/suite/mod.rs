@@ -93,6 +93,7 @@ mod model_tools;
 mod models_cache_ttl;
 mod models_etag_responses;
 mod otel;
+mod output_token_replay;
 mod pending_input;
 mod permissions_messages;
 mod personality;

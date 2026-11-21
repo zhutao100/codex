@@ -206,7 +206,9 @@ async fn plan_mode_compaction_preserves_literal_plan_tags_in_multipart_notes() -
                     content
                         .into_iter()
                         .filter_map(|part| match part {
-                            codex_protocol::models::ContentItem::OutputText { text } => Some(text),
+                            codex_protocol::models::ContentItem::OutputText { text, .. } => {
+                                Some(text)
+                            }
                             _ => None,
                         })
                         .collect::<String>(),

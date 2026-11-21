@@ -16,7 +16,7 @@ A completed response permits the next request in the same `ModelClientSession` t
 - The current full input begins with the prior full request input followed by the exact output items returned by that response.
 - The compared request properties match: model, instructions, tools, tool choice, parallel-tool setting, reasoning, storage, streaming, included fields, service tier, prompt cache key, and text/output-schema settings.
 
-The comparison borrows the request and uses `strip_prefix`; it does not clone complete histories merely to test eligibility. An empty delta is allowed. `client_metadata` and `generate` are excluded from the property comparison; ordinary generation leaves `generate` unset.
+The comparison walks the borrowed prior input and output, then clones only the suffix for the delta. An empty delta is allowed. `client_metadata` and `generate` are excluded from the property comparison; ordinary generation leaves `generate` unset. See [output replay](responses-output-replay.md) for full-request fidelity and continuation/removal diagnostics.
 
 If any condition fails, send a full `response.create` with no previous response ID. Do not infer eligibility from matching user text, token counts, or the presence of a cached socket. Server prompt caching and transport continuation are separate: an appended prompt can reuse a token prefix even when this client deliberately starts a new logical chain.
 
@@ -44,6 +44,7 @@ Create a fresh `ModelClientSession` for each logical turn. Reuse it for sampling
 |HTTP 426 during upgrade|Switch to HTTP.|
 |Retryable stream errors exhaust provider retry budget|Switch once to HTTP, reset retries, and keep subsequent turns on HTTP.|
 |Connection lifetime-limit error|Treat as retryable, discard the closed connection, and reconnect.|
+|Wrapped `previous_response_not_found`|Use the normal stream retry budget; resend complete surviving input without the stale ID. Other invalid requests remain terminal.|
 
 A connection is cacheable only when no request is outstanding or its completion receiver yields a finished response. Both an empty receiver and a closed receiver without a result are non-cacheable. Transport completion makes socket reuse possible; it does not prove task finalization or rollout persistence succeeded.
 

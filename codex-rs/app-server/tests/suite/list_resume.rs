@@ -302,6 +302,8 @@ async fn test_list_and_resume_conversations() -> Result<()> {
     // Resuming with explicit history should succeed even without a stored rollout.
     let fork_history_text = "Hello from history";
     let history = vec![ResponseItem::Message {
+        encrypted_content: None,
+        status: None,
         id: None,
         role: "user".to_string(),
         content: vec![ContentItem::InputText {

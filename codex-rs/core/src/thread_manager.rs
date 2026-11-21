@@ -512,9 +512,13 @@ mod tests {
 
     fn user_msg(text: &str) -> ResponseItem {
         ResponseItem::Message {
+            encrypted_content: None,
+            status: None,
             id: None,
             role: "user".to_string(),
             content: vec![ContentItem::OutputText {
+                annotations: None,
+                logprobs: None,
                 text: text.to_string(),
             }],
             end_turn: None,
@@ -523,9 +527,13 @@ mod tests {
     }
     fn assistant_msg(text: &str) -> ResponseItem {
         ResponseItem::Message {
+            encrypted_content: None,
+            status: None,
             id: None,
             role: "assistant".to_string(),
             content: vec![ContentItem::OutputText {
+                annotations: None,
+                logprobs: None,
                 text: text.to_string(),
             }],
             end_turn: None,
@@ -550,6 +558,8 @@ mod tests {
                 encrypted_content: None,
             },
             ResponseItem::FunctionCall {
+                encrypted_content: None,
+                status: None,
                 id: None,
                 call_id: "c1".to_string(),
                 name: "tool".to_string(),

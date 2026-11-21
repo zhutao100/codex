@@ -198,6 +198,11 @@ fn normalize_trace_items(items: Vec<Value>, path: &Path) -> Result<Vec<Value>> {
             path.display()
         )));
     }
+    for item in &mut normalized {
+        if let Some(item) = item.as_object_mut() {
+            item.remove("encrypted_content");
+        }
+    }
     Ok(normalized)
 }
 
@@ -236,14 +241,14 @@ mod tests {
         let items = vec![
             serde_json::json!({
                 "type": "response_item",
-                "payload": {"type": "message", "role": "assistant", "content": []}
+                "payload": {"type": "message", "role": "assistant", "content": [], "encrypted_content": "opaque-output"}
             }),
             serde_json::json!({
                 "type": "response_item",
                 "payload": [
                     {"type": "message", "role": "user", "content": []},
                     {"type": "message", "role": "tool", "content": []},
-                    {"type": "function_call", "name": "shell", "arguments": "{}", "call_id": "c1"}
+                    {"type": "function_call", "name": "shell", "arguments": "{}", "call_id": "c1", "encrypted_content": "opaque-call"}
                 ]
             }),
             serde_json::json!({

@@ -73,6 +73,8 @@ async fn remote_compact_replaces_history_for_followups() -> Result<()> {
 
     let compacted_history = vec![
         ResponseItem::Message {
+            encrypted_content: None,
+            status: None,
             id: None,
             role: "user".to_string(),
             content: vec![ContentItem::InputText {
@@ -210,6 +212,8 @@ async fn remote_compact_runs_automatically() -> Result<()> {
 
     let compacted_history = vec![
         ResponseItem::Message {
+            encrypted_content: None,
+            status: None,
             id: None,
             role: "user".to_string(),
             content: vec![ContentItem::InputText {
@@ -633,6 +637,8 @@ async fn remote_manual_compact_emits_context_compaction_items() -> Result<()> {
 
     let compacted_history = vec![
         ResponseItem::Message {
+            encrypted_content: None,
+            status: None,
             id: None,
             role: "user".to_string(),
             content: vec![ContentItem::InputText {
@@ -736,6 +742,8 @@ async fn remote_compact_persists_replacement_history_in_rollout() -> Result<()> 
 
     let compacted_history = vec![
         ResponseItem::Message {
+            encrypted_content: None,
+            status: None,
             id: None,
             role: "user".to_string(),
             content: vec![ContentItem::InputText {
@@ -748,9 +756,13 @@ async fn remote_compact_persists_replacement_history_in_rollout() -> Result<()> 
             encrypted_content: "ENCRYPTED_COMPACTION_SUMMARY".to_string(),
         },
         ResponseItem::Message {
+            encrypted_content: None,
+            status: None,
             id: None,
             role: "assistant".to_string(),
             content: vec![ContentItem::OutputText {
+                annotations: None,
+                logprobs: None,
                 text: "COMPACTED_ASSISTANT_NOTE".to_string(),
             }],
             end_turn: None,

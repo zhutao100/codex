@@ -435,7 +435,9 @@ impl Session {
                 config.features.enabled(Feature::EnableRequestCompression),
                 config.features.enabled(Feature::RuntimeMetrics),
                 Self::build_model_client_beta_features_header(config.as_ref()),
-            ),
+                config.features.enabled(Feature::OutputTokenReplay),
+            )
+            .with_restored_history(!matches!(initial_history, InitialHistory::New)),
         };
 
         let sess = Arc::new(Session {

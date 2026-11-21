@@ -12,3 +12,6 @@ pub(crate) const RESPONSES_API_OVERHEAD_DURATION_METRIC: &str =
     "codex.responses_api_overhead.duration_ms";
 pub(crate) const RESPONSES_API_INFERENCE_TIME_DURATION_METRIC: &str =
     "codex.responses_api_inference_time.duration_ms";
+pub const WEBSOCKET_CONTINUATION_COUNT_METRIC: &str = "codex.websocket.continuation";
+pub const REASONING_REPLAY_COUNT_METRIC: &str = "codex.responses.reasoning_replay";
+pub const REASONING_ITEMS_REMOVED_METRIC: &str = "codex.responses.reasoning_items_removed";

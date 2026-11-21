@@ -7,7 +7,7 @@ Read [project principles](docs/principles.md) before changing the agent loop, co
 ## Project invariants
 
 - The harness owns task scheduling, tool execution, approvals, context and recovery. Keep model requests, UI events and durable host metadata distinct.
-- Preserve ordered history, tool-call/result pairing and exact opaque reasoning/compaction items. Keep stable request prefixes and deterministic tool ordering; validate [review payload budgets](docs/features/post_turn_completion_review/budget_accounting.md), context replacement and transport continuation together.
+- Preserve ordered history, tool-call/result pairing and opaque reasoning, compaction and [sampled-output replay](docs/features/responses-output-replay.md) data. Keep stable request prefixes and deterministic tool ordering; validate [review payload budgets](docs/features/post_turn_completion_review/budget_accounting.md), context replacement and transport continuation together.
 - Accepted input, consumed input and a completed answer have different owners and lifetimes. Changes to pause, steering, compaction or review must preserve those distinctions through cancellation and replay.
 - Local history and durable checkpoints must support recovery when an API connection disappears. A WebSocket continuation ID is not a session checkpoint; see the [context harness contract](docs/features/context-harness.md) for local evidence retained outside history.
 - Use checked-in implementation and tests to establish behavior. Upstream articles explain design principles; a newer schema or tool description does not establish support here. Keep custom changes focused and compatible with their current owner; refresh or rebase upstream only when requested.

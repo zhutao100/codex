@@ -43,6 +43,8 @@ fn resume_history(
         history: vec![
             RolloutItem::TurnContext(turn_ctx),
             RolloutItem::ResponseItem(ResponseItem::Message {
+                encrypted_content: None,
+                status: None,
                 id: None,
                 role: "user".to_string(),
                 content: vec![ContentItem::InputText {

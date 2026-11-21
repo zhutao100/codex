@@ -29,6 +29,8 @@ impl UserInstructions {
 impl From<UserInstructions> for ResponseItem {
     fn from(ui: UserInstructions) -> Self {
         ResponseItem::Message {
+            encrypted_content: None,
+            status: None,
             id: None,
             role: "user".to_string(),
             content: vec![ContentItem::InputText {
@@ -65,6 +67,8 @@ impl SkillInstructions {
 impl From<SkillInstructions> for ResponseItem {
     fn from(si: SkillInstructions) -> Self {
         ResponseItem::Message {
+            encrypted_content: None,
+            status: None,
             id: None,
             role: "user".to_string(),
             content: vec![ContentItem::InputText {

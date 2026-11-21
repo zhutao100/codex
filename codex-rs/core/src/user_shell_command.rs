@@ -57,6 +57,8 @@ pub fn user_shell_command_record_item(
     turn_context: &TurnContext,
 ) -> ResponseItem {
     ResponseItem::Message {
+        encrypted_content: None,
+        status: None,
         id: None,
         role: "user".to_string(),
         content: vec![ContentItem::InputText {

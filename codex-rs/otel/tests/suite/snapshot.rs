@@ -14,6 +14,105 @@ use pretty_assertions::assert_eq;
 use std::collections::BTreeMap;
 
 #[test]
+fn completed_responses_record_bounded_replay_reports() -> Result<()> {
+    use codex_api::sse::responses::process_responses_event;
+    use serde_json::json;
+
+    let metrics = MetricsClient::new(
+        MetricsConfig::in_memory(
+            "test",
+            "codex-cli",
+            codex_otel::CODEX_VERSION,
+            InMemoryMetricExporter::default(),
+        )
+        .with_runtime_reader(),
+    )?;
+    let manager = OtelManager::new(
+        ThreadId::new(),
+        "m",
+        "m",
+        None,
+        None,
+        None,
+        false,
+        "test".into(),
+        SessionSource::Cli,
+    )
+    .with_metrics(metrics.clone());
+    for report in [
+        None,
+        Some(json!(null)),
+        Some(json!("malformed")),
+        Some(json!([])),
+        Some(json!([
+            {"type":"reasoning","action":"removed","reason":"prefix_mismatch"},
+            {"type":"reasoning","action":"removed","reason":"unknown"},
+            {"type":"reasoning","action":"removed"},
+            {"type":"message","action":"removed","reason":"prefix_mismatch"},
+            {"type":"reasoning","action":"changed","reason":"prefix_mismatch"}
+        ])),
+        Some(json!([{"type":"reasoning","action":"removed","reason":"turn_boundary"}])),
+    ] {
+        let mut response = json!({"id":"r"});
+        if let Some(report) = report {
+            response["input_transformations"] = report;
+        }
+        let wire = serde_json::from_value(json!({"type":"response.completed","response":response}))
+            .unwrap();
+        let event = process_responses_event(wire).unwrap().unwrap();
+        manager.record_responses(&tracing::Span::none(), &event);
+    }
+    let snapshot = metrics.snapshot()?;
+    let counter = find_metric(&snapshot, "codex.responses.reasoning_replay").unwrap();
+    let AggregatedMetrics::U64(MetricData::Sum(sum)) = counter.data() else {
+        panic!("expected a counter")
+    };
+    let reports = sum
+        .data_points()
+        .map(|p| {
+            (
+                attributes_to_map(p.attributes())["report"].clone(),
+                p.value(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        reports,
+        BTreeMap::from([
+            ("unavailable".into(), 3),
+            ("no_removals_reported".into(), 1),
+            ("prefix_mismatch_reported".into(), 1),
+            ("removals_reported".into(), 1),
+        ])
+    );
+    let histogram = find_metric(&snapshot, "codex.responses.reasoning_items_removed").unwrap();
+    let AggregatedMetrics::F64(MetricData::Histogram(hist)) = histogram.data() else {
+        panic!("expected a histogram")
+    };
+    let removed = hist
+        .data_points()
+        .map(|p| {
+            (
+                attributes_to_map(p.attributes())["reason"].clone(),
+                (p.count(), p.sum()),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        removed,
+        BTreeMap::from([
+            ("prefix_mismatch".into(), (3, 1.)),
+            ("other".into(), (3, 2.)),
+            ("turn_boundary".into(), (3, 1.)),
+            ("model_mismatch".into(), (3, 0.)),
+            ("organization_mismatch".into(), (3, 0.)),
+            ("end_user_mismatch".into(), (3, 0.)),
+        ])
+    );
+    Ok(())
+}
+
+#[test]
 fn snapshot_collects_metrics_without_shutdown() -> Result<()> {
     let exporter = InMemoryMetricExporter::default();
     let config = MetricsConfig::in_memory(

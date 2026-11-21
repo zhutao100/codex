@@ -421,6 +421,8 @@ async fn reviewer_transcript_omits_completion_state_without_losing_parent_handof
         (
             "assistant",
             vec![ContentItem::OutputText {
+                annotations: None,
+                logprobs: None,
                 text: evaluation.to_string(),
             }],
         ),

@@ -709,6 +709,8 @@ impl Session {
                 .await;
 
                 let marker = ResponseItem::Message {
+                    encrypted_content: None,
+                    status: None,
                     id: None,
                     role: "user".to_string(),
                     content: vec![ContentItem::InputText {

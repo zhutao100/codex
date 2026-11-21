@@ -209,6 +209,9 @@
             "memory_tool": {
               "type": "boolean"
             },
+            "output_token_replay": {
+              "type": "boolean"
+            },
             "personality": {
               "type": "boolean"
             },
@@ -1841,6 +1844,9 @@
           "type": "boolean"
         },
         "memory_tool": {
+          "type": "boolean"
+        },
+        "output_token_replay": {
           "type": "boolean"
         },
         "personality": {

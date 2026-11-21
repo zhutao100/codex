@@ -20,7 +20,7 @@ pub(super) const RETAINED_MESSAGE_TOKEN_BUDGET: usize = 64_000;
 
 fn content_tokens(item: &ContentItem) -> usize {
     match item {
-        ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+        ContentItem::InputText { text } | ContentItem::OutputText { text, .. } => {
             approx_token_count(text)
         }
         ContentItem::InputImage { .. } => estimate_image_token_count(),
@@ -74,10 +74,23 @@ pub(super) fn retain_messages(input: &[ResponseItem], budget: usize) -> Vec<Resp
 }
 
 fn truncate_message(mut item: ResponseItem, budget: usize) -> Option<ResponseItem> {
+    // This is a newly constructed, shortened message, not the sampled output.
+    item.clear_output_ciphertext();
     let ResponseItem::Message { content, .. } = &mut item else {
         return None;
     };
-    let original = std::mem::take(content);
+    let mut original = std::mem::take(content);
+    for part in &mut original {
+        if let ContentItem::OutputText {
+            annotations,
+            logprobs,
+            ..
+        } = part
+        {
+            *annotations = None;
+            *logprobs = None;
+        }
+    }
     let overhead = retained_tokens(&item);
     let mut content_budget = budget.saturating_sub(overhead);
     loop {
@@ -155,7 +168,7 @@ fn truncate_content(mut content: Vec<ContentItem>, budget: usize) -> Vec<Content
 
 fn truncate_text_item(item: &mut ContentItem, remaining: &mut usize) -> bool {
     match item {
-        ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+        ContentItem::InputText { text } | ContentItem::OutputText { text, .. } => {
             if *remaining == 0 {
                 return false;
             }

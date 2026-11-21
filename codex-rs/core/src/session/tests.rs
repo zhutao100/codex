@@ -66,6 +66,8 @@ struct InstructionsTestCase {
 
 fn user_message(text: &str) -> ResponseItem {
     ResponseItem::Message {
+        encrypted_content: None,
+        status: None,
         id: None,
         role: "user".to_string(),
         content: vec![ContentItem::InputText {
@@ -78,9 +80,13 @@ fn user_message(text: &str) -> ResponseItem {
 
 fn assistant_message(text: &str) -> ResponseItem {
     ResponseItem::Message {
+        encrypted_content: None,
+        status: None,
         id: None,
         role: "assistant".to_string(),
         content: vec![ContentItem::OutputText {
+            annotations: None,
+            logprobs: None,
             text: text.to_string(),
         }],
         end_turn: None,
@@ -312,6 +318,8 @@ async fn usage_boundary_replays_unreported_output(context_record: bool, explicit
 
 fn review_rollout_user_message(text: &str) -> ResponseItem {
     ResponseItem::Message {
+        encrypted_content: None,
+        status: None,
         id: Some("review_rollout_user".to_string()),
         role: "user".to_string(),
         content: vec![ContentItem::InputText {
@@ -571,9 +579,13 @@ async fn rollout_reconstruction_review_output_does_not_commit_previous_settings(
     let context_items = session.build_initial_context(&turn_context).await;
     let review_user = review_rollout_user_message("User initiated a review task.\nreview result");
     let review_assistant = ResponseItem::Message {
+        encrypted_content: None,
+        status: None,
         id: Some("review_rollout_assistant".to_string()),
         role: "assistant".to_string(),
         content: vec![ContentItem::OutputText {
+            annotations: None,
+            logprobs: None,
             text: "review result".to_string(),
         }],
         end_turn: None,
@@ -1089,6 +1101,8 @@ fn trims_dangling_tool_call_before_continuation() {
         user_message("run a tool"),
         assistant_message("I will check."),
         ResponseItem::FunctionCall {
+            encrypted_content: None,
+            status: None,
             id: None,
             name: "shell".to_string(),
             arguments: "{}".to_string(),
@@ -1472,6 +1486,8 @@ async fn thread_rollback_drops_last_turn_from_history() {
 
     let turn_1 = vec![
         ResponseItem::Message {
+            encrypted_content: None,
+            status: None,
             id: None,
             role: "user".to_string(),
             content: vec![ContentItem::InputText {
@@ -1481,9 +1497,13 @@ async fn thread_rollback_drops_last_turn_from_history() {
             phase: None,
         },
         ResponseItem::Message {
+            encrypted_content: None,
+            status: None,
             id: None,
             role: "assistant".to_string(),
             content: vec![ContentItem::OutputText {
+                annotations: None,
+                logprobs: None,
                 text: "turn 1 assistant".to_string(),
             }],
             end_turn: None,
@@ -1494,6 +1514,8 @@ async fn thread_rollback_drops_last_turn_from_history() {
 
     let turn_2 = vec![
         ResponseItem::Message {
+            encrypted_content: None,
+            status: None,
             id: None,
             role: "user".to_string(),
             content: vec![ContentItem::InputText {
@@ -1503,9 +1525,13 @@ async fn thread_rollback_drops_last_turn_from_history() {
             phase: None,
         },
         ResponseItem::Message {
+            encrypted_content: None,
+            status: None,
             id: None,
             role: "assistant".to_string(),
             content: vec![ContentItem::OutputText {
+                annotations: None,
+                logprobs: None,
                 text: "turn 2 assistant".to_string(),
             }],
             end_turn: None,
@@ -1566,6 +1592,8 @@ async fn thread_rollback_clears_history_when_num_turns_exceeds_existing_turns() 
         .await;
 
     let turn_1 = vec![ResponseItem::Message {
+        encrypted_content: None,
+        status: None,
         id: None,
         role: "user".to_string(),
         content: vec![ContentItem::InputText {
@@ -2081,6 +2109,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
             config.features.enabled(Feature::EnableRequestCompression),
             config.features.enabled(Feature::RuntimeMetrics),
             Session::build_model_client_beta_features_header(config.as_ref()),
+            /*output_token_replay_enabled*/ false,
         ),
     };
 
@@ -2224,6 +2253,7 @@ pub(crate) async fn make_session_and_context_with_rx() -> (
             config.features.enabled(Feature::EnableRequestCompression),
             config.features.enabled(Feature::RuntimeMetrics),
             Session::build_model_client_beta_features_header(config.as_ref()),
+            /*output_token_replay_enabled*/ false,
         ),
     };
 
@@ -2850,6 +2880,8 @@ async fn task_finish_persists_leftover_pending_input() {
 
     let history = sess.clone_history().await;
     let expected = ResponseItem::Message {
+        encrypted_content: None,
+        status: None,
         id: None,
         role: "user".to_string(),
         content: vec![ContentItem::InputText {
@@ -3053,6 +3085,7 @@ async fn fatal_tool_error_stops_turn_and_reports_error() {
         turn_context.dynamic_tools.as_slice(),
     );
     let item = ResponseItem::CustomToolCall {
+        encrypted_content: None,
         id: None,
         status: None,
         call_id: "call-1".to_string(),
@@ -3097,6 +3130,8 @@ async fn sample_rollout(
     live_history.record_items(initial_context.iter(), turn_context.truncation_policy);
 
     let user1 = ResponseItem::Message {
+        encrypted_content: None,
+        status: None,
         id: None,
         role: "user".to_string(),
         content: vec![ContentItem::InputText {
@@ -3109,9 +3144,13 @@ async fn sample_rollout(
     rollout_items.push(RolloutItem::ResponseItem(user1.clone()));
 
     let assistant1 = ResponseItem::Message {
+        encrypted_content: None,
+        status: None,
         id: None,
         role: "assistant".to_string(),
         content: vec![ContentItem::OutputText {
+            annotations: None,
+            logprobs: None,
             text: "assistant reply one".to_string(),
         }],
         end_turn: None,
@@ -3131,6 +3170,8 @@ async fn sample_rollout(
     }));
 
     let user2 = ResponseItem::Message {
+        encrypted_content: None,
+        status: None,
         id: None,
         role: "user".to_string(),
         content: vec![ContentItem::InputText {
@@ -3143,9 +3184,13 @@ async fn sample_rollout(
     rollout_items.push(RolloutItem::ResponseItem(user2.clone()));
 
     let assistant2 = ResponseItem::Message {
+        encrypted_content: None,
+        status: None,
         id: None,
         role: "assistant".to_string(),
         content: vec![ContentItem::OutputText {
+            annotations: None,
+            logprobs: None,
             text: "assistant reply two".to_string(),
         }],
         end_turn: None,
@@ -3165,6 +3210,8 @@ async fn sample_rollout(
     }));
 
     let user3 = ResponseItem::Message {
+        encrypted_content: None,
+        status: None,
         id: None,
         role: "user".to_string(),
         content: vec![ContentItem::InputText {
@@ -3177,9 +3224,13 @@ async fn sample_rollout(
     rollout_items.push(RolloutItem::ResponseItem(user3));
 
     let assistant3 = ResponseItem::Message {
+        encrypted_content: None,
+        status: None,
         id: None,
         role: "assistant".to_string(),
         content: vec![ContentItem::OutputText {
+            annotations: None,
+            logprobs: None,
             text: "assistant reply three".to_string(),
         }],
         end_turn: None,

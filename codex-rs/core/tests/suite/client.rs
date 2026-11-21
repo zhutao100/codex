@@ -189,6 +189,8 @@ async fn resume_includes_initial_messages_and_sends_prior_items() {
 
     // Prior item: user message (should be delivered)
     let prior_user = codex_protocol::models::ResponseItem::Message {
+        encrypted_content: None,
+        status: None,
         id: None,
         role: "user".to_string(),
         content: vec![codex_protocol::models::ContentItem::InputText {
@@ -211,9 +213,13 @@ async fn resume_includes_initial_messages_and_sends_prior_items() {
 
     // Prior item: system message (excluded from API history)
     let prior_system = codex_protocol::models::ResponseItem::Message {
+        encrypted_content: None,
+        status: None,
         id: None,
         role: "system".to_string(),
         content: vec![codex_protocol::models::ContentItem::OutputText {
+            annotations: None,
+            logprobs: None,
             text: "resumed system instruction".to_string(),
         }],
         end_turn: None,
@@ -233,9 +239,13 @@ async fn resume_includes_initial_messages_and_sends_prior_items() {
 
     // Prior item: assistant message
     let prior_item = codex_protocol::models::ResponseItem::Message {
+        encrypted_content: None,
+        status: None,
         id: None,
         role: "assistant".to_string(),
         content: vec![codex_protocol::models::ContentItem::OutputText {
+            annotations: None,
+            logprobs: None,
             text: "resumed assistant message".to_string(),
         }],
         end_turn: None,
@@ -1277,6 +1287,7 @@ async fn azure_responses_request_includes_store_and_reasoning_ids() {
         false,
         false,
         None,
+        /*output_token_replay_enabled*/ false,
     );
     let mut client_session = client.new_session();
 
@@ -1292,15 +1303,20 @@ async fn azure_responses_request_includes_store_and_reasoning_ids() {
         encrypted_content: None,
     });
     prompt.input.push(ResponseItem::Message {
+        encrypted_content: None,
+        status: None,
         id: Some("message-id".into()),
         role: "assistant".into(),
         content: vec![ContentItem::OutputText {
+            annotations: None,
+            logprobs: None,
             text: "message".into(),
         }],
         end_turn: None,
         phase: None,
     });
     prompt.input.push(ResponseItem::WebSearchCall {
+        encrypted_content: None,
         id: Some("web-search-id".into()),
         status: Some("completed".into()),
         action: Some(WebSearchAction::Search {
@@ -1309,6 +1325,8 @@ async fn azure_responses_request_includes_store_and_reasoning_ids() {
         }),
     });
     prompt.input.push(ResponseItem::FunctionCall {
+        encrypted_content: None,
+        status: None,
         id: Some("function-id".into()),
         name: "do_thing".into(),
         arguments: "{}".into(),
@@ -1319,6 +1337,7 @@ async fn azure_responses_request_includes_store_and_reasoning_ids() {
         output: FunctionCallOutputPayload::from_text("ok".into()),
     });
     prompt.input.push(ResponseItem::LocalShellCall {
+        encrypted_content: None,
         id: Some("local-shell-id".into()),
         call_id: Some("local-shell-call-id".into()),
         status: LocalShellStatus::Completed,
@@ -1331,6 +1350,7 @@ async fn azure_responses_request_includes_store_and_reasoning_ids() {
         }),
     });
     prompt.input.push(ResponseItem::CustomToolCall {
+        encrypted_content: None,
         id: Some("custom-tool-id".into()),
         status: Some("completed".into()),
         call_id: "custom-tool-call-id".into(),

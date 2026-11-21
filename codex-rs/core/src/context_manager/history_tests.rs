@@ -20,11 +20,34 @@ use regex_lite::Regex;
 const EXEC_FORMAT_MAX_BYTES: usize = 10_000;
 const EXEC_FORMAT_MAX_TOKENS: usize = 2_500;
 
+#[test]
+fn sampled_output_replay_does_not_double_count_model_tokens() {
+    let opaque = "x".repeat(32_000);
+    for plain in [
+        serde_json::json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer"}]}),
+        serde_json::json!({"type":"function_call","name":"lookup","arguments":"{}","call_id":"c"}),
+        serde_json::json!({"type":"custom_tool_call","name":"patch","input":"change","call_id":"p"}),
+        serde_json::json!({"type":"web_search_call","action":{"type":"search","query":"query"}}),
+    ] {
+        let mut with_replay = plain.clone();
+        with_replay["encrypted_content"] = serde_json::json!(opaque);
+        if plain["type"] == "message" {
+            with_replay["content"][0]["logprobs"] = serde_json::json!([opaque]);
+        }
+        let estimate = |wire| estimate_item_token_count(&serde_json::from_value(wire).unwrap());
+        assert_eq!(estimate(plain), estimate(with_replay));
+    }
+}
+
 fn assistant_msg(text: &str) -> ResponseItem {
     ResponseItem::Message {
+        encrypted_content: None,
+        status: None,
         id: None,
         role: "assistant".to_string(),
         content: vec![ContentItem::OutputText {
+            annotations: None,
+            logprobs: None,
             text: text.to_string(),
         }],
         end_turn: None,
@@ -43,9 +66,13 @@ fn create_history_with_items(items: Vec<ResponseItem>) -> ContextManager {
 
 fn user_msg(text: &str) -> ResponseItem {
     ResponseItem::Message {
+        encrypted_content: None,
+        status: None,
         id: None,
         role: "user".to_string(),
         content: vec![ContentItem::OutputText {
+            annotations: None,
+            logprobs: None,
             text: text.to_string(),
         }],
         end_turn: None,
@@ -55,6 +82,8 @@ fn user_msg(text: &str) -> ResponseItem {
 
 fn user_input_text_msg(text: &str) -> ResponseItem {
     ResponseItem::Message {
+        encrypted_content: None,
+        status: None,
         id: None,
         role: "user".to_string(),
         content: vec![ContentItem::InputText {
@@ -124,9 +153,13 @@ fn filters_non_api_messages() {
     let policy = TruncationPolicy::Tokens(10_000);
     // System message is not API messages; Other is ignored.
     let system = ResponseItem::Message {
+        encrypted_content: None,
+        status: None,
         id: None,
         role: "system".to_string(),
         content: vec![ContentItem::OutputText {
+            annotations: None,
+            logprobs: None,
             text: "ignored".to_string(),
         }],
         end_turn: None,
@@ -155,18 +188,26 @@ fn filters_non_api_messages() {
                 encrypted_content: None,
             },
             ResponseItem::Message {
+                encrypted_content: None,
+                status: None,
                 id: None,
                 role: "user".to_string(),
                 content: vec![ContentItem::OutputText {
+                    annotations: None,
+                    logprobs: None,
                     text: "hi".to_string()
                 }],
                 end_turn: None,
                 phase: None,
             },
             ResponseItem::Message {
+                encrypted_content: None,
+                status: None,
                 id: None,
                 role: "assistant".to_string(),
                 content: vec![ContentItem::OutputText {
+                    annotations: None,
+                    logprobs: None,
                     text: "hello".to_string()
                 }],
                 end_turn: None,
@@ -302,6 +343,8 @@ fn continuation_cleanup_preserves_usage_boundary_before_unreported_reasoning() {
     );
     let reasoning = reasoning_with_encrypted_content(2_000);
     let dangling = ResponseItem::FunctionCall {
+        encrypted_content: None,
+        status: None,
         id: None,
         name: "tool".into(),
         arguments: "{}".into(),
@@ -333,6 +376,8 @@ fn get_history_for_prompt_drops_ghost_commits() {
 #[test]
 fn for_prompt_strips_images_for_text_only_models() {
     let user_with_image = ResponseItem::Message {
+        encrypted_content: None,
+        status: None,
         id: None,
         role: "user".to_string(),
         content: vec![
@@ -347,6 +392,8 @@ fn for_prompt_strips_images_for_text_only_models() {
         phase: None,
     };
     let call = ResponseItem::FunctionCall {
+        encrypted_content: None,
+        status: None,
         id: None,
         name: "view_image".to_string(),
         arguments: "{}".to_string(),
@@ -374,6 +421,8 @@ fn for_prompt_strips_images_for_text_only_models() {
         filtered,
         vec![
             ResponseItem::Message {
+                encrypted_content: None,
+                status: None,
                 id: None,
                 role: "user".to_string(),
                 content: vec![
@@ -388,6 +437,8 @@ fn for_prompt_strips_images_for_text_only_models() {
                 phase: None,
             },
             ResponseItem::FunctionCall {
+                encrypted_content: None,
+                status: None,
                 id: None,
                 name: "view_image".to_string(),
                 arguments: "{}".to_string(),
@@ -415,6 +466,8 @@ fn for_prompt_strips_images_for_text_only_models() {
 fn image_data_url_payload_is_discounted_in_token_estimates() {
     let payload = "a".repeat(40_000);
     let image_item = ResponseItem::Message {
+        encrypted_content: None,
+        status: None,
         id: None,
         role: "user".to_string(),
         content: vec![ContentItem::InputImage {
@@ -424,6 +477,8 @@ fn image_data_url_payload_is_discounted_in_token_estimates() {
         phase: None,
     };
     let text_item = ResponseItem::Message {
+        encrypted_content: None,
+        status: None,
         id: None,
         role: "user".to_string(),
         content: vec![ContentItem::InputText { text: payload }],
@@ -460,6 +515,8 @@ fn estimate_token_count_with_base_instructions_uses_provided_text() {
 fn remove_first_item_removes_matching_output_for_function_call() {
     let items = vec![
         ResponseItem::FunctionCall {
+            encrypted_content: None,
+            status: None,
             id: None,
             name: "do_it".to_string(),
             arguments: "{}".to_string(),
@@ -484,6 +541,8 @@ fn remove_first_item_removes_matching_call_for_output() {
             output: FunctionCallOutputPayload::from_text("ok".to_string()),
         },
         ResponseItem::FunctionCall {
+            encrypted_content: None,
+            status: None,
             id: None,
             name: "do_it".to_string(),
             arguments: "{}".to_string(),
@@ -501,6 +560,8 @@ fn remove_last_item_removes_matching_call_for_output() {
     let items = vec![
         user_msg("before tool call"),
         ResponseItem::FunctionCall {
+            encrypted_content: None,
+            status: None,
             id: None,
             name: "do_it".to_string(),
             arguments: "{}".to_string(),
@@ -627,6 +688,8 @@ fn replace_last_turn_images_stops_at_real_user_boundary() {
 #[test]
 fn replace_last_turn_images_does_not_touch_user_images() {
     let items = vec![ResponseItem::Message {
+        encrypted_content: None,
+        status: None,
         id: None,
         role: "user".to_string(),
         content: vec![ContentItem::InputImage {
@@ -645,6 +708,7 @@ fn replace_last_turn_images_does_not_touch_user_images() {
 fn remove_first_item_handles_local_shell_pair() {
     let items = vec![
         ResponseItem::LocalShellCall {
+            encrypted_content: None,
             id: None,
             call_id: Some("call-3".to_string()),
             status: LocalShellStatus::Completed,
@@ -707,6 +771,8 @@ fn drop_last_n_user_turns_trims_context_updates_before_rolled_back_turn() {
     let environment_update =
         user_input_text_msg("<environment_context>new cwd</environment_context>");
     let permissions_update = ResponseItem::Message {
+        encrypted_content: None,
+        status: None,
         id: None,
         role: "developer".to_string(),
         content: vec![ContentItem::InputText {
@@ -843,6 +909,7 @@ fn drop_last_n_user_turns_skips_preserved_work_notes() {
 fn remove_first_item_handles_custom_tool_pair() {
     let items = vec![
         ResponseItem::CustomToolCall {
+            encrypted_content: None,
             id: None,
             status: None,
             call_id: "tool-1".to_string(),
@@ -864,6 +931,7 @@ fn remove_first_item_handles_custom_tool_pair() {
 fn normalization_retains_local_shell_outputs() {
     let items = vec![
         ResponseItem::LocalShellCall {
+            encrypted_content: None,
             id: None,
             call_id: Some("shell-1".to_string()),
             status: LocalShellStatus::Completed,
@@ -1080,6 +1148,8 @@ fn format_exec_output_prefers_line_marker_when_both_limits_exceeded() {
 #[test]
 fn normalize_adds_missing_output_for_function_call() {
     let items = vec![ResponseItem::FunctionCall {
+        encrypted_content: None,
+        status: None,
         id: None,
         name: "do_it".to_string(),
         arguments: "{}".to_string(),
@@ -1094,6 +1164,8 @@ fn normalize_adds_missing_output_for_function_call() {
         h.raw_items(),
         vec![
             ResponseItem::FunctionCall {
+                encrypted_content: None,
+                status: None,
                 id: None,
                 name: "do_it".to_string(),
                 arguments: "{}".to_string(),
@@ -1111,6 +1183,7 @@ fn normalize_adds_missing_output_for_function_call() {
 #[test]
 fn normalize_adds_missing_output_for_custom_tool_call() {
     let items = vec![ResponseItem::CustomToolCall {
+        encrypted_content: None,
         id: None,
         status: None,
         call_id: "tool-x".to_string(),
@@ -1125,6 +1198,7 @@ fn normalize_adds_missing_output_for_custom_tool_call() {
         h.raw_items(),
         vec![
             ResponseItem::CustomToolCall {
+                encrypted_content: None,
                 id: None,
                 status: None,
                 call_id: "tool-x".to_string(),
@@ -1143,6 +1217,7 @@ fn normalize_adds_missing_output_for_custom_tool_call() {
 #[test]
 fn normalize_adds_missing_output_for_local_shell_call_with_id() {
     let items = vec![ResponseItem::LocalShellCall {
+        encrypted_content: None,
         id: None,
         call_id: Some("shell-1".to_string()),
         status: LocalShellStatus::Completed,
@@ -1162,6 +1237,7 @@ fn normalize_adds_missing_output_for_local_shell_call_with_id() {
         h.raw_items(),
         vec![
             ResponseItem::LocalShellCall {
+                encrypted_content: None,
                 id: None,
                 call_id: Some("shell-1".to_string()),
                 status: LocalShellStatus::Completed,
@@ -1215,6 +1291,8 @@ fn normalize_mixed_inserts_and_removals() {
     let items = vec![
         // Will get an inserted output
         ResponseItem::FunctionCall {
+            encrypted_content: None,
+            status: None,
             id: None,
             name: "f1".to_string(),
             arguments: "{}".to_string(),
@@ -1227,6 +1305,7 @@ fn normalize_mixed_inserts_and_removals() {
         },
         // Will get an inserted custom tool output
         ResponseItem::CustomToolCall {
+            encrypted_content: None,
             id: None,
             status: None,
             call_id: "t1".to_string(),
@@ -1235,6 +1314,7 @@ fn normalize_mixed_inserts_and_removals() {
         },
         // Local shell call also gets an inserted function call output
         ResponseItem::LocalShellCall {
+            encrypted_content: None,
             id: None,
             call_id: Some("s1".to_string()),
             status: LocalShellStatus::Completed,
@@ -1255,6 +1335,8 @@ fn normalize_mixed_inserts_and_removals() {
         h.raw_items(),
         vec![
             ResponseItem::FunctionCall {
+                encrypted_content: None,
+                status: None,
                 id: None,
                 name: "f1".to_string(),
                 arguments: "{}".to_string(),
@@ -1265,6 +1347,7 @@ fn normalize_mixed_inserts_and_removals() {
                 output: FunctionCallOutputPayload::from_text("aborted".to_string()),
             },
             ResponseItem::CustomToolCall {
+                encrypted_content: None,
                 id: None,
                 status: None,
                 call_id: "t1".to_string(),
@@ -1276,6 +1359,7 @@ fn normalize_mixed_inserts_and_removals() {
                 output: "aborted".to_string(),
             },
             ResponseItem::LocalShellCall {
+                encrypted_content: None,
                 id: None,
                 call_id: Some("s1".to_string()),
                 status: LocalShellStatus::Completed,
@@ -1298,6 +1382,8 @@ fn normalize_mixed_inserts_and_removals() {
 #[test]
 fn normalize_adds_missing_output_for_function_call_inserts_output() {
     let items = vec![ResponseItem::FunctionCall {
+        encrypted_content: None,
+        status: None,
         id: None,
         name: "do_it".to_string(),
         arguments: "{}".to_string(),
@@ -1309,6 +1395,8 @@ fn normalize_adds_missing_output_for_function_call_inserts_output() {
         h.raw_items(),
         vec![
             ResponseItem::FunctionCall {
+                encrypted_content: None,
+                status: None,
                 id: None,
                 name: "do_it".to_string(),
                 arguments: "{}".to_string(),
@@ -1327,6 +1415,7 @@ fn normalize_adds_missing_output_for_function_call_inserts_output() {
 #[should_panic]
 fn normalize_adds_missing_output_for_custom_tool_call_panics_in_debug() {
     let items = vec![ResponseItem::CustomToolCall {
+        encrypted_content: None,
         id: None,
         status: None,
         call_id: "tool-x".to_string(),
@@ -1342,6 +1431,7 @@ fn normalize_adds_missing_output_for_custom_tool_call_panics_in_debug() {
 #[should_panic]
 fn normalize_adds_missing_output_for_local_shell_call_with_id_panics_in_debug() {
     let items = vec![ResponseItem::LocalShellCall {
+        encrypted_content: None,
         id: None,
         call_id: Some("shell-1".to_string()),
         status: LocalShellStatus::Completed,
@@ -1387,6 +1477,8 @@ fn normalize_removes_orphan_custom_tool_call_output_panics_in_debug() {
 fn normalize_mixed_inserts_and_removals_panics_in_debug() {
     let items = vec![
         ResponseItem::FunctionCall {
+            encrypted_content: None,
+            status: None,
             id: None,
             name: "f1".to_string(),
             arguments: "{}".to_string(),
@@ -1397,6 +1489,7 @@ fn normalize_mixed_inserts_and_removals_panics_in_debug() {
             output: FunctionCallOutputPayload::from_text("ok".to_string()),
         },
         ResponseItem::CustomToolCall {
+            encrypted_content: None,
             id: None,
             status: None,
             call_id: "t1".to_string(),
@@ -1404,6 +1497,7 @@ fn normalize_mixed_inserts_and_removals_panics_in_debug() {
             input: "{}".to_string(),
         },
         ResponseItem::LocalShellCall {
+            encrypted_content: None,
             id: None,
             call_id: Some("s1".to_string()),
             status: LocalShellStatus::Completed,

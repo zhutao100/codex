@@ -98,11 +98,14 @@ async fn responses_stream_includes_subagent_header_on_review() {
         false,
         false,
         None,
+        /*output_token_replay_enabled*/ false,
     );
     let mut client_session = client.new_session();
 
     let mut prompt = Prompt::default();
     prompt.input = vec![ResponseItem::Message {
+        encrypted_content: None,
+        status: None,
         id: None,
         role: "user".into(),
         content: vec![ContentItem::InputText {
@@ -209,11 +212,14 @@ async fn responses_stream_includes_subagent_header_on_other() {
         false,
         false,
         None,
+        /*output_token_replay_enabled*/ false,
     );
     let mut client_session = client.new_session();
 
     let mut prompt = Prompt::default();
     prompt.input = vec![ResponseItem::Message {
+        encrypted_content: None,
+        status: None,
         id: None,
         role: "user".into(),
         content: vec![ContentItem::InputText {
@@ -319,11 +325,14 @@ async fn responses_respects_model_info_overrides_from_config() {
         false,
         false,
         None,
+        /*output_token_replay_enabled*/ false,
     );
     let mut client_session = client.new_session();
 
     let mut prompt = Prompt::default();
     prompt.input = vec![ResponseItem::Message {
+        encrypted_content: None,
+        status: None,
         id: None,
         role: "user".into(),
         content: vec![ContentItem::InputText {
@@ -436,11 +445,14 @@ async fn provider_local_bearer_401_does_not_run_chatgpt_recovery() {
         false,
         false,
         None,
+        /*output_token_replay_enabled*/ false,
     );
     let mut client_session = client.new_session();
 
     let mut prompt = Prompt::default();
     prompt.input = vec![ResponseItem::Message {
+        encrypted_content: None,
+        status: None,
         id: None,
         role: "user".into(),
         content: vec![ContentItem::InputText {

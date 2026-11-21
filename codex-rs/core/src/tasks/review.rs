@@ -337,6 +337,8 @@ pub(crate) async fn exit_review_mode(
         .record_conversation_items(
             &ctx,
             &[ResponseItem::Message {
+                encrypted_content: None,
+                status: None,
                 id: Some(REVIEW_USER_MESSAGE_ID.to_string()),
                 role: "user".to_string(),
                 content: vec![ContentItem::InputText { text: user_message }],
@@ -358,9 +360,13 @@ pub(crate) async fn exit_review_mode(
         .record_response_item_and_emit_turn_item(
             ctx.as_ref(),
             ResponseItem::Message {
+                encrypted_content: None,
+                status: None,
                 id: Some(REVIEW_ASSISTANT_MESSAGE_ID.to_string()),
                 role: "assistant".to_string(),
                 content: vec![ContentItem::OutputText {
+                    annotations: None,
+                    logprobs: None,
                     text: assistant_message,
                 }],
                 end_turn: None,

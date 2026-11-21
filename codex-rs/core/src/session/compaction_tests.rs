@@ -19,15 +19,21 @@ async fn compaction_notes_preserve_multipart_text_and_source_model_after_replay(
     };
     *content = vec![
         ContentItem::OutputText {
+            annotations: None,
+            logprobs: None,
             text: "<AUTO_COMPACT_WORK_".into(),
         },
         ContentItem::InputText {
             text: "not assistant output".into(),
         },
         ContentItem::OutputText {
+            annotations: None,
+            logprobs: None,
             text: "NOTES>\n`let val".into(),
         },
         ContentItem::OutputText {
+            annotations: None,
+            logprobs: None,
             text: "ue = 1;`\n<proposed_plan>literal notes</proposed_plan>".into(),
         },
     ];
@@ -94,6 +100,8 @@ fn compaction_notes_accept_only_matching_rejected_capture_outputs() {
     for (call, output) in [
         (
             ResponseItem::FunctionCall {
+                encrypted_content: None,
+                status: None,
                 id: None,
                 call_id: "capture".into(),
                 name: "update_plan".into(),
@@ -109,6 +117,8 @@ fn compaction_notes_accept_only_matching_rejected_capture_outputs() {
         ),
         (
             ResponseItem::FunctionCall {
+                encrypted_content: None,
+                status: None,
                 id: None,
                 call_id: "capture".into(),
                 name: "mcp__server__tool".into(),
@@ -122,6 +132,7 @@ fn compaction_notes_accept_only_matching_rejected_capture_outputs() {
         ),
         (
             ResponseItem::CustomToolCall {
+                encrypted_content: None,
                 id: None,
                 call_id: "capture".into(),
                 name: "apply_patch".into(),
@@ -158,6 +169,8 @@ fn compaction_notes_accept_only_matching_rejected_capture_outputs() {
 #[tokio::test]
 async fn continuation_cleanup_preserves_notes_before_rejected_outputs_are_recorded() {
     let call = ResponseItem::FunctionCall {
+        encrypted_content: None,
+        status: None,
         id: None,
         call_id: "capture".into(),
         name: "update_plan".into(),
@@ -177,6 +190,8 @@ async fn continuation_cleanup_preserves_notes_before_rejected_outputs_are_record
             items.extend([
                 user_message("later task"),
                 ResponseItem::FunctionCall {
+                    encrypted_content: None,
+                    status: None,
                     id: None,
                     call_id: "actual-work".into(),
                     name: "shell".into(),
@@ -387,6 +402,8 @@ async fn encrypted_only_replay_retains_incomplete_tool_rounds_and_respects_rollb
         RolloutItem::TurnContext(context.to_turn_context_item()),
         RolloutItem::ResponseItem(assistant_message("intermediate")),
         RolloutItem::ResponseItem(ResponseItem::FunctionCall {
+            encrypted_content: None,
+            status: None,
             id: None,
             call_id: "pending".into(),
             name: "shell".into(),
@@ -476,6 +493,8 @@ async fn completed_work_notes_with_response_tail_remain_pending_work_after_resta
     for later_work in [
         assistant_message("unidentified later work"),
         ResponseItem::Message {
+            encrypted_content: None,
+            status: None,
             id: None,
             role: "assistant".into(),
             content: vec![ContentItem::InputImage {
@@ -485,6 +504,8 @@ async fn completed_work_notes_with_response_tail_remain_pending_work_after_resta
             phase: None,
         },
         ResponseItem::Message {
+            encrypted_content: None,
+            status: None,
             id: None,
             role: "assistant".into(),
             content: vec![ContentItem::InputText {
@@ -494,6 +515,8 @@ async fn completed_work_notes_with_response_tail_remain_pending_work_after_resta
             phase: None,
         },
         ResponseItem::FunctionCall {
+            encrypted_content: None,
+            status: None,
             id: None,
             call_id: "later-work".into(),
             name: "update_plan".into(),
@@ -637,6 +660,8 @@ async fn previous_model_compaction_reports_a_missing_provider() {
 fn canonical_context_anchors_on_images_then_summaries_then_encrypted_state() {
     let context: ResponseItem = DeveloperInstructions::new("canonical").into();
     let image = ResponseItem::Message {
+        encrypted_content: None,
+        status: None,
         id: None,
         role: "user".into(),
         content: vec![ContentItem::InputImage {
@@ -683,6 +708,8 @@ fn continuation_trims_dangling_work_after_encrypted_compaction_and_keeps_undo() 
     let mut history = vec![
         summary.clone(),
         ResponseItem::FunctionCall {
+            encrypted_content: None,
+            status: None,
             id: None,
             call_id: "unfinished".into(),
             name: "shell".into(),

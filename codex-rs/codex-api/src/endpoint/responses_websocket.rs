@@ -153,6 +153,7 @@ const X_MODELS_ETAG_HEADER: &str = "x-models-etag";
 const X_REASONING_INCLUDED_HEADER: &str = "x-reasoning-included";
 const OPENAI_MODEL_HEADER: &str = "openai-model";
 const WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE: &str = "websocket_connection_limit_reached";
+const PREVIOUS_RESPONSE_NOT_FOUND_CODE: &str = "previous_response_not_found";
 const WEBSOCKET_CONNECTION_LIMIT_REACHED_MESSAGE: &str = "Responses websocket connection limit reached (60 minutes). Create a new websocket connection to continue.";
 
 pub struct ResponsesWebsocketConnection {
@@ -444,13 +445,21 @@ fn map_wrapped_websocket_error_event(
 
     if let Some(error) = error.as_ref()
         && let Some(code) = error.code.as_deref()
-        && code == WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE
+        && let Some(fallback) = match code {
+            WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE => {
+                Some(WEBSOCKET_CONNECTION_LIMIT_REACHED_MESSAGE)
+            }
+            PREVIOUS_RESPONSE_NOT_FOUND_CODE => {
+                Some("Previous response was not found. Retrying the full request.")
+            }
+            _ => None,
+        }
     {
         return Some(ApiError::Retryable {
             message: error
                 .message
                 .clone()
-                .unwrap_or_else(|| WEBSOCKET_CONNECTION_LIMIT_REACHED_MESSAGE.to_string()),
+                .unwrap_or_else(|| fallback.to_string()),
             delay: None,
         });
     }
@@ -661,6 +670,8 @@ mod tests {
             instructions: "Use the available tools.".to_string(),
             previous_response_id: Some("resp-1".to_string()),
             input: vec![ResponseItem::Message {
+                encrypted_content: None,
+                status: None,
                 id: Some("msg-1".to_string()),
                 role: "user".to_string(),
                 content: vec![ContentItem::InputText {

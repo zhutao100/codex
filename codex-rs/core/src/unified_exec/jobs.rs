@@ -290,6 +290,8 @@ fn delivery(id: Uuid, outcome: Option<&JobOutcome>) -> ResponseItem {
         ),
     };
     ResponseItem::Message {
+        encrypted_content: None,
+        status: None,
         id: None,
         role: "developer".into(),
         content: vec![ContentItem::InputText { text }],
@@ -482,6 +484,8 @@ mod tests {
         session
             .record_into_history(
                 &[ResponseItem::FunctionCall {
+                    encrypted_content: None,
+                    status: None,
                     id: None,
                     name: "exec_command".into(),
                     arguments: "{}".into(),

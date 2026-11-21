@@ -74,7 +74,7 @@ fn content_to_markdown(content: &[ContentItem]) -> String {
 
     for item in content {
         match item {
-            ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+            ContentItem::InputText { text } | ContentItem::OutputText { text, .. } => {
                 if !text.trim().is_empty() {
                     parts.push(text.clone());
                 }
@@ -169,7 +169,7 @@ fn rollout_lines_to_export_messages(lines: &[RolloutLine]) -> Vec<ExportMessage>
         let mut items = Vec::new();
         for item in content {
             match item {
-                ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+                ContentItem::InputText { text } | ContentItem::OutputText { text, .. } => {
                     if !text.trim().is_empty() {
                         items.push(ExportContentItem::Text { text: text.clone() });
                     }
@@ -244,6 +244,8 @@ mod tests {
     fn export_skips_injected_user_messages() {
         let lines = vec![
             line(RolloutItem::ResponseItem(ResponseItem::Message {
+                encrypted_content: None,
+                status: None,
                 id: None,
                 role: "user".to_string(),
                 content: vec![ContentItem::InputText {
@@ -255,6 +257,8 @@ mod tests {
                 phase: None,
             })),
             line(RolloutItem::ResponseItem(ResponseItem::Message {
+                encrypted_content: None,
+                status: None,
                 id: None,
                 role: "user".to_string(),
                 content: vec![ContentItem::InputText {
@@ -264,9 +268,13 @@ mod tests {
                 phase: None,
             })),
             line(RolloutItem::ResponseItem(ResponseItem::Message {
+                encrypted_content: None,
+                status: None,
                 id: None,
                 role: "assistant".to_string(),
                 content: vec![ContentItem::OutputText {
+                    annotations: None,
+                    logprobs: None,
                     text: "Hi there".to_string(),
                 }],
                 end_turn: None,
@@ -285,6 +293,8 @@ mod tests {
     fn json_export_includes_only_user_and_assistant_messages() {
         let lines = vec![
             line(RolloutItem::ResponseItem(ResponseItem::Message {
+                encrypted_content: None,
+                status: None,
                 id: None,
                 role: "user".to_string(),
                 content: vec![ContentItem::InputText {
@@ -296,18 +306,26 @@ mod tests {
                 phase: None,
             })),
             line(RolloutItem::ResponseItem(ResponseItem::Message {
+                encrypted_content: None,
+                status: None,
                 id: None,
                 role: "assistant".to_string(),
                 content: vec![ContentItem::OutputText {
+                    annotations: None,
+                    logprobs: None,
                     text: "Hello".to_string(),
                 }],
                 end_turn: None,
                 phase: None,
             })),
             line(RolloutItem::ResponseItem(ResponseItem::Message {
+                encrypted_content: None,
+                status: None,
                 id: None,
                 role: "tool".to_string(),
                 content: vec![ContentItem::OutputText {
+                    annotations: None,
+                    logprobs: None,
                     text: "ignored".to_string(),
                 }],
                 end_turn: None,

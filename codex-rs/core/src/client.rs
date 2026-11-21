@@ -112,6 +112,7 @@ struct ModelClientState {
     enable_responses_websockets: bool,
     enable_request_compression: bool,
     include_timing_metrics: bool,
+    output_token_replay_enabled: bool,
     beta_features_header: Option<String>,
     disable_websockets: AtomicBool,
     cached_websocket_connection: StdMutex<Option<CachedWebsocketConnection>>,
@@ -132,6 +133,7 @@ struct ModelClientState {
 /// This type is cheap to clone.
 #[derive(Debug, Clone)]
 pub struct ModelClient {
+    restored_history: bool,
     state: Arc<ModelClientState>,
 }
 
@@ -153,6 +155,7 @@ pub struct ModelClientSession {
     provider: ModelProviderInfo,
     connection: Option<ApiWebSocketConnection>,
     connection_auth_mode: Option<Option<AuthMode>>,
+    continuation_reset_reason: Option<&'static str>,
     websocket_last_request: Option<ResponseCreateWsRequest>,
     websocket_last_response_rx: Option<oneshot::Receiver<LastResponse>>,
     /// Actual sampling tools, captured before opening the stream for inline compaction.
@@ -220,10 +223,12 @@ impl ModelClient {
         enable_request_compression: bool,
         include_timing_metrics: bool,
         beta_features_header: Option<String>,
+        output_token_replay_enabled: bool,
     ) -> Self {
         let enable_responses_websockets =
             enable_responses_websockets || enable_responses_websockets_v2;
         Self {
+            restored_history: false,
             state: Arc::new(ModelClientState {
                 auth_manager,
                 conversation_id,
@@ -233,11 +238,17 @@ impl ModelClient {
                 enable_responses_websockets,
                 enable_request_compression,
                 include_timing_metrics,
+                output_token_replay_enabled,
                 beta_features_header,
                 disable_websockets: AtomicBool::new(false),
                 cached_websocket_connection: StdMutex::new(None),
             }),
         }
+    }
+
+    pub(crate) fn with_restored_history(mut self, restored_history: bool) -> Self {
+        self.restored_history = restored_history;
+        self
     }
 
     /// Creates a fresh turn-scoped streaming session.
@@ -254,6 +265,7 @@ impl ModelClient {
             provider,
             connection: None,
             connection_auth_mode: None,
+            continuation_reset_reason: None,
             websocket_last_request: None,
             websocket_last_response_rx: None,
             sampling_tools: None,
@@ -307,9 +319,10 @@ impl ModelClient {
             .with_telemetry(Some(request_telemetry));
 
         let instructions = prompt.base_instructions.text.clone();
+        let input = project_provider_input(std::borrow::Cow::Borrowed(&prompt.input), provider);
         let payload = ApiCompactionInput {
             model: &model_info.slug,
-            input: &prompt.input,
+            input: &input,
             instructions: &instructions,
         };
 
@@ -467,6 +480,7 @@ impl ModelClient {
 
 impl ModelClientSession {
     pub(crate) fn reset_after_compaction(&mut self) {
+        self.continuation_reset_reason.get_or_insert("other");
         if websocket_response_finished_for_cache(
             self.websocket_last_request.as_ref(),
             self.websocket_last_response_rx.as_mut(),
@@ -485,6 +499,13 @@ impl ModelClientSession {
     }
 
     pub(crate) fn drop_websocket_connection(&mut self) {
+        self.invalidate_websocket("connection_closed");
+    }
+
+    fn invalidate_websocket(&mut self, reason: &'static str) {
+        if self.connection.is_some() || self.websocket_last_request.is_some() {
+            self.continuation_reset_reason.get_or_insert(reason);
+        }
         self.connection = None;
         self.connection_auth_mode = None;
         self.clear_websocket_continuation();
@@ -522,10 +543,17 @@ impl ModelClientSession {
             && (*CODEX_RS_SSE_FIXTURE).is_none()
     }
 
-    fn build_responses_request(prompt: &Prompt) -> Result<ApiPrompt> {
+    fn build_responses_request(&self, prompt: &Prompt) -> Result<ApiPrompt> {
         let instructions = prompt.base_instructions.text.clone();
         let tools_json: Vec<Value> = create_tools_json_for_responses_api(&prompt.tools)?;
-        Ok(build_api_prompt(prompt, instructions, tools_json))
+        Ok(ApiPrompt {
+            instructions,
+            input: project_provider_input(prompt.get_formatted_input().into(), &self.provider)
+                .into_owned(),
+            tools: tools_json,
+            parallel_tool_calls: prompt.parallel_tool_calls,
+            output_schema: prompt.output_schema.clone(),
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -558,11 +586,14 @@ impl ModelClientSession {
             None
         };
 
-        let include = if reasoning.is_some() {
+        let mut include = if reasoning.is_some() {
             vec!["reasoning.encrypted_content".to_string()]
         } else {
             Vec::new()
         };
+        if self.client.state.output_token_replay_enabled && self.provider.is_openai() {
+            include.push("output.encrypted_content".to_string());
+        }
 
         let verbosity = if model_info.support_verbosity {
             self.client
@@ -604,32 +635,31 @@ impl ModelClientSession {
     fn get_incremental_items(
         &self,
         request: &ResponseCreateWsRequest,
-        last_response: Option<&LastResponse>,
-        allow_empty_delta: bool,
-    ) -> Option<Vec<ResponseItem>> {
-        // Incremental websocket requests are only valid when non-input fields are unchanged and
-        // the new input extends the previous request plus output items already returned by the server.
-        let previous_request = self.websocket_last_request.as_ref()?;
-        if !response_create_properties_match(previous_request, request) {
-            return None;
+        previous_output: &[ResponseItem],
+    ) -> std::result::Result<Vec<ResponseItem>, NonIncrementalReason> {
+        let previous = self
+            .websocket_last_request
+            .as_ref()
+            .ok_or(NonIncrementalReason::NoPreviousRequest)?;
+        if let Some(reason) = response_create_properties_mismatch(previous, request) {
+            return Err(NonIncrementalReason::RequestPropertyChanged { reason });
         }
-
-        let after_previous_request = request
-            .input
-            .as_slice()
-            .strip_prefix(previous_request.input.as_slice())?;
-        let delta = match last_response {
-            Some(last_response) => {
-                after_previous_request.strip_prefix(last_response.items_added.as_slice())?
+        let previous_items = previous.input.iter().chain(previous_output);
+        let mut current_items = request.input.iter();
+        for previous in previous_items {
+            let Some(current) = current_items.next() else {
+                return Err(NonIncrementalReason::InputShortened {
+                    previous: previous.item_type(),
+                });
+            };
+            if previous != current {
+                return Err(NonIncrementalReason::InputMismatch {
+                    previous: previous.item_type(),
+                    current: current.item_type(),
+                });
             }
-            None => after_previous_request,
-        };
-
-        if !allow_empty_delta && delta.is_empty() {
-            return None;
         }
-
-        Some(delta.to_vec())
+        Ok(current_items.cloned().collect())
     }
 
     fn get_last_response(&mut self) -> Option<LastResponse> {
@@ -646,7 +676,11 @@ impl ModelClientSession {
         model_slug: &str,
         api_prompt: &ApiPrompt,
         options: &ApiResponsesOptions,
-    ) -> (ResponsesWsRequest, ResponseCreateWsRequest) {
+    ) -> (
+        ResponsesWsRequest,
+        ResponseCreateWsRequest,
+        Option<NonIncrementalReason>,
+    ) {
         let ApiResponsesOptions {
             reasoning,
             include,
@@ -686,25 +720,34 @@ impl ModelClientSession {
             client_metadata,
         };
 
-        let Some(last_response) = self.get_last_response() else {
-            return (ResponsesWsRequest::ResponseCreate(payload.clone()), payload);
+        let continuation = self
+            .get_last_response()
+            .ok_or(NonIncrementalReason::NoPreviousResponse)
+            .and_then(|last| {
+                let items = self.get_incremental_items(&payload, &last.items_added)?;
+                if last.response_id.is_empty() {
+                    return Err(NonIncrementalReason::NoPreviousResponseId);
+                }
+                Ok((last.response_id, items))
+            });
+        let (response_id, incremental_items) = match continuation {
+            Ok(continuation) => continuation,
+            Err(failure) => {
+                return (
+                    ResponsesWsRequest::ResponseCreate(payload.clone()),
+                    payload,
+                    Some(failure),
+                );
+            }
         };
-        let Some(incremental_items) =
-            self.get_incremental_items(&payload, Some(&last_response), true)
-        else {
-            return (ResponsesWsRequest::ResponseCreate(payload.clone()), payload);
-        };
-        if last_response.response_id.is_empty() {
-            return (ResponsesWsRequest::ResponseCreate(payload.clone()), payload);
-        }
-
         (
             ResponsesWsRequest::ResponseCreate(ResponseCreateWsRequest {
-                previous_response_id: Some(last_response.response_id),
+                previous_response_id: Some(response_id),
                 input: incremental_items,
                 ..payload.clone()
             }),
             payload,
+            None,
         )
     }
 
@@ -717,7 +760,7 @@ impl ModelClientSession {
         options: &ApiResponsesOptions,
     ) -> std::result::Result<&ApiWebSocketConnection, ApiError> {
         if self.connection.is_some() && self.connection_auth_mode != Some(auth_mode) {
-            self.drop_websocket_connection();
+            self.invalidate_websocket("other");
         }
         if self.connection.is_none()
             && let Some(connection) = self
@@ -803,7 +846,7 @@ impl ModelClientSession {
         }
 
         let auth_manager = self.client.state.auth_manager.clone();
-        let api_prompt = Self::build_responses_request(prompt)?;
+        let api_prompt = self.build_responses_request(prompt)?;
 
         let mut auth_recovery = None;
         loop {
@@ -870,7 +913,7 @@ impl ModelClientSession {
         turn_metadata_header: Option<&str>,
     ) -> Result<WebsocketStreamOutcome> {
         let auth_manager = self.client.state.auth_manager.clone();
-        let api_prompt = Self::build_responses_request(prompt)?;
+        let api_prompt = self.build_responses_request(prompt)?;
 
         let mut auth_recovery = None;
         loop {
@@ -922,13 +965,30 @@ impl ModelClientSession {
                 Err(err) => return Err(map_api_error(err)),
             };
 
-            let (request, last_request) =
+            let (request, last_request, failure) =
                 self.prepare_websocket_request(&model_info.slug, &api_prompt, &options);
             let connection = self.connection.as_ref().ok_or_else(|| {
                 map_api_error(ApiError::Stream(
                     "websocket connection is unavailable".to_string(),
                 ))
             })?;
+            let (mode, reason, previous, current) = match failure {
+                None => ("incremental", "incremental", "none", "none"),
+                Some(failure) => {
+                    let reason = self.continuation_reset_reason.take().unwrap_or_else(|| {
+                        if self.websocket_last_request.is_some() {
+                            failure.as_str()
+                        } else if self.client.restored_history {
+                            "restored_history"
+                        } else {
+                            "no_previous_request"
+                        }
+                    });
+                    let (previous, current) = failure.item_types();
+                    ("full", reason, previous, current)
+                }
+            };
+            otel_manager.record_websocket_continuation(mode, reason, previous, current);
             let stream_result = connection
                 .stream_request(request, Some(Arc::clone(&self.turn_state)))
                 .await
@@ -1058,14 +1118,16 @@ impl Drop for ModelClientSession {
 }
 
 /// Adapts the core `Prompt` type into the `codex-api` payload shape.
-fn build_api_prompt(prompt: &Prompt, instructions: String, tools_json: Vec<Value>) -> ApiPrompt {
-    ApiPrompt {
-        instructions,
-        input: prompt.get_formatted_input(),
-        tools: tools_json,
-        parallel_tool_calls: prompt.parallel_tool_calls,
-        output_schema: prompt.output_schema.clone(),
+fn project_provider_input<'a>(
+    mut input: std::borrow::Cow<'a, [ResponseItem]>,
+    provider: &ModelProviderInfo,
+) -> std::borrow::Cow<'a, [ResponseItem]> {
+    if !provider.is_openai() {
+        for item in input.to_mut() {
+            item.clear_output_ciphertext();
+        }
     }
+    input
 }
 
 fn websocket_response_finished_for_cache(
@@ -1081,10 +1143,52 @@ fn websocket_response_finished_for_cache(
     }
 }
 
-fn response_create_properties_match(
+// Continuation diagnostics use bounded labels, never request contents or identifiers.
+#[derive(Debug, PartialEq, Eq)]
+enum NonIncrementalReason {
+    NoPreviousRequest,
+    NoPreviousResponse,
+    NoPreviousResponseId,
+    RequestPropertyChanged {
+        reason: &'static str,
+    },
+    InputShortened {
+        previous: &'static str,
+    },
+    InputMismatch {
+        previous: &'static str,
+        current: &'static str,
+    },
+}
+
+impl NonIncrementalReason {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::NoPreviousRequest => "no_previous_request",
+            Self::NoPreviousResponse => "no_previous_response",
+            Self::NoPreviousResponseId => "no_previous_response_id",
+            Self::RequestPropertyChanged { reason } => reason,
+            Self::InputShortened { .. } => "input_shortened",
+            Self::InputMismatch { .. } => "input_mismatch",
+        }
+    }
+
+    fn item_types(&self) -> (&'static str, &'static str) {
+        match self {
+            Self::InputShortened { previous } => (previous, "none"),
+            Self::InputMismatch { previous, current } => (previous, current),
+            Self::NoPreviousRequest
+            | Self::NoPreviousResponse
+            | Self::NoPreviousResponseId
+            | Self::RequestPropertyChanged { .. } => ("none", "none"),
+        }
+    }
+}
+
+fn response_create_properties_mismatch(
     previous: &ResponseCreateWsRequest,
     current: &ResponseCreateWsRequest,
-) -> bool {
+) -> Option<&'static str> {
     let ResponseCreateWsRequest {
         model: previous_model,
         instructions: previous_instructions,
@@ -1123,18 +1227,43 @@ fn response_create_properties_match(
         client_metadata: _,
     } = current;
 
-    previous_model == current_model
-        && previous_instructions == current_instructions
-        && previous_tools == current_tools
-        && previous_tool_choice == current_tool_choice
-        && previous_parallel_tool_calls == current_parallel_tool_calls
-        && previous_reasoning == current_reasoning
-        && previous_store == current_store
-        && previous_stream == current_stream
-        && previous_include == current_include
-        && previous_service_tier == current_service_tier
-        && previous_prompt_cache_key == current_prompt_cache_key
-        && previous_text == current_text
+    if previous_model != current_model {
+        return Some("model_changed");
+    }
+    if previous_instructions != current_instructions {
+        return Some("instructions_changed");
+    }
+    if previous_tools != current_tools {
+        return Some("tools_changed");
+    }
+    if previous_tool_choice != current_tool_choice {
+        return Some("tool_choice_changed");
+    }
+    if previous_parallel_tool_calls != current_parallel_tool_calls {
+        return Some("parallel_tool_calls_changed");
+    }
+    if previous_reasoning != current_reasoning {
+        return Some("reasoning_changed");
+    }
+    if previous_store != current_store {
+        return Some("store_changed");
+    }
+    if previous_stream != current_stream {
+        return Some("stream_changed");
+    }
+    if previous_include != current_include {
+        return Some("include_changed");
+    }
+    if previous_service_tier != current_service_tier {
+        return Some("service_tier_changed");
+    }
+    if previous_prompt_cache_key != current_prompt_cache_key {
+        return Some("prompt_cache_key_changed");
+    }
+    if previous_text != current_text {
+        return Some("text_changed");
+    }
+    None
 }
 
 fn turn_metadata_header_from_options(options: &ApiResponsesOptions) -> Option<&str> {
@@ -1251,6 +1380,7 @@ where
                     response_id,
                     token_usage,
                     end_turn,
+                    reasoning_removals,
                 }) => {
                     if let Some(usage) = &token_usage {
                         otel_manager.sse_event_completed(
@@ -1272,6 +1402,7 @@ where
                             response_id,
                             token_usage,
                             end_turn,
+                            reasoning_removals,
                         }))
                         .await
                         .is_err()
@@ -1487,6 +1618,7 @@ mod tests {
         let api_stream = futures::stream::iter(vec![
             Ok(ResponseEvent::OutputItemDone(item.clone())),
             Ok(ResponseEvent::Completed {
+                reasoning_removals: None,
                 response_id: "resp-1".to_string(),
                 token_usage: None,
                 end_turn: Some(true),
@@ -1689,29 +1821,28 @@ mod tests {
         ]);
 
         assert_eq!(
-            session.get_incremental_items(&post_steer_request, Some(&last_response), false),
-            Some(vec![tool_output.clone(), steer.clone()])
+            session.get_incremental_items(&post_steer_request, &last_response.items_added),
+            Ok(vec![tool_output.clone(), steer.clone()])
         );
 
         let reordered_request = ws_request(vec![initial_user, steer, assistant, tool_output]);
 
         assert_eq!(
-            session.get_incremental_items(&reordered_request, Some(&last_response), false),
-            None
+            session.get_incremental_items(&reordered_request, &last_response.items_added),
+            Err(NonIncrementalReason::InputMismatch {
+                previous: "message",
+                current: "message"
+            })
         );
     }
 
     #[test]
-    fn incremental_items_respects_empty_delta_setting() {
+    fn incremental_items_allows_empty_delta() {
         let initial_user = user_message_item("initial prompt");
         let request = ws_request(vec![initial_user]);
         let session = test_client_session(request.clone());
 
-        assert_eq!(
-            session.get_incremental_items(&request, None, true),
-            Some(Vec::new())
-        );
-        assert_eq!(session.get_incremental_items(&request, None, false), None);
+        assert_eq!(session.get_incremental_items(&request, &[]), Ok(Vec::new()));
     }
 
     #[test]
@@ -1730,8 +1861,8 @@ mod tests {
         )]));
 
         assert_eq!(
-            session.get_incremental_items(&request, None, false),
-            Some(vec![next_user])
+            session.get_incremental_items(&request, &[]),
+            Ok(vec![next_user])
         );
     }
 
@@ -1790,18 +1921,24 @@ mod tests {
             mutate(&mut request);
 
             assert_eq!(
-                session.get_incremental_items(&request, None, false),
-                None,
-                "{name} change should force full create"
+                session
+                    .get_incremental_items(&request, &[])
+                    .unwrap_err()
+                    .as_str(),
+                format!("{name}_changed")
             );
         }
     }
 
     fn assistant_message_item(id: &str, text: &str) -> ResponseItem {
         ResponseItem::Message {
+            encrypted_content: None,
+            status: None,
             id: Some(id.to_string()),
             role: "assistant".to_string(),
             content: vec![ContentItem::OutputText {
+                annotations: None,
+                logprobs: None,
                 text: text.to_string(),
             }],
             end_turn: None,
@@ -1811,6 +1948,8 @@ mod tests {
 
     fn user_message_item(text: &str) -> ResponseItem {
         ResponseItem::Message {
+            encrypted_content: None,
+            status: None,
             id: None,
             role: "user".to_string(),
             content: vec![ContentItem::InputText {
@@ -1865,6 +2004,7 @@ mod tests {
             false,
             false,
             None,
+            /*output_token_replay_enabled*/ false,
         );
         let mut session = client.new_session();
         session.websocket_last_request = Some(previous_request);
@@ -1904,6 +2044,7 @@ mod tests {
             false,
             false,
             None,
+            /*output_token_replay_enabled*/ false,
         )
     }
 

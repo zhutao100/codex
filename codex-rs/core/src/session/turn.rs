@@ -1400,7 +1400,7 @@ pub(super) fn is_review_rollout_user_message(item: &ResponseItem) -> bool {
 
     id.as_deref() == Some("review_rollout_user")
         || content.iter().any(|item| match item {
-            ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+            ContentItem::InputText { text } | ContentItem::OutputText { text, .. } => {
                 text.contains("User initiated a review task.")
             }
             ContentItem::InputImage { .. } => false,
@@ -2190,7 +2190,13 @@ async fn maybe_complete_plan_item_from_message(
     {
         let mut text = String::new();
         for entry in content {
-            if let ContentItem::OutputText { text: chunk } = entry {
+            if let ContentItem::OutputText {
+                annotations: None,
+                logprobs: None,
+                text: chunk,
+                ..
+            } = entry
+            {
                 text.push_str(chunk);
             }
         }
@@ -2416,7 +2422,7 @@ async fn try_run_sampling_request(
             }
         };
 
-        sess.services
+        turn_context
             .otel_manager
             .record_responses(&handle_responses, &event);
 
@@ -2564,6 +2570,7 @@ async fn try_run_sampling_request(
                 response_id: _,
                 token_usage,
                 end_turn,
+                ..
             } => {
                 progress_trace_state.finalize(&sess, &turn_context).await;
                 if let Some(state) = plan_mode_state.as_mut() {
@@ -2727,7 +2734,7 @@ pub(crate) fn get_last_assistant_message_from_turn(responses: &[ResponseItem]) -
         if let ResponseItem::Message { role, content, .. } = item {
             if role == "assistant" {
                 content.iter().rev().find_map(|ci| {
-                    if let ContentItem::OutputText { text } = ci {
+                    if let ContentItem::OutputText { text, .. } = ci {
                         Some(text.clone())
                     } else {
                         None
@@ -2805,6 +2812,8 @@ mod tests {
         let large_output = "tool output line\n".repeat(8_000);
         let mut input = vec![
             ResponseItem::Message {
+                encrypted_content: None,
+                status: None,
                 id: None,
                 role: "user".to_string(),
                 content: vec![ContentItem::InputText {
@@ -2814,6 +2823,8 @@ mod tests {
                 phase: None,
             },
             ResponseItem::FunctionCall {
+                encrypted_content: None,
+                status: None,
                 id: None,
                 name: "shell".to_string(),
                 arguments: "{}".to_string(),
@@ -2827,6 +2838,8 @@ mod tests {
                 },
             },
             ResponseItem::Message {
+                encrypted_content: None,
+                status: None,
                 id: None,
                 role: "developer".to_string(),
                 content: vec![ContentItem::InputText {
@@ -2863,6 +2876,8 @@ mod tests {
         assert_eq!(
             input.last(),
             Some(&ResponseItem::Message {
+                encrypted_content: None,
+                status: None,
                 id: None,
                 role: "developer".to_string(),
                 content: vec![ContentItem::InputText {
@@ -2900,6 +2915,8 @@ mod tests {
                 },
             },
             ResponseItem::Message {
+                encrypted_content: None,
+                status: None,
                 id: None,
                 role: "developer".to_string(),
                 content: vec![ContentItem::InputText {

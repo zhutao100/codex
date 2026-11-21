@@ -810,6 +810,7 @@ mod tests {
                 id: "evt".to_string(),
                 msg: EventMsg::RawResponseItem(RawResponseItemEvent {
                     item: ResponseItem::CustomToolCall {
+                        encrypted_content: None,
                         id: None,
                         status: None,
                         call_id: "call-1".to_string(),

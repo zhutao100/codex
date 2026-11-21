@@ -1,3 +1,4 @@
+use crate::ReasoningRemovalReason;
 use crate::common::ResponseEvent;
 use crate::common::ResponseStream;
 use crate::error::ApiError;
@@ -14,6 +15,7 @@ use futures::StreamExt;
 use futures::TryStreamExt;
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::io::BufRead;
 use std::path::Path;
 use std::sync::Arc;
@@ -300,6 +302,29 @@ impl ResponsesEventError {
     }
 }
 
+// Diagnostic fields are optional and must never make an otherwise valid response fail.
+fn reasoning_removals(response: &Value) -> Option<BTreeMap<ReasoningRemovalReason, i64>> {
+    let transformations = response.get("input_transformations")?.as_array()?;
+    let mut counts = BTreeMap::new();
+    for transformation in transformations {
+        if transformation.get("type").and_then(Value::as_str) != Some("reasoning")
+            || transformation.get("action").and_then(Value::as_str) != Some("removed")
+        {
+            continue;
+        }
+        let reason = match transformation.get("reason").and_then(Value::as_str) {
+            Some("organization_mismatch") => ReasoningRemovalReason::OrganizationMismatch,
+            Some("end_user_mismatch") => ReasoningRemovalReason::EndUserMismatch,
+            Some("model_mismatch") => ReasoningRemovalReason::ModelMismatch,
+            Some("prefix_mismatch") => ReasoningRemovalReason::PrefixMismatch,
+            Some("turn_boundary") => ReasoningRemovalReason::TurnBoundary,
+            _ => ReasoningRemovalReason::Other,
+        };
+        *counts.entry(reason).or_default() += 1;
+    }
+    Some(counts)
+}
+
 pub fn process_responses_event(
     event: ResponsesStreamEvent,
 ) -> std::result::Result<Option<ResponseEvent>, ResponsesEventError> {
@@ -399,12 +424,14 @@ pub fn process_responses_event(
         }
         "response.completed" => {
             if let Some(resp_val) = event.response {
+                let reasoning_removals = reasoning_removals(&resp_val);
                 match serde_json::from_value::<ResponseCompleted>(resp_val) {
                     Ok(resp) => {
                         return Ok(Some(ResponseEvent::Completed {
                             response_id: resp.id,
                             token_usage: resp.usage.map(Into::into),
                             end_turn: resp.end_turn,
+                            reasoning_removals,
                         }));
                     }
                     Err(err) => {
@@ -417,12 +444,14 @@ pub fn process_responses_event(
         }
         "response.done" => {
             if let Some(resp_val) = event.response {
+                let reasoning_removals = reasoning_removals(&resp_val);
                 match serde_json::from_value::<ResponseDone>(resp_val) {
                     Ok(resp) => {
                         return Ok(Some(ResponseEvent::Completed {
                             response_id: resp.id.unwrap_or_default(),
                             token_usage: resp.usage.map(Into::into),
                             end_turn: None,
+                            reasoning_removals,
                         }));
                     }
                     Err(err) => {
@@ -436,6 +465,7 @@ pub fn process_responses_event(
             debug!("response.done missing response payload");
             return Ok(Some(ResponseEvent::Completed {
                 response_id: String::new(),
+                reasoning_removals: None,
                 token_usage: None,
                 end_turn: None,
             }));
@@ -739,6 +769,7 @@ mod tests {
                 response_id,
                 token_usage,
                 end_turn,
+                ..
             }) => {
                 assert_eq!(response_id, "resp1");
                 assert!(token_usage.is_none());
@@ -803,6 +834,7 @@ mod tests {
                 response_id,
                 token_usage,
                 end_turn,
+                ..
             }) => {
                 assert_eq!(response_id, "");
                 assert!(token_usage.is_some());
@@ -830,6 +862,7 @@ mod tests {
                 response_id,
                 token_usage,
                 end_turn,
+                ..
             }) => {
                 assert_eq!(response_id, "");
                 assert!(token_usage.is_none());
@@ -891,6 +924,7 @@ mod tests {
                 response_id,
                 token_usage,
                 end_turn,
+                ..
             }) => {
                 assert_eq!(response_id, "resp1");
                 assert!(token_usage.is_none());
@@ -959,6 +993,7 @@ mod tests {
                 response_id,
                 token_usage,
                 end_turn,
+                ..
             }) => {
                 assert_eq!(response_id, "resp1");
                 assert!(token_usage.is_none());

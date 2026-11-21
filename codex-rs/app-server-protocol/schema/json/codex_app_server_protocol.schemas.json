@@ -2238,6 +2238,20 @@
         },
         {
           "properties": {
+            "annotations": {
+              "items": true,
+              "type": [
+                "array",
+                "null"
+              ]
+            },
+            "logprobs": {
+              "items": true,
+              "type": [
+                "array",
+                "null"
+              ]
+            },
             "text": {
               "type": "string"
             },
@@ -7150,6 +7164,12 @@
               },
               "type": "array"
             },
+            "encrypted_content": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "end_turn": {
               "type": [
                 "boolean",
@@ -7175,6 +7195,12 @@
             },
             "role": {
               "type": "string"
+            },
+            "status": {
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "type": {
               "enum": [
@@ -7248,6 +7274,12 @@
                 "null"
               ]
             },
+            "encrypted_content": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "id": {
               "description": "Legacy id field retained for compatibility with older payloads.",
               "type": [
@@ -7283,6 +7315,12 @@
             "call_id": {
               "type": "string"
             },
+            "encrypted_content": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "id": {
               "type": [
                 "string",
@@ -7292,6 +7330,12 @@
             },
             "name": {
               "type": "string"
+            },
+            "status": {
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "type": {
               "enum": [
@@ -7338,6 +7382,12 @@
           "properties": {
             "call_id": {
               "type": "string"
+            },
+            "encrypted_content": {
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "id": {
               "type": [
@@ -7409,6 +7459,12 @@
                 {
                   "type": "null"
                 }
+              ]
+            },
+            "encrypted_content": {
+              "type": [
+                "string",
+                "null"
               ]
             },
             "id": {
@@ -11815,6 +11871,20 @@
           },
           {
             "properties": {
+              "annotations": {
+                "items": true,
+                "type": [
+                  "array",
+                  "null"
+                ]
+              },
+              "logprobs": {
+                "items": true,
+                "type": [
+                  "array",
+                  "null"
+                ]
+              },
               "text": {
                 "type": "string"
               },
@@ -13626,6 +13696,12 @@
                 },
                 "type": "array"
               },
+              "encrypted_content": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
               "end_turn": {
                 "type": [
                   "boolean",
@@ -13651,6 +13727,12 @@
               },
               "role": {
                 "type": "string"
+              },
+              "status": {
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "type": {
                 "enum": [
@@ -13724,6 +13806,12 @@
                   "null"
                 ]
               },
+              "encrypted_content": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
               "id": {
                 "description": "Legacy id field retained for compatibility with older payloads.",
                 "type": [
@@ -13759,6 +13847,12 @@
               "call_id": {
                 "type": "string"
               },
+              "encrypted_content": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
               "id": {
                 "type": [
                   "string",
@@ -13768,6 +13862,12 @@
               },
               "name": {
                 "type": "string"
+              },
+              "status": {
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "type": {
                 "enum": [
@@ -13814,6 +13914,12 @@
             "properties": {
               "call_id": {
                 "type": "string"
+              },
+              "encrypted_content": {
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "id": {
                 "type": [
@@ -13885,6 +13991,12 @@
                   {
                     "type": "null"
                   }
+                ]
+              },
+              "encrypted_content": {
+                "type": [
+                  "string",
+                  "null"
                 ]
               },
               "id": {

@@ -38,6 +38,7 @@ fn stream(events: Vec<CodexResult<ResponseEvent>>) -> ResponseStream {
 
 fn completed() -> CodexResult<ResponseEvent> {
     Ok(ResponseEvent::Completed {
+        reasoning_removals: None,
         response_id: "complete".into(),
         token_usage: Some(TokenUsage {
             input_tokens: 100,
@@ -53,6 +54,8 @@ fn completed() -> CodexResult<ResponseEvent> {
 async fn collector_accepts_only_completed_compaction_and_never_records_extra_output() {
     let (session, context) = make_session_and_context().await;
     let extra = ResponseItem::FunctionCall {
+        encrypted_content: None,
+        status: None,
         id: None,
         call_id: "ignored".into(),
         name: "shell".into(),
@@ -200,6 +203,8 @@ async fn tail_rewrite_preserves_calls_status_and_live_source() {
     let (_, mut context) = make_session_and_context().await;
     context.model_info.context_window = Some(1000);
     let call = ResponseItem::FunctionCall {
+        encrypted_content: None,
+        status: None,
         id: None,
         call_id: "call".into(),
         name: "shell".into(),
@@ -315,6 +320,8 @@ async fn installation_persists_before_task_stop_and_replays_exactly(pause: bool)
     let path = recorder.rollout_path.clone();
     *session.services.rollout.lock().await = Some(recorder);
     let user = ResponseItem::Message {
+        encrypted_content: None,
+        status: None,
         id: None,
         role: "user".into(),
         content: vec![ContentItem::InputText {
@@ -517,6 +524,8 @@ async fn snapshot_completed_during_the_compaction_stream_survives_installation()
     let session = Arc::new(session);
     let context = Arc::new(context);
     let user = ResponseItem::Message {
+        encrypted_content: None,
+        status: None,
         id: None,
         role: "user".into(),
         content: vec![ContentItem::InputText {

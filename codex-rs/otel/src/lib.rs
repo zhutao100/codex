@@ -136,6 +136,22 @@ impl OtelManager {
         }
     }
 
+    fn histogram_with_boundaries(
+        &self,
+        name: &str,
+        value: i64,
+        boundaries: &[f64],
+        tags: &[(&str, &str)],
+    ) {
+        if let Some(metrics) = &self.metrics
+            && let Err(e) = self
+                .tags_with_metadata(tags)
+                .and_then(|tags| metrics.histogram_with_boundaries(name, value, boundaries, &tags))
+        {
+            tracing::warn!("metrics histogram [{name}] failed: {e}");
+        }
+    }
+
     pub fn start_timer(&self, name: &str, tags: &[(&str, &str)]) -> Result<Timer, MetricsError> {
         let Some(metrics) = &self.metrics else {
             return Err(MetricsError::ExporterDisabled);

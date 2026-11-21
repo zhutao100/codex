@@ -156,6 +156,8 @@ async fn stream_thread_name(
 ) -> Result<Option<String>> {
     let prompt = Prompt {
         input: vec![ResponseItem::Message {
+            encrypted_content: None,
+            status: None,
             id: None,
             role: "user".to_string(),
             content: vec![ContentItem::InputText {

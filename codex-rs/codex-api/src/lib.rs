@@ -21,6 +21,7 @@ pub use crate::common::MemoryTraceMetadata;
 pub use crate::common::MemoryTraceSummarizeInput;
 pub use crate::common::MemoryTraceSummaryOutput;
 pub use crate::common::Prompt;
+pub use crate::common::ReasoningRemovalReason;
 pub use crate::common::ResponseCreateWsRequest;
 pub use crate::common::ResponseEvent;
 pub use crate::common::ResponseStream;

@@ -67,6 +67,40 @@ pub struct MemoryTraceSummaryOutput {
     pub memory_summary: String,
 }
 
+/// A bounded reason for removing a replayed reasoning item from model input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ReasoningRemovalReason {
+    OrganizationMismatch,
+    EndUserMismatch,
+    ModelMismatch,
+    PrefixMismatch,
+    TurnBoundary,
+    Other,
+}
+
+impl ReasoningRemovalReason {
+    /// Every metric category, including unrecognized API reasons.
+    pub const ALL: [Self; 6] = [
+        Self::OrganizationMismatch,
+        Self::EndUserMismatch,
+        Self::ModelMismatch,
+        Self::PrefixMismatch,
+        Self::TurnBoundary,
+        Self::Other,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OrganizationMismatch => "organization_mismatch",
+            Self::EndUserMismatch => "end_user_mismatch",
+            Self::ModelMismatch => "model_mismatch",
+            Self::PrefixMismatch => "prefix_mismatch",
+            Self::TurnBoundary => "turn_boundary",
+            Self::Other => "other",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum ResponseEvent {
     Created,
@@ -86,6 +120,7 @@ pub enum ResponseEvent {
         /// Did the model affirmatively end its turn? Some providers do not set this,
         /// so callers rely on fallback logic when this is `None`.
         end_turn: Option<bool>,
+        reasoning_removals: Option<std::collections::BTreeMap<ReasoningRemovalReason, i64>>,
     },
     OutputTextDelta(String),
     ToolCallInputDelta {

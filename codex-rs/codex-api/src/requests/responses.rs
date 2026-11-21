@@ -225,6 +225,8 @@ mod tests {
         let provider = provider("azure", "https://example.openai.azure.com/v1");
         let input = vec![
             ResponseItem::Message {
+                encrypted_content: None,
+                status: None,
                 id: Some("m1".into()),
                 role: "assistant".into(),
                 content: Vec::new(),
@@ -232,6 +234,8 @@ mod tests {
                 phase: None,
             },
             ResponseItem::Message {
+                encrypted_content: None,
+                status: None,
                 id: None,
                 role: "assistant".into(),
                 content: Vec::new(),

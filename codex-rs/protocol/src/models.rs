@@ -67,9 +67,21 @@ pub enum ResponseInputItem {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentItem {
-    InputText { text: String },
-    InputImage { image_url: String },
-    OutputText { text: String },
+    InputText {
+        text: String,
+    },
+    InputImage {
+        image_url: String,
+    },
+    OutputText {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional, type = "unknown[]")]
+        annotations: Option<Vec<serde_json::Value>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional, type = "unknown[]")]
+        logprobs: Option<Vec<serde_json::Value>>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema, TS)]
@@ -83,6 +95,12 @@ pub enum MessagePhase {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseItem {
     Message {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        encrypted_content: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        status: Option<String>,
         #[serde(default, skip_serializing)]
         #[ts(skip)]
         id: Option<String>,
@@ -109,6 +127,9 @@ pub enum ResponseItem {
         encrypted_content: Option<String>,
     },
     LocalShellCall {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        encrypted_content: Option<String>,
         /// Legacy id field retained for compatibility with older payloads.
         #[serde(default, skip_serializing)]
         #[ts(skip)]
@@ -119,6 +140,12 @@ pub enum ResponseItem {
         action: LocalShellAction,
     },
     FunctionCall {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        encrypted_content: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        status: Option<String>,
         #[serde(default, skip_serializing)]
         #[ts(skip)]
         id: Option<String>,
@@ -139,6 +166,9 @@ pub enum ResponseItem {
         output: FunctionCallOutputPayload,
     },
     CustomToolCall {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        encrypted_content: Option<String>,
         #[serde(default, skip_serializing)]
         #[ts(skip)]
         id: Option<String>,
@@ -163,6 +193,9 @@ pub enum ResponseItem {
     //   "action": {"type":"search","query":"weather: San Francisco, CA"}
     // }
     WebSearchCall {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        encrypted_content: Option<String>,
         #[serde(default, skip_serializing)]
         #[ts(skip)]
         id: Option<String>,
@@ -188,6 +221,53 @@ pub enum ResponseItem {
 }
 
 pub const BASE_INSTRUCTIONS_DEFAULT: &str = include_str!("prompts/base_instructions/default.md");
+
+impl ResponseItem {
+    pub fn item_type(&self) -> &'static str {
+        match self {
+            Self::Message { .. } => "message",
+            Self::Reasoning { .. } => "reasoning",
+            Self::LocalShellCall { .. } => "local_shell_call",
+            Self::FunctionCall { .. } => "function_call",
+            Self::FunctionCallOutput { .. } => "function_call_output",
+            Self::CustomToolCall { .. } => "custom_tool_call",
+            Self::CustomToolCallOutput { .. } => "custom_tool_call_output",
+            Self::WebSearchCall { .. } => "web_search_call",
+            Self::GhostSnapshot { .. } => "ghost_snapshot",
+            Self::Compaction { .. } => "compaction",
+            Self::CompactionTrigger {} => "compaction_trigger",
+            Self::Other => "other",
+        }
+    }
+
+    /// Removes sampled-output replay data, not reasoning or compaction checkpoints.
+    pub fn clear_output_ciphertext(&mut self) {
+        match self {
+            Self::Message {
+                encrypted_content, ..
+            }
+            | Self::LocalShellCall {
+                encrypted_content, ..
+            }
+            | Self::FunctionCall {
+                encrypted_content, ..
+            }
+            | Self::CustomToolCall {
+                encrypted_content, ..
+            }
+            | Self::WebSearchCall {
+                encrypted_content, ..
+            } => *encrypted_content = None,
+            Self::Reasoning { .. }
+            | Self::Compaction { .. }
+            | Self::FunctionCallOutput { .. }
+            | Self::CustomToolCallOutput { .. }
+            | Self::GhostSnapshot { .. }
+            | Self::CompactionTrigger {}
+            | Self::Other => {}
+        }
+    }
+}
 
 /// Base instructions for the model in a thread. Corresponds to the `instructions` field in the ResponsesAPI.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema, TS)]
@@ -477,6 +557,8 @@ fn render_command_prefix(prefix: &[String]) -> String {
 impl From<DeveloperInstructions> for ResponseItem {
     fn from(di: DeveloperInstructions) -> Self {
         ResponseItem::Message {
+            encrypted_content: None,
+            status: None,
             id: None,
             role: "developer".to_string(),
             content: vec![ContentItem::InputText {
@@ -637,6 +719,8 @@ impl From<ResponseInputItem> for ResponseItem {
     fn from(item: ResponseInputItem) -> Self {
         match item {
             ResponseInputItem::Message { role, content } => Self::Message {
+                encrypted_content: None,
+                status: None,
                 role,
                 content,
                 id: None,
@@ -1595,6 +1679,7 @@ mod tests {
         {
             let parsed: ResponseItem = serde_json::from_str(json_literal)?;
             let expected = ResponseItem::WebSearchCall {
+                encrypted_content: None,
                 id: expected_id.clone(),
                 status: expected_status.clone(),
                 action: expected_action.clone(),

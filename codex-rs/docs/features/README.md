@@ -12,6 +12,7 @@ Choose the feature being changed. Each page states current behavior, non-obvious
 |Reconstruct history, compaction epochs or rollback|[History and replay](history-replay.md)|
 |Select/run streaming compaction or install its replacement|[Remote compaction](remote_compaction_v2/README.md)|
 |Change Responses transport, caching or fallback|[WebSocket transport](responses-websocket.md)|
+|Preserve sampled output on full replay or diagnose prefix loss|[Responses output replay](responses-output-replay.md)|
 
 ## Reviews and delegated work
 

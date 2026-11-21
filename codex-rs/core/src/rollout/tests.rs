@@ -180,9 +180,13 @@ async fn unchanged_completion_review_snapshot_still_flushes_transcript() -> Resu
     recorder.record_items(std::slice::from_ref(&state)).await?;
     recorder.flush().await?;
     let message = RolloutItem::ResponseItem(ResponseItem::Message {
+        encrypted_content: None,
+        status: None,
         id: None,
         role: "assistant".into(),
         content: vec![ContentItem::OutputText {
+            annotations: None,
+            logprobs: None,
             text: "durable transcript".into(),
         }],
         end_turn: None,
@@ -317,6 +321,8 @@ async fn load_rollout_items_ignores_custom_pause_continue_events() -> Result<()>
             },
         ))),
         rollout_json_line(RolloutItem::ResponseItem(ResponseItem::Message {
+            encrypted_content: None,
+            status: None,
             id: None,
             role: "user".to_string(),
             content: vec![ContentItem::InputText {
@@ -345,6 +351,8 @@ async fn clean_for_continue_uses_compaction_epoch_and_keeps_late_snapshots() -> 
     let path = temp.path().join("rollout.jsonl");
     let call = |id: &str| {
         RolloutItem::ResponseItem(ResponseItem::FunctionCall {
+            encrypted_content: None,
+            status: None,
             id: None,
             name: "shell".into(),
             arguments: "{}".into(),
@@ -430,6 +438,8 @@ async fn clean_for_continue_removes_abort_custom_and_dangling_records() -> Resul
             git: None,
         })),
         rollout_json_line(RolloutItem::ResponseItem(ResponseItem::Message {
+            encrypted_content: None,
+            status: None,
             id: None,
             role: "user".to_string(),
             content: vec![ContentItem::InputText {
@@ -439,12 +449,16 @@ async fn clean_for_continue_removes_abort_custom_and_dangling_records() -> Resul
             phase: None,
         })),
         rollout_json_line(RolloutItem::ResponseItem(ResponseItem::FunctionCall {
+            encrypted_content: None,
+            status: None,
             id: None,
             name: "shell".to_string(),
             arguments: "{}".to_string(),
             call_id: "call-1".to_string(),
         })),
         rollout_json_line(RolloutItem::ResponseItem(ResponseItem::Message {
+            encrypted_content: None,
+            status: None,
             id: None,
             role: "user".to_string(),
             content: vec![ContentItem::InputText {
@@ -1593,9 +1607,13 @@ async fn test_updated_at_uses_file_mtime() -> Result<()> {
         let response_line = RolloutLine {
             timestamp: format!("{ts}-{idx:02}"),
             item: RolloutItem::ResponseItem(ResponseItem::Message {
+                encrypted_content: None,
+                status: None,
                 id: None,
                 role: "assistant".into(),
                 content: vec![ContentItem::OutputText {
+                    annotations: None,
+                    logprobs: None,
                     text: format!("reply-{idx}"),
                 }],
                 end_turn: None,

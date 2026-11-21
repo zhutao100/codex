@@ -61,7 +61,7 @@ fn is_contextual_user_fragment(content_item: &ContentItem) -> bool {
                 || is_user_shell_command_text(text)
                 || is_preserved_work_notes_message(text)
         }
-        ContentItem::OutputText { text } => {
+        ContentItem::OutputText { text, .. } => {
             is_session_prefix(text) || is_preserved_work_notes_message(text)
         }
         ContentItem::InputImage { .. } => false,
@@ -111,7 +111,7 @@ fn parse_user_message(message: &[ContentItem]) -> Option<UserMessageItem> {
                     image_url: image_url.clone(),
                 });
             }
-            ContentItem::OutputText { text } => {
+            ContentItem::OutputText { text, .. } => {
                 warn!("Output text in user message: {}", text);
             }
         }
@@ -124,7 +124,7 @@ fn parse_agent_message(id: Option<&String>, message: &[ContentItem]) -> AgentMes
     let mut content: Vec<AgentMessageContent> = Vec::new();
     for content_item in message.iter() {
         match content_item {
-            ContentItem::OutputText { text } => {
+            ContentItem::OutputText { text, .. } => {
                 content.push(AgentMessageContent::Text { text: text.clone() });
             }
             _ => {
@@ -214,6 +214,8 @@ mod tests {
         let img2 = "https://example.com/two.jpg".to_string();
 
         let item = ResponseItem::Message {
+            encrypted_content: None,
+            status: None,
             id: None,
             role: "user".to_string(),
             content: vec![
@@ -265,6 +267,8 @@ mod tests {
         let user_text = "Please review this image.".to_string();
 
         let item = ResponseItem::Message {
+            encrypted_content: None,
+            status: None,
             id: None,
             role: "user".to_string(),
             content: vec![
@@ -307,6 +311,8 @@ mod tests {
         let user_text = "Please review this image.".to_string();
 
         let item = ResponseItem::Message {
+            encrypted_content: None,
+            status: None,
             id: None,
             role: "user".to_string(),
             content: vec![
@@ -346,7 +352,7 @@ mod tests {
     fn skips_user_instructions_and_env() {
         let items = vec![
             ResponseItem::Message {
-                id: None,
+                encrypted_content: None, status: None, id: None,
                 role: "user".to_string(),
                 content: vec![ContentItem::InputText {
                     text: "<user_instructions>test_text</user_instructions>".to_string(),
@@ -355,7 +361,7 @@ mod tests {
             phase: None,
             },
             ResponseItem::Message {
-                id: None,
+                encrypted_content: None, status: None, id: None,
                 role: "user".to_string(),
                 content: vec![ContentItem::InputText {
                     text: "<environment_context>test_text</environment_context>".to_string(),
@@ -364,7 +370,7 @@ mod tests {
             phase: None,
             },
             ResponseItem::Message {
-                id: None,
+                encrypted_content: None, status: None, id: None,
                 role: "user".to_string(),
                 content: vec![ContentItem::InputText {
                     text: "# AGENTS.md instructions for test_directory\n\n<INSTRUCTIONS>\ntest_text\n</INSTRUCTIONS>".to_string(),
@@ -373,7 +379,7 @@ mod tests {
             phase: None,
             },
             ResponseItem::Message {
-                id: None,
+                encrypted_content: None, status: None, id: None,
                 role: "user".to_string(),
                 content: vec![ContentItem::InputText {
                     text: "<skill>\n<name>demo</name>\n<path>skills/demo/SKILL.md</path>\nbody\n</skill>"
@@ -383,7 +389,7 @@ mod tests {
             phase: None,
             },
             ResponseItem::Message {
-                id: None,
+                encrypted_content: None, status: None, id: None,
                 role: "user".to_string(),
                 content: vec![ContentItem::InputText {
                     text: "<user_shell_command>echo 42</user_shell_command>".to_string(),
@@ -402,9 +408,13 @@ mod tests {
     #[test]
     fn parses_agent_message() {
         let item = ResponseItem::Message {
+            encrypted_content: None,
+            status: None,
             id: Some("msg-1".to_string()),
             role: "assistant".to_string(),
             content: vec![ContentItem::OutputText {
+                annotations: None,
+                logprobs: None,
                 text: "Hello from Codex".to_string(),
             }],
             end_turn: None,
@@ -491,6 +501,7 @@ mod tests {
     #[test]
     fn parses_web_search_call() {
         let item = ResponseItem::WebSearchCall {
+            encrypted_content: None,
             id: Some("ws_1".to_string()),
             status: Some("completed".to_string()),
             action: Some(WebSearchAction::Search {
@@ -520,6 +531,7 @@ mod tests {
     #[test]
     fn parses_web_search_open_page_call() {
         let item = ResponseItem::WebSearchCall {
+            encrypted_content: None,
             id: Some("ws_open".to_string()),
             status: Some("completed".to_string()),
             action: Some(WebSearchAction::OpenPage {
@@ -547,6 +559,7 @@ mod tests {
     #[test]
     fn parses_web_search_find_in_page_call() {
         let item = ResponseItem::WebSearchCall {
+            encrypted_content: None,
             id: Some("ws_find".to_string()),
             status: Some("completed".to_string()),
             action: Some(WebSearchAction::FindInPage {
@@ -576,6 +589,7 @@ mod tests {
     #[test]
     fn parses_partial_web_search_call_without_action_as_other() {
         let item = ResponseItem::WebSearchCall {
+            encrypted_content: None,
             id: Some("ws_partial".to_string()),
             status: Some("in_progress".to_string()),
             action: None,

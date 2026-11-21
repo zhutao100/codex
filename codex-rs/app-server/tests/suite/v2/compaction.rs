@@ -124,9 +124,13 @@ async fn auto_compaction_remote_emits_started_and_completed_items() -> Result<()
 
     let compacted_history = vec![
         ResponseItem::Message {
+            encrypted_content: None,
+            status: None,
             id: None,
             role: "assistant".to_string(),
             content: vec![ContentItem::OutputText {
+                annotations: None,
+                logprobs: None,
                 text: "REMOTE_COMPACT_SUMMARY".to_string(),
             }],
             end_turn: None,

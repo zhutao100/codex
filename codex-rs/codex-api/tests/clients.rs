@@ -256,6 +256,8 @@ async fn streaming_client_retries_on_transport_error() -> Result<()> {
     let prompt = codex_api::Prompt {
         instructions: "Say hi".to_string(),
         input: vec![ResponseItem::Message {
+            encrypted_content: None,
+            status: None,
             id: None,
             role: "user".to_string(),
             content: vec![ContentItem::InputText {

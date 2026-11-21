@@ -553,6 +553,48 @@ fn estimate_response_item_model_visible_bytes(item: &ResponseItem) -> i64 {
         | ResponseItem::Compaction {
             encrypted_content: content,
         } => i64::try_from(estimate_reasoning_length(content.len())).unwrap_or(i64::MAX),
+        // Sampled output can carry a second, encrypted representation of its tokens.
+        // Charge the visible output once, not ciphertext, annotations or logprobs.
+        ResponseItem::Message {
+            role,
+            content,
+            encrypted_content,
+            ..
+        } if role == "assistant"
+            || encrypted_content.is_some()
+            || content
+                .iter()
+                .any(|part| matches!(part, ContentItem::OutputText { .. })) =>
+        {
+            content
+                .iter()
+                .map(|part| match part {
+                    ContentItem::InputText { text } | ContentItem::OutputText { text, .. } => {
+                        text.len() as i64
+                    }
+                    ContentItem::InputImage { image_url } => {
+                        if parse_base64_image_data_url(image_url).is_some() {
+                            RESIZED_IMAGE_BYTES_ESTIMATE
+                        } else {
+                            image_url.len() as i64
+                        }
+                    }
+                })
+                .sum()
+        }
+        ResponseItem::FunctionCall {
+            name,
+            arguments: input,
+            ..
+        }
+        | ResponseItem::CustomToolCall { name, input, .. } => (name.len() + input.len()) as i64,
+        ResponseItem::LocalShellCall { action, .. } => {
+            serde_json::to_vec(action).map_or(0, |json| json.len() as i64)
+        }
+        ResponseItem::WebSearchCall { action, .. } => action
+            .as_ref()
+            .and_then(|action| serde_json::to_vec(action).ok())
+            .map_or(0, |bytes| bytes.len() as i64),
         item => {
             let raw = serde_json::to_string(item)
                 .map(|serialized| i64::try_from(serialized.len()).unwrap_or(i64::MAX))
