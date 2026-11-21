@@ -2112,6 +2112,22 @@ fn table_renders_halfwidth_sound_marks_at_constrained_width_snapshot() {
 }
 
 #[test]
+fn table_in_double_digit_ordered_item_aligns_header_and_multiline_body() {
+    let md = "10. Date|Notes\n    ---|---\n    2026-05-01|one two three four&#13;&#10;OK\n";
+    assert_eq!(
+        plain_lines(&render_markdown_text_with_width(md, Some(28))),
+        [
+            "10.  Date          Notes",
+            "    ━━━━━━━━━━━━  ━━━━━━━━━━",
+            "     2026-05-01    one two",
+            "                   three",
+            "                   four",
+            "                   OK",
+        ]
+    );
+}
+
+#[test]
 fn table_inside_blockquote_has_quote_prefix() {
     let md = "> | A | B |\n> |---|---|\n> | 1 | 2 |\n";
     let text = render_markdown_text(md);

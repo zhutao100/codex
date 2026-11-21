@@ -1145,11 +1145,6 @@ impl<'a, 'policy> Writer<'a, 'policy> {
         self.list_item_start_line_counts.push(self.text.len());
         self.pending_marker_line = true;
         let depth = self.list_indices.len();
-        let is_ordered = self
-            .list_indices
-            .last()
-            .map(Option::is_some)
-            .unwrap_or(false);
         let width = depth * 4 - 3;
         let marker = if let Some(last_index) = self.list_indices.last_mut() {
             match last_index {
@@ -1173,12 +1168,9 @@ impl<'a, 'policy> Writer<'a, 'policy> {
         } else {
             None
         };
-        let indent_prefix = if depth == 0 {
-            Vec::new()
-        } else {
-            let indent_len = if is_ordered { width + 2 } else { width + 1 };
-            vec![Span::from(" ".repeat(indent_len))]
-        };
+        let indent_prefix = marker.as_ref().map_or_else(Vec::new, |spans| {
+            vec![Span::from(" ".repeat(Self::spans_display_width(spans)))]
+        });
         self.indent_stack.push(IndentContext::new(
             indent_prefix,
             marker,
