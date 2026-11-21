@@ -32,6 +32,10 @@ fn verdict(evaluation: &str, followup: bool) -> String {
 }
 
 fn configure_recovery_models(config: &mut Config) {
+    configure_recovery_models_with_limit(config, 200_000);
+}
+
+fn configure_recovery_models_with_limit(config: &mut Config, auto_compact_limit: i64) {
     config.model = Some("completion-recovery-small".into());
     config.review_model = Some("completion-recovery-large".into());
     config.features.enable(Feature::RemoteCompaction);
@@ -48,7 +52,7 @@ fn configure_recovery_models(config: &mut Config) {
             patch: ModelInfoPatch {
                 base_instructions: Some("Complete the requested work.".into()),
                 context_window: Some(Some(window)),
-                auto_compact_token_limit: Some(Some(200_000)),
+                auto_compact_token_limit: Some(Some(auto_compact_limit)),
                 ..Default::default()
             },
             final_instruction_override: None,
@@ -58,14 +62,21 @@ fn configure_recovery_models(config: &mut Config) {
     });
 }
 
-fn compacted_answer() -> String {
+const REVIEW_WORK_NOTES: &str =
+    "<AUTO_COMPACT_WORK_NOTES>\nFinish verifying the review.\n</AUTO_COMPACT_WORK_NOTES>";
+
+fn compacted_answer_with(summary: &str) -> String {
     sse(vec![
         serde_json::json!({
             "type": "response.output_item.done",
-            "item": {"type": "compaction", "encrypted_content": "compacted review follow-up"},
+            "item": {"type": "compaction", "encrypted_content": summary},
         }),
         ev_completed("compact"),
     ])
+}
+
+fn compacted_answer() -> String {
+    compacted_answer_with("compacted review follow-up")
 }
 
 fn context_override(cwd: Option<PathBuf>, model: Option<&str>) -> Op {
@@ -107,6 +118,40 @@ fn packet(request: &ResponsesRequest) -> String {
         })
         .and_then(|item| item["content"][0]["text"].as_str().map(str::to_string))
         .expect("review packet")
+}
+
+fn followup_frame(request: &ResponsesRequest) -> Option<String> {
+    request
+        .input()
+        .iter()
+        .filter(|item| item["role"] == "developer")
+        .filter_map(|item| item["content"][0]["text"].as_str())
+        .find(|text| text.contains("<completed_turn_review_context>"))
+        .map(str::to_owned)
+}
+
+fn assert_review_compaction_cycle(requests: &[ResponsesRequest]) {
+    let [notes, compact, replacement] = requests else {
+        panic!("expected notes capture, compaction and one follow-up")
+    };
+    assert!(notes.input().last().is_some_and(|item| {
+        item["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("<AUTO_COMPACT_WORK_NOTES_REQUEST>"))
+    }));
+    assert_eq!(
+        compact.input().last(),
+        Some(&serde_json::json!({"type":"compaction_trigger"}))
+    );
+    assert_eq!(followup_frame(notes), None);
+    assert_eq!(followup_frame(compact), None);
+    assert!(
+        replacement
+            .input()
+            .iter()
+            .any(|item| item["type"] == "compaction")
+    );
+    assert!(followup_frame(replacement).is_some());
 }
 
 #[expect(clippy::unwrap_used)]
@@ -945,54 +990,141 @@ async fn review_followup_uses_reported_usage_instead_of_full_history_byte_estima
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn review_followup_rejects_reported_usage_over_budget() -> anyhow::Result<()> {
+async fn review_followup_omits_optional_reference_before_compacting() -> anyhow::Result<()> {
     skip_if_no_network_unless_localhost!(Ok(()));
     let server = MockServer::start().await;
+    let initial = "Superseded reference.\n".repeat(400);
+    let candidate = "Complete current candidate.";
     let requests = mount_sse_sequence(
         &server,
         vec![
+            answer(&initial),
+            verdict("Revise the initial answer.", true),
             sse(vec![
-                ev_response_created("initial"),
-                ev_assistant_message("candidate", "Exact completed candidate."),
-                ev_completed_with_tokens("initial", 20_000),
+                ev_assistant_message("candidate", candidate),
+                ev_completed_with_tokens("candidate", 14_600),
             ]),
-            verdict("Verify the work and replace the complete answer.", true),
+            verdict("Verify the replacement.", true),
+            answer("Verified the replacement."),
         ],
     )
     .await;
-    let home = Arc::new(TempDir::new()?);
-    let codex = new_conversation_for_server(&server, home.clone(), configure_recovery_models).await;
-    submit_request(&codex, "Preserve the exact scope.").await;
-    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
-    codex.submit(Op::ReviewCompletedTurn).await?;
+    let codex = new_conversation_for_server(
+        &server,
+        Arc::new(TempDir::new()?),
+        configure_recovery_models,
+    )
+    .await;
+    submit_request(&codex, "Keep the exact user request.").await;
+    for expected_answer in [&initial, candidate] {
+        wait_for_event(&codex, |event| {
+            matches!(event, EventMsg::TurnComplete(turn)
+            if turn.last_agent_message.as_deref() == Some(expected_answer))
+        })
+        .await;
+        codex.submit(Op::ReviewCompletedTurn).await?;
+    }
     wait_for_event(&codex, |event| match event {
-        EventMsg::Error(event) => {
-            assert!(event.message.contains("Review follow-up context exceeds"));
-            true
-        }
-        EventMsg::TurnComplete(event) if event.last_agent_message.is_some() => {
-            panic!("over-budget follow-up must not complete")
+        EventMsg::Error(event) => panic!("optional omission failed: {}", event.message),
+        EventMsg::TurnComplete(turn) => {
+            turn.last_agent_message.as_deref() == Some("Verified the replacement.")
         }
         _ => false,
     })
     .await;
+    let captured = requests.requests();
+    assert_eq!(captured.len(), 5);
+    let frame = followup_frame(&captured[4]).context("missing replacement frame")?;
+    assert!(frame.contains("omitted_for_budget"));
+    assert!(!frame.contains(&initial));
+    assert!(frame.contains(candidate));
+    assert!(frame.contains("Keep the exact user request."));
+    server.verify().await;
+    Ok(())
+}
+
+#[test_case::test_case(false; "first followup")]
+#[test_case::test_case(true; "unreported tool result crosses review limit")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_followup_compacts_before_sending_over_budget_prompt(
+    after_tool: bool,
+) -> anyhow::Result<()> {
+    skip_if_no_network_unless_localhost!(Ok(()));
+    let server = MockServer::start().await;
+    let mut replies = vec![
+        sse(vec![
+            ev_assistant_message("candidate", "Exact completed candidate."),
+            ev_completed_with_tokens("initial", if after_tool { 4_000 } else { 14_600 }),
+        ]),
+        verdict("Verify the work and replace the complete answer.", true),
+    ];
+    if after_tool {
+        replies.push(sse(vec![
+            ev_function_call(
+                "plan",
+                "update_plan",
+                r#"{"plan":[{"step":"Verify the correction","status":"completed"}]}"#,
+            ),
+            ev_completed_with_tokens("followup", 14_600),
+        ]));
+    }
+    replies.extend([
+        answer(REVIEW_WORK_NOTES),
+        compacted_answer(),
+        answer("Complete replacement."),
+    ]);
+    let requests = mount_sse_sequence(&server, replies).await;
+    let home = Arc::new(TempDir::new()?);
+    let codex = new_conversation_for_server(&server, home, |config| {
+        // Effective review budget: 24,000 * 95% - 8,192 = 14,608.
+        configure_recovery_models_with_limit(config, 15_000);
+    })
+    .await;
+    submit_request(&codex, "Preserve the exact scope.").await;
     wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
-    assert_eq!(requests.requests().len(), 2);
+    codex.submit(Op::ReviewCompletedTurn).await?;
+    wait_for_event(&codex, |event| match event {
+        EventMsg::Error(event) => panic!("automatic review recovery failed: {}", event.message),
+        EventMsg::TurnComplete(event) => {
+            event.last_agent_message.as_deref() == Some("Complete replacement.")
+        }
+        _ => false,
+    })
+    .await;
+    let captured = requests.requests();
+    let first = 2 + usize::from(after_tool);
+    assert_review_compaction_cycle(&captured[first..]);
+    if after_tool {
+        assert!(
+            captured[first]
+                .input()
+                .iter()
+                .any(|item| item["type"] == "function_call_output" && item["call_id"] == "plan")
+        );
+    }
+    let frame =
+        followup_frame(&captured[first + 2]).context("missing review frame after compaction")?;
+    for required in [
+        "Exact completed candidate.",
+        "Preserve the exact scope.",
+        "Verify the work and replace the complete answer.",
+        "self-contained final answer",
+    ] {
+        assert!(frame.contains(required));
+    }
     codex.submit(Op::Shutdown).await?;
     wait_for_event(&codex, |event| matches!(event, EventMsg::ShutdownComplete)).await;
     server.verify().await;
     Ok(())
 }
 
-#[test_case::test_case(false, false, false; "live")]
-#[test_case::test_case(true, false, false; "after restart")]
-#[test_case::test_case(false, true, false; "reported overflow")]
-#[test_case::test_case(false, false, true; "earlier reasoning live")]
-#[test_case::test_case(true, false, true; "earlier reasoning after restart")]
+#[test_case::test_case(false, false; "live")]
+#[test_case::test_case(true, false; "after restart")]
+#[test_case::test_case(false, true; "earlier reasoning live")]
+#[test_case::test_case(true, true; "earlier reasoning after restart")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn review_followup_counts_request_context_once_near_budget(
     restart: bool,
-    over_budget: bool,
     prior_reasoning: bool,
 ) -> anyhow::Result<()> {
     skip_if_no_network_unless_localhost!(Ok(()));
@@ -1012,7 +1144,7 @@ async fn review_followup_counts_request_context_once_near_budget(
                 "update_plan",
                 r#"{"plan":[{"step":"Verify the correction","status":"completed"}]}"#,
             ),
-            ev_completed_with_tokens("followup", if over_budget { 15_000 } else { 11_200 }),
+            ev_completed_with_tokens("followup", 11_200),
         ])),
     ];
     if restart {
@@ -1021,9 +1153,7 @@ async fn review_followup_counts_request_context_once_near_budget(
                 .set_delay(std::time::Duration::from_secs(5)),
         );
     }
-    if !over_budget {
-        replies.push(sse_response(answer("Complete near-budget replacement.")));
-    }
+    replies.push(sse_response(answer("Complete near-budget replacement.")));
     let prior_requests = usize::from(prior_reasoning);
     if prior_reasoning {
         replies.insert(
@@ -1049,25 +1179,6 @@ async fn review_followup_counts_request_context_once_near_budget(
     submit_request(&codex, "Preserve the exact scope and candidate.").await;
     wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
     codex.submit(Op::ReviewCompletedTurn).await?;
-    if over_budget {
-        wait_for_event(&codex, |event| match event {
-            EventMsg::Error(event) => {
-                assert!(event.message.contains("Review follow-up context exceeds"));
-                true
-            }
-            EventMsg::TurnComplete(event) if event.last_agent_message.is_some() => {
-                panic!("over-budget tool round must not complete")
-            }
-            _ => false,
-        })
-        .await;
-        wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
-        assert_eq!(requests.requests().len(), 3 + prior_requests);
-        codex.submit(Op::Shutdown).await?;
-        wait_for_event(&codex, |event| matches!(event, EventMsg::ShutdownComplete)).await;
-        server.verify().await;
-        return Ok(());
-    }
     let active = if restart {
         wait_for_captured_requests(&requests, 4 + prior_requests).await;
         codex.submit(Op::Pause).await?;
@@ -1125,7 +1236,7 @@ async fn review_followup_counts_request_context_once_near_budget(
 #[test_case::test_case(true, false; "failed stream live")]
 #[test_case::test_case(true, true; "failed stream after restart")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn review_followup_rejects_unreported_model_output(
+async fn review_followup_compacts_unreported_model_output(
     failed_stream: bool,
     restart: bool,
 ) -> anyhow::Result<()> {
@@ -1137,29 +1248,30 @@ async fn review_followup_rejects_unreported_model_output(
     ];
     if !failed_stream {
         unreported.extend([
-            ev_function_call(
-                "plan",
-                "update_plan",
-                r#"{"plan":[{"step":"Verify","status":"completed"}]}"#,
-            ),
+            ev_assistant_message("usage-less", "Candidate with unreported reasoning."),
             serde_json::json!({
                 "type": "response.completed",
                 "response": {"id": "without-usage"},
             }),
         ]);
     }
-    let requests = mount_sse_sequence(
-        &server,
-        vec![
-            sse(vec![
-                ev_assistant_message("candidate", "Exact completed candidate."),
-                ev_completed_with_tokens("initial", 4_000),
-            ]),
-            verdict("Verify and replace the complete answer.", true),
-            sse(unreported),
-        ],
-    )
-    .await;
+    let mut replies = vec![
+        sse(vec![
+            ev_assistant_message("candidate", "Exact completed candidate."),
+            ev_completed_with_tokens("initial", 4_000),
+        ]),
+        verdict("Verify and replace the complete answer.", true),
+        sse(unreported),
+    ];
+    if !failed_stream {
+        replies.push(verdict("Check the latest candidate.", true));
+    }
+    replies.extend([
+        answer(REVIEW_WORK_NOTES),
+        compacted_answer(),
+        answer("Verified after compaction."),
+    ]);
+    let requests = mount_sse_sequence(&server, replies).await;
     let configure = |config: &mut Config| {
         configure_recovery_models(config);
         config.model_provider.stream_max_retries = Some(0);
@@ -1171,44 +1283,41 @@ async fn review_followup_rejects_unreported_model_output(
     codex.submit(Op::ReviewCompletedTurn).await?;
     if failed_stream {
         wait_for_event(&codex, |event| matches!(event, EventMsg::Error(_))).await;
-        wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
-        codex.submit(Op::Continue).await?;
     }
-    wait_for_followup_budget_rejection(&codex).await;
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(turn)
+        if failed_stream || turn.last_agent_message.as_deref() == Some("Candidate with unreported reasoning."))).await;
     assert_eq!(requests.requests().len(), 3);
 
     let active = if restart {
         let path = codex.rollout_path().context("expected rollout path")?;
         codex.submit(Op::Shutdown).await?;
         wait_for_event(&codex, |event| matches!(event, EventMsg::ShutdownComplete)).await;
-        let resumed = resume_conversation_for_server(&server, home, path, configure).await;
-        resumed.submit(Op::Continue).await?;
-        wait_for_followup_budget_rejection(&resumed).await;
-        assert_eq!(requests.requests().len(), 3);
-        resumed
+        resume_conversation_for_server(&server, home, path, configure).await
     } else {
         codex
     };
-    active.submit(Op::Shutdown).await?;
-    wait_for_event(&active, |event| matches!(event, EventMsg::ShutdownComplete)).await;
-    server.verify().await;
-    Ok(())
-}
-
-async fn wait_for_followup_budget_rejection(codex: &CodexThread) {
-    wait_for_event(codex, |event| match event {
-        EventMsg::Error(event) => {
-            assert!(event.message.contains("Review follow-up context exceeds"));
-            assert!(event.message.contains("14608 available"));
-            true
-        }
-        EventMsg::TurnComplete(event) if event.last_agent_message.is_some() => {
-            panic!("unreported overflow must not complete")
+    active
+        .submit(if failed_stream {
+            Op::Continue
+        } else {
+            Op::ReviewCompletedTurn
+        })
+        .await?;
+    wait_for_event(&active, |event| match event {
+        EventMsg::Error(event) => panic!("recovery failed: {}", event.message),
+        EventMsg::TurnComplete(turn) => {
+            turn.last_agent_message.as_deref() == Some("Verified after compaction.")
         }
         _ => false,
     })
     .await;
-    wait_for_event(codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    let captured = requests.requests();
+    let first = 3 + usize::from(!failed_stream);
+    assert_review_compaction_cycle(&captured[first..]);
+    active.submit(Op::Shutdown).await?;
+    wait_for_event(&active, |event| matches!(event, EventMsg::ShutdownComplete)).await;
+    server.verify().await;
+    Ok(())
 }
 
 #[test_case::test_case(false, false, None; "compact")]
@@ -1229,6 +1338,9 @@ async fn review_followup_budget_recovery_preserves_scope(
     let mut replies = vec![
         answer(&initial),
         verdict("Verify the work and replace the complete answer.", true),
+        answer(REVIEW_WORK_NOTES),
+        // A valid replacement can still leave too little space for the exact candidate.
+        compacted_answer_with(&"s".repeat(64_000)),
     ];
     if !select_larger_model {
         replies.push(compacted_answer());
@@ -1251,7 +1363,11 @@ async fn review_followup_budget_recovery_preserves_scope(
     codex.submit(Op::ReviewCompletedTurn).await?;
     wait_for_event(&codex, |event| match event {
         EventMsg::Error(event) => {
-            assert!(event.message.contains("Review follow-up context exceeds"));
+            assert!(
+                event
+                    .message
+                    .contains("Compaction did not free enough space")
+            );
             true
         }
         EventMsg::TurnComplete(event) if event.last_agent_message.is_some() => {
@@ -1261,7 +1377,7 @@ async fn review_followup_budget_recovery_preserves_scope(
     })
     .await;
     wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
-    assert_eq!(requests.requests().len(), 2);
+    assert_eq!(requests.requests().len(), 4);
     if select_larger_model {
         codex
             .submit(context_override(None, Some("completion-recovery-large")))
@@ -1326,7 +1442,7 @@ async fn review_followup_budget_recovery_preserves_scope(
     })
     .await;
     let captured = requests.requests();
-    assert_eq!(captured.len(), if select_larger_model { 4 } else { 5 });
+    assert_eq!(captured.len(), if select_larger_model { 6 } else { 7 });
     let request = captured.last().context("expected recovery request")?;
     assert_eq!(
         request.body_json()["model"],
@@ -1348,7 +1464,7 @@ async fn review_followup_budget_recovery_preserves_scope(
             })
     }));
     if !select_larger_model {
-        let compact_input = captured[2].input();
+        let compact_input = captured[4].input();
         assert_eq!(
             compact_input.last().context("expected compaction input")?["type"],
             "compaction_trigger"
@@ -1473,7 +1589,7 @@ async fn review_followup_directory_ownership_survives_pause_and_restart(
     for restart in [false, true] {
         let server = MockServer::start().await;
         let initial = if budget_stopped {
-            "Exact candidate details.\n".repeat(1_500)
+            "Exact candidate details.\n".repeat(3_000)
         } else {
             "Original complete answer.".into()
         };
@@ -1513,7 +1629,7 @@ async fn review_followup_directory_ownership_survives_pause_and_restart(
         let request_count = if budget_stopped {
             wait_for_event(&codex, |event| {
                 matches!(event, EventMsg::Error(error)
-                    if error.message.contains("Review follow-up context exceeds"))
+                    if error.message.contains("mandatory review frame alone does not fit"))
             })
             .await;
             wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;

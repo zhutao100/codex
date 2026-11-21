@@ -13,11 +13,15 @@ use crate::truncate::truncate_text;
 use codex_protocol::models::FunctionCallOutputBody;
 use std::sync::atomic::Ordering;
 
-#[derive(Clone, Copy, Debug, Default)]
-enum PreCompactNotesState {
-    #[default]
+#[derive(Clone, Copy, Debug)]
+enum FollowUpCompaction {
     Idle,
-    AwaitingNotes,
+    Pending,
+    AwaitingNotes {
+        attempts: u8,
+    },
+    /// Recheck the projected prompt before sampling; do not compact it again without model progress.
+    Compacted,
 }
 
 const AUTO_COMPACT_WORK_NOTES_CAPTURE_MAX_ATTEMPTS: u8 = WORK_NOTES_CAPTURE_MAX_ATTEMPTS;
@@ -443,6 +447,11 @@ async fn run_turn_inner(
         }
     }
 
+    let mut compaction = if recovered_notes {
+        FollowUpCompaction::Compacted
+    } else {
+        FollowUpCompaction::Idle
+    };
     let (explicit_app_paths, skill_name_counts_lower) = if continuation.is_some() {
         (Vec::new(), HashMap::new())
     } else {
@@ -455,6 +464,7 @@ async fn run_turn_inner(
         .await
         {
             Ok(true) => {
+                compaction = FollowUpCompaction::Compacted;
                 total_usage_tokens = sess.get_total_token_usage().await;
             }
             Ok(false) => {}
@@ -464,8 +474,8 @@ async fn run_turn_inner(
             }
         }
 
-        if total_usage_tokens >= auto_compact_limit
-            && let Err(e) = run_pre_turn_compact(
+        if total_usage_tokens >= auto_compact_limit {
+            if let Err(e) = run_pre_turn_compact(
                 &sess,
                 CompactionContext::new(&turn_context),
                 InitialContextInjection::DoNotInject,
@@ -473,9 +483,11 @@ async fn run_turn_inner(
                 &cancellation_token,
             )
             .await
-        {
-            info!("Auto-compaction failed before turn sampling: {e:#}");
-            return None;
+            {
+                info!("Auto-compaction failed before turn sampling: {e:#}");
+                return None;
+            }
+            compaction = FollowUpCompaction::Compacted;
         }
 
         sess.record_context_updates_and_set_reference_context_item(turn_context.as_ref())
@@ -603,8 +615,6 @@ async fn run_turn_inner(
         .model_client
         .new_session_with_provider(turn_context.provider.clone());
 
-    let mut pre_compact_notes_state = PreCompactNotesState::Idle;
-    let mut pre_compact_notes_attempts: u8 = 0;
     let mut explorer_rounds = 0;
     let mut explorer_limited = false;
 
@@ -616,31 +626,33 @@ async fn run_turn_inner(
             .await
         && sess.get_total_token_usage().await >= auto_compact_limit
     {
-        match begin_follow_up_compaction(
-            &sess,
-            &turn_context,
-            &mut client_session,
-            &cancellation_token,
-        )
-        .await
-        {
-            Ok(state) => pre_compact_notes_state = state,
-            Err(error) => {
-                info!("Auto-compaction failed after reconciling a waiting job: {error:#}");
-                return None;
-            }
-        }
+        compaction = FollowUpCompaction::Pending;
     }
     loop {
+        if matches!(compaction, FollowUpCompaction::Pending) {
+            compaction = match begin_follow_up_compaction(
+                &sess,
+                &turn_context,
+                &mut client_session,
+                &cancellation_token,
+            )
+            .await
+            {
+                Ok(state) => state,
+                Err(error) => {
+                    info!("Auto-compaction failed during follow-up: {error:#}");
+                    return None;
+                }
+            };
+        }
+        let capturing_notes = matches!(compaction, FollowUpCompaction::AwaitingNotes { .. });
         // Note that pending_input would be something like a message the user
         // submitted through the UI while the model was running. Though the UI
         // may support this, the model might not.
         //
         // During pre-compact work-notes capture, defer pending input until after compaction so
         // the notes reflect the pre-interruption history and ordering is preserved.
-        let pending_input = if can_drain_pending_input
-            && matches!(pre_compact_notes_state, PreCompactNotesState::Idle)
-        {
+        let pending_input = if can_drain_pending_input && !capturing_notes {
             match turn_state.as_ref() {
                 Some(turn_state) => sess.take_pending_input_for_turn_state(turn_state).await,
                 None => Vec::new(),
@@ -664,8 +676,6 @@ async fn run_turn_inner(
         }
 
         // Construct the input that we will send to the model.
-        let capturing_notes =
-            matches!(pre_compact_notes_state, PreCompactNotesState::AwaitingNotes);
         let mut sampling_request_input = if capturing_notes {
             sampling_input_for_pre_compact_work_notes(&sess, &turn_context).await
         } else {
@@ -690,7 +700,7 @@ async fn run_turn_inner(
                 );
             }
         }
-        let review_instructions = if matches!(pre_compact_notes_state, PreCompactNotesState::Idle) {
+        let review_instructions = if !capturing_notes {
             match sess.completion_review_main_instructions(true).await {
                 Ok(instructions) => instructions,
                 Err(error) => {
@@ -728,8 +738,7 @@ async fn run_turn_inner(
             });
             // Reported usage already includes the preceding request-only frame.
             // Charge its replacement delta, not a second complete frame.
-            let estimate_prompt_tokens = |item: &ResponseItem| {
-                let context_tokens = estimate_item_token_count(item);
+            let estimate_prompt_tokens = |context_tokens: i64| {
                 history_tokens
                     .saturating_add(context_tokens.saturating_sub(included_context_tokens))
                     .max(context_tokens)
@@ -739,7 +748,8 @@ async fn run_turn_inner(
                 .unwrap_or_default()
                 .saturating_sub(8_192);
             let mut review_item: ResponseItem = DeveloperInstructions::new(instructions).into();
-            if estimate_prompt_tokens(&review_item) > target {
+            let mut frame_tokens = estimate_item_token_count(&review_item);
+            if estimate_prompt_tokens(frame_tokens) > target {
                 let instructions = match sess.completion_review_main_instructions(false).await {
                     Ok(Some(instructions)) => instructions,
                     Ok(None) => return None,
@@ -750,15 +760,29 @@ async fn run_turn_inner(
                     }
                 };
                 review_item = DeveloperInstructions::new(instructions).into();
-                let prompt_tokens = estimate_prompt_tokens(&review_item);
+                frame_tokens = estimate_item_token_count(&review_item);
+                let prompt_tokens = estimate_prompt_tokens(frame_tokens);
                 if prompt_tokens > target {
+                    if frame_tokens <= target && matches!(compaction, FollowUpCompaction::Idle) {
+                        // The exact frame fits alone. The projected request can run out
+                        // of headroom before ordinary history reaches auto_compact_limit.
+                        info!(turn_id = %turn_context.sub_id, prompt_tokens, frame_tokens, target, auto_compact_limit, "compacting history to fit review follow-up");
+                        compaction = FollowUpCompaction::Pending;
+                        can_drain_pending_input = false;
+                        continue;
+                    }
+                    let recovery = if frame_tokens > target {
+                        "The mandatory review frame alone does not fit. Select a larger context window, then /continue."
+                    } else {
+                        "Compaction did not free enough space. Run /compact or select a larger context window, then /continue."
+                    };
                     sess.send_event(&turn_context, EventMsg::Error(CodexErr::Fatal(
-                        format!("Review follow-up context exceeds the main model's payload budget ({prompt_tokens} estimated tokens, {target} available). Compact or select a larger context window, then /continue. No truncated follow-up request was sent.")
+                        format!("Review follow-up context exceeds the main model's payload budget ({prompt_tokens} estimated tokens, {target} available). {recovery} No truncated follow-up request was sent.")
                     ).to_error_event(None))).await;
                     return None;
                 }
             }
-            request_context_tokens = estimate_item_token_count(&review_item);
+            request_context_tokens = frame_tokens;
             insert_completion_review_instructions(&mut sampling_request_input, review_item);
         }
 
@@ -774,14 +798,16 @@ async fn run_turn_inner(
             explicit_app_paths: &explicit_app_paths,
             skill_name_counts_lower: &skill_name_counts_lower,
         };
-        let tool_execution_mode = match pre_compact_notes_state {
-            PreCompactNotesState::Idle if explorer_limited => ToolCallExecutionMode::RejectAll {
-                reason: "Exploration evidence budget exhausted; report partial coverage.",
-            },
-            PreCompactNotesState::Idle => ToolCallExecutionMode::Normal,
-            PreCompactNotesState::AwaitingNotes => ToolCallExecutionMode::RejectAll {
+        let tool_execution_mode = if capturing_notes {
+            ToolCallExecutionMode::RejectAll {
                 reason: AUTO_COMPACT_WORK_NOTES_TOOL_REJECT_REASON,
-            },
+            }
+        } else if explorer_limited {
+            ToolCallExecutionMode::RejectAll {
+                reason: "Exploration evidence budget exhausted; report partial coverage.",
+            }
+        } else {
+            ToolCallExecutionMode::Normal
         };
         let sampling_cancel = cancellation_token.child_token();
         let sampling = run_sampling_request(
@@ -840,7 +866,7 @@ async fn run_turn_inner(
                 }
                 can_drain_pending_input = true;
                 if needs_follow_up
-                    && matches!(pre_compact_notes_state, PreCompactNotesState::Idle)
+                    && !capturing_notes
                     && turn_context.tools_config.exec_job_completion
                     && let Some(state) = turn_state.as_ref()
                 {
@@ -871,93 +897,48 @@ async fn run_turn_inner(
                     "post sampling token usage"
                 );
 
-                if matches!(pre_compact_notes_state, PreCompactNotesState::AwaitingNotes) {
+                if let FollowUpCompaction::AwaitingNotes { attempts } = compaction {
                     let notes = match captured_pre_compact_work_notes(&sess, &turn_context).await {
                         Ok(notes) => notes,
                         Err(_) => return None,
                     };
-                    if let Some(notes) = notes {
-                        match run_auto_compact(
-                            &sess,
-                            CompactionContext::new(&turn_context),
-                            Some(notes),
-                            InitialContextInjection::BeforeLastUserMessage,
-                            Some(&mut client_session),
-                            CompactionReason::TokenLimit,
-                            &cancellation_token,
-                        )
-                        .await
-                        {
-                            Ok(_) => {}
-                            Err(e) => {
-                                info!("Auto-compaction failed after work-notes capture: {e:#}");
-                                return None;
-                            }
+                    if notes.is_none() {
+                        let attempts = attempts + 1;
+                        if attempts < AUTO_COMPACT_WORK_NOTES_CAPTURE_MAX_ATTEMPTS {
+                            info!(
+                                "Work-notes capture yielded no notes; retrying capture ({attempts}/{AUTO_COMPACT_WORK_NOTES_CAPTURE_MAX_ATTEMPTS})"
+                            );
+                            compaction = FollowUpCompaction::AwaitingNotes { attempts };
+                            continue;
                         }
-                        can_drain_pending_input = false;
-                        pre_compact_notes_state = PreCompactNotesState::Idle;
-                        pre_compact_notes_attempts = 0;
-                        continue;
-                    }
-
-                    pre_compact_notes_attempts += 1;
-                    if pre_compact_notes_attempts >= AUTO_COMPACT_WORK_NOTES_CAPTURE_MAX_ATTEMPTS {
                         info!(
-                            "Work-notes capture yielded no notes; compacting without notes after {pre_compact_notes_attempts} attempts"
+                            "Work-notes capture yielded no notes; compacting without notes after {attempts} attempts"
                         );
-                        match run_auto_compact(
-                            &sess,
-                            CompactionContext::new(&turn_context),
-                            None,
-                            InitialContextInjection::BeforeLastUserMessage,
-                            Some(&mut client_session),
-                            CompactionReason::TokenLimit,
-                            &cancellation_token,
-                        )
-                        .await
-                        {
-                            Ok(_) => {}
-                            Err(e) => {
-                                info!(
-                                    "Auto-compaction failed after work-notes capture attempts: {e:#}"
-                                );
-                                return None;
-                            }
-                        }
-                        can_drain_pending_input = false;
-                        pre_compact_notes_state = PreCompactNotesState::Idle;
-                        pre_compact_notes_attempts = 0;
-                        continue;
                     }
-
-                    info!(
-                        "Work-notes capture yielded no notes; retrying capture ({pre_compact_notes_attempts}/{AUTO_COMPACT_WORK_NOTES_CAPTURE_MAX_ATTEMPTS})"
-                    );
-                    continue;
-                }
-
-                // as long as compaction works well in getting us way below the token limit, we
-                // shouldn't worry about being in an infinite loop.
-                if token_limit_reached && needs_follow_up {
-                    match begin_follow_up_compaction(
+                    if let Err(e) = run_auto_compact(
                         &sess,
-                        &turn_context,
-                        &mut client_session,
+                        CompactionContext::new(&turn_context),
+                        notes,
+                        InitialContextInjection::BeforeLastUserMessage,
+                        Some(&mut client_session),
+                        CompactionReason::TokenLimit,
                         &cancellation_token,
                     )
                     .await
                     {
-                        Ok(state) => pre_compact_notes_state = state,
-                        Err(error) => {
-                            info!("Auto-compaction failed during follow-up: {error:#}");
-                            return None;
-                        }
+                        info!("Auto-compaction failed after work-notes capture: {e:#}");
+                        return None;
                     }
-                    if matches!(pre_compact_notes_state, PreCompactNotesState::AwaitingNotes) {
-                        pre_compact_notes_attempts = 0;
-                    } else {
-                        can_drain_pending_input = !model_needs_follow_up;
-                    }
+                    can_drain_pending_input = false;
+                    compaction = FollowUpCompaction::Compacted;
+                    continue;
+                }
+
+                // A successful ordinary round can add fresh tool work to compact.
+                compaction = FollowUpCompaction::Idle;
+                if token_limit_reached && needs_follow_up {
+                    compaction = FollowUpCompaction::Pending;
+                    can_drain_pending_input = !model_needs_follow_up;
                     continue;
                 }
 
@@ -986,7 +967,7 @@ async fn run_turn_inner(
                 // Aborted turn is reported via a different event.
                 break;
             }
-            Err(e) if matches!(pre_compact_notes_state, PreCompactNotesState::AwaitingNotes) => {
+            Err(e) if capturing_notes => {
                 info!("Work-notes capture failed; compacting without notes: {e:#}");
                 match run_auto_compact(
                     &sess,
@@ -1008,8 +989,7 @@ async fn run_turn_inner(
                     }
                 }
                 can_drain_pending_input = false;
-                pre_compact_notes_state = PreCompactNotesState::Idle;
-                pre_compact_notes_attempts = 0;
+                compaction = FollowUpCompaction::Compacted;
                 continue;
             }
             Err(CodexErr::InvalidImageRequest()) => {
@@ -1055,10 +1035,10 @@ async fn begin_follow_up_compaction(
     turn_context: &Arc<TurnContext>,
     client_session: &mut ModelClientSession,
     cancellation_token: &CancellationToken,
-) -> CodexResult<PreCompactNotesState> {
+) -> CodexResult<FollowUpCompaction> {
     if turn_context.final_output_json_schema.is_none() {
         inject_pre_compact_work_notes_request(sess, turn_context).await;
-        return Ok(PreCompactNotesState::AwaitingNotes);
+        return Ok(FollowUpCompaction::AwaitingNotes { attempts: 0 });
     }
     run_auto_compact(
         sess,
@@ -1070,7 +1050,7 @@ async fn begin_follow_up_compaction(
         cancellation_token,
     )
     .await?;
-    Ok(PreCompactNotesState::Idle)
+    Ok(FollowUpCompaction::Compacted)
 }
 
 async fn work_notes_request_context(

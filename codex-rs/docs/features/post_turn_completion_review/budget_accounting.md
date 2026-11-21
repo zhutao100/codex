@@ -7,7 +7,7 @@ Read this before changing review payload limits, usage accounting, compaction ba
 |Request|Budget policy|
 |---|---|
 |Independent reviewer|Use the resolved review model's effective window. Reserve half for tools/output/inspection, then subtract base/project/developer instructions, static tool schemas and 8,192 tokens from the packet allowance.|
-|Review-derived main follow-up|Use the current main model's context window minus 8,192 tokens. Reuse the session usage ledger and charge the replacement delta for the request-only review frame.|
+|Review-derived main follow-up|Use the main model's effective context window minus 8,192 tokens. Reuse the session usage ledger and charge the replacement delta for the request-only review frame.|
 
 Deduplicate identical initial/latest answers. Omit the optional initial reference first; if exact scope and candidate still do not fit, stop without truncation. Estimates are approximate, not tokenizer guarantees. Reviewer compaction invalidates coverage rather than authorizing a verdict against rewritten scope.
 
@@ -35,10 +35,14 @@ Do not duplicate this ledger when integrating another usage representation. Pres
 
 ## Recovering from overflow
 
-A budget-stopped follow-up retains `/continue` ownership. Standalone `/compact` reduces ordinary history while preserving that owner. Explicit main-model selection updates the durable recovery destination even after steering invalidates the advisory handoff, and survives restart under another default. Neither route alters exact snapshots or the notes capture's separate source model. If mandatory snapshots alone do not fit, a larger model is required.
+The ordinary auto-compaction threshold is not the review payload limit. Before every main follow-up request (including the first handoff, a tool round or `/continue`), try the full frame, then omit the optional reference. If the mandatory frame fits alone but not with history, run normal inline compaction even below the ordinary threshold. Rebuild history, advisory and frame against the installed baseline before sending. Notes capture and compaction are not replacement answers and do not receive the request-only frame.
+
+Within one run, the review guard does not compact again without an intervening successful ordinary sample. If the rebuilt request still exceeds the limit, stop before sending it; the user can compact further or select a larger main model, then `/continue`. If the mandatory frame alone is too large, skip the review-triggered compaction and ask for a larger window. Neither path truncates the scope or candidate.
+
+A budget stop preserves `/continue` ownership across standalone `/compact` and restart. Explicit main-model selection updates the durable recovery destination even after steering invalidates the advisory handoff; it does not alter the snapshots or the notes capture's source model.
 
 ## Regression obligations
 
 [Completion-review HTTP tests](../../../core/tests/suite/completion_review.rs), [history tests](../../../core/src/context_manager/history_tests.rs) and [session tests](../../../core/src/session/completion_review_tests.rs) cover long reported-usage histories, near-limit frame reuse, multi-round encrypted reasoning, missing/zero usage, failed streams, successful empty responses and live/restarted continuation. Keep tests for actual `/compact` or model selection followed by `/continue`; restoring a snapshot alone does not exercise the advertised recovery path.
 
-Use mocked transport to verify exact requests, accounting and rejection before another POST. Live model acceptance, summary quality and cache behavior require separate evidence.
+Use captured requests to distinguish notes and compaction from ordinary sampling. Verify that recoverable overflow resumes with the exact frame, and that an irreducible or still-over-budget prompt sends no ordinary follow-up. Live model acceptance, summary quality and cache behavior require separate evidence.

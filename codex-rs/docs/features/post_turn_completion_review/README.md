@@ -51,7 +51,7 @@ Host instruction filenames resolve under `CODEX_HOME`; project instructions are 
 |Unknown or invalidated request provenance|Full review is unavailable. Start a new session with the complete request, or recover only from verified host-owned checkpoints. Another prompt or reload cannot restore missing requirements.|
 |Nontext input or `request_user_input` clarification answers|Main work continues normally, but the current text projection cannot claim complete review coverage.|
 |Reviewer compaction, malformed/empty output, delegate failure or mandatory-packet overflow|No structured clean verdict is accepted. Mandatory scope and candidate are never truncated.|
-|Main follow-up budget overflow|The continuation remains available. `/compact` or explicitly select a larger main model, then `/continue`; compaction cannot help if mandatory snapshots alone exceed capacity.|
+|Main follow-up budget overflow|If ordinary history is the obstacle, automatically compact and recheck before sampling. If it still does not fit, the continuation remains available. Select a larger main model if the mandatory frame alone exceeds capacity; otherwise `/compact` is also available. Then `/continue`.|
 |Candidate-directory mismatch|Restore the completed task's directory before continuing. Rejection preserves the pending continuation.|
 |Checkpoint I/O failure|Repair storage and reload the last durable rollout. Preserve the storage error instead of reporting a missing candidate.|
 
