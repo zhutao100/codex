@@ -35,7 +35,7 @@ Before finalizing a large change to `codex-rs`, run `just-local fix -p <crate>` 
 
 ## TUI style conventions
 
-See `codex-rs/tui/styles.md`.
+See [TUI styles](codex-rs/tui/styles.md) and [Markdown table rendering](codex-rs/docs/features/tui-markdown-tables.md).
 
 ## TUI code conventions
 
@@ -74,11 +74,11 @@ This repo uses snapshot tests (via `insta`), especially in `codex-rs/tui`, to va
 - Run tests to generate any updated snapshots:
   - `CODEX_SANDBOX_NETWORK_DISABLED=1 cargo-local test --quiet -p codex-tui`
 - Check what’s pending:
-  - `cargo-local insta pending-snapshots -p codex-tui`
+  - `cargo-local insta pending-snapshots --manifest-path tui/Cargo.toml`
 - Review changes by reading the generated `*.snap.new` files directly in the repo, or preview a specific file:
-  - `cargo-local insta show -p codex-tui path/to/file.snap.new`
+  - `cargo-local insta show --manifest-path tui/Cargo.toml path/to/file.snap.new`
 - Only if you intend to accept all new snapshots in this crate, run:
-  - `cargo-local insta accept -p codex-tui`
+  - `cargo-local insta accept --manifest-path tui/Cargo.toml`
 
 If you don’t have the tool:
 

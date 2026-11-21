@@ -3,7 +3,14 @@ use ratatui::text::Span;
 use std::borrow::Cow;
 use std::ops::Range;
 use textwrap::Options;
+use textwrap::WordSeparator;
+use textwrap::WordSplitter;
+use textwrap::core::Fragment;
+use textwrap::word_splitters::split_words;
+use textwrap::wrap_algorithms::wrap_first_fit;
+use unicode_segmentation::UnicodeSegmentation;
 
+use crate::render::line_utils::display_width;
 use crate::render::line_utils::push_owned_lines;
 
 pub(crate) fn wrap_ranges<'a, O>(text: &str, width_or_options: O) -> Vec<Range<usize>>
@@ -353,6 +360,97 @@ where
         first = false;
     }
     out
+}
+
+/// Wrap table cells with the same display-width rules used to allocate columns.
+pub(crate) fn word_wrap_table_cell<'a>(
+    line: &'a Line<'a>,
+    width: usize,
+    splitter: WordSplitter,
+) -> Vec<Line<'a>> {
+    if line.spans.iter().all(|span| span.content.is_ascii()) {
+        return word_wrap_line(line, RtOptions::new(width).word_splitter(splitter));
+    }
+
+    #[derive(Debug)]
+    struct CellFragment {
+        range: Range<usize>,
+        width: usize,
+        whitespace: usize,
+    }
+
+    impl Fragment for CellFragment {
+        fn width(&self) -> f64 {
+            self.width as f64
+        }
+
+        fn whitespace_width(&self) -> f64 {
+            self.whitespace as f64
+        }
+
+        fn penalty_width(&self) -> f64 {
+            0.0
+        }
+    }
+
+    let mut text = String::new();
+    let span_bounds: Vec<_> = line
+        .spans
+        .iter()
+        .map(|span| {
+            let start = text.len();
+            text.push_str(&span.content);
+            (start..text.len(), span.style)
+        })
+        .collect();
+    let mut boundaries = text
+        .grapheme_indices(true)
+        .map(|(start, _)| start)
+        .peekable();
+    let words = split_words(WordSeparator::new().find_words(&text), &splitter);
+    let mut fragments = Vec::new();
+    let (mut start, mut end) = (0, 0);
+    for word in words {
+        end += word.word.len() + word.whitespace.len();
+        while boundaries.peek().is_some_and(|&start| start < end) {
+            boundaries.next();
+        }
+        if boundaries.peek().is_some_and(|&start| start != end) {
+            // A word boundary is not always a grapheme boundary.
+            continue;
+        }
+        let visible_end = start + text[start..end].trim_end_matches(' ').len();
+        let mut fragment_start = start;
+        let mut fragment_width = 0;
+        for (offset, grapheme) in text[start..visible_end].grapheme_indices(true) {
+            let grapheme_width = display_width(grapheme);
+            if fragment_width != 0 && fragment_width + grapheme_width > width {
+                fragments.push(CellFragment {
+                    range: fragment_start..start + offset,
+                    width: fragment_width,
+                    whitespace: 0,
+                });
+                fragment_start = start + offset;
+                fragment_width = 0;
+            }
+            fragment_width += grapheme_width;
+        }
+        fragments.push(CellFragment {
+            range: fragment_start..visible_end,
+            width: fragment_width,
+            whitespace: end - visible_end,
+        });
+        start = end;
+    }
+
+    wrap_first_fit(&fragments, &[width as f64])
+        .into_iter()
+        .map(|fragments| {
+            let start = fragments.first().map_or(0, |part| part.range.start);
+            let end = fragments.last().map_or(start, |part| part.range.end);
+            slice_line_spans(line, &span_bounds, &(start..end))
+        })
+        .collect()
 }
 
 fn slice_line_spans<'a>(

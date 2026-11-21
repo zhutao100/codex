@@ -21,11 +21,14 @@ use crate::exec_command::relativize_to_home;
 use crate::exec_command::strip_bash_lc_and_escape;
 use crate::live_wrap::take_prefix_by_width;
 use crate::markdown::append_markdown;
+use crate::markdown_render::MarkdownBlock;
+use crate::markdown_render::render_completed_markdown;
 use crate::progress_trace_style::ProgressTraceStyles;
 use crate::progress_trace_style::progress_trace_span;
 use crate::render::line_utils::line_to_static;
 use crate::render::line_utils::prefix_lines;
 use crate::render::line_utils::push_owned_lines;
+use crate::render::renderable::HistoryParagraph;
 use crate::render::renderable::Renderable;
 use crate::style::proposed_plan_style;
 use crate::style::user_message_style;
@@ -156,9 +159,7 @@ impl Renderable for dyn HistoryCell + '_ {
             let overflow = lines.len().saturating_sub(usize::from(area.height));
             u16::try_from(overflow).unwrap_or(u16::MAX)
         };
-        Paragraph::new(Text::from(lines))
-            .scroll((y, 0))
-            .render(area, buf);
+        HistoryParagraph::new(lines, Style::default(), y).render(area, buf);
     }
 
     fn desired_height(&self, width: u16) -> u16 {
@@ -364,31 +365,63 @@ impl HistoryCell for ReasoningSummaryCell {
 
 #[derive(Debug)]
 pub(crate) struct AgentMessageCell {
-    lines: Vec<Line<'static>>,
+    blocks: Vec<MarkdownBlock>,
     is_first_line: bool,
 }
 
 impl AgentMessageCell {
+    #[cfg(test)]
     pub(crate) fn new(lines: Vec<Line<'static>>, is_first_line: bool) -> Self {
+        Self::from_markdown(
+            lines.into_iter().map(MarkdownBlock::Line).collect(),
+            is_first_line,
+        )
+    }
+
+    pub(crate) fn from_markdown(blocks: Vec<MarkdownBlock>, is_first_line: bool) -> Self {
         Self {
-            lines,
+            blocks,
             is_first_line,
         }
+    }
+    pub(crate) fn render_blocks(
+        blocks: &[MarkdownBlock],
+        is_first_line: bool,
+        width: u16,
+    ) -> Vec<Line<'static>> {
+        let width = usize::from(width);
+        let mut lines = Vec::new();
+        let indent = Span::from("  ");
+        for (index, block) in blocks.iter().enumerate() {
+            let prefix = if index == 0 && is_first_line {
+                "• ".dim()
+            } else {
+                indent.clone()
+            };
+            match block {
+                MarkdownBlock::Line(line) => {
+                    let opts = RtOptions::new(width)
+                        .initial_indent(Line::from(prefix))
+                        .subsequent_indent(Line::from(indent.clone()));
+                    lines.extend(word_wrap_line(line, opts).iter().map(line_to_static));
+                }
+                MarkdownBlock::Table(table) => {
+                    let table_width = width.saturating_sub(indent.width());
+                    lines.extend(prefix_lines(
+                        table.render(Some(table_width)),
+                        prefix,
+                        indent.clone(),
+                    ));
+                }
+            }
+        }
+        lines
     }
 }
 
 impl HistoryCell for AgentMessageCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        word_wrap_lines(
-            &self.lines,
-            RtOptions::new(width as usize)
-                .initial_indent(if self.is_first_line {
-                    "• ".dim().into()
-                } else {
-                    "  ".into()
-                })
-                .subsequent_indent("  ".into()),
-        )
+        Self::render_blocks(&self.blocks, self.is_first_line, width)
     }
 
     fn is_stream_continuation(&self) -> bool {
@@ -1988,16 +2021,6 @@ pub(crate) fn new_proposed_plan(plan_markdown: String) -> ProposedPlanCell {
     ProposedPlanCell { plan_markdown }
 }
 
-pub(crate) fn new_proposed_plan_stream(
-    lines: Vec<Line<'static>>,
-    is_stream_continuation: bool,
-) -> ProposedPlanStreamCell {
-    ProposedPlanStreamCell {
-        lines,
-        is_stream_continuation,
-    }
-}
-
 #[derive(Debug)]
 pub(crate) struct ProposedPlanCell {
     plan_markdown: String,
@@ -2005,35 +2028,75 @@ pub(crate) struct ProposedPlanCell {
 
 #[derive(Debug)]
 pub(crate) struct ProposedPlanStreamCell {
-    lines: Vec<Line<'static>>,
+    blocks: Vec<MarkdownBlock>,
     is_stream_continuation: bool,
+    include_bottom_padding: bool,
 }
 
 impl HistoryCell for ProposedPlanCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        let mut lines: Vec<Line<'static>> = Vec::new();
-        lines.push(vec!["• ".dim(), "Proposed Plan".bold()].into());
-        lines.push(Line::from(" "));
-
-        let mut plan_lines: Vec<Line<'static>> = vec![Line::from(" ")];
-        let plan_style = proposed_plan_style();
-        let wrap_width = width.saturating_sub(4).max(1) as usize;
-        let mut body: Vec<Line<'static>> = Vec::new();
-        append_markdown(&self.plan_markdown, Some(wrap_width), &mut body);
-        if body.is_empty() {
-            body.push(Line::from("(empty)".dim().italic()));
+        let mut blocks =
+            render_completed_markdown(&self.plan_markdown, Some(plan_body_width(width)));
+        if blocks.is_empty() {
+            blocks.push(MarkdownBlock::Line("(empty)".dim().italic().into()));
         }
-        plan_lines.extend(prefix_lines(body, "  ".into(), "  ".into()));
-        plan_lines.push(Line::from(" "));
+        ProposedPlanStreamCell::render_blocks(&blocks, false, true, width)
+    }
+}
 
-        lines.extend(plan_lines.into_iter().map(|line| line.style(plan_style)));
+fn plan_body_width(width: u16) -> usize {
+    usize::from(width.saturating_sub(4).max(1))
+}
+
+impl ProposedPlanStreamCell {
+    pub(crate) fn new(
+        blocks: Vec<MarkdownBlock>,
+        is_stream_continuation: bool,
+        include_bottom_padding: bool,
+    ) -> Self {
+        Self {
+            blocks,
+            is_stream_continuation,
+            include_bottom_padding,
+        }
+    }
+
+    pub(crate) fn render_blocks(
+        blocks: &[MarkdownBlock],
+        is_stream_continuation: bool,
+        include_bottom_padding: bool,
+        width: u16,
+    ) -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+        let mut body = Vec::new();
+        if !is_stream_continuation {
+            lines.push(vec!["• ".dim(), "Proposed Plan".bold()].into());
+            lines.push(" ".into());
+            body.push(" ".into());
+        }
+        let width = Some(plan_body_width(width));
+        body.extend(blocks.iter().flat_map(|block| block.to_lines(width)));
+        if include_bottom_padding {
+            body.push(" ".into());
+        }
+        let style = proposed_plan_style();
+        lines.extend(
+            prefix_lines(body, "  ".into(), "  ".into())
+                .into_iter()
+                .map(|line| line.style(style)),
+        );
         lines
     }
 }
 
 impl HistoryCell for ProposedPlanStreamCell {
-    fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
-        self.lines.clone()
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        Self::render_blocks(
+            &self.blocks,
+            self.is_stream_continuation,
+            self.include_bottom_padding,
+            width,
+        )
     }
 
     fn is_stream_continuation(&self) -> bool {

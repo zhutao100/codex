@@ -1,6 +1,14 @@
 //! History replay and review-mode replay handlers for ChatWidget.
 
 use super::*;
+use crate::markdown_render::MarkdownBlock;
+use crate::markdown_render::render_completed_markdown;
+
+fn review_body(source: &str) -> Vec<MarkdownBlock> {
+    let mut blocks = vec![MarkdownBlock::Line("".into())];
+    blocks.extend(render_completed_markdown(source, None));
+    blocks
+}
 
 impl ChatWidget {
     pub(super) fn on_get_history_entry_response(
@@ -108,9 +116,8 @@ impl ChatWidget {
                     ));
                 } else {
                     // Show explanation when there are no structured findings.
-                    let mut rendered: Vec<ratatui::text::Line<'static>> = vec!["".into()];
-                    append_markdown(&explanation, None, &mut rendered);
-                    let body_cell = AgentMessageCell::new(rendered, false);
+                    let body_cell =
+                        AgentMessageCell::from_markdown(review_body(&explanation), false);
                     self.app_event_tx
                         .send(AppEvent::InsertHistoryCell(Box::new(body_cell)));
                 }
@@ -122,10 +129,9 @@ impl ChatWidget {
             self.flush_interrupt_queue();
             self.flush_active_cell();
 
-            let mut rendered: Vec<ratatui::text::Line<'static>> = vec!["".into()];
-            append_markdown(output.evaluation.trim(), None, &mut rendered);
-            rendered.push("".into());
-            rendered.push(
+            let mut blocks = review_body(output.evaluation.trim());
+            blocks.push(MarkdownBlock::Line("".into()));
+            blocks.push(MarkdownBlock::Line(
                 format!(
                     "Fix actions advised: {}",
                     if output.fix_actions_advised {
@@ -135,8 +141,8 @@ impl ChatWidget {
                     }
                 )
                 .into(),
-            );
-            let body_cell = AgentMessageCell::new(rendered, false);
+            ));
+            let body_cell = AgentMessageCell::from_markdown(blocks, false);
             self.app_event_tx
                 .send(AppEvent::InsertHistoryCell(Box::new(body_cell)));
         }

@@ -212,7 +212,6 @@ use crate::history_cell::WebSearchCell;
 use crate::key_hint;
 use crate::key_hint::KeyBinding;
 use crate::keybindings::Keybindings;
-use crate::markdown::append_markdown;
 use crate::render::Insets;
 use crate::render::renderable::ColumnRenderable;
 use crate::render::renderable::FlexRenderable;
@@ -960,12 +959,20 @@ impl ChatWidget {
     /// viewport updates.
     pub(crate) fn active_cell_transcript_key(&self) -> Option<ActiveCellTranscriptKey> {
         let cell = self.active_cell.as_ref();
-        if cell.is_none() && self.pending_token_activity_output().is_none() {
+        let preview = self.stream_previews().next();
+        if cell.is_none() && preview.is_none() && self.pending_token_activity_output().is_none() {
             return None;
         }
         Some(ActiveCellTranscriptKey {
             revision: self.active_cell_revision,
-            is_stream_continuation: cell.is_some_and(|cell| cell.is_stream_continuation()),
+            is_stream_continuation: cell.map_or_else(
+                || {
+                    preview
+                        .as_ref()
+                        .is_some_and(rendering::StreamPreview::is_continuation)
+                },
+                |cell| cell.is_stream_continuation(),
+            ),
             animation_tick: cell.and_then(|cell| cell.transcript_animation_tick()),
         })
     }
@@ -981,6 +988,9 @@ impl ChatWidget {
         if let Some(cell) = self.active_cell.as_ref() {
             lines.extend(cell.transcript_lines(width));
         }
+        for preview in self.stream_previews() {
+            lines.extend(preview.lines(width));
+        }
         if let Some(cell) = self.pending_token_activity_output() {
             let token_activity_lines = cell.transcript_lines(width);
             if !token_activity_lines.is_empty() && !lines.is_empty() {
@@ -989,6 +999,21 @@ impl ChatWidget {
             lines.extend(token_activity_lines);
         }
         (!lines.is_empty()).then_some(lines)
+    }
+
+    fn stream_previews(&self) -> impl Iterator<Item = rendering::StreamPreview<'_>> {
+        [
+            self.stream_controller
+                .as_ref()
+                .filter(|stream| stream.has_preview())
+                .map(rendering::StreamPreview::Answer),
+            self.plan_stream_controller
+                .as_ref()
+                .filter(|stream| stream.has_preview())
+                .map(rendering::StreamPreview::Plan),
+        ]
+        .into_iter()
+        .flatten()
     }
 
     /// Return a reference to the widget's current config (includes any

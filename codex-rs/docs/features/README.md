@@ -37,5 +37,6 @@ Choose the feature being changed. Each page states current behavior, non-obvious
 |Install local skills/MCP bundles or change activation|[Local plugins](local_plugins.md)|
 |Grant dedicated temp writes in read-only sessions|[Read-only temporary directories](read-only-temp.md)|
 |Fetch and display account token activity|[Usage command](usage-command.md)|
+|Render pipe tables in assistant replies|[TUI Markdown tables](tui-markdown-tables.md)|
 
 For core operations or client integration, return to the [documentation index](../README.md). Unfinished features remain in [active plans](../dev_plans/README.md).

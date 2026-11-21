@@ -18,6 +18,7 @@ impl ChatWidget {
             self.add_boxed_history_with_usage_barrier(cell);
         }
         self.adaptive_chunking.reset();
+        self.bump_active_cell_revision();
     }
 
     pub(super) fn on_agent_message(&mut self, message: String, from_replay: bool) {
@@ -67,6 +68,7 @@ impl ChatWidget {
             self.app_event_tx.send(AppEvent::StartCommitAnimation);
             self.run_catch_up_commit_tick();
         }
+        self.bump_active_cell_revision();
         self.request_redraw();
     }
 
@@ -83,6 +85,7 @@ impl ChatWidget {
         self.plan_delta_buffer.clear();
         self.plan_item_active = false;
         self.saw_plan_item_this_turn = true;
+        self.bump_active_cell_revision();
         if let Some(mut controller) = self.plan_stream_controller.take()
             && let Some(cell) = controller.finalize()
         {
@@ -185,6 +188,7 @@ impl ChatWidget {
         for cell in outcome.cells {
             self.bottom_pane.hide_status_indicator();
             self.add_boxed_history(cell);
+            self.bump_active_cell_revision();
         }
 
         if outcome.has_controller && outcome.all_idle {
@@ -270,6 +274,7 @@ impl ChatWidget {
             self.app_event_tx.send(AppEvent::StartCommitAnimation);
             self.run_catch_up_commit_tick();
         }
+        self.bump_active_cell_revision();
         self.request_redraw();
     }
 }

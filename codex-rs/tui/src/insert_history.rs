@@ -1,10 +1,15 @@
+use std::borrow::Cow;
 use std::fmt;
 use std::io;
 use std::io::Write;
 
-use crate::wrapping::word_wrap_lines_borrowed;
+use crate::render::line_utils::HALFWIDTH_SOUND_MARKS;
+use crate::render::line_utils::display_width;
+use crate::render::line_utils::line_width;
+use crate::wrapping::word_wrap_line;
 use crossterm::Command;
 use crossterm::cursor::MoveTo;
+use crossterm::cursor::MoveToColumn;
 use crossterm::queue;
 use crossterm::style::Color as CColor;
 use crossterm::style::Colors;
@@ -38,9 +43,17 @@ where
     let last_cursor_pos = terminal.last_known_cursor_pos;
     let writer = terminal.backend_mut();
 
-    // Pre-wrap lines using word-aware wrapping so terminal scrollback sees the same
-    // formatting as the TUI. This avoids character-level hard wrapping by the terminal.
-    let wrapped = word_wrap_lines_borrowed(&lines, area.width.max(1) as usize);
+    // Preserve rows already fitted to the viewport. Textwrap measures emoji
+    // sequences differently, so wrapping those rows again can split a table.
+    let width = usize::from(area.width.max(1));
+    let mut wrapped = Vec::with_capacity(lines.len());
+    for line in &lines {
+        if line_width(line) <= width && line.spans.iter().all(|span| !span.content.contains('\n')) {
+            wrapped.push(Cow::Borrowed(line));
+        } else {
+            wrapped.extend(word_wrap_line(line, width).into_iter().map(Cow::Owned));
+        }
+    }
     let wrapped_lines = wrapped.len() as u16;
     let cursor_top = if area.bottom() < screen_size.height {
         // If the viewport is not at the bottom of the screen, scroll it down to make room.
@@ -108,17 +121,27 @@ where
             ))
         )?;
         queue!(writer, Clear(ClearType::UntilNewLine))?;
-        // Merge line-level style into each span so that ANSI colors reflect
-        // line styles (e.g., blockquotes with green fg).
+        // Keep the same trailing-space behavior as the wrapping path, without
+        // disturbing padding between columns.
+        let last = line
+            .spans
+            .iter()
+            .rposition(|span| !span.content.trim_end_matches(' ').is_empty());
         let merged_spans: Vec<Span> = line
             .spans
             .iter()
-            .map(|s| Span {
-                style: s.style.patch(line.style),
-                content: s.content.clone(),
+            .take(last.map_or(0, |index| index + 1))
+            .enumerate()
+            .map(|(index, span)| {
+                let content = if Some(index) == last {
+                    span.content.trim_end_matches(' ')
+                } else {
+                    span.content.as_ref()
+                };
+                Span::styled(content, span.style.patch(line.style))
             })
             .collect();
-        write_spans(writer, merged_spans.iter())?;
+        write_spans(writer, &merged_spans)?;
     }
 
     queue!(writer, ResetScrollRegion)?;
@@ -241,14 +264,13 @@ impl ModifierDiff {
     }
 }
 
-fn write_spans<'a, I>(mut writer: &mut impl Write, content: I) -> io::Result<()>
-where
-    I: IntoIterator<Item = &'a Span<'a>>,
-{
+fn write_spans(mut writer: &mut impl Write, content: &[Span<'_>]) -> io::Result<()> {
     let mut fg = Color::Reset;
     let mut bg = Color::Reset;
     let mut last_modifier = Modifier::empty();
-    for span in content {
+    let mut measured = 0;
+    let mut column = 0usize;
+    for (index, span) in content.iter().enumerate() {
         let mut modifier = Modifier::empty();
         modifier.insert(span.style.add_modifier);
         modifier.remove(span.style.sub_modifier);
@@ -271,7 +293,20 @@ where
             bg = next_bg;
         }
 
-        queue!(writer, Print(span.content.clone()))?;
+        queue!(writer, Print(&span.content))?;
+        // Some terminals combine halfwidth sound marks. Start the next span at
+        // its allocated column rather than trusting that terminal's cursor advance.
+        if index + 1 < content.len() && span.content.contains(HALFWIDTH_SOUND_MARKS) {
+            column += content[measured..=index]
+                .iter()
+                .map(|s| display_width(&s.content))
+                .sum::<usize>();
+            measured = index + 1;
+            queue!(
+                writer,
+                MoveToColumn(u16::try_from(column).unwrap_or(u16::MAX))
+            )?;
+        }
     }
 
     queue!(
@@ -297,7 +332,7 @@ mod tests {
         let spans = ["A".bold(), "B".into()];
 
         let mut actual: Vec<u8> = Vec::new();
-        write_spans(&mut actual, spans.iter()).unwrap();
+        write_spans(&mut actual, &spans).unwrap();
 
         let mut expected: Vec<u8> = Vec::new();
         queue!(
@@ -316,6 +351,55 @@ mod tests {
             String::from_utf8(actual).unwrap(),
             String::from_utf8(expected).unwrap()
         );
+    }
+
+    #[test]
+    fn fitted_markdown_table_is_not_rewrapped_in_scrollback() {
+        use crate::streaming::controller::StreamController;
+
+        let width = 20;
+        let height = 8;
+        // Give the VT100 fixture room for terminals that count ZWJ components
+        // separately. The insert path must still honor its 20-column viewport.
+        let backend = VT100Backend::new(30, height);
+        let mut terminal =
+            crate::custom_terminal::Terminal::with_options(backend).expect("terminal");
+        terminal.set_viewport_area(Rect::new(0, height - 1, width, 1));
+        let mut stream = StreamController::new(Some(18));
+        stream.push("|Icon|State|\n|---|---|\n|👩‍💻👩‍💻👩‍💻|Passed|\n");
+        let cell = stream.finalize().expect("completed table");
+        let lines = cell.display_lines(width);
+        let expected = lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        insert_history_lines(&mut terminal, lines).expect("insert table");
+        assert_eq!(
+            terminal.backend().vt100().screen().contents().trim(),
+            expected.trim()
+        );
+    }
+
+    #[test]
+    fn wrapped_markdown_emoji_keeps_both_columns_aligned() {
+        use crate::streaming::controller::StreamController;
+        use unicode_width::UnicodeWidthStr;
+
+        let width = 20;
+        let mut stream = StreamController::new(Some(18));
+        stream.push("|Icon|Status|\n|---|---|\n|❤️❤️❤️❤️❤️❤️|Passed|\n|ok|OK|\n");
+        let cell = stream.finalize().expect("completed table");
+        let lines = cell.display_lines(width);
+        let text: Vec<_> = lines.iter().map(Line::to_string).collect();
+        let column_starts = [
+            text[0].split_once("Status").expect("header").0.width(),
+            text[2].split_once("Passed").expect("body row").0.width(),
+        ];
+        assert_eq!(column_starts, [13, 13]);
+        assert_eq!(text[2].split_whitespace().next(), Some("❤️❤️❤️"));
+        assert_eq!(text[3].trim(), "❤️❤️❤️");
+        assert!(lines.iter().all(|line| line.width() <= usize::from(width)));
     }
 
     #[test]

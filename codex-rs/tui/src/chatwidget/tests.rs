@@ -7792,6 +7792,309 @@ async fn chatwidget_exec_and_status_layout_vt100_snapshot() {
     assert_snapshot!(contents);
 }
 
+#[tokio::test]
+async fn markdown_shortcut_reference_does_not_hide_following_prose() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.on_agent_message_delta("Status: [OK]\n\n".into());
+    chat.on_agent_message_delta("The second paragraph is visible.\n".into());
+    assert!(drain_insert_history(&mut rx).is_empty());
+    let width = 60;
+    let area = Rect::new(0, 0, width, chat.desired_height(width));
+    let mut buffer = Buffer::empty(area);
+    chat.render(area, &mut buffer);
+    let displayed = buffer
+        .content
+        .chunks(usize::from(width))
+        .map(|row| {
+            row.iter()
+                .map(ratatui::buffer::Cell::symbol)
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(displayed[0].trim(), "• Status: [OK]");
+    assert_eq!(displayed[2].trim(), "The second paragraph is visible.");
+
+    chat.on_agent_message(
+        "Status: [OK]\n\nThe second paragraph is visible.\n".into(),
+        false,
+    );
+    let committed = drain_insert_history(&mut rx)
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        lines_to_single_string(&committed).trim_end(),
+        "• Status: [OK]\n  \n  The second paragraph is visible."
+    );
+    assert!(chat.stream_previews().next().is_none());
+}
+
+#[tokio::test]
+async fn markdown_fence_and_plan_prose_stay_visible_while_provisional() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-6.1-sol")).await;
+    let fence = "```md\nFirst line\nSecond line\n";
+    chat.on_agent_message_delta(fence.into());
+    assert!(drain_insert_history(&mut rx).is_empty());
+    let lines = chat
+        .active_cell_transcript_lines(80)
+        .expect("fence preview");
+    assert!(lines_to_single_string(&lines).contains("│ Second line"));
+    chat.on_agent_message_delta("```\n".into());
+    chat.on_agent_message(format!("{fence}```\n"), false);
+    assert_eq!(drain_insert_history(&mut rx).len(), 1);
+    assert!(chat.active_cell_transcript_lines(80).is_none());
+
+    chat.set_feature_enabled(Feature::CollaborationModes, true);
+    let plan_mask =
+        collaboration_modes::mask_for_kind(chat.models_manager.as_ref(), ModeKind::Plan)
+            .expect("plan collaboration mask");
+    chat.set_collaboration_mask(plan_mask);
+    let plan = "Status: [OK]\n\nContinue with the next step.\n";
+    chat.on_plan_delta(plan.into());
+    assert!(drain_insert_history(&mut rx).is_empty());
+    let preview = chat
+        .active_cell_transcript_lines(80)
+        .expect("proposed plan preview");
+    assert!(lines_to_single_string(&preview).contains("Continue with the next step."));
+    chat.on_plan_item_completed(plan.into());
+    let history = drain_insert_history(&mut rx);
+    assert_eq!(
+        history,
+        [preview
+            .into_iter()
+            .chain([Line::from(vec!["  ".into(), " ".into()])
+                .style(crate::style::proposed_plan_style())])
+            .collect::<Vec<_>>()]
+    );
+    assert!(chat.active_cell_transcript_lines(80).is_none());
+}
+
+#[tokio::test]
+async fn markdown_table_places_halfwidth_kana_in_preview_and_scrollback() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    let source = "Kana|State\n---|---\nｶﾞﾊﾟ|Ready\n";
+    chat.on_agent_message_delta(source.into());
+    let area = Rect::new(0, 0, 24, 3);
+    let mut buf = Buffer::empty(area);
+    chat.stream_previews()
+        .next()
+        .expect("live table")
+        .render(area, &mut buf);
+    // Two reply-prefix columns, one cell of padding, four kana columns, then the gutter.
+    assert_eq!([buf[(11, 0)].symbol(), buf[(11, 2)].symbol()], ["S", "R"]);
+    assert_eq!(
+        (3..7).map(|x| buf[(x, 2)].symbol()).collect::<Vec<_>>(),
+        ["ｶ", "ﾞ", "ﾊ", "ﾟ"]
+    );
+
+    chat.on_agent_message(source.into(), false);
+    let height = 8;
+    let mut terminal =
+        crate::custom_terminal::Terminal::with_options(VT100Backend::new(area.width, height))
+            .unwrap();
+    terminal.set_viewport_area(Rect::new(0, height - 1, area.width, 1));
+    crate::insert_history::insert_history_lines(
+        &mut terminal,
+        drain_insert_history(&mut rx)
+            .into_iter()
+            .flatten()
+            .collect(),
+    )
+    .unwrap();
+    let screen = terminal.backend().vt100().screen();
+    let at_column: Vec<_> = (0..height)
+        .map(|y| screen.cell(y, 11).unwrap().contents())
+        .filter(|text| !text.is_empty())
+        .collect();
+    assert_eq!(at_column, ["S", "━", "R"]);
+}
+
+#[tokio::test]
+async fn markdown_table_decoded_cells_align_in_preview_and_scrollback() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    let source = "|Name|Status|\n|---|---|\n|top&#13;&#10;bottom|OK|\n|a&#10;b&#13;c|Breaks|\n|❤&#xFE0F;|Encoded|\n|❤️|Literal|\n";
+    let width = 32;
+    chat.on_agent_message_delta(source.into());
+    chat.on_agent_message_delta("|tail".into());
+    assert!(drain_insert_history(&mut rx).is_empty());
+    let preview = chat
+        .active_cell_transcript_lines(width)
+        .expect("table preview");
+    let shown = preview
+        .iter()
+        .map(|line| line.to_string().trim_end().to_owned())
+        .collect::<Vec<_>>();
+    let expected = [
+        "•  Name      Status",
+        "  ━━━━━━━━  ━━━━━━━━━",
+        "   top       OK",
+        "   bottom",
+        "  ────────  ─────────",
+        "   a         Breaks",
+        "   b",
+        "   c",
+        "  ────────  ─────────",
+        "   ❤️        Encoded",
+        "  ────────  ─────────",
+        "   ❤️        Literal",
+    ];
+    assert_eq!(shown, expected);
+    chat.on_agent_message_delta("|Done|\n".into());
+    chat.on_agent_message(format!("{source}|tail|Done|\n"), false);
+    let history = drain_insert_history(&mut rx);
+    assert_eq!(history.len(), 1);
+    let height = 16;
+    let backend = VT100Backend::new(width, height);
+    let mut terminal = crate::custom_terminal::Terminal::with_options(backend).expect("terminal");
+    terminal.set_viewport_area(Rect::new(0, height - 1, width, 1));
+    crate::insert_history::insert_history_lines(
+        &mut terminal,
+        history.into_iter().flatten().collect(),
+    )
+    .expect("insert table");
+    let screen = terminal.backend().vt100().screen();
+    let top_row = screen
+        .rows(0, width)
+        .position(|row| row.trim_start().starts_with("top"))
+        .expect("top of CRLF cell");
+    assert_eq!(screen.cell(top_row as u16, 13).unwrap().contents(), "O");
+    let contents = screen.contents();
+    let lines: Vec<_> = contents
+        .trim_start_matches('\n')
+        .trim_end()
+        .lines()
+        .collect();
+    let expected = expected
+        .into_iter()
+        .chain(["  ────────  ─────────", "   tail      Done"])
+        .collect::<Vec<_>>();
+    assert_eq!(lines, expected);
+    assert!(chat.active_cell_transcript_lines(width).is_none());
+}
+
+#[tokio::test]
+async fn plan_and_review_markdown_tables_fit_the_insertion_width() {
+    use codex_core::protocol::ReviewOutputEvent;
+
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-6.1-sol")).await;
+    let fenced = "```md\n|Name|Status|\n|---|---|\n|alpha|OK|\n```\n";
+    chat.set_feature_enabled(Feature::CollaborationModes, true);
+    let plan_mask =
+        collaboration_modes::mask_for_kind(chat.models_manager.as_ref(), ModeKind::Plan)
+            .expect("plan collaboration mask");
+    chat.set_collaboration_mask(plan_mask);
+    chat.last_rendered_width.set(Some(40));
+    chat.on_plan_delta(fenced.into());
+    chat.on_plan_item_completed(fenced.into());
+    let plan = std::iter::from_fn(|| rx.try_recv().ok())
+        .find_map(|event| match event {
+            AppEvent::InsertHistoryCell(cell) => Some(cell),
+            _ => None,
+        })
+        .expect("completed plan");
+    let width = 15;
+    assert_eq!(
+        plan.display_lines(width),
+        history_cell::new_proposed_plan(fenced.into()).display_lines(width)
+    );
+    assert!(
+        lines_to_single_string(&plan.display_lines(width)).contains("Name: alpha\n  Status: OK")
+    );
+
+    chat.on_exited_review_mode(ExitedReviewModeEvent {
+        review_output: Some(ReviewOutputEvent {
+            overall_explanation: fenced.into(),
+            ..Default::default()
+        }),
+        post_turn_completion_review_output: Some(PostTurnCompletionReviewOutputEvent {
+            evaluation: fenced.into(),
+            fix_actions_advised: false,
+        }),
+    });
+    let table_cells = std::iter::from_fn(|| rx.try_recv().ok())
+        .filter_map(|event| match event {
+            AppEvent::InsertHistoryCell(cell) if cell.as_any().is::<AgentMessageCell>() => {
+                Some(lines_to_single_string(&cell.display_lines(width)))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        table_cells,
+        [
+            "  \n  Name: alpha\n  Status: OK\n",
+            "  \n  Name: alpha\n  Status: OK\n  \n  Fix actions\n  advised: no\n"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn chatwidget_markdown_table_vt100_snapshot() {
+    async fn render_table_reply(width: u16, stream: bool) -> String {
+        let height = 16;
+        let deltas = [
+            "Summary:\n\n```markdown\n",
+            "|Name|Result|\n",
+            "|---|---:|\n|**Build**|",
+            "OK|\n|End-to-end|Passing|\n",
+            "```",
+        ];
+        let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+        let backend = VT100Backend::new(width, height);
+        let mut term = crate::custom_terminal::Terminal::with_options(backend).expect("terminal");
+        term.set_viewport_area(Rect::new(0, height - 1, width, 1));
+        let mut insert_history = |rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>| {
+            while let Ok(event) = rx.try_recv() {
+                if let AppEvent::InsertHistoryCell(cell) = event {
+                    crate::insert_history::insert_history_lines(
+                        &mut term,
+                        cell.display_lines(width),
+                    )
+                    .expect("insert assistant message");
+                }
+            }
+        };
+        if stream {
+            chat.last_rendered_width.set(Some(40));
+            for delta in deltas {
+                chat.handle_codex_event(Event {
+                    id: "t1".into(),
+                    msg: EventMsg::AgentMessageDelta(AgentMessageDeltaEvent {
+                        delta: delta.into(),
+                    }),
+                });
+                chat.on_commit_tick();
+                insert_history(&mut rx);
+            }
+        }
+        chat.last_rendered_width.set(Some(usize::from(width)));
+        chat.handle_codex_event(Event {
+            id: "t1".into(),
+            msg: EventMsg::AgentMessage(AgentMessageEvent {
+                message: deltas.concat(),
+            }),
+        });
+        insert_history(&mut rx);
+        term.backend()
+            .vt100()
+            .screen()
+            .contents()
+            .trim()
+            .to_string()
+    }
+
+    let streamed = render_table_reply(40, /*stream*/ true).await;
+    assert_eq!(streamed, render_table_reply(40, /*stream*/ false).await);
+    assert_snapshot!(streamed);
+
+    let resized = render_table_reply(14, /*stream*/ true).await;
+    assert_eq!(resized, render_table_reply(14, /*stream*/ false).await);
+    assert_eq!(
+        resized,
+        "• Summary:\n\n  Name: Build\n  Result: OK\n\n  Name:\n  End-to-end\n  Result:\n  Passing"
+    );
+}
+
 // E2E vt100 snapshot for complex markdown with indented and nested fenced code blocks
 #[tokio::test]
 async fn chatwidget_markdown_code_blocks_vt100_snapshot() {

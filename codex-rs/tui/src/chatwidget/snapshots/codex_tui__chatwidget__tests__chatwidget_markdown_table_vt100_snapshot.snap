@@ -1,0 +1,11 @@
+---
+source: tui/src/chatwidget/tests.rs
+expression: streamed
+---
+• Summary:
+
+   Name           Result
+  ━━━━━━━━━━━━  ━━━━━━━━━
+   Build              OK
+  ────────────  ─────────
+   End-to-end    Passing

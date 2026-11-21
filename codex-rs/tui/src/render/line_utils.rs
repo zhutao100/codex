@@ -1,5 +1,20 @@
 use ratatui::text::Line;
 use ratatui::text::Span;
+use unicode_width::UnicodeWidthStr;
+
+pub(crate) const HALFWIDTH_SOUND_MARKS: [char; 2] = ['ﾞ', 'ﾟ'];
+
+/// Terminal cells, including one column for each halfwidth kana sound mark.
+pub(crate) fn display_width(text: &str) -> usize {
+    text.width() + text.matches(HALFWIDTH_SOUND_MARKS).count()
+}
+
+pub(crate) fn line_width(line: &Line<'_>) -> usize {
+    line.spans
+        .iter()
+        .map(|span| display_width(&span.content))
+        .sum()
+}
 
 /// Clone a borrowed ratatui `Line` into an owned `'static` line.
 pub fn line_to_static(line: &Line<'_>) -> Line<'static> {

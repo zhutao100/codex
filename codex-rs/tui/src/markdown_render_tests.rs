@@ -846,6 +846,7 @@ Table below (alignment test):
 | Left | Center | Right |
 |:-----|:------:|------:|
 | a    |   b    |     c |
+
 Inline HTML: <sup>sup</sup> and <sub>sub</sub>.
 HTML block:
 <div style="border:1px solid #ccc;padding:2px">inline block</div>

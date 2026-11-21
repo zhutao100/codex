@@ -243,7 +243,6 @@ pub struct Tui {
     draw_tx: broadcast::Sender<()>,
     event_broker: Arc<EventBroker>,
     pub(crate) terminal: Terminal,
-    pending_history_lines: Vec<Line<'static>>,
     alt_saved_viewport: Option<ratatui::layout::Rect>,
     #[cfg(unix)]
     suspend_context: SuspendContext,
@@ -274,7 +273,6 @@ impl Tui {
             draw_tx,
             event_broker: Arc::new(EventBroker::new()),
             terminal,
-            pending_history_lines: vec![],
             alt_saved_viewport: None,
             #[cfg(unix)]
             suspend_context: SuspendContext::new(),
@@ -440,14 +438,18 @@ impl Tui {
         Ok(())
     }
 
-    pub fn insert_history_lines(&mut self, lines: Vec<Line<'static>>) {
-        self.pending_history_lines.extend(lines);
-        self.frame_requester().schedule_frame();
-    }
-
     pub fn draw(
         &mut self,
         height: u16,
+        draw_fn: impl FnOnce(&mut custom_terminal::Frame),
+    ) -> Result<()> {
+        self.draw_with_history(height, |_| Vec::new(), draw_fn)
+    }
+
+    pub(crate) fn draw_with_history(
+        &mut self,
+        height: u16,
+        history_lines: impl FnOnce(u16) -> Vec<Line<'static>>,
         draw_fn: impl FnOnce(&mut custom_terminal::Frame),
     ) -> Result<()> {
         // If we are resuming from ^Z, we need to prepare the resume action now so we can apply it
@@ -491,12 +493,9 @@ impl Tui {
                 terminal.set_viewport_area(area);
             }
 
-            if !self.pending_history_lines.is_empty() {
-                crate::insert_history::insert_history_lines(
-                    terminal,
-                    self.pending_history_lines.clone(),
-                )?;
-                self.pending_history_lines.clear();
+            let history = history_lines(size.width);
+            if !history.is_empty() {
+                crate::insert_history::insert_history_lines(terminal, history)?;
             }
 
             // Update the y position for suspending so Ctrl-Z can place the cursor correctly.

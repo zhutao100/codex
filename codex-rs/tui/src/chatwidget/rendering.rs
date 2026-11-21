@@ -1,9 +1,48 @@
 //! Renderable implementations for ChatWidget.
 
 use super::*;
+use crate::render::renderable::HistoryParagraph;
 
 struct BorrowedHistoryCellRenderable<'a> {
     cell: &'a dyn HistoryCell,
+}
+
+pub(super) enum StreamPreview<'a> {
+    Answer(&'a StreamController),
+    Plan(&'a PlanStreamController),
+}
+
+impl StreamPreview<'_> {
+    pub(super) fn lines(&self, width: u16) -> Vec<Line<'static>> {
+        match self {
+            Self::Answer(stream) => stream.preview_lines(width),
+            Self::Plan(stream) => stream.preview_lines(width),
+        }
+    }
+
+    pub(super) fn is_continuation(&self) -> bool {
+        match self {
+            Self::Answer(stream) => stream.preview_is_continuation(),
+            Self::Plan(stream) => stream.preview_is_continuation(),
+        }
+    }
+}
+
+impl Renderable for StreamPreview<'_> {
+    fn render(&self, area: Rect, buf: &mut Buffer) {
+        let lines = self.lines(area.width);
+        let overflow = lines.len().saturating_sub(usize::from(area.height));
+        HistoryParagraph::new(
+            lines,
+            Style::default(),
+            u16::try_from(overflow).unwrap_or(u16::MAX),
+        )
+        .render(area, buf);
+    }
+
+    fn desired_height(&self, width: u16) -> u16 {
+        u16::try_from(self.lines(width).len()).unwrap_or(u16::MAX)
+    }
 }
 
 impl Renderable for BorrowedHistoryCellRenderable<'_> {
@@ -45,6 +84,9 @@ impl ChatWidget {
         };
         let mut flex = FlexRenderable::new();
         flex.push(1, active_cell_renderable);
+        for preview in self.stream_previews() {
+            flex.push(1, RenderableItem::Owned(Box::new(preview)));
+        }
         if let Some(cell) = self.pending_token_activity_output() {
             flex.push(
                 1,

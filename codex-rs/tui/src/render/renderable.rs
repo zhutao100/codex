@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
+use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::text::Span;
 use ratatui::widgets::Paragraph;
@@ -9,6 +10,7 @@ use ratatui::widgets::WidgetRef;
 
 use crate::render::Insets;
 use crate::render::RectExt as _;
+use crate::render::line_utils::HALFWIDTH_SOUND_MARKS;
 
 pub trait Renderable {
     fn render(&self, area: Rect, buf: &mut Buffer);
@@ -110,6 +112,52 @@ impl<'a> Renderable for Paragraph<'a> {
     }
     fn desired_height(&self, width: u16) -> u16 {
         self.line_count(width) as u16
+    }
+}
+
+/// Project prewrapped history into Ratatui 0.29's buffer. Unlike physical terminals,
+/// its paragraph widget assigns no cell to a halfwidth kana sound mark.
+pub(crate) struct HistoryParagraph {
+    paragraph: Paragraph<'static>,
+    has_sound_marks: bool,
+}
+
+impl HistoryParagraph {
+    pub(crate) fn new(mut lines: Vec<Line<'static>>, style: Style, scroll: u16) -> Self {
+        let mut has_sound_marks = false;
+        for span in lines.iter_mut().flat_map(|line| &mut line.spans) {
+            if span.content.contains(HALFWIDTH_SOUND_MARKS) {
+                // A space plus its combining mark occupies one widget cell. Remove the
+                // artificial base from that cell before the buffer reaches the backend.
+                span.content = span.content.replace('ﾞ', " ﾞ").replace('ﾟ', " ﾟ").into();
+                has_sound_marks = true;
+            }
+        }
+        Self {
+            paragraph: Paragraph::new(lines).style(style).scroll((scroll, 0)),
+            has_sound_marks,
+        }
+    }
+}
+
+impl Renderable for HistoryParagraph {
+    fn render(&self, area: Rect, buf: &mut Buffer) {
+        self.paragraph.render_ref(area, buf);
+        if self.has_sound_marks {
+            for pos in area.intersection(buf.area).positions() {
+                let cell = &mut buf[pos];
+                if let Some(mark) = cell.symbol().strip_prefix(' ')
+                    && mark.starts_with(HALFWIDTH_SOUND_MARKS)
+                {
+                    let symbol = mark.to_owned();
+                    cell.set_symbol(&symbol);
+                }
+            }
+        }
+    }
+
+    fn desired_height(&self, width: u16) -> u16 {
+        self.paragraph.desired_height(width)
     }
 }
 

@@ -1,8 +1,7 @@
 use crate::history_cell::HistoryCell;
+use crate::history_cell::ProposedPlanStreamCell;
 use crate::history_cell::{self};
-use crate::render::line_utils::prefix_lines;
-use crate::style::proposed_plan_style;
-use ratatui::prelude::Stylize;
+use crate::markdown_render::MarkdownBlock;
 use ratatui::text::Line;
 use std::time::Duration;
 use std::time::Instant;
@@ -20,7 +19,7 @@ pub(crate) struct StreamController {
 impl StreamController {
     pub(crate) fn new(width: Option<usize>) -> Self {
         Self {
-            state: StreamState::new(width),
+            state: StreamState::new(width, /*unwrap_fences*/ true),
             finishing_after_drain: false,
             header_emitted: false,
         }
@@ -34,7 +33,7 @@ impl StreamController {
         }
         state.collector.push_delta(delta);
         if delta.contains('\n') {
-            let newly_completed = state.collector.commit_complete_lines();
+            let newly_completed = state.collector.commit_complete_blocks();
             if !newly_completed.is_empty() {
                 state.enqueue(newly_completed);
                 return true;
@@ -95,15 +94,32 @@ impl StreamController {
         self.state.oldest_queued_age(now)
     }
 
-    fn emit(&mut self, lines: Vec<Line<'static>>) -> Option<Box<dyn HistoryCell>> {
-        if lines.is_empty() {
+    pub(crate) fn has_preview(&self) -> bool {
+        self.state.has_preview()
+    }
+
+    pub(crate) fn preview_is_continuation(&self) -> bool {
+        self.header_emitted
+    }
+
+    pub(crate) fn preview_lines(&self, width: u16) -> Vec<Line<'static>> {
+        history_cell::AgentMessageCell::render_blocks(
+            self.state.collector.preview(),
+            !self.header_emitted,
+            width,
+        )
+    }
+
+    fn emit(&mut self, blocks: Vec<MarkdownBlock>) -> Option<Box<dyn HistoryCell>> {
+        if blocks.is_empty() {
             return None;
         }
-        Some(Box::new(history_cell::AgentMessageCell::new(lines, {
-            let header_emitted = self.header_emitted;
-            self.header_emitted = true;
-            !header_emitted
-        })))
+        let is_first_line = !self.header_emitted;
+        self.header_emitted = true;
+        Some(Box::new(history_cell::AgentMessageCell::from_markdown(
+            blocks,
+            is_first_line,
+        )))
     }
 }
 
@@ -111,15 +127,13 @@ impl StreamController {
 pub(crate) struct PlanStreamController {
     state: StreamState,
     header_emitted: bool,
-    top_padding_emitted: bool,
 }
 
 impl PlanStreamController {
     pub(crate) fn new(width: Option<usize>) -> Self {
         Self {
-            state: StreamState::new(width),
+            state: StreamState::new(width, /*unwrap_fences*/ true),
             header_emitted: false,
-            top_padding_emitted: false,
         }
     }
 
@@ -131,7 +145,7 @@ impl PlanStreamController {
         }
         state.collector.push_delta(delta);
         if delta.contains('\n') {
-            let newly_completed = state.collector.commit_complete_lines();
+            let newly_completed = state.collector.commit_complete_blocks();
             if !newly_completed.is_empty() {
                 state.enqueue(newly_completed);
                 return true;
@@ -188,43 +202,38 @@ impl PlanStreamController {
         self.state.oldest_queued_age(now)
     }
 
+    pub(crate) fn has_preview(&self) -> bool {
+        self.state.has_preview()
+    }
+
+    pub(crate) fn preview_is_continuation(&self) -> bool {
+        self.header_emitted
+    }
+
+    pub(crate) fn preview_lines(&self, width: u16) -> Vec<Line<'static>> {
+        ProposedPlanStreamCell::render_blocks(
+            self.state.collector.preview(),
+            self.header_emitted,
+            /*include_bottom_padding*/ false,
+            width,
+        )
+    }
+
     fn emit(
         &mut self,
-        lines: Vec<Line<'static>>,
+        blocks: Vec<MarkdownBlock>,
         include_bottom_padding: bool,
     ) -> Option<Box<dyn HistoryCell>> {
-        if lines.is_empty() && !include_bottom_padding {
+        if blocks.is_empty() && !include_bottom_padding {
             return None;
         }
 
-        let mut out_lines: Vec<Line<'static>> = Vec::new();
         let is_stream_continuation = self.header_emitted;
-        if !self.header_emitted {
-            out_lines.push(vec!["• ".dim(), "Proposed Plan".bold()].into());
-            out_lines.push(Line::from(" "));
-            self.header_emitted = true;
-        }
-
-        let mut plan_lines: Vec<Line<'static>> = Vec::new();
-        if !self.top_padding_emitted {
-            plan_lines.push(Line::from(" "));
-            self.top_padding_emitted = true;
-        }
-        plan_lines.extend(lines);
-        if include_bottom_padding {
-            plan_lines.push(Line::from(" "));
-        }
-
-        let plan_style = proposed_plan_style();
-        let plan_lines = prefix_lines(plan_lines, "  ".into(), "  ".into())
-            .into_iter()
-            .map(|line| line.style(plan_style))
-            .collect::<Vec<_>>();
-        out_lines.extend(plan_lines);
-
-        Some(Box::new(history_cell::new_proposed_plan_stream(
-            out_lines,
+        self.header_emitted = true;
+        Some(Box::new(ProposedPlanStreamCell::new(
+            blocks,
             is_stream_continuation,
+            include_bottom_padding,
         )))
     }
 }

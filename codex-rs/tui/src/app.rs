@@ -549,8 +549,7 @@ pub(crate) struct App {
 
     // Pager overlay state (Transcript or Static like Diff)
     pub(crate) overlay: Option<Overlay>,
-    pub(crate) deferred_history_lines: Vec<Line<'static>>,
-    has_emitted_history_lines: bool,
+    pending_history: PendingHistory,
 
     pub(crate) enhanced_keys_supported: bool,
 
@@ -597,15 +596,28 @@ enum PendingUsageAppEvent {
 }
 
 #[derive(Default)]
-struct AppUiUpdate {
-    history_lines: Vec<Line<'static>>,
-    schedule_frame: bool,
+struct PendingHistory {
+    cells: Vec<Arc<dyn HistoryCell>>,
+    has_emitted: bool,
 }
 
-impl AppUiUpdate {
-    fn merge(&mut self, mut other: Self) {
-        self.history_lines.append(&mut other.history_lines);
-        self.schedule_frame |= other.schedule_frame;
+impl PendingHistory {
+    fn take_lines(&mut self, width: u16) -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+        for cell in self.cells.drain(..) {
+            let display = cell.display_lines(width);
+            if display.is_empty() {
+                continue;
+            }
+            if !cell.is_stream_continuation() {
+                if self.has_emitted {
+                    lines.push(Line::default());
+                }
+                self.has_emitted = true;
+            }
+            lines.extend(display);
+        }
+        lines
     }
 }
 
@@ -1102,8 +1114,7 @@ impl App {
     fn reset_for_thread_switch(&mut self, tui: &mut tui::Tui) -> Result<()> {
         self.overlay = None;
         self.transcript_cells.clear();
-        self.deferred_history_lines.clear();
-        self.has_emitted_history_lines = false;
+        self.pending_history = PendingHistory::default();
         self.backtrack = BacktrackState::default();
         self.backtrack_render_pending = false;
         tui.terminal.clear_scrollback()?;
@@ -1366,8 +1377,7 @@ impl App {
             enhanced_keys_supported,
             transcript_cells: Vec::new(),
             overlay: None,
-            deferred_history_lines: Vec::new(),
-            has_emitted_history_lines: false,
+            pending_history: PendingHistory::default(),
             commit_anim_running: Arc::new(AtomicBool::new(false)),
             status_line_invalid_items_warned: status_line_invalid_items_warned.clone(),
             backtrack: BacktrackState::default(),
@@ -1536,7 +1546,10 @@ impl App {
                 TuiEvent::Draw => {
                     if self.backtrack_render_pending {
                         self.backtrack_render_pending = false;
-                        self.render_transcript_once(tui);
+                        self.pending_history = PendingHistory {
+                            cells: self.transcript_cells.clone(),
+                            has_emitted: false,
+                        };
                     }
                     self.chat_widget.maybe_post_pending_notification(tui);
                     if self
@@ -1545,11 +1558,14 @@ impl App {
                     {
                         return Ok(AppRunControl::Continue);
                     }
-                    tui.draw(
-                        self.chat_widget.desired_height(tui.terminal.size()?.width),
+                    let width = tui.terminal.size()?.width;
+                    let widget = &self.chat_widget;
+                    tui.draw_with_history(
+                        widget.desired_height(width),
+                        |width| self.pending_history.take_lines(width),
                         |frame| {
-                            self.chat_widget.render(frame.area(), frame.buffer);
-                            if let Some((x, y)) = self.chat_widget.cursor_pos(frame.area()) {
+                            widget.render(frame.area(), frame.buffer);
+                            if let Some((x, y)) = widget.cursor_pos(frame.area()) {
                                 frame.set_cursor_position((x, y));
                             }
                         },
@@ -1565,57 +1581,14 @@ impl App {
         Ok(AppRunControl::Continue)
     }
 
-    fn record_history_cell(&mut self, cell: Box<dyn HistoryCell>, width: u16) -> AppUiUpdate {
-        let mut update = AppUiUpdate::default();
+    fn record_history_cell(&mut self, cell: Box<dyn HistoryCell>) {
         let cell: Arc<dyn HistoryCell> = cell.into();
         if let Some(Overlay::Transcript(t)) = &mut self.overlay {
             t.insert_cell(cell.clone());
-            update.schedule_frame = true;
         }
         self.transcript_cells.push(cell.clone());
-        let mut display = cell.display_lines(width);
-        if !display.is_empty() {
-            // Only insert a separating blank line for new cells that are not
-            // part of an ongoing stream. Streaming continuations should not
-            // accrue extra blank lines between chunks.
-            if !cell.is_stream_continuation() {
-                if self.has_emitted_history_lines {
-                    display.insert(0, Line::from(""));
-                } else {
-                    self.has_emitted_history_lines = true;
-                }
-            }
-            if self.overlay.is_some() {
-                self.deferred_history_lines.extend(display);
-            } else {
-                update.history_lines = display;
-            }
-        }
+        self.pending_history.cells.push(cell);
         self.chat_widget.request_pending_usage_output_insertion();
-        update
-    }
-
-    fn apply_ui_update(tui: &mut tui::Tui, update: AppUiUpdate) {
-        if update.schedule_frame {
-            tui.frame_requester().schedule_frame();
-        }
-        if !update.history_lines.is_empty() {
-            tui.insert_history_lines(update.history_lines);
-        }
-    }
-
-    fn insert_history_cell(&mut self, tui: &mut tui::Tui, cell: Box<dyn HistoryCell>) {
-        let width = tui.terminal.last_known_screen_size.width;
-        let update = self.record_history_cell(cell, width);
-        Self::apply_ui_update(tui, update);
-    }
-
-    fn record_pending_usage_output_if_ready(&mut self, width: u16) -> AppUiUpdate {
-        if let Some(cell) = self.take_pending_usage_output_if_ready() {
-            self.record_history_cell(Box::new(cell), width)
-        } else {
-            AppUiUpdate::default()
-        }
     }
 
     fn take_pending_usage_output_if_ready(&mut self) -> Option<CompositeHistoryCell> {
@@ -1625,15 +1598,11 @@ impl App {
         self.chat_widget.take_completed_token_activity_output()
     }
 
-    async fn apply_pending_usage_app_event(
-        &mut self,
-        event: PendingUsageAppEvent,
-        width: u16,
-    ) -> AppUiUpdate {
-        let mut update = AppUiUpdate::default();
+    async fn apply_pending_usage_app_event(&mut self, event: PendingUsageAppEvent) -> bool {
+        let mut schedule_frame = false;
         let should_insert = match event {
             PendingUsageAppEvent::Loaded { request_id, result } => {
-                update.schedule_frame |= self.drain_active_thread_events_state().await;
+                schedule_frame |= self.drain_active_thread_events_state().await;
                 let error = result.as_ref().err().cloned();
                 let finished = self
                     .chat_widget
@@ -1644,22 +1613,23 @@ impl App {
                 finished
             }
             PendingUsageAppEvent::Commit => {
-                update.schedule_frame |= self.drain_active_thread_events_state().await;
+                schedule_frame |= self.drain_active_thread_events_state().await;
                 true
             }
             PendingUsageAppEvent::ReleaseHistoryBarrier { barrier_id } => {
                 self.chat_widget
                     .release_pending_usage_history_barrier(barrier_id);
-                update.schedule_frame |= self.drain_active_thread_events_state().await;
+                schedule_frame |= self.drain_active_thread_events_state().await;
                 true
             }
         };
-        if should_insert {
+        if should_insert && let Some(cell) = self.take_pending_usage_output_if_ready() {
             // Commit directly so later app events cannot overtake a settled card. Avoid
             // ChatWidget::add_to_history because it can flush an in-progress active cell.
-            update.merge(self.record_pending_usage_output_if_ready(width));
+            self.record_history_cell(Box::new(cell));
+            schedule_frame = true;
         }
-        update
+        schedule_frame
     }
 
     async fn handle_event(&mut self, tui: &mut tui::Tui, event: AppEvent) -> Result<AppRunControl> {
@@ -1938,7 +1908,10 @@ impl App {
 
                 tui.frame_requester().schedule_frame();
             }
-            AppEvent::InsertHistoryCell(cell) => self.insert_history_cell(tui, cell),
+            AppEvent::InsertHistoryCell(cell) => {
+                self.record_history_cell(cell);
+                tui.frame_requester().schedule_frame();
+            }
             AppEvent::StartCommitAnimation => {
                 if self
                     .commit_anim_running
@@ -2045,31 +2018,33 @@ impl App {
                 self.chat_widget.on_rate_limit_snapshot(Some(snapshot));
             }
             AppEvent::TokenActivityLoaded { request_id, result } => {
-                let width = tui.terminal.last_known_screen_size.width;
-                let update = self
-                    .apply_pending_usage_app_event(
-                        PendingUsageAppEvent::Loaded { request_id, result },
-                        width,
-                    )
-                    .await;
-                Self::apply_ui_update(tui, update);
+                if self
+                    .apply_pending_usage_app_event(PendingUsageAppEvent::Loaded {
+                        request_id,
+                        result,
+                    })
+                    .await
+                {
+                    tui.frame_requester().schedule_frame();
+                }
             }
             AppEvent::CommitPendingUsageOutput => {
-                let width = tui.terminal.last_known_screen_size.width;
-                let update = self
-                    .apply_pending_usage_app_event(PendingUsageAppEvent::Commit, width)
-                    .await;
-                Self::apply_ui_update(tui, update);
+                if self
+                    .apply_pending_usage_app_event(PendingUsageAppEvent::Commit)
+                    .await
+                {
+                    tui.frame_requester().schedule_frame();
+                }
             }
             AppEvent::ReleasePendingUsageHistoryBarrier { barrier_id } => {
-                let width = tui.terminal.last_known_screen_size.width;
-                let update = self
-                    .apply_pending_usage_app_event(
-                        PendingUsageAppEvent::ReleaseHistoryBarrier { barrier_id },
-                        width,
-                    )
-                    .await;
-                Self::apply_ui_update(tui, update);
+                if self
+                    .apply_pending_usage_app_event(PendingUsageAppEvent::ReleaseHistoryBarrier {
+                        barrier_id,
+                    })
+                    .await
+                {
+                    tui.frame_requester().schedule_frame();
+                }
             }
             AppEvent::ConnectorsLoaded(result) => {
                 self.chat_widget.on_connectors_loaded(result);
@@ -3357,8 +3332,7 @@ mod tests {
             file_search,
             transcript_cells: Vec::new(),
             overlay: None,
-            deferred_history_lines: Vec::new(),
-            has_emitted_history_lines: false,
+            pending_history: PendingHistory::default(),
             enhanced_keys_supported: false,
             commit_anim_running: Arc::new(AtomicBool::new(false)),
             status_line_invalid_items_warned: Arc::new(AtomicBool::new(false)),
@@ -3375,6 +3349,39 @@ mod tests {
             primary_thread_id: None,
             primary_session_configured: None,
             pending_primary_events: VecDeque::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_markdown_table_uses_width_at_insertion_with_or_without_overlay() {
+        for overlay in [false, true] {
+            let mut app = make_test_app().await;
+            let mut stream = crate::streaming::controller::StreamController::new(Some(38));
+            stream.push("|Name|Status|\n|---|---|\n|alpha|OK|\n");
+            let cell = stream.finalize().expect("completed assistant reply");
+            if overlay {
+                app.overlay = Some(Overlay::new_transcript(Vec::new()));
+            }
+            let height = 10;
+            let backend = crate::test_backend::VT100Backend::new(40, height);
+            let mut terminal =
+                crate::custom_terminal::Terminal::with_options(backend).expect("terminal");
+            app.record_history_cell(cell);
+
+            app.overlay = None;
+            // The draw backend reports the narrower width after the cell was queued.
+            *terminal.backend_mut() = crate::test_backend::VT100Backend::new(14, height);
+            let width = terminal.size().expect("resized terminal").width;
+            terminal.set_viewport_area(ratatui::layout::Rect::new(0, height - 1, width, 1));
+            app.record_history_cell(Box::new(AgentMessageCell::new(vec!["Later".into()], true)));
+            let lines = app.pending_history.take_lines(width);
+            crate::insert_history::insert_history_lines(&mut terminal, lines)
+                .expect("insert history");
+            assert_eq!(
+                terminal.backend().vt100().screen().contents().trim(),
+                "• Name: alpha\n  Status: OK\n\n• Later"
+            );
+            assert!(app.pending_history.take_lines(width).is_empty());
         }
     }
 
@@ -3412,8 +3419,7 @@ mod tests {
                 file_search,
                 transcript_cells: Vec::new(),
                 overlay: None,
-                deferred_history_lines: Vec::new(),
-                has_emitted_history_lines: false,
+                pending_history: PendingHistory::default(),
                 enhanced_keys_supported: false,
                 commit_anim_running: Arc::new(AtomicBool::new(false)),
                 status_line_invalid_items_warned: Arc::new(AtomicBool::new(false)),
@@ -3504,7 +3510,7 @@ mod tests {
                         .any(|span| span.content.contains("Loading..."))
                 })
         );
-        app.apply_pending_usage_app_event(loaded_event, 80).await;
+        app.apply_pending_usage_app_event(loaded_event).await;
         assert!(app.chat_widget.usage_history_insertion_blocked());
         assert!(app.transcript_cells.is_empty());
 
@@ -3521,16 +3527,15 @@ mod tests {
                 }
                 match app_event_rx.recv().await {
                     Some(AppEvent::InsertHistoryCell(cell)) => {
-                        app.record_history_cell(cell, 80);
+                        app.record_history_cell(cell);
                     }
                     Some(AppEvent::CommitPendingUsageOutput) => {
-                        app.apply_pending_usage_app_event(PendingUsageAppEvent::Commit, 80)
+                        app.apply_pending_usage_app_event(PendingUsageAppEvent::Commit)
                             .await;
                     }
                     Some(AppEvent::ReleasePendingUsageHistoryBarrier { barrier_id }) => {
                         app.apply_pending_usage_app_event(
                             PendingUsageAppEvent::ReleaseHistoryBarrier { barrier_id },
-                            80,
                         )
                         .await;
                     }
@@ -3543,13 +3548,10 @@ mod tests {
         .expect("timed out waiting for usage history commit");
 
         assert!(app.chat_widget.active_cell_transcript_lines(80).is_none());
-        app.record_history_cell(
-            Box::new(AgentMessageCell::new(
-                vec![Line::from("later event")],
-                /*is_first_line*/ false,
-            )),
-            80,
-        );
+        app.record_history_cell(Box::new(AgentMessageCell::new(
+            vec![Line::from("later event")],
+            /*is_first_line*/ false,
+        )));
 
         let transcript = app
             .transcript_cells

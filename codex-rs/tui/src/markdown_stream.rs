@@ -1,27 +1,32 @@
-use ratatui::text::Line;
+use crate::markdown_render::MarkdownBlock;
+use crate::markdown_render::SourceBlock;
+use crate::markdown_render::render_markdown_blocks;
+use crate::render::line_utils::is_blank_line_spaces_only;
 
-use crate::markdown;
-
-/// Newline-gated accumulator that renders markdown and commits only fully
-/// completed logical lines.
+/// Newline-gated accumulator for Markdown destined for append-only history.
 pub(crate) struct MarkdownStreamCollector {
     buffer: String,
-    committed_line_count: usize,
+    committed_through: Option<usize>,
+    preview: Vec<MarkdownBlock>,
     width: Option<usize>,
+    unwrap_fences: bool,
 }
 
 impl MarkdownStreamCollector {
-    pub fn new(width: Option<usize>) -> Self {
+    pub fn new(width: Option<usize>, unwrap_fences: bool) -> Self {
         Self {
             buffer: String::new(),
-            committed_line_count: 0,
+            committed_through: None,
+            preview: Vec::new(),
             width,
+            unwrap_fences,
         }
     }
 
     pub fn clear(&mut self) {
         self.buffer.clear();
-        self.committed_line_count = 0;
+        self.committed_through = None;
+        self.preview.clear();
     }
 
     pub fn push_delta(&mut self, delta: &str) {
@@ -29,66 +34,75 @@ impl MarkdownStreamCollector {
         self.buffer.push_str(delta);
     }
 
-    /// Render the full buffer and return only the newly completed logical lines
-    /// since the last commit. When the buffer does not end with a newline, the
-    /// final rendered line is considered incomplete and is not emitted.
-    pub fn commit_complete_lines(&mut self) -> Vec<Line<'static>> {
-        let source = self.buffer.clone();
-        let last_newline_idx = source.rfind('\n');
-        let source = if let Some(last_newline_idx) = last_newline_idx {
-            source[..=last_newline_idx].to_string()
-        } else {
+    /// Keep any unfinished table out of history until stable.
+    pub fn commit_complete_blocks(&mut self) -> Vec<MarkdownBlock> {
+        let Some(last_newline_idx) = self.buffer.rfind('\n') else {
             return Vec::new();
         };
-        let mut rendered: Vec<Line<'static>> = Vec::new();
-        markdown::append_markdown(&source, self.width, &mut rendered);
-        let mut complete_line_count = rendered.len();
-        if complete_line_count > 0
-            && crate::render::line_utils::is_blank_line_spaces_only(
-                &rendered[complete_line_count - 1],
-            )
+        let mut rendered = render_markdown_blocks(
+            &self.buffer[..=last_newline_idx],
+            self.width,
+            /*streaming*/ true,
+            self.unwrap_fences,
+        );
+        if let Some(SourceBlock {
+            block: MarkdownBlock::Line(line),
+            ..
+        }) = rendered.blocks.last()
+            && is_blank_line_spaces_only(line)
         {
-            complete_line_count -= 1;
+            rendered.blocks.pop();
         }
-
-        if self.committed_line_count >= complete_line_count {
-            return Vec::new();
+        self.preview.clear();
+        let through = self.committed_through;
+        let mut out = Vec::new();
+        for entry in rendered.blocks {
+            if through.is_some_and(|start| entry.start <= start) {
+                continue;
+            }
+            if rendered
+                .mutable_from
+                .is_some_and(|start| entry.start >= start)
+            {
+                self.preview.push(entry.block);
+            } else {
+                self.committed_through = self.committed_through.max(Some(entry.start));
+                out.push(entry.block);
+            }
         }
-
-        let out_slice = &rendered[self.committed_line_count..complete_line_count];
-
-        let out = out_slice.to_vec();
-        self.committed_line_count = complete_line_count;
         out
     }
 
-    /// Finalize the stream: emit all remaining lines beyond the last commit.
-    /// If the buffer does not end with a newline, a temporary one is appended
-    /// for rendering. Optionally unwraps ```markdown language fences in
-    /// non-test builds.
-    pub fn finalize_and_drain(&mut self) -> Vec<Line<'static>> {
-        let raw_buffer = self.buffer.clone();
-        let mut source: String = raw_buffer.clone();
+    pub(crate) fn preview(&self) -> &[MarkdownBlock] {
+        &self.preview
+    }
+
+    /// Finalize the stream: emit all remaining blocks beyond the last commit.
+    /// If the buffer does not end with a newline, a temporary one is appended for rendering.
+    pub fn finalize_and_drain(&mut self) -> Vec<MarkdownBlock> {
+        let raw_len = self.buffer.len();
+        let mut source = std::mem::take(&mut self.buffer);
         if !source.ends_with('\n') {
             source.push('\n');
         }
-        tracing::debug!(
-            raw_len = raw_buffer.len(),
-            source_len = source.len(),
-            "markdown finalize (raw length: {}, rendered length: {})",
-            raw_buffer.len(),
-            source.len()
-        );
+        tracing::debug!(raw_len, source_len = source.len(), "finalizing markdown");
         tracing::trace!("markdown finalize (raw source):\n---\n{source}\n---");
 
-        let mut rendered: Vec<Line<'static>> = Vec::new();
-        markdown::append_markdown(&source, self.width, &mut rendered);
-
-        let out = if self.committed_line_count >= rendered.len() {
-            Vec::new()
-        } else {
-            rendered[self.committed_line_count..].to_vec()
-        };
+        let rendered = render_markdown_blocks(
+            &source,
+            self.width,
+            /*streaming*/ false,
+            self.unwrap_fences,
+        );
+        let out = rendered
+            .blocks
+            .into_iter()
+            .filter(|entry| {
+                self.committed_through
+                    .is_none_or(|start| entry.start > start)
+            })
+            .map(|entry| entry.block)
+            .collect();
 
         // Reset collector state for next stream.
         self.clear();
@@ -97,20 +111,31 @@ impl MarkdownStreamCollector {
 }
 
 #[cfg(test)]
+use ratatui::text::Line;
+
+#[cfg(test)]
+fn rendered_lines(blocks: Vec<MarkdownBlock>, width: Option<usize>) -> Vec<Line<'static>> {
+    blocks
+        .into_iter()
+        .flat_map(|block| block.into_lines(width))
+        .collect()
+}
+
+#[cfg(test)]
 pub(crate) fn simulate_stream_markdown_for_tests(
     deltas: &[&str],
     finalize: bool,
 ) -> Vec<Line<'static>> {
-    let mut collector = MarkdownStreamCollector::new(None);
+    let mut collector = MarkdownStreamCollector::new(None, /*unwrap_fences*/ true);
     let mut out = Vec::new();
     for d in deltas {
         collector.push_delta(d);
         if d.contains('\n') {
-            out.extend(collector.commit_complete_lines());
+            out.extend(rendered_lines(collector.commit_complete_blocks(), None));
         }
     }
     if finalize {
-        out.extend(collector.finalize_and_drain());
+        out.extend(rendered_lines(collector.finalize_and_drain(), None));
     }
     out
 }
@@ -118,22 +143,158 @@ pub(crate) fn simulate_stream_markdown_for_tests(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
     use ratatui::style::Color;
+
+    #[test]
+    fn table_is_committed_once_its_widths_are_stable() {
+        let width = Some(24);
+        let mut collector = MarkdownStreamCollector::new(width, /*unwrap_fences*/ true);
+        let preamble = "Summary:\n";
+        collector.push_delta(preamble);
+        let mut lines = rendered_lines(collector.commit_complete_blocks(), width);
+        assert_eq!(lines, [Line::from("Summary:")]);
+
+        // The header immediately after prose is a table once its delimiter arrives.
+        let table = [
+            "|Item|Qty|\n",
+            "|---|---:|\n",
+            "|a|2|\n",
+            "|longer label|120|\n",
+        ];
+        for delta in table {
+            collector.push_delta(delta);
+            assert!(collector.commit_complete_blocks().is_empty());
+        }
+        collector.push_delta("\n");
+        let committed_table = collector.commit_complete_blocks();
+        assert!(matches!(
+            committed_table.as_slice(),
+            [MarkdownBlock::Line(_), MarkdownBlock::Table(_)]
+        ));
+        lines.extend(rendered_lines(committed_table, width));
+        collector.push_delta("Done.");
+        lines.extend(rendered_lines(collector.finalize_and_drain(), width));
+        let expected = crate::markdown_render::render_markdown_text_with_width(
+            &format!("{preamble}{}\nDone.\n", table.concat()),
+            width,
+        );
+        assert_eq!(lines, expected.lines);
+    }
+
+    #[test]
+    fn possible_table_header_in_quote_does_not_drop_prose() {
+        let deltas = ["> first\n> A | B\n", "> last\n"];
+        let expected =
+            crate::markdown_render::render_markdown_text_with_width(&deltas.concat(), Some(24));
+        let mut collector = MarkdownStreamCollector::new(Some(24), /*unwrap_fences*/ true);
+        collector.push_delta(deltas[0]);
+        let mut lines = rendered_lines(collector.commit_complete_blocks(), Some(24));
+        assert_eq!(lines, expected.lines[..1]);
+        collector.push_delta(deltas[1]);
+        lines.extend(rendered_lines(collector.commit_complete_blocks(), Some(24)));
+        lines.extend(rendered_lines(collector.finalize_and_drain(), Some(24)));
+        assert_eq!(lines, expected.lines);
+    }
+
+    #[test]
+    fn multiline_inline_code_before_table_keeps_the_table() {
+        let deltas = ["`a\nb\nc\n", "d`\n\n|K|V|\n|---|---|\n|1|2|\n"];
+        let width = Some(38);
+        let mut collector = MarkdownStreamCollector::new(width, /*unwrap_fences*/ true);
+        let mut blocks = Vec::new();
+        for delta in deltas {
+            collector.push_delta(delta);
+            blocks.extend(collector.commit_complete_blocks());
+        }
+        blocks.extend(collector.finalize_and_drain());
+        let expected =
+            crate::markdown_render::render_markdown_text_with_width(&deltas.concat(), width);
+        assert_eq!(rendered_lines(blocks, width), expected.lines);
+    }
+
+    #[test]
+    fn nested_quoted_table_is_not_skipped_after_its_separator() {
+        let deltas = ["> Intro\n>\n> > |K|V|\n", "> > |---|---|\n> > |1|2|\n"];
+        let source = deltas.concat();
+        let expected = crate::markdown_render::render_markdown_text_with_width(&source, None);
+        assert_eq!(
+            simulate_stream_markdown_for_tests(&deltas, true),
+            expected.lines
+        );
+        assert_eq!(
+            simulate_stream_markdown_for_tests(&[&source], true),
+            expected.lines
+        );
+    }
+
+    #[test]
+    fn closed_table_with_unresolved_reference_stays_out_of_history() {
+        let table_and_prose = "Intro\n\n|Name|Status|\n|---|---|\n|[Alice][ref]|OK|\n\nAfter.\n\n";
+        let definition = "[ref]: https://example.com";
+        let expected = crate::markdown_render::render_markdown_text_with_width(
+            &format!("{table_and_prose}{definition}\n"),
+            None,
+        );
+        let mut collector = MarkdownStreamCollector::new(None, /*unwrap_fences*/ true);
+        collector.push_delta(table_and_prose);
+        let mut lines = rendered_lines(collector.commit_complete_blocks(), None);
+        assert_eq!(lines, [Line::from("Intro")]);
+        collector.push_delta(definition);
+        lines.extend(rendered_lines(collector.finalize_and_drain(), None));
+        assert_eq!(lines, expected.lines);
+    }
+
+    #[test]
+    fn late_reference_before_table_does_not_duplicate_it() {
+        let width = Some(20);
+        for reference in ["[r]", "## [r]", "> [r]"] {
+            let preamble = format!("Intro\n\n{reference}\n\n");
+            let table = "|Key|Value|\n|---|---|\n|one|two|\n\n";
+            let definition = "[r]: https://example.com/a/long/link/destination\n";
+            let mut collector = MarkdownStreamCollector::new(width, /*unwrap_fences*/ true);
+            collector.push_delta(&preamble);
+            let mut lines = rendered_lines(collector.commit_complete_blocks(), width);
+            collector.push_delta(table);
+            lines.extend(rendered_lines(collector.commit_complete_blocks(), width));
+            assert_eq!(
+                lines
+                    .iter()
+                    .filter(|line| line.width() != 0)
+                    .collect::<Vec<_>>(),
+                [&Line::from("Intro")]
+            );
+
+            collector.push_delta(definition);
+            let mut rest = collector.commit_complete_blocks();
+            rest.extend(collector.finalize_and_drain());
+            assert_eq!(
+                rest.iter()
+                    .filter(|block| matches!(block, MarkdownBlock::Table(_)))
+                    .count(),
+                1
+            );
+            lines.extend(rendered_lines(rest, width));
+            let source = format!("{preamble}{table}{definition}");
+            let expected = crate::markdown_render::render_markdown_text_with_width(&source, width);
+            assert_eq!(lines, expected.lines);
+        }
+    }
 
     #[tokio::test]
     async fn no_commit_until_newline() {
-        let mut c = super::MarkdownStreamCollector::new(None);
+        let mut c = MarkdownStreamCollector::new(None, /*unwrap_fences*/ true);
         c.push_delta("Hello, world");
-        let out = c.commit_complete_lines();
+        let out = c.commit_complete_blocks();
         assert!(out.is_empty(), "should not commit without newline");
         c.push_delta("!\n");
-        let out2 = c.commit_complete_lines();
+        let out2 = c.commit_complete_blocks();
         assert_eq!(out2.len(), 1, "one completed line after newline");
     }
 
     #[tokio::test]
     async fn finalize_commits_partial_line() {
-        let mut c = super::MarkdownStreamCollector::new(None);
+        let mut c = MarkdownStreamCollector::new(None, /*unwrap_fences*/ true);
         c.push_delta("Line without newline");
         let out = c.finalize_and_drain();
         assert_eq!(out.len(), 1);
@@ -253,9 +414,9 @@ mod tests {
     async fn heading_starts_on_new_line_when_following_paragraph() {
         // Stream a paragraph line, then a heading on the next line.
         // Expect two distinct rendered lines: "Hello." and "Heading".
-        let mut c = super::MarkdownStreamCollector::new(None);
+        let mut c = MarkdownStreamCollector::new(None, /*unwrap_fences*/ true);
         c.push_delta("Hello.\n");
-        let out1 = c.commit_complete_lines();
+        let out1 = rendered_lines(c.commit_complete_blocks(), None);
         let s1: Vec<String> = out1
             .iter()
             .map(|l| {
@@ -275,7 +436,7 @@ mod tests {
         );
 
         c.push_delta("## Heading\n");
-        let out2 = c.commit_complete_lines();
+        let out2 = rendered_lines(c.commit_complete_blocks(), None);
         let s2: Vec<String> = out2
             .iter()
             .map(|l| {
@@ -309,14 +470,14 @@ mod tests {
         // Paragraph without trailing newline, then a chunk that starts with the newline
         // and the heading text, then a final newline. The collector should first commit
         // only the paragraph line, and later commit the heading as its own line.
-        let mut c = super::MarkdownStreamCollector::new(None);
+        let mut c = MarkdownStreamCollector::new(None, /*unwrap_fences*/ true);
         c.push_delta("Sounds good!");
         // No commit yet
-        assert!(c.commit_complete_lines().is_empty());
+        assert!(c.commit_complete_blocks().is_empty());
 
         // Introduce the newline that completes the paragraph and the start of the heading.
         c.push_delta("\n## Adding Bird subcommand");
-        let out1 = c.commit_complete_lines();
+        let out1 = rendered_lines(c.commit_complete_blocks(), None);
         let s1: Vec<String> = out1
             .iter()
             .map(|l| {
@@ -335,7 +496,7 @@ mod tests {
 
         // Now finish the heading line with the trailing newline.
         c.push_delta("\n");
-        let out2 = c.commit_complete_lines();
+        let out2 = rendered_lines(c.commit_complete_blocks(), None);
         let s2: Vec<String> = out2
             .iter()
             .map(|l| {

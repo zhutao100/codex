@@ -24,6 +24,7 @@ use crate::history_cell::UserHistoryCell;
 use crate::key_hint;
 use crate::key_hint::KeyBinding;
 use crate::render::Insets;
+use crate::render::renderable::HistoryParagraph;
 use crate::render::renderable::InsetRenderable;
 use crate::render::renderable::Renderable;
 use crate::style::user_message_style;
@@ -409,9 +410,8 @@ struct CellRenderable {
 
 impl Renderable for CellRenderable {
     fn render(&self, area: Rect, buf: &mut Buffer) {
-        let p =
-            Paragraph::new(Text::from(self.cell.transcript_lines(area.width))).style(self.style);
-        p.render(area, buf);
+        HistoryParagraph::new(self.cell.transcript_lines(area.width), self.style, 0)
+            .render(area, buf);
     }
 
     fn desired_height(&self, width: u16) -> u16 {
@@ -625,7 +625,7 @@ impl TranscriptOverlay {
         has_prior_cells: bool,
         is_stream_continuation: bool,
     ) -> Box<dyn Renderable> {
-        let paragraph = Paragraph::new(Text::from(lines));
+        let paragraph = HistoryParagraph::new(lines, Style::default(), 0);
         let mut renderable: Box<dyn Renderable> = Box::new(CachedRenderable::new(paragraph));
         if has_prior_cells && !is_stream_continuation {
             renderable = Box::new(InsetRenderable::new(renderable, Insets::tlbr(1, 0, 0, 0)));

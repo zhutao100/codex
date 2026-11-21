@@ -290,26 +290,13 @@ impl App {
     pub(crate) fn close_transcript_overlay(&mut self, tui: &mut tui::Tui) {
         let _ = tui.leave_alt_screen();
         let was_backtrack = self.backtrack.overlay_preview_active;
-        if !self.deferred_history_lines.is_empty() {
-            let lines = std::mem::take(&mut self.deferred_history_lines);
-            tui.insert_history_lines(lines);
-        }
         self.overlay = None;
+        // The next inline draw lays out deferred cells at its actual terminal width.
+        tui.frame_requester().schedule_frame();
         self.backtrack.overlay_preview_active = false;
         if was_backtrack {
             // Ensure backtrack state is fully reset when overlay closes (e.g. via 'q').
             self.reset_backtrack_state();
-        }
-    }
-
-    /// Re-render the full transcript into the terminal scrollback in one call.
-    /// Useful when switching sessions to ensure prior history remains visible.
-    pub(crate) fn render_transcript_once(&mut self, tui: &mut tui::Tui) {
-        if !self.transcript_cells.is_empty() {
-            let width = tui.terminal.last_known_screen_size.width;
-            for cell in &self.transcript_cells {
-                tui.insert_history_lines(cell.display_lines(width));
-            }
         }
     }
 
@@ -437,7 +424,6 @@ impl App {
             }
             if close_overlay {
                 self.close_transcript_overlay(tui);
-                tui.frame_requester().schedule_frame();
             }
             return Ok(());
         }
@@ -446,7 +432,6 @@ impl App {
             overlay.handle_event(tui, event)?;
             if overlay.is_done() {
                 self.close_transcript_overlay(tui);
-                tui.frame_requester().schedule_frame();
             }
         }
         Ok(())
@@ -459,7 +444,6 @@ impl App {
         self.close_transcript_overlay(tui);
         if let Some(selection) = selection {
             self.apply_backtrack_rollback(selection);
-            tui.frame_requester().schedule_frame();
         }
     }
 
