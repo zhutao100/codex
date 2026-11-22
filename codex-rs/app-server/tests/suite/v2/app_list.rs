@@ -93,7 +93,8 @@ async fn list_apps_returns_connectors_with_accessible_flags() -> Result<()> {
     ];
 
     let tools = vec![connector_tool("beta", "Beta App")?];
-    let (server_url, server_handle) = start_apps_server(connectors.clone(), tools).await?;
+    let (server_url, server_handle, directory_requests) =
+        start_apps_server(connectors.clone(), tools).await?;
 
     let codex_home = TempDir::new()?;
     write_connectors_config(codex_home.path(), &server_url)?;
@@ -150,6 +151,32 @@ async fn list_apps_returns_connectors_with_accessible_flags() -> Result<()> {
     assert_eq!(data, expected);
     assert!(next_cursor.is_none());
 
+    let before_logout = directory_requests.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(before_logout > 0);
+    let logout = mcp.send_logout_account_request().await?;
+    timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(logout)),
+    )
+    .await??;
+    let again = mcp
+        .send_apps_list_request(AppsListParams {
+            limit: None,
+            cursor: None,
+        })
+        .await?;
+    let response = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(again)),
+    )
+    .await??;
+    let result: AppsListResponse = to_response(response)?;
+    assert_eq!(result.data, Vec::new());
+    assert_eq!(
+        directory_requests.load(std::sync::atomic::Ordering::SeqCst),
+        before_logout
+    );
+
     server_handle.abort();
     Ok(())
 }
@@ -180,7 +207,7 @@ async fn list_apps_paginates_results() -> Result<()> {
     ];
 
     let tools = vec![connector_tool("beta", "Beta App")?];
-    let (server_url, server_handle) = start_apps_server(connectors.clone(), tools).await?;
+    let (server_url, server_handle, _) = start_apps_server(connectors.clone(), tools).await?;
 
     let codex_home = TempDir::new()?;
     write_connectors_config(codex_home.path(), &server_url)?;
@@ -262,6 +289,7 @@ async fn list_apps_paginates_results() -> Result<()> {
 
 #[derive(Clone)]
 struct AppsServerState {
+    requests: Arc<std::sync::atomic::AtomicUsize>,
     expected_bearer: String,
     expected_account_id: String,
     response: serde_json::Value,
@@ -306,8 +334,10 @@ impl ServerHandler for AppListMcpServer {
 async fn start_apps_server(
     connectors: Vec<AppInfo>,
     tools: Vec<Tool>,
-) -> Result<(String, JoinHandle<()>)> {
+) -> Result<(String, JoinHandle<()>, Arc<std::sync::atomic::AtomicUsize>)> {
+    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let state = AppsServerState {
+        requests: requests.clone(),
         expected_bearer: "Bearer chatgpt-token".to_string(),
         expected_account_id: "account-123".to_string(),
         response: json!({ "apps": connectors, "next_token": null }),
@@ -340,13 +370,16 @@ async fn start_apps_server(
         let _ = axum::serve(listener, router).await;
     });
 
-    Ok((format!("http://{addr}"), handle))
+    Ok((format!("http://{addr}"), handle, requests))
 }
 
 async fn list_directory_connectors(
     State(state): State<Arc<AppsServerState>>,
     headers: HeaderMap,
 ) -> Result<impl axum::response::IntoResponse, StatusCode> {
+    state
+        .requests
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let bearer_ok = headers
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())

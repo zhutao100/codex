@@ -4,7 +4,6 @@ use clap::Parser;
 use codex_common::CliConfigOverrides;
 use codex_core::config::Config;
 
-use crate::chatgpt_token::init_chatgpt_token_from_auth;
 use crate::get_task::GetTaskResponse;
 use crate::get_task::OutputItem;
 use crate::get_task::PrOutputItem;
@@ -29,9 +28,6 @@ pub async fn run_apply_command(
             .map_err(anyhow::Error::msg)?,
     )
     .await?;
-
-    init_chatgpt_token_from_auth(&config.codex_home, config.cli_auth_credentials_store_mode)
-        .await?;
 
     let task_response = get_task(&config, apply_cli.task_id).await?;
     apply_diff_from_task(task_response, cwd).await

@@ -1,8 +1,8 @@
 use codex_core::config::Config;
 use codex_core::default_client::create_client;
 
-use crate::chatgpt_token::get_chatgpt_token_data;
-use crate::chatgpt_token::init_chatgpt_token_from_auth;
+use crate::chatgpt_token::load_chatgpt_token;
+use codex_core::token_data::TokenData;
 
 use anyhow::Context;
 use serde::de::DeserializeOwned;
@@ -13,26 +13,25 @@ pub(crate) async fn chatgpt_get_request<T: DeserializeOwned>(
     config: &Config,
     path: String,
 ) -> anyhow::Result<T> {
-    chatgpt_get_request_with_timeout(config, path, None).await
+    let token = load_chatgpt_token(&config.codex_home, config.cli_auth_credentials_store_mode)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("ChatGPT token not available"))?;
+    chatgpt_get_request_with_timeout(config, &token, path, None).await
 }
 
 pub(crate) async fn chatgpt_get_request_with_timeout<T: DeserializeOwned>(
     config: &Config,
+    token: &TokenData,
     path: String,
     timeout: Option<Duration>,
 ) -> anyhow::Result<T> {
     let chatgpt_base_url = &config.chatgpt_base_url;
-    init_chatgpt_token_from_auth(&config.codex_home, config.cli_auth_credentials_store_mode)
-        .await?;
 
     // Make direct HTTP request to ChatGPT backend API with the token
     let client = create_client();
     let url = format!("{chatgpt_base_url}{path}");
 
-    let token =
-        get_chatgpt_token_data().ok_or_else(|| anyhow::anyhow!("ChatGPT token not available"))?;
-
-    let account_id = token.account_id.ok_or_else(|| {
+    let account_id = token.account_id.as_deref().ok_or_else(|| {
         anyhow::anyhow!("ChatGPT account ID not available, please re-run `codex login`")
     });
 

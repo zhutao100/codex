@@ -6,8 +6,8 @@ use serde::Deserialize;
 use std::time::Duration;
 
 use crate::chatgpt_client::chatgpt_get_request_with_timeout;
-use crate::chatgpt_token::get_chatgpt_token_data;
-use crate::chatgpt_token::init_chatgpt_token_from_auth;
+use crate::chatgpt_token::load_chatgpt_token;
+use codex_core::token_data::TokenData;
 
 pub use codex_core::connectors::AppInfo;
 pub use codex_core::connectors::connector_display_label;
@@ -56,14 +56,14 @@ pub async fn list_all_connectors(config: &Config) -> anyhow::Result<Vec<AppInfo>
     if !config.features.enabled(Feature::Apps) {
         return Ok(Vec::new());
     }
-    init_chatgpt_token_from_auth(&config.codex_home, config.cli_auth_credentials_store_mode)
-        .await?;
-
-    let token_data =
-        get_chatgpt_token_data().ok_or_else(|| anyhow::anyhow!("ChatGPT token not available"))?;
-    let mut apps = list_directory_connectors(config).await?;
+    let Some(token_data) =
+        load_chatgpt_token(&config.codex_home, config.cli_auth_credentials_store_mode).await?
+    else {
+        return Ok(Vec::new());
+    };
+    let mut apps = list_directory_connectors(config, &token_data).await?;
     if token_data.id_token.is_workspace_account() {
-        apps.extend(list_workspace_connectors(config).await?);
+        apps.extend(list_workspace_connectors(config, &token_data).await?);
     }
     let mut connectors = merge_directory_apps(apps)
         .into_iter()
@@ -87,7 +87,10 @@ pub async fn list_all_connectors(config: &Config) -> anyhow::Result<Vec<AppInfo>
     Ok(connectors)
 }
 
-async fn list_directory_connectors(config: &Config) -> anyhow::Result<Vec<DirectoryApp>> {
+async fn list_directory_connectors(
+    config: &Config,
+    token: &TokenData,
+) -> anyhow::Result<Vec<DirectoryApp>> {
     let mut apps = Vec::new();
     let mut next_token: Option<String> = None;
     loop {
@@ -98,9 +101,13 @@ async fn list_directory_connectors(config: &Config) -> anyhow::Result<Vec<Direct
             }
             None => "/connectors/directory/list?tier=categorized".to_string(),
         };
-        let response: DirectoryListResponse =
-            chatgpt_get_request_with_timeout(config, path, Some(DIRECTORY_CONNECTORS_TIMEOUT))
-                .await?;
+        let response: DirectoryListResponse = chatgpt_get_request_with_timeout(
+            config,
+            token,
+            path,
+            Some(DIRECTORY_CONNECTORS_TIMEOUT),
+        )
+        .await?;
         apps.extend(
             response
                 .apps
@@ -118,9 +125,13 @@ async fn list_directory_connectors(config: &Config) -> anyhow::Result<Vec<Direct
     Ok(apps)
 }
 
-async fn list_workspace_connectors(config: &Config) -> anyhow::Result<Vec<DirectoryApp>> {
+async fn list_workspace_connectors(
+    config: &Config,
+    token: &TokenData,
+) -> anyhow::Result<Vec<DirectoryApp>> {
     let response: anyhow::Result<DirectoryListResponse> = chatgpt_get_request_with_timeout(
         config,
+        token,
         "/connectors/directory/list_workspace".to_string(),
         Some(DIRECTORY_CONNECTORS_TIMEOUT),
     )
