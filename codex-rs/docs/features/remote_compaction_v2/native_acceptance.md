@@ -16,9 +16,9 @@ CODEX_SANDBOX_NETWORK_DISABLED=1 python3 scripts/validate-remote-compaction.py "
 |`--auth-source PATH`|Read a prepared credential file; otherwise use the user's auth file.|
 |`--model MODEL`|Use an explicit available model; otherwise read the source configuration.|
 |`--timeout SECONDS`|Set the per-turn deadline; default 120 seconds.|
-|`--websocket`|Enable Responses WebSockets v2 for an additional transport check.|
+|`--websocket`|Select `responses_transport = "auto"` on the WebSocket-capable provider for an additional transport check.|
 
-The script creates temporary state/workspaces, copies authentication, clears the copied refresh token and leaves source credentials untouched. It uses the built-in OpenAI provider and disables shell execution, undo, remote-model refresh, auto-rename and completion review. It emits JSON milestones and bounded failure diagnostics.
+The script creates temporary state/workspaces, copies authentication, clears the copied refresh token and leaves source credentials untouched. It uses the built-in OpenAI provider and disables shell tools, auto-rename and completion review. OpenAI model discovery still follows the normal authentication and cache rules; catalog traffic is not a compaction request. The script emits JSON milestones and bounded failure diagnostics.
 
 The generated config currently contains `base_instructions`, which is not a supported top-level TOML override. This runner therefore does not establish a custom base-prompt configuration; use `model_instructions_file` when changing that behavior.
 

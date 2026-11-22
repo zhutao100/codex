@@ -242,7 +242,7 @@ def main() -> None:
             "-c", f'model_providers.plugin-probe.base_url="{server.url}/v1"',
             "-c", 'model_providers.plugin-probe.wire_api="responses"',
             "-c", "model_providers.plugin-probe.requires_openai_auth=false",
-            "-c", "features.remote_compaction_v2=false",
+            "-c", 'compaction_mode="local"',
             "-c", "features.unified_exec=false",
         ]
 

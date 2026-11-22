@@ -698,7 +698,7 @@ To enable or disable a skill by path:
 
 ## Apps
 
-Use `app/list` to fetch available apps (connectors). Each entry includes metadata like the app `id`, display `name`, `installUrl`, and whether it is currently accessible.
+Use `app/list` to fetch available apps (connectors). Each entry includes metadata like the app `id`, display `name`, `installUrl`, and whether it is currently accessible. Hosted directory requests use the current ChatGPT account. After logout, listing does not contact the directory with the previous account's credentials.
 
 ```json
 { "method": "app/list", "id": 50, "params": {
