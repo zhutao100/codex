@@ -8,9 +8,8 @@ use clap::ArgGroup;
 use codex_common::CliConfigOverrides;
 use codex_common::format_env_display::format_env_display;
 use codex_core::config::Config;
-use codex_core::config::edit::ConfigEditsBuilder;
+use codex_core::config::edit::edit_mcp_server;
 use codex_core::config::find_codex_home;
-use codex_core::config::load_global_mcp_servers;
 use codex_core::config::types::McpServerConfig;
 use codex_core::config::types::McpServerTransportConfig;
 use codex_core::mcp::auth::McpOAuthLoginSupport;
@@ -197,9 +196,6 @@ async fn run_add(config_overrides: &CliConfigOverrides, add_args: AddArgs) -> Re
     validate_server_name(&name)?;
 
     let codex_home = find_codex_home().context("failed to resolve CODEX_HOME")?;
-    let mut servers = load_global_mcp_servers(&codex_home)
-        .await
-        .with_context(|| format!("failed to load MCP servers from {}", codex_home.display()))?;
 
     let transport = match transport_args {
         AddMcpTransportArgs {
@@ -251,11 +247,7 @@ async fn run_add(config_overrides: &CliConfigOverrides, add_args: AddArgs) -> Re
         scopes: None,
     };
 
-    servers.insert(name.clone(), new_entry);
-
-    ConfigEditsBuilder::new(&codex_home)
-        .replace_mcp_servers(&servers)
-        .apply()
+    edit_mcp_server(&codex_home, name.clone(), Some(new_entry))
         .await
         .with_context(|| format!("failed to write MCP servers to {}", codex_home.display()))?;
 
@@ -295,19 +287,9 @@ async fn run_remove(config_overrides: &CliConfigOverrides, remove_args: RemoveAr
     validate_server_name(&name)?;
 
     let codex_home = find_codex_home().context("failed to resolve CODEX_HOME")?;
-    let mut servers = load_global_mcp_servers(&codex_home)
+    let removed = edit_mcp_server(&codex_home, name.clone(), None)
         .await
-        .with_context(|| format!("failed to load MCP servers from {}", codex_home.display()))?;
-
-    let removed = servers.remove(&name).is_some();
-
-    if removed {
-        ConfigEditsBuilder::new(&codex_home)
-            .replace_mcp_servers(&servers)
-            .apply()
-            .await
-            .with_context(|| format!("failed to write MCP servers to {}", codex_home.display()))?;
-    }
+        .with_context(|| format!("failed to write MCP servers to {}", codex_home.display()))?;
 
     if removed {
         println!("Removed global MCP server '{name}'.");

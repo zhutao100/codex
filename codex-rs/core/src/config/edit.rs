@@ -753,6 +753,57 @@ pub(super) fn read_or_create_user_config(home: &Path) -> anyhow::Result<toml::Va
     })
 }
 
+/// Add, replace, or remove a single user MCP server without replacing concurrent entries.
+pub async fn edit_mcp_server(
+    home: &Path,
+    name: String,
+    server: Option<McpServerConfig>,
+) -> anyhow::Result<bool> {
+    let home = home.to_owned();
+    task::spawn_blocking(move || {
+        edit_locked(&home, None, |doc| {
+            let changed = match server {
+                Some(config) => {
+                    if let Some(inline) = doc
+                        .doc
+                        .get_mut("mcp_servers")
+                        .and_then(|root| root.get_mut(&name))
+                        .and_then(TomlItem::as_inline_table_mut)
+                    {
+                        document_helpers::merge_inline_table(
+                            inline,
+                            document_helpers::serialize_mcp_server_inline(&config),
+                        );
+                        true
+                    } else {
+                        doc.write_value(
+                            Scope::Global,
+                            &["mcp_servers", &name],
+                            document_helpers::serialize_mcp_server(&config),
+                        )
+                    }
+                }
+                None => {
+                    let removed = doc.clear(Scope::Global, &["mcp_servers", &name]);
+                    if removed
+                        && doc
+                            .doc
+                            .get("mcp_servers")
+                            .and_then(TomlItem::as_table_like)
+                            .is_some_and(toml_edit::TableLike::is_empty)
+                    {
+                        doc.clear(Scope::Global, &["mcp_servers"]);
+                    }
+                    removed
+                }
+            };
+            Ok((changed, changed))
+        })
+    })
+    .await
+    .context("MCP config persistence task panicked")?
+}
+
 /// Select and insert absent MCP entries against the same locked user document.
 pub(crate) async fn add_mcp_servers(
     codex_home: PathBuf,
@@ -1522,15 +1573,15 @@ gpt-5 = "gpt-5.1"
                 HashMap::from([(name.to_owned(), server)])
             })
         };
-        let remove = apply(
+        let cli = edit_mcp_server(
             home.path(),
-            None,
-            vec![ConfigEdit::ClearPath {
-                segments: vec!["mcp_servers".into(), "retired".into()],
-            }],
+            "cli".into(),
+            Some(toml::from_str("command = 'cli'")?),
         );
-        let (a, b, ()) = tokio::try_join!(add("first"), add("second"), remove)?;
-        assert_eq!((a.len(), b.len()), (1, 1));
+        let remove = edit_mcp_server(home.path(), "retired".into(), None);
+        let (a, b, inserted, removed) = tokio::try_join!(add("first"), add("second"), cli, remove)?;
+        assert_eq!((a.len(), b.len(), inserted, removed), (1, 1, true, true));
+        assert!(!edit_mcp_server(home.path(), "retired".into(), None).await?);
         let file: toml::Table =
             toml::from_str(&std::fs::read_to_string(home.path().join("config.toml"))?)?;
         assert_eq!(
@@ -1544,7 +1595,7 @@ gpt-5 = "gpt-5.1"
                 .keys()
                 .map(String::as_str)
                 .collect::<std::collections::BTreeSet<_>>(),
-            ["first", "second"].into_iter().collect()
+            ["first", "second", "cli"].into_iter().collect()
         );
         Ok(())
     }
