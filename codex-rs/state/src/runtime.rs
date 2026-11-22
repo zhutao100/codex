@@ -219,6 +219,7 @@ SELECT
     updated_at,
     source,
     model_provider,
+    model_provider_inferred,
     CASE WHEN ? THEN COALESCE(rollout_cwd, cwd) ELSE cwd END AS cwd,
     cli_version,
     title,
@@ -238,8 +239,12 @@ WHERE id = ?
         .bind(id.to_string())
         .fetch_optional(self.pool.as_ref())
         .await?;
-        row.map(|row| ThreadRow::try_from_row(&row).and_then(ThreadMetadata::try_from))
-            .transpose()
+        row.map(|row| {
+            ThreadRow::try_from_row(&row)
+                .and_then(ThreadMetadata::try_from)
+                .map(|metadata| metadata.for_provider(&self.default_provider))
+        })
+        .transpose()
     }
 
     /// Get dynamic tools for a thread, if present.
@@ -353,6 +358,7 @@ SELECT
     updated_at,
     source,
     model_provider,
+    model_provider_inferred,
     COALESCE(rollout_cwd, cwd) AS cwd,
     cli_version,
     title,
@@ -372,6 +378,7 @@ FROM threads
             archived_only,
             allowed_sources,
             model_providers,
+            &self.default_provider,
             anchor,
             sort_key,
         );
@@ -380,7 +387,11 @@ FROM threads
         let rows = builder.build().fetch_all(self.pool.as_ref()).await?;
         let mut items = rows
             .into_iter()
-            .map(|row| ThreadRow::try_from_row(&row).and_then(ThreadMetadata::try_from))
+            .map(|row| {
+                ThreadRow::try_from_row(&row)
+                    .and_then(ThreadMetadata::try_from)
+                    .map(|metadata| metadata.for_provider(&self.default_provider))
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let num_scanned_rows = items.len();
         let next_anchor = if items.len() > page_size {
@@ -508,6 +519,7 @@ INSERT INTO threads (
     updated_at,
     source,
     model_provider,
+    model_provider_inferred,
     cwd,
     cli_version,
     title,
@@ -521,7 +533,7 @@ INSERT INTO threads (
     git_branch,
     git_origin_url,
     rollout_cwd
-) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
 WHERE ? IS NULL OR EXISTS (SELECT 1 FROM backfill_state WHERE id = 1 AND generation = ? AND status = 'running')
 ON CONFLICT(id) DO UPDATE SET
     rollout_path = excluded.rollout_path,
@@ -529,6 +541,7 @@ ON CONFLICT(id) DO UPDATE SET
     updated_at = excluded.updated_at,
     source = excluded.source,
     model_provider = excluded.model_provider,
+    model_provider_inferred = excluded.model_provider_inferred,
     cwd = excluded.cwd,
     cli_version = excluded.cli_version,
     title = excluded.title,
@@ -549,7 +562,8 @@ ON CONFLICT(id) DO UPDATE SET
         .bind(datetime_to_epoch_seconds(metadata.created_at))
         .bind(datetime_to_epoch_seconds(metadata.updated_at))
         .bind(metadata.source.as_str())
-        .bind(metadata.model_provider.as_str())
+        .bind(if metadata.provider_inferred { "" } else { metadata.model_provider.as_str() })
+        .bind(metadata.provider_inferred)
         .bind(metadata.cwd.display().to_string())
         .bind(metadata.cli_version.as_str())
         .bind(metadata.title.as_str())
@@ -923,6 +937,7 @@ fn push_thread_filters<'a>(
     archived_only: bool,
     allowed_sources: &'a [String],
     model_providers: Option<&'a [String]>,
+    default_provider: &str,
     anchor: Option<&crate::Anchor>,
     sort_key: SortKey,
 ) {
@@ -944,12 +959,20 @@ fn push_thread_filters<'a>(
     if let Some(model_providers) = model_providers
         && !model_providers.is_empty()
     {
-        builder.push(" AND model_provider IN (");
+        builder.push(" AND (model_provider_inferred = 0 AND model_provider IN (");
         let mut separated = builder.separated(", ");
         for provider in model_providers {
             separated.push_bind(provider);
         }
         separated.push_unseparated(")");
+        if model_providers
+            .iter()
+            .any(|provider| provider == default_provider)
+        {
+            // Inferred rows store an empty key so both alternatives can use the provider index.
+            builder.push(" OR (model_provider = '' AND model_provider_inferred = 1)");
+        }
+        builder.push(")");
     }
     if let Some(anchor) = anchor {
         let anchor_ts = datetime_to_epoch_seconds(anchor.ts);
@@ -1441,6 +1464,7 @@ mod tests {
             updated_at: now,
             source: "cli".to_string(),
             model_provider: "test-provider".to_string(),
+            provider_inferred: false,
             cwd,
             cli_version: "0.0.0".to_string(),
             title: String::new(),

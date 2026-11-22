@@ -26,8 +26,8 @@ use uuid::Uuid;
 /// Core-facing handle to the optional SQLite-backed state runtime.
 pub type StateDbHandle = Arc<codex_state::StateRuntime>;
 
-/// Initialize the metadata index for a persistent recorder. JSONL remains authoritative
-/// if the database cannot open or its backfill has not completed.
+/// Start or recover the history index, but keep independent services (memories and
+/// logs) available even when one rollout cannot be indexed.
 pub(crate) async fn init_for_rollout(
     config: &Config,
     otel: Option<&OtelManager>,
@@ -51,15 +51,16 @@ pub(crate) async fn init_for_rollout(
             return None;
         }
     };
-    verified_index(runtime, &config.model_provider_id, otel, true).await
+    verified_index(runtime.clone(), &config.model_provider_id, otel, true).await;
+    Some(runtime)
 }
 
-/// Open an existing complete index without creating one for ephemeral sessions.
+/// Open the existing state store for services that do not require a complete history index.
 pub async fn get_state_db(config: &Config, otel: Option<&OtelManager>) -> Option<StateDbHandle> {
     if config.ephemeral {
         return None;
     }
-    open_existing(&config.codex_home, Some(&config.model_provider_id), otel).await
+    open_database(&config.codex_home, &config.model_provider_id, otel).await
 }
 
 /// Open the index only if the file and a complete backfill already exist.
@@ -130,17 +131,7 @@ async fn open_existing(
     default_provider: Option<&str>,
     otel: Option<&OtelManager>,
 ) -> Option<StateDbHandle> {
-    let db_path = codex_state::state_db_path(codex_home);
-    if !tokio::fs::try_exists(&db_path).await.unwrap_or(false) {
-        return None;
-    }
-    let runtime = codex_state::StateRuntime::init(
-        codex_home.to_path_buf(),
-        default_provider.unwrap_or_default().to_owned(),
-        otel.cloned(),
-    )
-    .await
-    .ok()?;
+    let runtime = open_database(codex_home, default_provider.unwrap_or_default(), otel).await?;
     if let Some(provider) = default_provider {
         return verified_index(runtime, provider, otel, false).await;
     }
@@ -148,6 +139,24 @@ async fn open_existing(
     let state = runtime.get_backfill_state().await.ok()?;
     (state.status == codex_state::BackfillStatus::Complete && state.generation >= generation)
         .then_some(runtime)
+}
+
+async fn open_database(
+    codex_home: &Path,
+    default_provider: &str,
+    otel: Option<&OtelManager>,
+) -> Option<StateDbHandle> {
+    let db_path = codex_state::state_db_path(codex_home);
+    if !tokio::fs::try_exists(&db_path).await.unwrap_or(false) {
+        return None;
+    }
+    codex_state::StateRuntime::init(
+        codex_home.to_path_buf(),
+        default_provider.to_owned(),
+        otel.cloned(),
+    )
+    .await
+    .ok()
 }
 
 const MISSED_INDEX_WRITES: &str = "state_index_misses";

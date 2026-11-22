@@ -41,6 +41,38 @@ async fn get_memory_tool_returns_persisted_thread_memory() -> Result<()> {
     db.upsert_thread_memory(thread_id, trace_summary, memory_summary)
         .await?;
 
+    let home = test.home.clone();
+    let orphan = test
+        .session_configured
+        .rollout_path
+        .as_ref()
+        .expect("rollout")
+        .with_file_name(format!(
+            "rollout-2026-01-27T12-00-00-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+    std::fs::File::create(&orphan)?;
+    db.invalidate_backfill(1).await?;
+    let test = test_codex()
+        .with_home(home)
+        .with_config(|config| {
+            config.features.enable(Feature::MemoryTool);
+        })
+        .build(&server)
+        .await?;
+    assert_ne!(
+        db.get_backfill_state().await?.status,
+        codex_state::BackfillStatus::Complete
+    );
+    assert!(
+        codex_core::state_db::open_if_present(
+            test.codex_home_path(),
+            &test.config.model_provider_id
+        )
+        .await
+        .is_none()
+    );
+
     let call_id = "memory-call-1";
     let arguments = json!({
         "memory_id": thread_id_string,
@@ -79,5 +111,18 @@ async fn get_memory_tool_returns_persisted_thread_memory() -> Result<()> {
         })
     );
 
+    std::fs::remove_file(orphan)?;
+    let _next = test_codex()
+        .with_home(test.home.clone())
+        .build(&server)
+        .await?;
+    assert!(
+        codex_core::state_db::open_if_present(
+            test.codex_home_path(),
+            &test.config.model_provider_id
+        )
+        .await
+        .is_some()
+    );
     Ok(())
 }

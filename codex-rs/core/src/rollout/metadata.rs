@@ -550,7 +550,12 @@ mod tests {
         let state = runtime.get_backfill_state().await?;
         assert_ne!(state.status, BackfillStatus::Complete);
         assert!(state.last_watermark.is_none());
-        assert!(crate::state_db::get_state_db(&config, None).await.is_none());
+        assert!(crate::state_db::get_state_db(&config, None).await.is_some());
+        assert!(
+            crate::state_db::open_if_present(dir.path(), &config.model_provider_id)
+                .await
+                .is_none()
+        );
         std::fs::write(&path, contents)?;
         let list = || {
             RolloutRecorder::list_threads(
@@ -618,6 +623,13 @@ mod tests {
         let mut config = crate::config::test_config();
         config.codex_home = home.path().into();
         config.model_provider_id = "configured-provider".into();
+        let explicit = write_rollout_in_sessions(
+            home.path(),
+            "2026-01-27T11-00-00",
+            "2026-01-27T19:00:00Z",
+            Uuid::new_v4(),
+        );
+        append_picker_message(&explicit)?;
         let db = crate::state_db::init_for_rollout(&config, None)
             .await
             .unwrap();
@@ -660,6 +672,75 @@ mod tests {
             db.get_thread(thread).await?.unwrap().model_provider,
             config.model_provider_id
         );
+        let other = "test-provider".to_owned();
+        let queried = crate::state_db::history_index(home.path(), &other, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            queried
+                .get_thread_for_history(thread)
+                .await?
+                .unwrap()
+                .model_provider,
+            other
+        );
+        for sql in [true, false] {
+            if !sql {
+                // An unavailable journal makes the same public APIs use JSONL.
+                let journal = home.path().join("state_index_misses");
+                std::fs::remove_file(&journal)?;
+                std::fs::create_dir(journal)?;
+            }
+            assert_eq!(
+                crate::state_db::history_index(home.path(), &other, false)
+                    .await
+                    .is_some(),
+                sql
+            );
+            for (reader, expected) in [
+                (
+                    &other,
+                    vec![(&path, None), (&explicit, Some(other.as_str()))],
+                ),
+                (
+                    &config.model_provider_id,
+                    vec![(&explicit, Some(other.as_str()))],
+                ),
+            ] {
+                let filters = Some(std::slice::from_ref(&other));
+                let page = RolloutRecorder::list_threads(
+                    home.path(),
+                    5,
+                    None,
+                    crate::ThreadSortKey::CreatedAt,
+                    &[],
+                    filters,
+                    reader,
+                )
+                .await?;
+                assert_eq!(
+                    page.items
+                        .iter()
+                        .map(|item| (&item.path, item.model_provider.as_deref()))
+                        .collect::<Vec<_>>(),
+                    expected
+                );
+                assert_eq!(
+                    RolloutRecorder::find_latest_thread_path(
+                        home.path(),
+                        1,
+                        None,
+                        crate::ThreadSortKey::CreatedAt,
+                        &[],
+                        filters,
+                        reader,
+                        Some(home.path())
+                    )
+                    .await?,
+                    Some(expected[0].0.clone())
+                );
+            }
+        }
         Ok(())
     }
 

@@ -66,6 +66,8 @@ pub struct ThreadMetadata {
     pub source: String,
     /// The model provider identifier.
     pub model_provider: String,
+    /// The header omitted the provider; `model_provider` uses this reader's default.
+    pub provider_inferred: bool,
     /// The working directory for the thread.
     pub cwd: PathBuf,
     /// Version of the CLI that created the thread.
@@ -165,6 +167,7 @@ impl ThreadMetadataBuilder {
             created_at,
             updated_at,
             source,
+            provider_inferred: self.model_provider.is_none(),
             model_provider: self
                 .model_provider
                 .clone()
@@ -185,6 +188,13 @@ impl ThreadMetadataBuilder {
 }
 
 impl ThreadMetadata {
+    pub(crate) fn for_provider(mut self, default_provider: &str) -> Self {
+        if self.provider_inferred {
+            self.model_provider = default_provider.to_owned();
+        }
+        self
+    }
+
     /// Return the list of field names that differ between `self` and `other`.
     pub fn diff_fields(&self, other: &Self) -> Vec<&'static str> {
         let mut diffs = Vec::new();
@@ -205,6 +215,9 @@ impl ThreadMetadata {
         }
         if self.model_provider != other.model_provider {
             diffs.push("model_provider");
+        }
+        if self.provider_inferred != other.provider_inferred {
+            diffs.push("model_provider_inferred");
         }
         if self.cwd != other.cwd {
             diffs.push("cwd");
@@ -255,6 +268,7 @@ pub(crate) struct ThreadRow {
     updated_at: i64,
     source: String,
     model_provider: String,
+    provider_inferred: bool,
     cwd: String,
     cli_version: String,
     title: String,
@@ -277,6 +291,7 @@ impl ThreadRow {
             updated_at: row.try_get("updated_at")?,
             source: row.try_get("source")?,
             model_provider: row.try_get("model_provider")?,
+            provider_inferred: row.try_get("model_provider_inferred")?,
             cwd: row.try_get("cwd")?,
             cli_version: row.try_get("cli_version")?,
             title: row.try_get("title")?,
@@ -303,6 +318,7 @@ impl TryFrom<ThreadRow> for ThreadMetadata {
             updated_at,
             source,
             model_provider,
+            provider_inferred,
             cwd,
             cli_version,
             title,
@@ -321,6 +337,7 @@ impl TryFrom<ThreadRow> for ThreadMetadata {
             created_at: epoch_seconds_to_datetime(created_at)?,
             updated_at: epoch_seconds_to_datetime(updated_at)?,
             source,
+            provider_inferred,
             model_provider,
             cwd: PathBuf::from(cwd),
             cli_version,

@@ -911,7 +911,7 @@ impl From<codex_state::ThreadsPage> for ThreadsPage {
                 git_sha: item.git_sha,
                 git_origin_url: item.git_origin_url,
                 source: Some(state_db::decode_session_source(item.source)),
-                model_provider: Some(item.model_provider),
+                model_provider: (!item.provider_inferred).then_some(item.model_provider),
                 cli_version: Some(item.cli_version),
                 created_at: Some(item.created_at.to_rfc3339_opts(SecondsFormat::Secs, true)),
                 updated_at: Some(item.updated_at.to_rfc3339_opts(SecondsFormat::Secs, true)),

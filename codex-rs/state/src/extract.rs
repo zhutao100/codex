@@ -26,7 +26,7 @@ pub fn apply_rollout_item(
         | RolloutItem::TokenUsageContext { .. }
         | RolloutItem::PostTurnCompletionReviewState(_) => {}
     }
-    if metadata.model_provider.is_empty() {
+    if metadata.provider_inferred {
         metadata.model_provider = default_provider.to_string();
     }
 }
@@ -39,9 +39,8 @@ fn apply_session_meta_from_item(metadata: &mut ThreadMetadata, meta_line: &Sessi
     }
     metadata.id = meta_line.meta.id;
     metadata.source = enum_to_string(&meta_line.meta.source);
-    if let Some(provider) = meta_line.meta.model_provider.as_deref() {
-        metadata.model_provider = provider.to_string();
-    }
+    metadata.provider_inferred = meta_line.meta.model_provider.is_none();
+    metadata.model_provider = meta_line.meta.model_provider.clone().unwrap_or_default();
     if !meta_line.meta.cli_version.is_empty() {
         metadata.cli_version = meta_line.meta.cli_version.clone();
     }
@@ -234,6 +233,7 @@ mod tests {
             updated_at: created_at,
             source: "cli".to_string(),
             model_provider: "openai".to_string(),
+            provider_inferred: false,
             cwd: PathBuf::from("/tmp"),
             cli_version: "0.0.0".to_string(),
             title: String::new(),
