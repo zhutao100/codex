@@ -41,10 +41,12 @@ pub struct ThreadsPage {
 }
 
 /// The outcome of extracting metadata from a rollout.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ExtractionOutcome {
     /// The extracted thread metadata.
     pub metadata: ThreadMetadata,
+    pub rollout_cwd: PathBuf,
+    pub dynamic_tools: Option<Vec<codex_protocol::dynamic_tools::DynamicToolSpec>>,
     /// The number of rollout lines that failed to parse.
     pub parse_errors: usize,
 }

@@ -125,6 +125,13 @@ pub(crate) async fn extract_metadata_from_rollout(
     }
     Ok(ExtractionOutcome {
         metadata,
+        rollout_cwd: builder.cwd,
+        dynamic_tools: items.iter().find_map(|item| match item {
+            RolloutItem::SessionMeta(line) if line.meta.id == builder.id => {
+                line.meta.dynamic_tools.clone()
+            }
+            _ => None,
+        }),
         parse_errors,
     })
 }
@@ -171,8 +178,16 @@ pub(crate) async fn backfill_sessions(
     let archived_root = config.codex_home.join(rollout::ARCHIVED_SESSIONS_SUBDIR);
     let mut rollout_paths: Vec<BackfillRolloutPath> = Vec::new();
     for (root, archived) in [(sessions_root, false), (archived_root, true)] {
-        if !tokio::fs::try_exists(&root).await.unwrap_or(false) {
-            continue;
+        match tokio::fs::try_exists(&root).await {
+            Ok(false) => continue,
+            Ok(true) => {}
+            Err(err) => {
+                warn!(
+                    "failed to inspect rollout directory {}: {err}",
+                    root.display()
+                );
+                return;
+            }
         }
         match collect_rollout_paths(&root).await {
             Ok(paths) => {
@@ -187,6 +202,7 @@ pub(crate) async fn backfill_sessions(
                     "failed to collect rollout paths under {}: {err}",
                     root.display()
                 );
+                return;
             }
         }
     }
@@ -201,76 +217,19 @@ pub(crate) async fn backfill_sessions(
         failed: 0,
     };
     let mut last_watermark = backfill_state.last_watermark.clone();
-    for batch in rollout_paths.chunks(BACKFILL_BATCH_SIZE) {
+    'backfill: for batch in rollout_paths.chunks(BACKFILL_BATCH_SIZE) {
         for rollout in batch {
             stats.scanned = stats.scanned.saturating_add(1);
-            match extract_metadata_from_rollout(
-                &rollout.path,
-                config.model_provider_id.as_str(),
-                otel,
-            )
-            .await
-            {
-                Ok(outcome) => {
-                    if outcome.parse_errors > 0
-                        && let Some(otel) = otel
-                    {
-                        otel.counter(
-                            DB_ERROR_METRIC,
-                            outcome.parse_errors as i64,
-                            &[("stage", "backfill_sessions")],
-                        );
-                    }
-                    let mut metadata = outcome.metadata;
-                    if rollout.archived && metadata.archived_at.is_none() {
-                        let fallback_archived_at = metadata.updated_at;
-                        metadata.archived_at = file_modified_time_utc(&rollout.path)
-                            .await
-                            .or(Some(fallback_archived_at));
-                    }
-                    if let Err(err) = runtime.upsert_thread(&metadata).await {
-                        stats.failed = stats.failed.saturating_add(1);
-                        warn!("failed to upsert rollout {}: {err}", rollout.path.display());
-                    } else {
-                        stats.upserted = stats.upserted.saturating_add(1);
-                        if let Ok(meta_line) =
-                            rollout::list::read_session_meta_line(&rollout.path).await
-                        {
-                            if let Err(err) = runtime
-                                .persist_dynamic_tools(
-                                    meta_line.meta.id,
-                                    meta_line.meta.dynamic_tools.as_deref(),
-                                )
-                                .await
-                            {
-                                if let Some(otel) = otel {
-                                    otel.counter(
-                                        DB_ERROR_METRIC,
-                                        1,
-                                        &[("stage", "backfill_dynamic_tools")],
-                                    );
-                                }
-                                warn!(
-                                    "failed to backfill dynamic tools {}: {err}",
-                                    rollout.path.display()
-                                );
-                            }
-                        } else {
-                            warn!(
-                                "failed to read session meta for dynamic tools {}",
-                                rollout.path.display()
-                            );
-                        }
-                    }
+            if let Err(err) = backfill_rollout(runtime, config, rollout, otel).await {
+                // Only successful batches are checkpointed; retry this batch after recovery.
+                warn!("failed to index rollout {}: {err}", rollout.path.display());
+                if let Some(otel) = otel {
+                    otel.counter(DB_ERROR_METRIC, 1, &[("stage", "backfill_sessions")]);
                 }
-                Err(err) => {
-                    stats.failed = stats.failed.saturating_add(1);
-                    warn!(
-                        "failed to extract rollout {}: {err}",
-                        rollout.path.display()
-                    );
-                }
+                stats.failed = stats.failed.saturating_add(1);
+                break 'backfill;
             }
+            stats.upserted = stats.upserted.saturating_add(1);
         }
 
         if let Some(last_entry) = batch.last() {
@@ -289,15 +248,19 @@ pub(crate) async fn backfill_sessions(
                         &[("stage", "backfill_state_checkpoint")],
                     );
                 }
+                stats.failed = stats.failed.saturating_add(1);
+                break;
             } else {
                 last_watermark = Some(last_entry.watermark.clone());
             }
         }
     }
-    if let Err(err) = runtime
-        .mark_backfill_complete(last_watermark.as_deref())
-        .await
+    if stats.failed == 0
+        && let Err(err) = runtime
+            .mark_backfill_complete(last_watermark.as_deref())
+            .await
     {
+        stats.failed = stats.failed.saturating_add(1);
         warn!(
             "failed to mark backfill complete at {}: {err}",
             config.codex_home.display()
@@ -371,39 +334,37 @@ fn parse_timestamp_to_utc(ts: &str) -> Option<DateTime<Utc>> {
     None
 }
 
+async fn backfill_rollout(
+    runtime: &codex_state::StateRuntime,
+    config: &Config,
+    rollout: &BackfillRolloutPath,
+    otel: Option<&OtelManager>,
+) -> anyhow::Result<()> {
+    let outcome =
+        extract_metadata_from_rollout(&rollout.path, &config.model_provider_id, otel).await?;
+    let mut metadata = outcome.metadata;
+    if rollout.archived && metadata.archived_at.is_none() {
+        metadata.archived_at = file_modified_time_utc(&rollout.path)
+            .await
+            .or(Some(metadata.updated_at));
+    }
+    runtime
+        .upsert_rollout_thread(&metadata, Some(&outcome.rollout_cwd))
+        .await?;
+    runtime
+        .persist_dynamic_tools(metadata.id, outcome.dynamic_tools.as_deref())
+        .await?;
+    Ok(())
+}
+
 async fn collect_rollout_paths(root: &Path) -> std::io::Result<Vec<PathBuf>> {
     let mut stack = vec![root.to_path_buf()];
     let mut paths = Vec::new();
     while let Some(dir) = stack.pop() {
-        let mut read_dir = match tokio::fs::read_dir(&dir).await {
-            Ok(read_dir) => read_dir,
-            Err(err) => {
-                warn!("failed to read directory {}: {err}", dir.display());
-                continue;
-            }
-        };
-        loop {
-            let next_entry = match read_dir.next_entry().await {
-                Ok(next_entry) => next_entry,
-                Err(err) => {
-                    warn!(
-                        "failed to read directory entry under {}: {err}",
-                        dir.display()
-                    );
-                    continue;
-                }
-            };
-            let Some(entry) = next_entry else {
-                break;
-            };
+        let mut read_dir = tokio::fs::read_dir(&dir).await?;
+        while let Some(entry) = read_dir.next_entry().await? {
             let path = entry.path();
-            let file_type = match entry.file_type().await {
-                Ok(file_type) => file_type,
-                Err(err) => {
-                    warn!("failed to read file type for {}: {err}", path.display());
-                    continue;
-                }
-            };
+            let file_type = entry.file_type().await?;
             if file_type.is_dir() {
                 stack.push(path);
                 continue;
@@ -523,6 +484,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn incomplete_backfill_retries_failed_rollouts_and_indexes_original_workspace()
+    -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let id = Uuid::new_v4();
+        let path = write_rollout_in_sessions(
+            dir.path(),
+            "2026-01-27T12-34-56",
+            "2026-01-27T12:34:56Z",
+            id,
+        );
+        let message = RolloutLine {
+            timestamp: "2026-01-27T12:35:00Z".into(),
+            item: RolloutItem::EventMsg(codex_protocol::protocol::EventMsg::UserMessage(
+                codex_protocol::protocol::UserMessageEvent {
+                    message: "visible in the picker".into(),
+                    client_user_message_id: None,
+                    images: None,
+                    local_images: vec![],
+                    text_elements: vec![],
+                },
+            )),
+        };
+        writeln!(
+            File::options().append(true).open(&path)?,
+            "{}",
+            serde_json::to_string(&message)?
+        )?;
+        let contents = std::fs::read(&path)?;
+        std::fs::write(&path, [])?;
+        let mut config = crate::config::test_config();
+        config.codex_home = dir.path().to_path_buf();
+        let runtime = codex_state::StateRuntime::init(
+            config.codex_home.clone(),
+            config.model_provider_id.clone(),
+            None,
+        )
+        .await?;
+        backfill_sessions(&runtime, &config, None).await;
+        let state = runtime.get_backfill_state().await?;
+        assert_ne!(state.status, BackfillStatus::Complete);
+        assert!(state.last_watermark.is_none());
+        assert!(crate::state_db::get_state_db(&config, None).await.is_none());
+        std::fs::write(&path, contents)?;
+        let list = || {
+            RolloutRecorder::list_threads(
+                dir.path(),
+                10,
+                None,
+                crate::ThreadSortKey::UpdatedAt,
+                &[],
+                None,
+                &config.model_provider_id,
+            )
+        };
+        let from_jsonl = list().await?;
+        let id = ThreadId::from_string(&id.to_string())?;
+        assert_eq!(
+            from_jsonl
+                .items
+                .iter()
+                .map(|item| item.thread_id)
+                .collect::<Vec<_>>(),
+            vec![Some(id)]
+        );
+        backfill_sessions(&runtime, &config, None).await;
+        assert_eq!(
+            runtime.get_backfill_state().await?.status,
+            BackfillStatus::Complete
+        );
+        let mut changed = runtime.get_thread(id).await?.expect("recovered thread");
+        changed.cwd = dir.path().join("later-workspace");
+        runtime.upsert_thread(&changed).await?;
+        assert_eq!(runtime.get_thread(id).await?, Some(changed));
+        let indexed = list().await?;
+        assert_eq!(indexed.items[0].cwd, from_jsonl.items[0].cwd);
+        assert_eq!(indexed.items[0].cwd.as_deref(), Some(dir.path()));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn backfill_sessions_resumes_from_watermark_and_marks_complete() {
         let dir = tempdir().expect("tempdir");
         let codex_home = dir.path().to_path_buf();
@@ -597,7 +638,7 @@ mod tests {
         thread_uuid: Uuid,
     ) -> PathBuf {
         let id = ThreadId::from_string(&thread_uuid.to_string()).expect("thread id");
-        let sessions_dir = codex_home.join("sessions");
+        let sessions_dir = codex_home.join("sessions/2026/01/27");
         std::fs::create_dir_all(sessions_dir.as_path()).expect("create sessions dir");
         let path = sessions_dir.join(format!("rollout-{filename_ts}-{thread_uuid}.jsonl"));
         let session_meta = SessionMeta {

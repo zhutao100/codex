@@ -355,27 +355,23 @@ pub async fn reconcile_rollout(
         }
         Some(true) | None => {}
     }
-    if let Err(err) = ctx.upsert_thread(&metadata).await {
+    if let Err(err) = ctx
+        .upsert_rollout_thread(&metadata, Some(&outcome.rollout_cwd))
+        .await
+    {
         warn!(
             "state db reconcile_rollout upsert failed {}: {err}",
             rollout_path.display()
         );
         return;
     }
-    if let Ok(meta_line) = crate::rollout::list::read_session_meta_line(rollout_path).await {
-        persist_dynamic_tools(
-            Some(ctx),
-            meta_line.meta.id,
-            meta_line.meta.dynamic_tools.as_deref(),
-            "reconcile_rollout",
-        )
-        .await;
-    } else {
-        warn!(
-            "state db reconcile_rollout missing session meta {}",
-            rollout_path.display()
-        );
-    }
+    persist_dynamic_tools(
+        Some(ctx),
+        metadata.id,
+        outcome.dynamic_tools.as_deref(),
+        "reconcile_rollout",
+    )
+    .await;
 }
 
 /// Repair a thread's rollout path after filesystem fallback succeeds.

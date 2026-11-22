@@ -945,15 +945,9 @@ async fn select_resume_path_from_db_page(
 ) -> Option<PathBuf> {
     for item in &page.items {
         let path = &item.rollout_path;
-        let matches = match filter_cwd {
-            // SQLite tracks the latest turn's cwd (also used by memories).
-            // Resume groups a thread by its original recorded workspace.
-            Some(cwd) => super::list::read_session_meta_line(path)
-                .await
-                .is_ok_and(|meta| cwd_matches(&meta.meta.cwd, cwd)),
-            None => tokio::fs::try_exists(path).await.unwrap_or(false),
-        };
-        if matches {
+        if filter_cwd.is_none_or(|cwd| cwd_matches(&item.cwd, cwd))
+            && tokio::fs::try_exists(path).await.unwrap_or(false)
+        {
             return Some(path.clone());
         }
     }

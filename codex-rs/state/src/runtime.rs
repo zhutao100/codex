@@ -295,7 +295,7 @@ SELECT
     updated_at,
     source,
     model_provider,
-    cwd,
+    COALESCE(rollout_cwd, cwd) AS cwd,
     cli_version,
     title,
     sandbox_policy,
@@ -411,6 +411,15 @@ FROM threads
 
     /// Insert or replace thread metadata directly.
     pub async fn upsert_thread(&self, metadata: &crate::ThreadMetadata) -> anyhow::Result<()> {
+        self.upsert_rollout_thread(metadata, None).await
+    }
+
+    /// Update mutable turn metadata without changing the workspace that owns the rollout.
+    pub async fn upsert_rollout_thread(
+        &self,
+        metadata: &crate::ThreadMetadata,
+        rollout_cwd: Option<&Path>,
+    ) -> anyhow::Result<()> {
         sqlx::query(
             r#"
 INSERT INTO threads (
@@ -431,8 +440,9 @@ INSERT INTO threads (
     archived_at,
     git_sha,
     git_branch,
-    git_origin_url
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    git_origin_url,
+    rollout_cwd
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
     rollout_path = excluded.rollout_path,
     created_at = excluded.created_at,
@@ -450,7 +460,8 @@ ON CONFLICT(id) DO UPDATE SET
     archived_at = excluded.archived_at,
     git_sha = excluded.git_sha,
     git_branch = excluded.git_branch,
-    git_origin_url = excluded.git_origin_url
+    git_origin_url = excluded.git_origin_url,
+    rollout_cwd = COALESCE(threads.rollout_cwd, excluded.rollout_cwd)
             "#,
         )
         .bind(metadata.id.to_string())
@@ -471,6 +482,11 @@ ON CONFLICT(id) DO UPDATE SET
         .bind(metadata.git_sha.as_deref())
         .bind(metadata.git_branch.as_deref())
         .bind(metadata.git_origin_url.as_deref())
+        .bind(
+            rollout_cwd
+                .filter(|cwd| !cwd.as_os_str().is_empty())
+                .map(|cwd| cwd.to_string_lossy().into_owned()),
+        )
         .execute(self.pool.as_ref())
         .await?;
         Ok(())
@@ -620,7 +636,10 @@ ON CONFLICT(thread_id, position) DO NOTHING
         }
         // Keep the thread upsert before dynamic tools to satisfy the foreign key constraint:
         // thread_dynamic_tools.thread_id -> threads.id.
-        if let Err(err) = self.upsert_thread(&metadata).await {
+        if let Err(err) = self
+            .upsert_rollout_thread(&metadata, Some(&builder.cwd))
+            .await
+        {
             if let Some(otel) = otel {
                 otel.counter(DB_ERROR_METRIC, 1, &[("stage", "apply_rollout_items")]);
             }
