@@ -1,4 +1,5 @@
 use crate::auth::AuthMode;
+use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ModelsResponse;
 use once_cell::sync::Lazy;
@@ -7,11 +8,19 @@ pub const HIDE_GPT5_1_MIGRATION_PROMPT_CONFIG: &str = "hide_gpt5_1_migration_pro
 pub const HIDE_GPT_5_1_CODEX_MAX_MIGRATION_PROMPT_CONFIG: &str =
     "hide_gpt-5.1-codex-max_migration_prompt";
 
+static BUNDLED: Lazy<ModelsResponse> = Lazy::new(|| {
+    serde_json::from_str(include_str!("../../models.json"))
+        .expect("bundled models.json should deserialize")
+});
+
+pub(super) fn bundled_models() -> &'static [ModelInfo] {
+    &BUNDLED.models
+}
+
 static PRESETS: Lazy<Vec<ModelPreset>> = Lazy::new(|| {
-    let mut response: ModelsResponse = serde_json::from_str(include_str!("../../models.json"))
-        .expect("bundled models.json should deserialize");
-    response.models.sort_by_key(|model| model.priority);
-    let mut presets: Vec<ModelPreset> = response.models.into_iter().map(Into::into).collect();
+    let mut models = bundled_models().to_vec();
+    models.sort_by_key(|model| model.priority);
+    let mut presets: Vec<ModelPreset> = models.into_iter().map(Into::into).collect();
     if let Some(default) = presets.iter_mut().find(|preset| preset.show_in_picker) {
         default.is_default = true;
     }

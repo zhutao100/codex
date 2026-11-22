@@ -2,7 +2,7 @@
 
 ## Contract
 
-[The bundled catalog](../../core/models.json) supplies fallback model metadata, including instructions, reasoning levels, tools, visibility and context limits. Offline presets are derived from this catalog and sorted by priority; the first picker-visible model is the default. Keep one catalog rather than handwritten parallel preset/default lists.
+[The bundled catalog](../../core/models.json) supplies fallback model metadata, including instructions, reasoning levels, tools, visibility and context limits. The process parses it once; picker presets and offline turns read the same immutable entries instead of deserializing the catalog on a turn worker's stack. Presets are sorted by priority; the first picker-visible model is the default. A remote refresh modifies only the manager's own copy.
 
 An overlay-selected provider owns discovery from the first turn. Only a turn served by OpenAI can refresh its catalog on a response ETag. The picker and runtime resolve each model slug against the same provider: a model bound to another provider uses bundled/overlay visibility and input modalities even when OpenAI has a cached entry for the same slug. Conversely, a model explicitly bound to OpenAI can use its catalog when the configured default is another provider.
 

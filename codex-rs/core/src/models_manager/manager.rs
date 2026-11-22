@@ -11,13 +11,13 @@ use crate::model_provider_info::ModelProviderInfo;
 use crate::models_manager::collaboration_mode_presets::builtin_collaboration_mode_presets;
 use crate::models_manager::model_info;
 use crate::models_manager::model_presets::builtin_model_presets;
+use crate::models_manager::model_presets::bundled_models;
 use codex_api::ModelsClient;
 use codex_api::ReqwestTransport;
 use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::config_types::Personality;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelPreset;
-use codex_protocol::openai_models::ModelsResponse;
 use http::HeaderMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -63,7 +63,7 @@ impl ModelsManager {
         let cache_manager = ModelsCacheManager::new(cache_path, DEFAULT_MODEL_CACHE_TTL);
         Self {
             local_models: builtin_model_presets(auth_manager.auth_mode()),
-            remote_models: RwLock::new(Self::load_remote_models_from_file().unwrap_or_default()),
+            remote_models: RwLock::new(bundled_models().to_vec()),
             auth_manager,
             etag: RwLock::new(None),
             cache_manager,
@@ -170,7 +170,7 @@ impl ModelsManager {
         let mut candidates = if Self::uses_openai_catalog(model, config) {
             self.remote_models.read().await.clone()
         } else {
-            Self::load_remote_models_from_file().unwrap_or_default()
+            bundled_models().to_vec()
         };
         for entry in &overlay.models {
             if !candidates
@@ -409,7 +409,7 @@ impl ModelsManager {
 
     /// Replace the cached remote models and rebuild the derived presets list.
     async fn apply_remote_models(&self, models: Vec<ModelInfo>) {
-        let mut existing_models = Self::load_remote_models_from_file().unwrap_or_default();
+        let mut existing_models = bundled_models().to_vec();
         for model in models {
             if let Some(existing_index) = existing_models
                 .iter()
@@ -421,12 +421,6 @@ impl ModelsManager {
             }
         }
         *self.remote_models.write().await = existing_models;
-    }
-
-    fn load_remote_models_from_file() -> Result<Vec<ModelInfo>, std::io::Error> {
-        let file_contents = include_str!("../../models.json");
-        let response: ModelsResponse = serde_json::from_str(file_contents)?;
-        Ok(response.models)
     }
 
     /// Attempt to satisfy the refresh from the cache when it matches the provider.
@@ -523,10 +517,10 @@ impl ModelsManager {
         {
             remote_models.retain(|model| Self::uses_openai_catalog(&model.slug, config));
             remote_models.extend(
-                Self::load_remote_models_from_file()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|model| !Self::uses_openai_catalog(&model.slug, config)),
+                bundled_models()
+                    .iter()
+                    .filter(|model| !Self::uses_openai_catalog(&model.slug, config))
+                    .cloned(),
             );
         }
         overlay.apply_to_candidates(&remote_models)
@@ -543,7 +537,7 @@ impl ModelsManager {
         let cache_manager = ModelsCacheManager::new(cache_path, DEFAULT_MODEL_CACHE_TTL);
         Self {
             local_models: builtin_model_presets(auth_manager.auth_mode()),
-            remote_models: RwLock::new(Self::load_remote_models_from_file().unwrap_or_default()),
+            remote_models: RwLock::new(bundled_models().to_vec()),
             auth_manager,
             etag: RwLock::new(None),
             cache_manager,
@@ -568,8 +562,7 @@ impl ModelsManager {
 
     /// Build `ModelInfo` without consulting remote state or cache.
     pub fn construct_model_info_offline(model: &str, config: &Config) -> ModelInfo {
-        let candidates = Self::load_remote_models_from_file().unwrap_or_default();
-        Self::construct_model_info_from_candidates(model, &candidates, config)
+        Self::construct_model_info_from_candidates(model, bundled_models(), config)
     }
 }
 
@@ -1224,12 +1217,13 @@ mod tests {
         use codex_protocol::openai_models::ModelVisibility;
 
         core_test_support::skip_if_no_network_unless_localhost!(Ok(()));
-        let bundled = ModelsManager::load_remote_models_from_file()?
-            .into_iter()
+        let bundled = bundled_models()
+            .iter()
             .find(|model| {
                 model.visibility == ModelVisibility::List
                     && model.input_modalities.contains(&InputModality::Image)
             })
+            .cloned()
             .expect("visible bundled model with image input");
         let mut hosted = bundled.clone();
         hosted.input_modalities = vec![InputModality::Text];
