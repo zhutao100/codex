@@ -26,6 +26,8 @@ CODEX_SANDBOX_NETWORK_DISABLED=1 cargo-local test -p codex-core --lib <filter>
 CODEX_SANDBOX_NETWORK_DISABLED=1 cargo-local test -p codex-core --test all <filter>
 ```
 
+For `codex-exec-server` integration tests, provision the pinned fixture before the offline run: set `DOTSLASH_CACHE` to a writable fixture-cache directory, run `dotslash -- fetch exec-server/tests/suite/bash`, and keep that cache setting for `cargo-local test`. The tests use the manifest's verified patched Bash rather than substituting the system shell.
+
 - Keep test exclusions in [the sandbox skip list](../scripts/cargo-local-network-sandbox-skips.txt). On a configured macOS host, the shared wrapper supplies localhost-only access and handles nested-sandbox exclusions. `CODEX_SANDBOX_NETWORK_DISABLED` alone is not an OS sandbox on arbitrary hosts.
 - Use `skip_if_no_network_unless_localhost!` from [core test support](../core/tests/common/lib.rs) for localhost-only HTTP/WebSocket fixtures. Do not forge the wrapper's capability flag or report early-return tests as executed transport coverage.
 - Prefer `-- --show-output` for diagnostics. Shared-wrapper raw output mode can bypass its exclusions; use it only for a deliberately scoped compatible test.

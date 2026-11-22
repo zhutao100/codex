@@ -65,8 +65,6 @@ jobs:
     defaults:
       run:
         working-directory: codex-rs
-    env:
-      CODEX_BWRAP_ENABLE_FFI: ${{ contains(matrix.target, 'unknown-linux') && '1' || '0' }}
 
     strategy:
       fail-fast: false
@@ -91,13 +89,17 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
-      - name: Install Linux bwrap build dependencies
+      - name: Build the Linux sandbox resource
         if: ${{ runner.os == 'Linux' }}
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update -y
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends pkg-config libcap-dev
+          resource="$RUNNER_TEMP/codex-resources/bwrap"
+          [[ "${{ matrix.target }}" == "$(uname -m)"-* ]]
+          bash linux-sandbox/build-bwrap.sh "$resource"
+          echo "CODEX_BWRAP_SHA256=$(sha256sum "$resource" | cut -d' ' -f1)" >> "$GITHUB_ENV"
       - name: Install UBSan runtime (musl)
         if: ${{ matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl' }}
         shell: bash
@@ -325,6 +327,7 @@ jobs:
           fi
 
           if [[ "${{ matrix.target }}" == *linux* ]]; then
+            cp "$RUNNER_TEMP/codex-resources/bwrap" "$dest/codex-bwrap-${{ matrix.target }}"
             cp target/${{ matrix.target }}/release/codex.sigstore "$dest/codex-${{ matrix.target }}.sigstore"
             cp target/${{ matrix.target }}/release/codex-responses-api-proxy.sigstore "$dest/codex-responses-api-proxy-${{ matrix.target }}.sigstore"
             cp target/${{ matrix.target }}/release/codex-stdio-to-uds.sigstore "$dest/codex-stdio-to-uds-${{ matrix.target }}.sigstore"
@@ -379,7 +382,11 @@ jobs:
             fi
 
             # Create per-binary tar.gz
-            tar -C "$dest" -czf "$dest/${base}.tar.gz" "$base"
+            if [[ "$base" == "codex-${{ matrix.target }}" && "${{ matrix.target }}" == *linux* ]]; then
+              tar -C "$dest" -czf "$dest/${base}.tar.gz" "$base" -C "$RUNNER_TEMP" codex-resources/bwrap
+            else
+              tar -C "$dest" -czf "$dest/${base}.tar.gz" "$base"
+            fi
 
             # Create zip archive for Windows binaries
             # Must run from inside the dest dir so 7z won't
@@ -423,6 +430,14 @@ jobs:
             fi
             zstd "${zstd_args[@]}" "$dest/$base"
           done
+
+      - name: Verify Linux archive and npm sandbox resources
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          dest="dist/${{ matrix.target }}"
+          tar -xOzf "$dest/codex-${{ matrix.target }}.tar.gz" codex-resources/bwrap | sha256sum --check <(echo "$CODEX_BWRAP_SHA256  -")
+          zstd -dc "$dest/codex-bwrap-${{ matrix.target }}.zst" | sha256sum --check <(echo "$CODEX_BWRAP_SHA256  -")
 
       - uses: actions/upload-artifact@v6
         with:

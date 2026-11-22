@@ -32,7 +32,7 @@ pub struct LandlockCommand {
     #[clap(skip)]
     pub config_overrides: CliConfigOverrides,
 
-    /// Full command args to run under landlock.
+    /// Command and arguments to run in the Linux sandbox.
     #[arg(trailing_var_arg = true)]
     pub command: Vec<String>,
 }

@@ -56,6 +56,9 @@ where
     // `bash` is a test resource rather than a binary target, so we must use
     // `find_resource!` to locate it instead of `cargo_bin()`.
     let bash = find_resource!("../suite/bash")?;
+    let cache = std::env::var_os("DOTSLASH_CACHE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| dotslash_cache.as_ref().to_path_buf());
 
     // Need to ensure the artifact associated with the bash DotSlash file is
     // available before it is run in a read-only sandbox.
@@ -63,7 +66,7 @@ where
         .arg("--")
         .arg("fetch")
         .arg(bash.clone())
-        .env("DOTSLASH_CACHE", dotslash_cache.as_ref())
+        .env("DOTSLASH_CACHE", &cache)
         .status()
         .await?;
     assert!(status.success(), "dotslash fetch failed: {status:?}");
@@ -72,7 +75,7 @@ where
         cmd.arg("--bash").arg(bash);
         cmd.arg("--execve").arg(&execve_wrapper);
         cmd.env("CODEX_HOME", codex_home.as_ref());
-        cmd.env("DOTSLASH_CACHE", dotslash_cache.as_ref());
+        cmd.env("DOTSLASH_CACHE", &cache);
 
         // Important: pipe stdio so rmcp can speak JSON-RPC over stdin/stdout
         cmd.stdin(Stdio::piped());
@@ -108,7 +111,6 @@ where
         sandbox_policy: SandboxPolicy::new_read_only_policy(),
         codex_linux_sandbox_exe,
         sandbox_cwd: sandbox_cwd.as_ref().to_path_buf(),
-        use_linux_sandbox_bwrap: false,
     };
     send_sandbox_state_update(sandbox_state, service).await
 }
@@ -136,7 +138,6 @@ where
         },
         codex_linux_sandbox_exe,
         sandbox_cwd: writable_folder.as_ref().to_path_buf(),
-        use_linux_sandbox_bwrap: false,
     };
     send_sandbox_state_update(sandbox_state, service).await
 }

@@ -99,9 +99,6 @@ jobs:
       USE_SCCACHE: ${{ startsWith(matrix.runner, 'windows') && 'false' || 'true' }}
       CARGO_INCREMENTAL: "0"
       SCCACHE_CACHE_SIZE: 10G
-      # Keep cargo-based CI independent of system bwrap build deps.
-      # The bwrap FFI path is validated in Bazel workflows.
-      CODEX_BWRAP_ENABLE_FFI: "0"
 
     strategy:
       fail-fast: false
@@ -470,9 +467,6 @@ jobs:
       USE_SCCACHE: ${{ startsWith(matrix.runner, 'windows') && 'false' || 'true' }}
       CARGO_INCREMENTAL: "0"
       SCCACHE_CACHE_SIZE: 10G
-      # Keep cargo-based CI independent of system bwrap build deps.
-      # The bwrap FFI path is validated in Bazel workflows.
-      CODEX_BWRAP_ENABLE_FFI: "0"
 
     strategy:
       fail-fast: false
@@ -580,6 +574,10 @@ jobs:
         with:
           tool: nextest
           version: 0.9.103
+
+      - name: Install Linux sandbox launcher
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends bubblewrap
 
       - name: tests
         id: test

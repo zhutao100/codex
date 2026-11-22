@@ -20,7 +20,6 @@ from urllib.request import urlopen
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 CODEX_CLI_ROOT = SCRIPT_DIR.parent
-DEFAULT_WORKFLOW_URL = "https://github.com/openai/codex/actions/runs/17952349351"  # rust-v0.40.0
 VENDOR_DIR_NAME = "vendor"
 RG_MANIFEST = CODEX_CLI_ROOT / "bin" / "rg"
 BINARY_TARGETS = (
@@ -44,6 +43,12 @@ class BinaryComponent:
 WINDOWS_TARGETS = tuple(target for target in BINARY_TARGETS if "windows" in target)
 
 BINARY_COMPONENTS = {
+    "codex-bwrap": BinaryComponent(
+        artifact_prefix="codex-bwrap",
+        dest_dir="codex/codex-resources",
+        binary_basename="bwrap",
+        targets=tuple(target for target in BINARY_TARGETS if "linux" in target),
+    ),
     "codex": BinaryComponent(
         artifact_prefix="codex",
         dest_dir="codex",
@@ -128,10 +133,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Install native Codex binaries.")
     parser.add_argument(
         "--workflow-url",
-        help=(
-            "GitHub Actions workflow URL that produced the artifacts. Defaults to a "
-            "known good run when omitted."
-        ),
+        required=True,
+        help="GitHub Actions workflow URL that produced these matching release artifacts.",
     )
     parser.add_argument(
         "--component",
@@ -173,9 +176,10 @@ def main() -> int:
         "rg",
     ]
 
-    workflow_url = (args.workflow_url or DEFAULT_WORKFLOW_URL).strip()
-    if not workflow_url:
-        workflow_url = DEFAULT_WORKFLOW_URL
+    if "codex" in components and "codex-bwrap" not in components:
+        components = [*components, "codex-bwrap"]
+
+    workflow_url = args.workflow_url.strip()
 
     workflow_id = workflow_url.rstrip("/").split("/")[-1]
     print(f"Downloading native artifacts from workflow {workflow_id}...")

@@ -1589,7 +1589,6 @@ dependencies = [
  "indexmap 2.13.0",
  "indoc",
  "keyring",
- "landlock",
  "libc",
  "maplit",
  "multimap",
@@ -1815,16 +1814,14 @@ dependencies = [
 name = "codex-linux-sandbox"
 version = "0.0.0"
 dependencies = [
- "cc",
  "clap",
  "codex-core",
  "codex-utils-absolute-path",
- "landlock",
  "libc",
- "pkg-config",
  "pretty_assertions",
  "seccompiler",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
 ]
@@ -4840,17 +4837,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3c48237b9604c5a4702de6b824e02006c3214327564636aef27c1028a8fa0ed"
 dependencies = [
  "regex",
-]
-
-[[package]]
-name = "landlock"
-version = "0.4.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "49fefd6652c57d68aaa32544a4c0e642929725bdc1fd929367cdeb673ab81088"
-dependencies = [
- "enumflags2",
- "libc",
- "thiserror 2.0.18",
 ]
 
 [[package]]

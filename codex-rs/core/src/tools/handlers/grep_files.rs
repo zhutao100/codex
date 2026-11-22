@@ -204,9 +204,6 @@ fn search_command(turn: &TurnContext) -> Result<Command, FunctionCallError> {
             sandbox,
             sandbox_policy_cwd: &turn.cwd,
             codex_linux_sandbox_exe: turn.codex_linux_sandbox_exe.as_ref(),
-            use_linux_sandbox_bwrap: turn
-                .features
-                .enabled(crate::features::Feature::UseLinuxSandboxBwrap),
             windows_sandbox_level: turn.windows_sandbox_level,
         })
         .map_err(|err| {

@@ -277,6 +277,10 @@ def copy_native_binaries(
                 raise RuntimeError(
                     f"Missing native component '{component}' in vendor source: {src_component_dir}"
                 )
+            if component == "codex" and "linux" in target_dir.name:
+                resource = src_component_dir / "codex-resources" / "bwrap"
+                if not resource.is_file():
+                    raise RuntimeError(f"Missing bundled bubblewrap: {resource}")
 
             dest_component_dir = dest_target_dir / dest_dir_name
             if dest_component_dir.exists():

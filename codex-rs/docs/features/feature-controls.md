@@ -4,6 +4,7 @@
 
 |Former control|Current owner and behavior|
 |---|---|
+|`use_linux_sandbox_bwrap`|Linux filesystem restrictions always use [bubblewrap](../../linux-sandbox/README.md). Use the distribution package for a development build or keep the verified resource next to the release binary. A missing backend does not run the command unrestricted.|
 |`undo`, `child_agents_md`, `skill_env_var_dependency_prompt`|No new worktree snapshots, extra hierarchy prompt, or secret-question workflow. Old rollout records remain readable and stay out of model input. The legacy undo operation returns a bad-request error. Normal project instruction discovery, skill metadata loading, shell environment configuration and MCP dependencies are independent.|
 |`exec_policy`, `request_rule`, `powershell_utf8`|Execution rules and approved-prefix persistence are always active. The selected shell, not the host OS, determines PowerShell UTF-8 handling.|
 |`steer`, `collaboration_modes`|[Steering and explicit queueing](steering-and-queue.md) and Plan/Default modes are always available. Both advertise `request_user_input`; the sampled turn's mode, not a subsequent settings change, decides whether it can execute. Resume and regular `/continue` restore the recorded mode and its instructions. Legacy `execute` and `pair_programming` inputs deserialize to Default.|
@@ -18,10 +19,13 @@
 
 ## Runtime boundaries
 
+- The feature CLI rejects writes to retired keys and read-only migration aliases. Use `[agents].enabled`, `[windows].sandbox`, or `web_search` for their respective settings. Reading an old config is not permission to write an ineffective override.
+- Omitting a collaboration mode on `codex exec resume` inherits the durable mode and its instructions. Explicit turn model and reasoning settings still apply; an explicit collaboration mode takes precedence.
 - After a child selects its model and provider, inherited window and compaction overrides survive only when both match the parent. A different child uses its own catalog/overlay limits.
 - A nonempty retained-terminal write uses the actual launch sandbox and the current turn's authority. Changed authority requires a fresh decision or rejection. An empty poll is a read. The manager checks the process identity again after any wait before enqueueing bytes, and registered background jobs still reject polling. Run the [retained-terminal fixtures](../../core/src/unified_exec/mod.rs) in a PTY-capable disposable guest to cover cancellation and ID reuse; a nested-sandbox skip is not process evidence.
 - History listing and `resume --last` check rollout paths and modification times before trusting SQLite. For a file with no indexed preview, they check the JSONL header and first user event: a newly started, empty thread does not invalidate the index. An unindexed visible thread, missing path or changed timestamp selects the JSONL reader for that query, even if another CLI never wrote an index-miss journal. This costs a directory traversal; a read does not delete memory rows when files differ.
 - Both history readers use UTC header time (or filesystem modification time for `updated_at`) and a UUID tiebreaker. On filesystem fallback, finding a `created_at` page can require reading the headers of up to the existing scan cap; local wall-clock filenames are not chronological cursors. By-ID reads validate the individual cached path, timestamp and preview, checking active and archived JSONL on a miss. A path-only lookup never backfills legacy rows without a configured default provider.
+- An omitted provider matches the querying profile's default, not the profile that built the index. Explicit providers keep their recorded value. An incomplete backfill leaves JSONL in charge of history; an unrelated empty rollout cannot hide an existing SQLite memory or log. A subsequent scan retries the incomplete file.
 - Skill MCP installation checks workspace and managed constraints after approval, then adds only missing servers to the locked user config. CLI `mcp add` and `remove` edit one entry under the same lock. RPC writes validate `expectedVersion` and compute table merges from that locked document; explicit replacement is still replacement. `never` does not prompt; bounded explorers do not start MCP transports on reload.
 - Hosted apps remain opt-in and require ChatGPT authentication or the explicit connector credential. A loaded thread rebinds the hosted connection without restarting workspace servers. A call, pending approval and remembered grant are scoped to the connection that advertised the tool; switching accounts does not retarget a same-named tool.
 - Automatic titles are opt-in and are generated after an eligible completed turn. An explicit rename wins over in-flight generation; the index writer serializes the conditional append across processes. Reopening a thread reads the persisted winner.
@@ -32,5 +36,5 @@ The four custom controls (`auto_rename_thread`, `auto_post_turn_completion_revie
 ## Intentional differences
 
 - The opt-in `memory_tool` is a metadata lookup, not an extraction or consolidation service. The existing replay, request-compression and runtime-metrics settings retain their own provider and exporter contracts.
-- The Linux backend and Windows unified-exec defaults depend on packaging and runtime evidence. See [native acceptance](../dev_plans/feature_alignment/README.md).
+- Windows unified exec and broader shell-snapshot defaults still require [native acceptance](../dev_plans/feature_alignment/README.md).
 - Async compaction, token-budget windows, a second agent scheduler, Code Mode and desktop or hosted product features were not selected. They would change the owner of history, execution or approvals rather than complete a registry migration.

@@ -32,7 +32,6 @@ impl Session {
                 sandbox_policy: session.sandbox_policy.get().clone(),
                 sandbox_cwd: session.cwd.clone(),
                 codex_linux_sandbox_exe: config.codex_linux_sandbox_exe.clone(),
-                use_linux_sandbox_bwrap: self.features.enabled(Feature::UseLinuxSandboxBwrap),
             }
         };
         let mut guard = clients.write().await;
@@ -178,7 +177,6 @@ impl Session {
             sandbox_policy: turn_context.sandbox_policy.clone(),
             codex_linux_sandbox_exe: turn_context.codex_linux_sandbox_exe.clone(),
             sandbox_cwd: turn_context.cwd.clone(),
-            use_linux_sandbox_bwrap: turn_context.features.enabled(Feature::UseLinuxSandboxBwrap),
         };
         let cancel_token = self.reset_mcp_startup_cancellation_token().await;
 

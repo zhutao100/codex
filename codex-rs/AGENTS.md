@@ -18,7 +18,7 @@ Use `cargo-local` for local Cargo build/check/test/run commands and `just-local`
 
 Set `CODEX_SANDBOX_NETWORK_DISABLED=1` for tests. Use the existing localhost-aware guard for mock transport tests and let the wrapper declare that capability. Do not count a skipped network test as transport coverage. Capture noisy output outside the repository and report the relevant result and limitations.
 
-Match the check to the contract: recorder/replay for durable history, captured requests/events for transport, a disposable child-process probe for sandbox policy, and live evaluation for model behavior. Documentation-only edits need link, format and source-consistency checks, not a workspace rebuild.
+Match the check to the contract: recorder/replay for durable history, captured requests/events for transport, disposable child processes for sandbox policy (including [ordinary and packaged Linux launchers](linux-sandbox/README.md)), and live evaluation for model behavior. Documentation-only edits need link, format and source-consistency checks, not a workspace rebuild.
 
 ## Documentation maintenance
 

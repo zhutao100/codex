@@ -1,33 +1,18 @@
-# codex-linux-sandbox
+# Linux sandbox
 
-This crate is responsible for producing:
+The standalone `codex-linux-sandbox` helper and `codex sandbox linux` use the same launcher. `landlock` remains a CLI alias, not a second backend.
 
-- a `codex-linux-sandbox` standalone executable for Linux that is bundled with the Node.js version of the Codex CLI
-- a lib crate that exposes the business logic of the executable as `run_main()` so that
-  - the `codex-exec` CLI can check if its arg0 is `codex-linux-sandbox` and, if so, execute as if it were `codex-linux-sandbox`
-  - this should also be true of the `codex` multitool CLI
+## Runtime
 
-On Linux, the bubblewrap pipeline uses the vendored bubblewrap path compiled
-into this binary.
+- A filesystem-restricted policy starts [bubblewrap](src/bwrap.rs) to create a read-only root and bind the permitted writable roots. Protected paths such as `.git` and `.codex` stay read-only inside a writable workspace. The helper isolates the PID namespace and normally mounts a fresh `/proc`; `--no-proc` omits that mount, not the filesystem restrictions.
+- The inner process sets `no_new_privs` for restricted policies and installs the [network seccomp filter](src/seccomp.rs) when network access is disabled. Policies with full disk access need no mount launcher.
+- The [resolver](src/bwrap_program.rs) prefers the distribution's executable `/usr/bin/bwrap`. Release binaries can also use `codex-resources/bwrap` beside the physical executable if its SHA-256 matches the digest compiled into the binary. Neither `PATH`, the working directory nor runtime environment variables select another launcher.
+- Without a usable launcher, a filesystem-restricted command fails before it runs. Install the distribution's `bubblewrap` package for an ordinary Cargo or Bazel build. For a release, extract the complete Linux tarball or install the complete npm package. The standalone `.zst` CLI alone needs the system launcher or its matching resource.
 
-**Current Behavior**
-- Legacy Landlock + mount protections remain available as the legacy pipeline.
-- The bubblewrap pipeline is standardized on the vendored path.
-- During rollout, the bubblewrap pipeline is gated by the temporary feature
-  flag `use_linux_sandbox_bwrap` (CLI `-c` alias for
-  `features.use_linux_sandbox_bwrap`; legacy remains default when off).
-- When enabled, the bubblewrap pipeline applies `PR_SET_NO_NEW_PRIVS` and a
-  seccomp network filter in-process.
-- When enabled, the filesystem is read-only by default via `--ro-bind / /`.
-- When enabled, writable roots are layered with `--bind <root> <root>`.
-- When enabled, protected subpaths under writable roots (for example `.git`,
-  resolved `gitdir:`, and `.codex`) are re-applied as read-only via `--ro-bind`.
-- When enabled, symlink-in-path and non-existent protected paths inside
-  writable roots are blocked by mounting `/dev/null` on the symlink or first
-  missing component.
-- When enabled, the helper isolates the PID namespace via `--unshare-pid`.
-- When enabled, it mounts a fresh `/proc` via `--proc /proc` by default, but
-  you can skip this in restrictive container environments with `--no-proc`.
+## Packaging and acceptance
 
-**Notes**
-- The CLI surface still uses legacy names like `codex debug landlock`.
+The [release workflow](../../.github/workflows/rust-release.yml) builds a static [vendored resource](build-bwrap.sh) on the target architecture and binds its digest to the Rust binary. The release tarball and npm component carry the same bytes. Ordinary builds do not require a C build of bubblewrap.
+
+The [Nix package](../default.nix) uses the same resource contract for its immutable store executable; it does not require `/usr/bin/bwrap` on NixOS.
+
+Qualify both paths in a disposable Linux guest: run the release without the system package, then an ordinary build with the distro package. Check allowed workspace writes, denied writes outside it and under `.git`, network policy, `NoNewPrivs`, retained-terminal input, and the MCP shell subprocess. A missing or mismatched release resource without a system launcher must leave the command's output file absent. A skipped or nested-sandbox test is not evidence of enforcement.

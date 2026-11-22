@@ -45,6 +45,10 @@ pub fn arg0_dispatch() -> Option<Arg0PathEntryGuard> {
     }
 
     let argv1 = args.next().unwrap_or_default();
+    #[cfg(target_os = "linux")]
+    if argv1 == codex_linux_sandbox::INNER_STAGE_ARG {
+        codex_linux_sandbox::run_main();
+    }
     if argv1 == CODEX_APPLY_PATCH_ARG1 {
         let patch_arg = args.next().and_then(|s| s.to_str().map(str::to_owned));
         let exit_code = match patch_arg {

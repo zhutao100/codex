@@ -1,6 +1,8 @@
 {
+  bubblewrap,
   openssl,
   rustPlatform,
+  stdenv,
   pkg-config,
   lib,
   ...
@@ -18,6 +20,14 @@ rustPlatform.buildRustPackage (_: {
     pkg-config
     openssl
   ];
+
+  preBuild = lib.optionalString stdenv.hostPlatform.isLinux ''
+    export CODEX_BWRAP_SHA256="$(sha256sum ${bubblewrap}/bin/bwrap | cut -d' ' -f1)"
+  '';
+  postInstall = lib.optionalString stdenv.hostPlatform.isLinux ''
+    mkdir -p "$out/bin/codex-resources"
+    ln -s ${bubblewrap}/bin/bwrap "$out/bin/codex-resources/bwrap"
+  '';
 
   cargoLock.outputHashes = {
     "ratatui-0.29.0" = "sha256-HBvT5c8GsiCxMffNjJGLmHnvG77A6cqEL+1ARurBXho=";

@@ -140,7 +140,6 @@ pub async fn process_exec_tool_call(
     sandbox_policy: &SandboxPolicy,
     sandbox_cwd: &Path,
     codex_linux_sandbox_exe: &Option<PathBuf>,
-    use_linux_sandbox_bwrap: bool,
     stdout_stream: Option<StdoutStream>,
 ) -> Result<ExecToolCallOutput> {
     let windows_sandbox_level = params.windows_sandbox_level;
@@ -191,7 +190,6 @@ pub async fn process_exec_tool_call(
             sandbox: sandbox_type,
             sandbox_policy_cwd: sandbox_cwd,
             codex_linux_sandbox_exe: codex_linux_sandbox_exe.as_ref(),
-            use_linux_sandbox_bwrap,
             windows_sandbox_level,
         })
         .map_err(CodexErr::from)?;
@@ -1158,7 +1156,6 @@ mod tests {
             &SandboxPolicy::DangerFullAccess,
             cwd.as_path(),
             &None,
-            false,
             None,
         )
         .await;

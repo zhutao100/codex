@@ -1,25 +1,12 @@
 //! In-process Linux sandbox primitives: `no_new_privs` and seccomp.
 //!
 //! Filesystem restrictions are enforced by bubblewrap in `linux_run_main`.
-//! Landlock helpers remain available here as legacy/backup utilities.
 use std::collections::BTreeMap;
-use std::path::Path;
 
-use codex_core::error::CodexErr;
 use codex_core::error::Result;
 use codex_core::error::SandboxErr;
 use codex_core::protocol::SandboxPolicy;
-use codex_utils_absolute_path::AbsolutePathBuf;
 
-use landlock::ABI;
-#[allow(unused_imports)]
-use landlock::Access;
-use landlock::AccessFs;
-use landlock::CompatLevel;
-use landlock::Compatible;
-use landlock::Ruleset;
-use landlock::RulesetAttr;
-use landlock::RulesetCreatedAttr;
 use seccompiler::BpfProgram;
 use seccompiler::SeccompAction;
 use seccompiler::SeccompCmpArgLen;
@@ -38,36 +25,14 @@ use seccompiler::apply_filter;
 /// - installing the network seccomp filter when network access is disabled.
 ///
 /// Filesystem restrictions are intentionally handled by bubblewrap.
-pub(crate) fn apply_sandbox_policy_to_current_thread(
-    sandbox_policy: &SandboxPolicy,
-    cwd: &Path,
-    apply_landlock_fs: bool,
-) -> Result<()> {
-    // `PR_SET_NO_NEW_PRIVS` is required for seccomp, but it also prevents
-    // setuid privilege elevation. Many `bwrap` deployments rely on setuid, so
-    // we avoid this unless we need seccomp or we are explicitly using the
-    // legacy Landlock filesystem pipeline.
-    if !sandbox_policy.has_full_network_access()
-        || (apply_landlock_fs && !sandbox_policy.has_full_disk_write_access())
-    {
+pub(crate) fn apply_sandbox_policy_to_current_thread(sandbox_policy: &SandboxPolicy) -> Result<()> {
+    if !sandbox_policy.has_full_disk_write_access() || !sandbox_policy.has_full_network_access() {
         set_no_new_privs()?;
     }
 
     if !sandbox_policy.has_full_network_access() {
         install_network_seccomp_filter_on_current_thread()?;
     }
-
-    if apply_landlock_fs && !sandbox_policy.has_full_disk_write_access() {
-        let writable_roots = sandbox_policy
-            .get_writable_roots_with_cwd(cwd)
-            .into_iter()
-            .map(|writable_root| writable_root.root)
-            .collect();
-        install_filesystem_landlock_rules_on_current_thread(writable_roots)?;
-    }
-
-    // TODO(ragona): Add appropriate restrictions if
-    // `sandbox_policy.has_full_disk_read_access()` is `false`.
 
     Ok(())
 }
@@ -78,43 +43,6 @@ fn set_no_new_privs() -> Result<()> {
     if result != 0 {
         return Err(std::io::Error::last_os_error().into());
     }
-    Ok(())
-}
-
-/// Installs Landlock file-system rules on the current thread allowing read
-/// access to the entire file-system while restricting write access to
-/// `/dev/null` and the provided list of `writable_roots`.
-///
-/// # Errors
-/// Returns [`CodexErr::Sandbox`] variants when the ruleset fails to apply.
-///
-/// Note: this is currently unused because filesystem sandboxing is performed
-/// via bubblewrap. It is kept for reference and potential fallback use.
-fn install_filesystem_landlock_rules_on_current_thread(
-    writable_roots: Vec<AbsolutePathBuf>,
-) -> Result<()> {
-    let abi = ABI::V5;
-    let access_rw = AccessFs::from_all(abi);
-    let access_ro = AccessFs::from_read(abi);
-
-    let mut ruleset = Ruleset::default()
-        .set_compatibility(CompatLevel::BestEffort)
-        .handle_access(access_rw)?
-        .create()?
-        .add_rules(landlock::path_beneath_rules(&["/"], access_ro))?
-        .add_rules(landlock::path_beneath_rules(&["/dev/null"], access_rw))?
-        .set_no_new_privs(true);
-
-    if !writable_roots.is_empty() {
-        ruleset = ruleset.add_rules(landlock::path_beneath_rules(&writable_roots, access_rw))?;
-    }
-
-    let status = ruleset.restrict_self()?;
-
-    if status.ruleset == landlock::RulesetStatus::NotEnforced {
-        return Err(CodexErr::Sandbox(SandboxErr::LandlockRestrict));
-    }
-
     Ok(())
 }
 

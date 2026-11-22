@@ -10,7 +10,7 @@ RUN apt-get update && \
 # now install build deps
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-    build-essential curl git ca-certificates \
+    bubblewrap build-essential curl git ca-certificates \
     pkg-config clang musl-tools libssl-dev just && \
     rm -rf /var/lib/apt/lists/*
 

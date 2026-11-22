@@ -50,10 +50,6 @@ pub enum SandboxErr {
     /// Command was killed by a signal
     #[error("command was killed by a signal")]
     Signal(i32),
-
-    /// Error from linux landlock
-    #[error("Landlock was not able to fully enforce all sandbox rules")]
-    LandlockRestrict,
 }
 
 #[derive(Error, Debug)]
@@ -169,14 +165,6 @@ pub enum CodexErr {
     #[error(transparent)]
     Json(#[from] serde_json::Error),
 
-    #[cfg(target_os = "linux")]
-    #[error(transparent)]
-    LandlockRuleset(#[from] landlock::RulesetError),
-
-    #[cfg(target_os = "linux")]
-    #[error(transparent)]
-    LandlockPathFd(#[from] landlock::PathFdError),
-
     #[error(transparent)]
     TokioJoin(#[from] JoinError),
 
@@ -224,8 +212,6 @@ impl CodexErr {
             | CodexErr::Io(_)
             | CodexErr::Json(_)
             | CodexErr::TokioJoin(_) => true,
-            #[cfg(target_os = "linux")]
-            CodexErr::LandlockRuleset(_) | CodexErr::LandlockPathFd(_) => false,
         }
     }
 }

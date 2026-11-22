@@ -6,11 +6,13 @@
 #[cfg(target_os = "linux")]
 mod bwrap;
 #[cfg(target_os = "linux")]
-mod landlock;
+mod bwrap_program;
 #[cfg(target_os = "linux")]
 mod linux_run_main;
 #[cfg(target_os = "linux")]
-mod vendored_bwrap;
+mod seccomp;
+
+pub const INNER_STAGE_ARG: &str = "--apply-seccomp-then-exec";
 
 #[cfg(target_os = "linux")]
 pub fn run_main() -> ! {

@@ -225,9 +225,6 @@
             "unified_exec": {
               "type": "boolean"
             },
-            "use_linux_sandbox_bwrap": {
-              "type": "boolean"
-            },
             "web_search": {
               "type": "boolean"
             },
@@ -1814,9 +1811,6 @@
           "type": "boolean"
         },
         "unified_exec": {
-          "type": "boolean"
-        },
-        "use_linux_sandbox_bwrap": {
           "type": "boolean"
         },
         "web_search": {

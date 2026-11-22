@@ -91,8 +91,6 @@ pub enum Feature {
     /// Allow the model to request web searches that fetch cached content.
     /// Takes precedence over `WebSearchRequest`.
     WebSearchCached,
-    /// Use the bubblewrap-based Linux sandbox pipeline.
-    UseLinuxSandboxBwrap,
     /// Enable Windows sandbox (restricted token) on Windows.
     WindowsSandbox,
     /// Use the elevated Windows sandbox pipeline (setup + runner).
@@ -322,8 +320,29 @@ impl Features {
     }
 }
 
+/// Historical configuration can still be read, but new CLI toggles must target the effective owner.
+pub fn feature_write_guidance(key: &str) -> Option<String> {
+    if let Some(guidance) = retired_feature_guidance(key) {
+        return Some(guidance.to_owned());
+    }
+    let feature = feature_for_key(key)?;
+    (key != feature.key()
+        || matches!(
+            feature,
+            Feature::Collab
+                | Feature::WindowsSandbox
+                | Feature::WindowsSandboxElevated
+                | Feature::WebSearchRequest
+                | Feature::WebSearchCached
+        ))
+    .then(|| legacy_usage_notice(key, feature).0)
+}
+
 fn retired_feature_guidance(key: &str) -> Option<&'static str> {
     Some(match key {
+        "use_linux_sandbox_bwrap" => {
+            "Linux filesystem sandboxing uses bubblewrap. Remove this setting."
+        }
         "remote_compaction" | "remote_compaction_v2" => {
             "Set `compaction_mode` to `auto`, `local`, or `unary` instead."
         }
@@ -501,12 +520,6 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::MemoryTool,
         key: "memory_tool",
-        stage: Stage::UnderDevelopment,
-        default_enabled: false,
-    },
-    FeatureSpec {
-        id: Feature::UseLinuxSandboxBwrap,
-        key: "use_linux_sandbox_bwrap",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
     },

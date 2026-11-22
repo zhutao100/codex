@@ -24,12 +24,12 @@ The implementation uses created directories rather than an owning `TempDir` guar
 
 ## Enforcement and maintenance
 
-The shared writable-root representation feeds macOS Seatbelt and Linux Landlock. Apply-patch eligibility also uses those roots. macOS has a dedicated integration test for allowed child writes and denied sibling writes; do not infer equivalent tested coverage for every platform from the shared type alone. Windows-specific temp-root support was not added by this feature.
+The shared writable-root representation feeds macOS Seatbelt and Linux bubblewrap. Apply-patch eligibility also uses those roots. Verify both the allowed child write and the denied sibling write on the target platform. Windows-specific temp-root support was not added by this feature.
 
 Preserve the empty-root default, workspace-write root calculation and existing escalation semantics. Any change to materialization must keep runtime policy, enforcement and rendered permissions in agreement; the warning path must never describe an uninstalled root as writable.
 
 ## Source and verification
 
 - [Materialization and unit tests](../../core/src/session/read_only_temp.rs), [session initialization](../../core/src/session/session.rs) and [config fields](../../core/src/config/types.rs).
-- [Sandbox root computation](../../protocol/src/protocol.rs), [permission rendering](../../protocol/src/models.rs), [Seatbelt](../../core/src/seatbelt.rs), [Landlock](../../linux-sandbox/src/landlock.rs) and [apply-patch eligibility](../../core/src/safety.rs).
+- [Sandbox root computation](../../protocol/src/protocol.rs), [permission rendering](../../protocol/src/models.rs), [Seatbelt](../../core/src/seatbelt.rs), [bubblewrap mounts](../../linux-sandbox/src/bwrap.rs) and [apply-patch eligibility](../../core/src/safety.rs).
 - Existing unit tests cover two roots, canonical duplicate parents, invalid/missing `TMPDIR` and exact permission text. [Seatbelt integration tests](../../core/tests/suite/seatbelt.rs) contain `read_only_temp_root_allows_only_dedicated_child_writes`. Platform enforcement checks require the appropriate sandbox-capable test environment; a skipped test is not enforcement evidence.

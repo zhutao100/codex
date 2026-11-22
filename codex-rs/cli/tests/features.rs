@@ -44,6 +44,29 @@ async fn features_disable_writes_feature_flag_to_config() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn superseded_controls_report_the_owner_without_modifying_config() -> Result<()> {
+    let home = TempDir::new()?;
+    let path = home.path().join("config.toml");
+    let original =
+        "web_search = 'disabled'\n[agents]\nenabled = false\n[windows]\nsandbox = 'elevated'\n";
+    std::fs::write(&path, original)?;
+    for (action, key, owner) in [
+        ("enable", "collab", "[agents].enabled"),
+        ("disable", "elevated_windows_sandbox", "[windows].sandbox"),
+        ("enable", "web_search_request", "Use `web_search`"),
+        ("disable", "use_linux_sandbox_bwrap", "Remove this setting"),
+    ] {
+        codex_command(home.path())?
+            .args(["features", action, key])
+            .assert()
+            .failure()
+            .stderr(contains(owner));
+        pretty_assertions::assert_eq!(std::fs::read_to_string(&path)?, original);
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn features_enable_under_development_feature_prints_warning() -> Result<()> {
     let codex_home = TempDir::new()?;

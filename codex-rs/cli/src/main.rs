@@ -28,6 +28,7 @@ use codex_tui::ExitReason;
 use codex_tui::update_action::UpdateAction;
 use owo_colors::OwoColorize;
 use std::ffi::OsString;
+#[cfg(target_os = "macos")]
 use std::fs;
 use std::io::IsTerminal;
 use std::path::Path;
@@ -242,7 +243,7 @@ enum SandboxCommand {
     #[clap(visible_alias = "seatbelt")]
     Macos(SeatbeltCommand),
 
-    /// Run a command under Landlock+seccomp (Linux only).
+    /// Run a command under bubblewrap and seccomp (Linux only).
     #[clap(visible_alias = "landlock")]
     Linux(LandlockCommand),
 
@@ -845,6 +846,9 @@ impl FeatureToggles {
     }
 
     fn validate_feature(feature: &str) -> anyhow::Result<()> {
+        if let Some(guidance) = codex_core::features::feature_write_guidance(feature) {
+            anyhow::bail!("{guidance}");
+        }
         if is_known_feature_key(feature) {
             Ok(())
         } else {

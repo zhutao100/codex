@@ -21,19 +21,13 @@ pub async fn spawn_command_under_linux_sandbox<P>(
     command_cwd: PathBuf,
     sandbox_policy: &SandboxPolicy,
     sandbox_policy_cwd: &Path,
-    use_bwrap_sandbox: bool,
     stdio_policy: StdioPolicy,
     env: HashMap<String, String>,
 ) -> std::io::Result<Child>
 where
     P: AsRef<Path>,
 {
-    let args = create_linux_sandbox_command_args(
-        command,
-        sandbox_policy,
-        sandbox_policy_cwd,
-        use_bwrap_sandbox,
-    );
+    let args = create_linux_sandbox_command_args(command, sandbox_policy, sandbox_policy_cwd);
     let arg0 = Some("codex-linux-sandbox");
     spawn_child_async(
         codex_linux_sandbox_exe.as_ref().to_path_buf(),
@@ -55,7 +49,6 @@ pub(crate) fn create_linux_sandbox_command_args(
     command: Vec<String>,
     sandbox_policy: &SandboxPolicy,
     sandbox_policy_cwd: &Path,
-    use_bwrap_sandbox: bool,
 ) -> Vec<String> {
     #[expect(clippy::expect_used)]
     let sandbox_policy_cwd = sandbox_policy_cwd
@@ -73,12 +66,6 @@ pub(crate) fn create_linux_sandbox_command_args(
         "--sandbox-policy".to_string(),
         sandbox_policy_json,
     ];
-    if use_bwrap_sandbox {
-        linux_cmd.push("--use-bwrap-sandbox".to_string());
-    }
-
-    // Separator so that command arguments starting with `-` are not parsed as
-    // options of the helper itself.
     linux_cmd.push("--".to_string());
 
     // Append the original tool command.
@@ -93,21 +80,22 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     #[test]
-    fn bwrap_flags_are_feature_gated() {
+    fn helper_receives_the_policy_and_the_literal_command() {
         let command = vec!["/bin/true".to_string()];
         let cwd = Path::new("/tmp");
         let policy = SandboxPolicy::new_read_only_policy();
 
-        let with_bwrap = create_linux_sandbox_command_args(command.clone(), &policy, cwd, true);
+        let args = create_linux_sandbox_command_args(command.clone(), &policy, cwd);
         assert_eq!(
-            with_bwrap.contains(&"--use-bwrap-sandbox".to_string()),
-            true
-        );
-
-        let without_bwrap = create_linux_sandbox_command_args(command, &policy, cwd, false);
-        assert_eq!(
-            without_bwrap.contains(&"--use-bwrap-sandbox".to_string()),
-            false
+            args,
+            [
+                "--sandbox-policy-cwd".to_owned(),
+                cwd.display().to_string(),
+                "--sandbox-policy".to_owned(),
+                serde_json::to_string(&policy).unwrap(),
+                "--".to_owned(),
+                command[0].clone(),
+            ]
         );
     }
 }

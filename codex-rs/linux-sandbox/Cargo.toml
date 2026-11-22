@@ -19,10 +19,10 @@ workspace = true
 clap = { workspace = true, features = ["derive"] }
 codex-core = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
-landlock = { workspace = true }
 libc = { workspace = true }
 seccompiler = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 pretty_assertions = { workspace = true }
@@ -34,7 +34,3 @@ tokio = { workspace = true, features = [
     "rt-multi-thread",
     "signal",
 ] }
-
-[build-dependencies]
-cc = "1"
-pkg-config = "0.3"
