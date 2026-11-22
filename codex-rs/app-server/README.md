@@ -119,7 +119,7 @@ Raw Responses items in resume payloads and raw item notifications can include op
 - `command/exec` — run a single command under the server sandbox without starting a thread/turn (handy for utilities and validation).
 - `config/read` — fetch the effective config on disk after resolving config layering.
 - `config/value/write` — write a single config key/value to the user's config.toml on disk.
-- `config/batchWrite` — apply multiple config edits atomically to the user's config.toml on disk.
+- `config/batchWrite` — apply multiple config edits atomically to the user's config.toml on disk. Both write methods check `expectedVersion` and apply `upsert` against the locked user document. A stale conditional write returns a version conflict without writing; an unconditional table upsert preserves unrelated keys.
 - `configRequirements/read` — fetch the loaded requirements allow-lists and `enforceResidency` from `requirements.toml` and/or MDM (or `null` if none are configured).
 
 ### Example: Start or resume a thread
@@ -228,6 +228,8 @@ When `nextCursor` is `null`, you’ve reached the final page.
 ### Example: Read a thread
 
 Use `thread/read` to fetch a stored thread by id without resuming it. Pass `includeTurns` when you want the rollout history loaded into `thread.turns`.
+
+The v2 read and v1 conversation summary check the individual rollout before using cached metadata. An externally appended first user message or a move between active and archived storage is visible without reopening the server. History pagination uses UTC creation time, not the writer's local-time filename.
 
 ```json
 { "method": "thread/read", "id": 22, "params": { "threadId": "thr_123" } }
