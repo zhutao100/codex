@@ -629,6 +629,27 @@ pub(crate) enum ThreadNameSource {
     Automatic,
 }
 
+impl SessionState {
+    /// Preserve the sampled mode and its instructions, not a historical model or effort override.
+    fn mode_for_continuation(&self) -> CollaborationMode {
+        let mut mode = self.session_configuration.collaboration_mode.clone();
+        let saved = self
+            .history
+            .reference_context_item()
+            .and_then(|item| item.collaboration_mode)
+            .or_else(|| {
+                self.previous_turn_settings
+                    .as_ref()
+                    .and_then(|settings| settings.collaboration_mode.clone())
+            });
+        if let Some(saved) = saved {
+            mode.mode = saved.mode;
+            mode.settings.developer_instructions = saved.settings.developer_instructions;
+        }
+        mode
+    }
+}
+
 impl Session {
     /// Builds the `x-codex-beta-features` header value for this session.
     ///
@@ -931,6 +952,10 @@ impl Session {
 
                 // Defer seeding the session's initial context until the first turn starts so
                 // turn/start overrides can be merged before we write to the rollout.
+                {
+                    let mut state = self.state.lock().await;
+                    state.session_configuration.collaboration_mode = state.mode_for_continuation();
+                }
                 self.flush_rollout().await;
             }
             InitialHistory::Forked(rollout_items) => {
@@ -1841,8 +1866,12 @@ impl Session {
     }
 
     pub(crate) async fn collaboration_mode(&self) -> CollaborationMode {
-        let state = self.state.lock().await;
-        state.session_configuration.collaboration_mode.clone()
+        self.state
+            .lock()
+            .await
+            .session_configuration
+            .collaboration_mode
+            .clone()
     }
 
     async fn send_raw_response_items(&self, turn_context: &TurnContext, items: &[ResponseItem]) {
@@ -2123,6 +2152,7 @@ impl Session {
         self.record_conversation_items(turn_context, std::slice::from_ref(&response_item))
             .await;
         self.set_previous_turn_settings(Some(PreviousTurnSettings {
+            collaboration_mode: Some(turn_context.collaboration_mode.clone()),
             model: turn_context.model_info.slug.clone(),
         }))
         .await;

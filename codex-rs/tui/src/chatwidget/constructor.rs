@@ -392,7 +392,7 @@ impl ChatWidget {
     }
 
     /// Create a ChatWidget attached to an existing conversation (e.g., a fork).
-    pub(crate) fn new_from_existing(
+    pub(crate) async fn new_from_existing(
         common: ChatWidgetInit,
         conversation: std::sync::Arc<codex_core::CodexThread>,
         session_configured: codex_core::protocol::SessionConfiguredEvent,
@@ -427,8 +427,15 @@ impl ChatWidget {
         let header_model = model
             .clone()
             .unwrap_or_else(|| session_configured.model.clone());
-        let active_collaboration_mask =
-            Self::initial_collaboration_mask(&config, models_manager.as_ref(), model_override);
+        let saved = conversation.collaboration_mode().await;
+        let active_collaboration_mask = Self::restored_mode_mask(
+            config.experimental_mode,
+            &saved,
+            model_override,
+        )
+        .or_else(|| {
+            Self::initial_collaboration_mask(&config, models_manager.as_ref(), model_override)
+        });
         let header_model = active_collaboration_mask
             .as_ref()
             .and_then(|mask| mask.model.clone())
@@ -438,16 +445,7 @@ impl ChatWidget {
         let codex_op_tx =
             spawn_agent_from_existing(conversation, session_configured, app_event_tx.clone());
 
-        let fallback_default = Settings {
-            model: header_model.clone(),
-            reasoning_effort: None,
-            developer_instructions: None,
-        };
-        // Collaboration modes start in Default mode.
-        let current_collaboration_mode = CollaborationMode {
-            mode: ModeKind::Default,
-            settings: fallback_default,
-        };
+        let current_collaboration_mode = saved.with_updates(Some(header_model.clone()), None, None);
 
         let mut widget = Self {
             app_event_tx: app_event_tx.clone(),

@@ -95,6 +95,10 @@ impl CodexThread {
         self.codex.thread_config_snapshot().await
     }
 
+    pub async fn collaboration_mode(&self) -> codex_protocol::config_types::CollaborationMode {
+        self.codex.session.collaboration_mode().await
+    }
+
     pub async fn effective_fork_config(&self) -> crate::config::Config {
         self.codex.session.effective_fork_config().await
     }

@@ -47,6 +47,7 @@ impl ReplayMetadata {
         if let Some(context_item) = pending_context {
             self.reference_context_item = Some(context_item.clone());
             self.previous_turn_settings = Some(PreviousTurnSettings {
+                collaboration_mode: context_item.collaboration_mode,
                 model: context_item.model,
             });
         }

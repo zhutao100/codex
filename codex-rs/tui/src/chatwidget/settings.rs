@@ -161,6 +161,25 @@ impl ChatWidget {
         Some(mask)
     }
 
+    pub(super) fn restored_mode_mask(
+        configured: Option<ModeKind>,
+        saved: &CollaborationMode,
+        model_override: Option<&str>,
+    ) -> Option<CollaborationModeMask> {
+        if configured.is_some()
+            || (saved.mode == ModeKind::Default && saved.settings.developer_instructions.is_none())
+        {
+            return None;
+        }
+        Some(CollaborationModeMask {
+            name: saved.mode.display_name().into(),
+            mode: Some(saved.mode),
+            model: model_override.map(str::to_owned),
+            reasoning_effort: None,
+            developer_instructions: None,
+        })
+    }
+
     pub(super) fn active_mode_kind(&self) -> ModeKind {
         self.active_collaboration_mask
             .as_ref()

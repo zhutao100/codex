@@ -372,6 +372,7 @@ async fn encrypted_only_replay_uses_inline_provenance_and_completion_tail() {
                         history,
                         reference_context_item: inline.then(|| baseline.clone()),
                         previous_turn_settings: Some(PreviousTurnSettings {
+                            collaboration_mode: source.collaboration_mode.clone(),
                             model: source.model.clone()
                         }),
                         pending_continuation: (inline && !completed).then(|| PendingContinuation {
@@ -623,6 +624,7 @@ async fn previous_model_compaction_reports_a_missing_provider() {
     }
     session
         .set_previous_turn_settings(Some(PreviousTurnSettings {
+            collaboration_mode: None,
             model: "previous-model".into(),
         }))
         .await;

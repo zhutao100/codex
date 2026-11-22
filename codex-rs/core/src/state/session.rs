@@ -33,6 +33,7 @@ pub(crate) struct PendingContinuation {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PreviousTurnSettings {
     pub(crate) model: String,
+    pub(crate) collaboration_mode: Option<codex_protocol::config_types::CollaborationMode>,
 }
 
 /// Persistent, session-scoped state previously stored directly on `Session`.

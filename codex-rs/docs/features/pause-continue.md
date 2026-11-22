@@ -18,7 +18,7 @@ The TUI dispatches `Op::Pause` and `Op::Continue` directly. The app-server recog
 ## Continuation contract
 
 - `ContinueTask` enters the same sampling loop as regular work, with a checkpoint and no new `UserInput`. It preserves completed conversation items and avoids repeating normal input/skill injection solely to resume.
-- A regular checkpoint retains its selected model. Explicit model selection can retarget pending regular work; paused completion review and compaction's source model have separate ownership. Preserve the review-specific CWD and recovery-model rules in the completion-review docs.
+- Regular continuation uses the last sampled collaboration mode and its instructions, including after restart. A settings change during sampling cannot reverse that invocation's tool permissions. A checkpoint retains its selected model; explicit model selection can retarget pending regular work. Paused completion review and compaction's source model have separate ownership.
 - Interrupted continuation removes the trailing interruption marker. It trims the incomplete tail from the first unmatched tool call after the latest real user boundary or encrypted compaction item, retaining ghost snapshots.
 - A pending work-notes transaction owns its capture segment. Generic continuation cleanup must leave that segment for notes recovery, which finishes before ordinary sampling or new input installation.
 - Cleanup also attempts to rewrite the rollout. Its current failure path logs a warning; do not describe it as an atomic transaction with in-memory cleanup. Completion-review persistence has stronger failure handling documented separately.

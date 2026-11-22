@@ -1895,6 +1895,27 @@ async fn plan_implementation_popup_yes_emits_submit_message_event() {
 }
 
 #[tokio::test]
+async fn attached_widget_submits_the_restored_plan_unless_a_mode_was_selected() {
+    let (mut chat, _rx, mut ops) = make_chatwidget_manual(Some("gpt-6-luna")).await;
+    chat.thread_id = Some(ThreadId::new());
+    let mut saved = chat.current_collaboration_mode.clone();
+    saved.mode = ModeKind::Plan;
+    saved.settings.developer_instructions = Some("saved plan instructions".into());
+    assert!(ChatWidget::restored_mode_mask(Some(ModeKind::Default), &saved, None).is_none());
+    chat.active_collaboration_mask = ChatWidget::restored_mode_mask(None, &saved, None);
+    chat.current_collaboration_mode = saved.clone();
+    assert_eq!(chat.active_collaboration_mode_kind(), ModeKind::Plan);
+    chat.submit_user_message("next turn".to_string().into());
+    let Op::UserTurn {
+        collaboration_mode, ..
+    } = next_submit_op(&mut ops)
+    else {
+        panic!("expected a user turn");
+    };
+    assert_eq!(collaboration_mode, Some(saved));
+}
+
+#[tokio::test]
 async fn submit_user_message_with_mode_sets_coding_collaboration_mode() {
     let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(Some("gpt-6-luna")).await;
     chat.thread_id = Some(ThreadId::new());

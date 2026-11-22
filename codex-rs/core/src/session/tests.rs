@@ -513,6 +513,7 @@ async fn rollout_reconstruction_restores_reference_context_item_after_regular_tu
             history,
             reference_context_item: Some(context_item.clone()),
             previous_turn_settings: Some(PreviousTurnSettings {
+                collaboration_mode: context_item.collaboration_mode.clone(),
                 model: context_item.model
             }),
             pending_continuation: None,
@@ -623,6 +624,7 @@ async fn rollout_reconstruction_review_output_does_not_commit_previous_settings(
             history: expected_history,
             reference_context_item: Some(review_context),
             previous_turn_settings: Some(PreviousTurnSettings {
+                collaboration_mode: first_context.collaboration_mode.clone(),
                 model: first_context.model,
             }),
             pending_continuation: None,
@@ -658,6 +660,7 @@ async fn rollout_reconstruction_clears_reference_context_item_after_legacy_compa
             history: expected_history,
             reference_context_item: None,
             previous_turn_settings: Some(PreviousTurnSettings {
+                collaboration_mode: context_item.collaboration_mode.clone(),
                 model: context_item.model,
             }),
             pending_continuation: None,
@@ -695,6 +698,7 @@ async fn rollout_reconstruction_ignores_adjacent_context_after_legacy_compaction
             history: expected_history,
             reference_context_item: None,
             previous_turn_settings: Some(PreviousTurnSettings {
+                collaboration_mode: first_context.collaboration_mode.clone(),
                 model: first_context.model,
             }),
             pending_continuation: None,
@@ -731,6 +735,7 @@ async fn rollout_reconstruction_restores_reference_context_item_after_replacemen
             history: replacement_history,
             reference_context_item: Some(compacted_context.clone()),
             previous_turn_settings: Some(PreviousTurnSettings {
+                collaboration_mode: previous_context.collaboration_mode.clone(),
                 model: previous_context.model.clone()
             }),
             pending_continuation: Some(PendingContinuation {
@@ -771,6 +776,7 @@ async fn rollout_reconstruction_suppresses_standalone_compaction_continuation() 
             history: replacement_history,
             reference_context_item: None,
             previous_turn_settings: Some(PreviousTurnSettings {
+                collaboration_mode: context_item.collaboration_mode.clone(),
                 model: context_item.model
             }),
             pending_continuation: None,
@@ -809,6 +815,7 @@ async fn rollout_reconstruction_thread_rollback_recomputes_reference_context_ite
             history: surviving_history,
             reference_context_item: Some(first_context.clone()),
             previous_turn_settings: Some(PreviousTurnSettings {
+                collaboration_mode: first_context.collaboration_mode.clone(),
                 model: first_context.model
             }),
             pending_continuation: None,
@@ -890,6 +897,7 @@ async fn rollout_reconstruction_thread_rollback_restores_compaction_epoch_metada
             history: replacement_history,
             reference_context_item: None,
             previous_turn_settings: Some(PreviousTurnSettings {
+                collaboration_mode: first_context.collaboration_mode.clone(),
                 model: first_context.model
             }),
             pending_continuation: None,
@@ -998,6 +1006,7 @@ async fn record_initial_history_restores_resumed_reference_context_item() {
     assert_eq!(
         session.previous_turn_settings().await,
         Some(PreviousTurnSettings {
+            collaboration_mode: context_item.collaboration_mode.clone(),
             model: context_item.model
         })
     );
@@ -1301,6 +1310,7 @@ async fn record_user_prompt_commits_previous_turn_settings() {
     assert_eq!(
         session.previous_turn_settings().await,
         Some(PreviousTurnSettings {
+            collaboration_mode: Some(turn_context.collaboration_mode.clone()),
             model: turn_context.model_info.slug.clone()
         })
     );
@@ -1343,6 +1353,7 @@ async fn record_context_updates_keeps_model_switch_when_legacy_baseline_needs_fu
             .history
             .set_reference_context_item(Some(previous.clone()));
         state.previous_turn_settings = Some(PreviousTurnSettings {
+            collaboration_mode: previous.collaboration_mode.clone(),
             model: previous.model.clone(),
         });
         state.initial_context_seeded = true;
@@ -1382,6 +1393,7 @@ async fn build_settings_update_items_emits_model_switch_before_other_developer_d
         }
     };
     let previous_settings = PreviousTurnSettings {
+        collaboration_mode: previous.collaboration_mode.clone(),
         model: previous.model.clone(),
     };
 
@@ -1415,6 +1427,7 @@ async fn replace_compacted_history_sets_reference_context_item() {
     let (session, turn_context) = make_session_and_context().await;
     let reference_context_item = turn_context.to_turn_context_item();
     let previous_turn_settings = PreviousTurnSettings {
+        collaboration_mode: None,
         model: "previous-model".to_string(),
     };
     session
@@ -1451,6 +1464,7 @@ async fn replace_compacted_history_sets_reference_context_item() {
 async fn replace_compacted_history_clears_reference_context_item() {
     let (session, turn_context) = make_session_and_context().await;
     let previous_turn_settings = PreviousTurnSettings {
+        collaboration_mode: Some(turn_context.collaboration_mode.clone()),
         model: turn_context.model_info.slug.clone(),
     };
     session
@@ -1564,6 +1578,7 @@ async fn thread_rollback_clears_reference_context_item_when_rollback_crosses_bas
             .history
             .set_reference_context_item(Some(context_item.clone()));
         state.previous_turn_settings = Some(PreviousTurnSettings {
+            collaboration_mode: context_item.collaboration_mode.clone(),
             model: context_item.model,
         });
         state.initial_context_seeded = true;

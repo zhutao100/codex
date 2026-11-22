@@ -364,32 +364,34 @@ async fn continue_with(sess: &Arc<Session>, sub_id: String, request: ContinueReq
         return;
     }
 
-    let continuation_model = checkpoint.model.clone();
-    let turn_context = if let Some(model) = continuation_model {
-        let collaboration_mode = {
-            let state = sess.state.lock().await;
-            state
-                .session_configuration
-                .collaboration_mode
-                .with_updates(Some(model), None, None)
+    let turn_context =
+        if checkpoint.target == PendingContinuationTarget::Regular || checkpoint.model.is_some() {
+            let collaboration_mode = {
+                let state = sess.state.lock().await;
+                let mode = if checkpoint.target == PendingContinuationTarget::Regular {
+                    state.mode_for_continuation()
+                } else {
+                    state.session_configuration.collaboration_mode.clone()
+                };
+                mode.with_updates(checkpoint.model.clone(), None, None)
+            };
+            let Ok(turn_context) = sess
+                .new_turn_with_sub_id(
+                    sub_id,
+                    SessionSettingsUpdate {
+                        collaboration_mode: Some(collaboration_mode),
+                        ..Default::default()
+                    },
+                )
+                .await
+            else {
+                sess.set_pending_continuation(Some(checkpoint)).await;
+                return;
+            };
+            turn_context
+        } else {
+            sess.new_default_turn_with_sub_id(sub_id).await
         };
-        let Ok(turn_context) = sess
-            .new_turn_with_sub_id(
-                sub_id,
-                SessionSettingsUpdate {
-                    collaboration_mode: Some(collaboration_mode),
-                    ..Default::default()
-                },
-            )
-            .await
-        else {
-            sess.set_pending_continuation(Some(checkpoint)).await;
-            return;
-        };
-        turn_context
-    } else {
-        sess.new_default_turn_with_sub_id(sub_id).await
-    };
     match checkpoint.target {
         PendingContinuationTarget::Regular => {
             sess.spawn_task(

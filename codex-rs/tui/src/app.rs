@@ -1317,6 +1317,7 @@ impl App {
                     otel_manager: otel_manager.clone(),
                 };
                 ChatWidget::new_from_existing(init, resumed.thread, resumed.session_configured)
+                    .await
             }
             ResumeSessionSelection::Fork(path) => {
                 let forked = thread_manager
@@ -1346,7 +1347,7 @@ impl App {
                     status_line_invalid_items_warned: status_line_invalid_items_warned.clone(),
                     otel_manager: otel_manager.clone(),
                 };
-                ChatWidget::new_from_existing(init, forked.thread, forked.session_configured)
+                ChatWidget::new_from_existing(init, forked.thread, forked.session_configured).await
             }
         };
 
@@ -1698,7 +1699,8 @@ impl App {
                                     init,
                                     resumed.thread,
                                     resumed.session_configured,
-                                );
+                                )
+                                .await;
                                 self.reset_thread_event_state();
                                 if let Some(summary) = summary {
                                     let mut lines: Vec<Line<'static>> =
@@ -1801,7 +1803,8 @@ impl App {
                                         init,
                                         resumed.thread,
                                         resumed.session_configured,
-                                    );
+                                    )
+                                    .await;
                                     self.reset_thread_event_state();
                                     if let Some(summary) = summary {
                                         let mut lines: Vec<Line<'static>> =
@@ -1875,7 +1878,8 @@ impl App {
                                 init,
                                 forked.thread,
                                 forked.session_configured,
-                            );
+                            )
+                            .await;
                             self.reset_thread_event_state();
                             if let Some(summary) = summary {
                                 let mut lines: Vec<Line<'static>> =
