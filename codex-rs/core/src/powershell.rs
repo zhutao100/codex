@@ -12,23 +12,12 @@ const POWERSHELL_FLAGS: &[&str] = &["-nologo", "-noprofile", "-command", "-c"];
 pub(crate) const UTF8_OUTPUT_PREFIX: &str =
     "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;\n";
 
-pub(crate) fn prefix_powershell_script_with_utf8(command: &[String]) -> Vec<String> {
-    let Some((_, script)) = extract_powershell_command(command) else {
-        return command.to_vec();
-    };
-
-    let trimmed = script.trim_start();
-    let script = if trimmed.starts_with(UTF8_OUTPUT_PREFIX) {
-        script.to_string()
-    } else {
-        format!("{UTF8_OUTPUT_PREFIX}{script}")
-    };
-
-    let mut command: Vec<String> = command[..(command.len() - 1)]
-        .iter()
-        .map(std::string::ToString::to_string)
-        .collect();
-    command.push(script);
+pub(crate) fn prefix_powershell_script_with_utf8(mut command: Vec<String>) -> Vec<String> {
+    if let Some(index) = powershell_script_index(&command)
+        && !command[index].trim_start().starts_with(UTF8_OUTPUT_PREFIX)
+    {
+        command[index].insert_str(0, UTF8_OUTPUT_PREFIX);
+    }
     command
 }
 
@@ -41,6 +30,11 @@ pub(crate) fn prefix_powershell_script_with_utf8(command: &[String]) -> Vec<Stri
 /// Returns (`shell`, `script`) when the first arg is a PowerShell executable and a
 /// `-Command` (or `-c`) flag is present followed by a script string.
 pub fn extract_powershell_command(command: &[String]) -> Option<(&str, &str)> {
+    let index = powershell_script_index(command)?;
+    Some((&command[0], &command[index]))
+}
+
+fn powershell_script_index(command: &[String]) -> Option<usize> {
     if command.len() < 3 {
         return None;
     }
@@ -62,8 +56,7 @@ pub fn extract_powershell_command(command: &[String]) -> Option<(&str, &str)> {
             return None;
         }
         if flag.eq_ignore_ascii_case("-Command") || flag.eq_ignore_ascii_case("-c") {
-            let script = &command[i + 1];
-            return Some((shell, script));
+            return Some(i + 1);
         }
         i += 1;
     }
@@ -160,6 +153,21 @@ fn is_powershellish_executable_available(powershell_or_pwsh_exe: &std::path::Pat
 #[cfg(test)]
 mod tests {
     use super::extract_powershell_command;
+
+    #[test]
+    fn utf8_follows_argv_and_preserves_script_arguments() {
+        let command = ["/opt/bin/pwsh", "-Command", "Write-Output $args", "keep"]
+            .map(str::to_string)
+            .to_vec();
+        let mut expected = command.clone();
+        expected[2].insert_str(0, super::UTF8_OUTPUT_PREFIX);
+        assert_eq!(super::prefix_powershell_script_with_utf8(command), expected);
+        let plain = ["bash", "-c", "echo ok"].map(str::to_string).to_vec();
+        assert_eq!(
+            super::prefix_powershell_script_with_utf8(plain.clone()),
+            plain
+        );
+    }
 
     #[test]
     fn extracts_basic_powershell_command() {

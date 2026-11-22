@@ -551,6 +551,12 @@ impl UnifiedExecProcessManager {
         tty: bool,
         capture: &mut crate::exec_output::OutputCapture,
     ) -> Result<UnifiedExecProcess, UnifiedExecError> {
+        if env.sandbox == crate::exec::SandboxType::WindowsRestrictedToken {
+            // Unlike the one-shot executor, neither retained launcher applies a Windows token.
+            return capture.after_spawn(Err(UnifiedExecError::create_process(
+                "unified exec cannot launch a retained process under the Windows token sandbox; use the regular shell executor".to_string(),
+            ))).await;
+        }
         let (program, args) = env
             .command
             .split_first()
@@ -778,6 +784,41 @@ mod tests {
     use pretty_assertions::assert_eq;
     use tokio::time::Duration;
     use tokio::time::Instant;
+
+    #[tokio::test]
+    async fn token_sandbox_is_rejected_before_opening_a_pipe_or_pty() {
+        use codex_protocol::config_types::WindowsSandboxLevel;
+        let manager = UnifiedExecProcessManager::default();
+        for level in [
+            WindowsSandboxLevel::RestrictedToken,
+            WindowsSandboxLevel::Elevated,
+        ] {
+            let env = ExecEnv {
+                command: vec![],
+                cwd: PathBuf::new(),
+                env: HashMap::new(),
+                expiration: crate::exec::ExecExpiration::DefaultTimeout,
+                sandbox: crate::exec::SandboxType::WindowsRestrictedToken,
+                windows_sandbox_level: level,
+                sandbox_permissions: Default::default(),
+                justification: None,
+                arg0: None,
+            };
+            for tty in [false, true] {
+                let error = manager
+                    .open_session_with_exec_env(
+                        &env,
+                        tty,
+                        &mut crate::exec_output::OutputCapture::Disabled,
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(error, UnifiedExecError::CreateProcess { message } if message.contains("Windows token sandbox"))
+                );
+            }
+        }
+    }
 
     #[tokio::test]
     async fn wait_collects_a_bounded_preview_across_drains() {

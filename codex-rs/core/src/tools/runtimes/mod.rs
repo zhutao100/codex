@@ -79,7 +79,8 @@ pub(crate) fn maybe_wrap_shell_lc_with_snapshot(
     let Ok(snapshot_path) = shlex::try_quote(&path) else {
         return command.to_vec();
     };
-    let rewritten_script = format!(". {snapshot_path} && {}", command[2]);
+    // Parse the user script only after the sourced aliases and shell options are active.
+    let rewritten_script = format!(". {snapshot_path} || exit $?\n{}", command[2]);
 
     let mut rewritten = command.to_vec();
     rewritten[1] = "-c".to_string();

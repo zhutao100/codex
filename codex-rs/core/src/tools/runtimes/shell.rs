@@ -9,7 +9,6 @@ use crate::exec::execute_captured_exec_env;
 use crate::exec_output::OutputCapture;
 use crate::powershell::prefix_powershell_script_with_utf8;
 use crate::sandboxing::SandboxPermissions;
-use crate::shell::ShellType;
 use crate::tools::runtimes::build_command_spec;
 use crate::tools::runtimes::maybe_wrap_shell_lc_with_snapshot;
 use crate::tools::sandboxing::Approvable;
@@ -153,11 +152,7 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
             session_shell.as_ref(),
             &ctx.turn.shell_environment_policy,
         );
-        let command = if matches!(session_shell.shell_type, ShellType::PowerShell) {
-            prefix_powershell_script_with_utf8(&command)
-        } else {
-            command
-        };
+        let command = prefix_powershell_script_with_utf8(command);
 
         let spec = build_command_spec(
             &command,

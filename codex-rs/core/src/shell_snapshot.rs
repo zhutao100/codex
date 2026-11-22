@@ -281,7 +281,7 @@ fn bash_snapshot_script() -> &'static str {
 fi
 echo '# Snapshot file'
 echo '# Unset all aliases to avoid conflicts with functions'
-unalias -a 2>/dev/null || true
+echo 'unalias -a 2>/dev/null || true'
 echo '# Functions'
 declare -f
 echo ''
@@ -294,6 +294,7 @@ fi
 echo ''
 alias_count=$(alias -p | wc -l | tr -d ' ')
 echo "# aliases $alias_count"
+shopt -p expand_aliases || true
 alias -p
 echo ''
 printf '\0'
@@ -307,7 +308,7 @@ fn sh_snapshot_script() -> &'static str {
 fi
 echo '# Snapshot file'
 echo '# Unset all aliases to avoid conflicts with functions'
-unalias -a 2>/dev/null || true
+echo 'unalias -a 2>/dev/null || true'
 echo '# Functions'
 if command -v typeset >/dev/null 2>&1; then
   typeset -f
@@ -329,7 +330,14 @@ echo ''
 if alias >/dev/null 2>&1; then
   alias_count=$(alias | wc -l | tr -d ' ')
   echo "# aliases $alias_count"
-  alias
+  if (alias -p) >/dev/null 2>&1; then
+    alias -p
+  else
+    # Ask the shell for each definition so quoted and multiline values survive.
+    alias | sed -n 's/^\([^=[:space:]]\{1,\}\)=.*/\1/p' | while IFS= read -r name; do
+      if definition=$(alias "$name" 2>/dev/null); then printf 'alias %s\n' "$definition"; fi
+    done
+  fi
   echo ''
 else
   echo '# aliases 0'
@@ -510,6 +518,58 @@ mod tests {
     fn strip_snapshot_preamble_requires_marker() {
         let result = strip_snapshot_preamble("missing header");
         assert!(result.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn captured_bash_and_sh_aliases_execute_in_a_fresh_shell() -> Result<()> {
+        let dir = tempdir()?;
+        let rc = dir.path().join(".bashrc");
+        std::fs::write(
+            &rc,
+            "if command -v shopt >/dev/null; then shopt -s expand_aliases; fi\nalias snapshot_probe='printf alias-ok'\n",
+        )?;
+        let policy = ShellEnvironmentPolicy::default();
+        for (exe, kind, script) in [
+            ("/bin/bash", ShellType::Bash, bash_snapshot_script()),
+            ("/bin/sh", ShellType::Sh, sh_snapshot_script()),
+        ] {
+            let captured = Command::new(exe)
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", dir.path())
+                .env("ENV", &rc)
+                .args(["-c", script])
+                .output()?;
+            let snapshot = render_snapshot(std::str::from_utf8(&captured.stdout)?, &policy)?;
+            let path = dir.path().join("captured aliases.sh");
+            std::fs::write(&path, snapshot)?;
+            let (_, rx) = watch::channel(Some(Arc::new(ShellSnapshot {
+                path,
+                policy: policy.clone(),
+            })));
+            let shell = Shell {
+                shell_type: kind,
+                shell_path: exe.into(),
+                shell_snapshot: rx,
+            };
+            let argv = crate::tools::runtimes::maybe_wrap_shell_lc_with_snapshot(
+                &shell.derive_exec_args("snapshot_probe", true),
+                &shell,
+                &policy,
+            );
+            let run = Command::new(&argv[0])
+                .env_clear()
+                .args(&argv[1..])
+                .output()?;
+            assert!(
+                run.status.success(),
+                "{exe}: {}",
+                String::from_utf8_lossy(&run.stderr)
+            );
+            assert_eq!(run.stdout, b"alias-ok");
+        }
+        Ok(())
     }
 
     #[cfg(unix)]
