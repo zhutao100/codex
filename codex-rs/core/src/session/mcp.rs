@@ -1,6 +1,16 @@
 use super::*;
 
 impl Session {
+    pub(crate) async fn queue_trusted_mcp_refresh(
+        &self,
+        refresh: McpServerRefreshConfig,
+        constraints: crate::mcp::ServerConstraints,
+    ) {
+        // Only the host config loader supplies constraints; a client-supplied map cannot relax them.
+        let mut latest = self.refreshed_mcp_constraints.write().await;
+        *latest = Some(constraints);
+        *self.pending_mcp_server_refresh_config.lock().await = Some(refresh);
+    }
     pub async fn resolve_elicitation(
         &self,
         server_name: String,
@@ -85,11 +95,17 @@ impl Session {
     ) {
         let auth = self.services.auth_manager.auth().await;
         let config = self.get_config().await;
-        let mut constrained = config.mcp_servers.clone();
-        if let Err(err) = constrained.set(mcp_servers) {
-            warn!("failed to validate refreshed MCP servers: {err}");
-            return;
-        }
+        let constrained = match crate::mcp::constrain_servers(
+            &config.mcp_servers,
+            self.refreshed_mcp_constraints.read().await.as_ref(),
+            mcp_servers,
+        ) {
+            Ok(servers) => servers,
+            Err(err) => {
+                warn!("failed to validate refreshed MCP servers: {err}");
+                return;
+            }
+        };
         let mcp_servers = with_codex_apps_mcp(
             constrained.get().clone(),
             self.features.enabled(Feature::Apps),

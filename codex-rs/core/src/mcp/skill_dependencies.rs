@@ -157,8 +157,13 @@ pub(crate) async fn maybe_prompt_and_install_mcp_dependencies(
 
     let unprompted_missing = filter_prompted_mcp_dependencies(sess, &missing).await;
     let auth = sess.services.auth_manager.auth().await;
-    let unprompted_missing =
-        admit_candidates(&config, auth.as_ref(), installed, unprompted_missing);
+    let unprompted_missing = admit_candidates(
+        &config,
+        sess.refreshed_mcp_constraints.read().await.as_ref(),
+        auth.as_ref(),
+        installed,
+        unprompted_missing,
+    );
     if unprompted_missing.is_empty() {
         return;
     }
@@ -173,6 +178,7 @@ pub(crate) async fn maybe_prompt_and_install_mcp_dependencies(
 
 fn admit_candidates(
     config: &Config,
+    current_constraints: Option<&crate::mcp::ServerConstraints>,
     auth: Option<&crate::CodexAuth>,
     mut installed: HashMap<String, McpServerConfig>,
     mut candidates: HashMap<String, McpServerConfig>,
@@ -191,10 +197,14 @@ fn admit_candidates(
     });
     installed.extend(candidates.clone());
     let mut staged = config.clone();
-    if let Err(err) = staged.mcp_servers.set(installed) {
-        warn!("failed to validate skill MCP dependencies: {err}");
-        return HashMap::new();
-    }
+    staged.mcp_servers =
+        match super::constrain_servers(&config.mcp_servers, current_constraints, installed) {
+            Ok(servers) => servers,
+            Err(err) => {
+                warn!("failed to validate skill MCP dependencies: {err}");
+                return HashMap::new();
+            }
+        };
     let effective = effective_mcp_servers(&staged, auth);
     candidates.retain(|name, candidate| {
         effective
@@ -221,6 +231,7 @@ async fn maybe_install_mcp_dependencies(
         }
     };
 
+    let current_constraints = sess.refreshed_mcp_constraints.read().await;
     let mut installed = sess.configured_mcp_servers().await;
     for (name, server) in &servers {
         installed
@@ -228,7 +239,13 @@ async fn maybe_install_mcp_dependencies(
             .or_insert_with(|| server.clone());
     }
     let auth = sess.services.auth_manager.auth().await;
-    let missing = admit_candidates(config, auth.as_ref(), installed, approved);
+    let missing = admit_candidates(
+        config,
+        current_constraints.as_ref(),
+        auth.as_ref(),
+        installed,
+        approved,
+    );
     if missing.is_empty() || cancellation_token.is_cancelled() {
         return;
     }
@@ -247,6 +264,7 @@ async fn maybe_install_mcp_dependencies(
         return;
     }
 
+    drop(current_constraints);
     for (name, server_config) in &added {
         let oauth_config = match oauth_login_support(&server_config.transport).await {
             McpOAuthLoginSupport::Supported(config) => config,
@@ -466,7 +484,7 @@ mod tests {
             ("first".into(), server("one")),
             ("second".into(), server("two")),
         ]);
-        let offered = admit_candidates(&config, None, HashMap::new(), requested.clone());
+        let offered = admit_candidates(&config, None, None, HashMap::new(), requested.clone());
         assert_eq!(offered, requested);
         config.mcp_servers = crate::config::Constrained::normalized(
             HashMap::new(),
@@ -480,9 +498,100 @@ mod tests {
         .unwrap();
         let installed = HashMap::from([("runtime-alias".into(), server("two"))]);
         assert_eq!(
-            admit_candidates(&config, None, installed, offered),
+            admit_candidates(&config, None, None, installed, offered),
             HashMap::new()
         );
+    }
+
+    #[tokio::test]
+    async fn refreshed_requirements_reject_an_approved_dependency_before_persistence()
+    -> anyhow::Result<()> {
+        use crate::config::Constrained;
+        use crate::protocol::EventMsg;
+        use crate::protocol::McpServerRefreshConfig;
+        use crate::session::tests::make_session_and_context_with_rx;
+        use codex_protocol::request_user_input::RequestUserInputAnswer;
+        let (sess, mut turn, events) = make_session_and_context_with_rx().await;
+        let home = tempfile::tempdir()?;
+        let turn = std::sync::Arc::get_mut(&mut turn).expect("unsubmitted turn");
+        let config = std::sync::Arc::make_mut(&mut turn.config);
+        config.codex_home = home.path().to_path_buf();
+        config.features.enable(Feature::SkillMcpDependencyInstall);
+        turn.approval_policy = AskForApproval::OnRequest;
+        *sess.active_turn.lock().await = Some(crate::state::ActiveTurn::default());
+        let skills = [skill_with_tools(vec![SkillToolDependency {
+            r#type: "mcp".into(),
+            value: "candidate".into(),
+            description: None,
+            transport: Some("stdio".into()),
+            command: Some("candidate".into()),
+            url: None,
+        }])];
+        let cancelled = CancellationToken::new();
+        let refresh = async {
+            loop {
+                if let EventMsg::RequestUserInput(_) = events.recv().await?.msg {
+                    break;
+                }
+            }
+            let constraints = Constrained::normalized(
+                HashMap::new(),
+                |mut servers: HashMap<String, McpServerConfig>| {
+                    for server in servers.values_mut() {
+                        server.enabled = false;
+                    }
+                    servers
+                },
+            )?;
+            sess.queue_trusted_mcp_refresh(
+                McpServerRefreshConfig {
+                    mcp_servers: serde_json::json!({}),
+                    mcp_oauth_credentials_store_mode: serde_json::to_value(
+                        turn.config.mcp_oauth_credentials_store_mode,
+                    )?,
+                },
+                constraints,
+            )
+            .await;
+            sess.notify_user_input_response(
+                &turn.sub_id,
+                RequestUserInputResponse {
+                    answers: HashMap::from([(
+                        SKILL_MCP_DEPENDENCY_PROMPT_ID.into(),
+                        RequestUserInputAnswer {
+                            answers: vec![MCP_DEPENDENCY_OPTION_INSTALL.into()],
+                        },
+                    )]),
+                },
+            )
+            .await;
+            anyhow::Ok(())
+        };
+        let (_, refreshed) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(
+                maybe_prompt_and_install_mcp_dependencies(&sess, turn, &cancelled, &skills),
+                refresh
+            )
+        })
+        .await?;
+        refreshed?;
+        assert!(load_global_mcp_servers(home.path()).await?.is_empty());
+        assert!(
+            !sess
+                .configured_mcp_servers()
+                .await
+                .contains_key("candidate")
+        );
+        assert!(
+            !sess
+                .services
+                .mcp_connection_manager
+                .read()
+                .await
+                .configured_servers
+                .contains_key("candidate")
+        );
+        Ok(())
     }
 
     #[test]

@@ -29,6 +29,21 @@ use crate::mcp_connection_manager::SandboxState;
 const MCP_TOOL_NAME_PREFIX: &str = "mcp";
 const MCP_TOOL_NAME_DELIMITER: &str = "__";
 pub(crate) const CODEX_APPS_MCP_SERVER_NAME: &str = "codex_apps";
+pub(crate) type ServerConstraints = crate::config::Constrained<HashMap<String, McpServerConfig>>;
+
+pub(crate) fn constrain_servers(
+    original: &ServerConstraints,
+    refreshed: Option<&ServerConstraints>,
+    servers: HashMap<String, McpServerConfig>,
+) -> crate::config::ConstraintResult<ServerConstraints> {
+    let mut effective = original.clone();
+    effective.set(servers)?;
+    if let Some(mut current) = refreshed.cloned() {
+        current.set(effective.get().clone())?;
+        return Ok(current);
+    }
+    Ok(effective)
+}
 const CODEX_CONNECTORS_TOKEN_ENV_VAR: &str = "CODEX_CONNECTORS_TOKEN";
 
 fn codex_apps_mcp_bearer_token_env_var() -> Option<String> {

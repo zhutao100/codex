@@ -220,7 +220,13 @@ impl ThreadManager {
         self.state.threads.read().await.keys().copied().collect()
     }
 
-    pub async fn refresh_mcp_servers(&self, refresh_config: McpServerRefreshConfig) {
+    pub async fn refresh_mcp_servers(&self, config: &Config) -> serde_json::Result<()> {
+        let refresh = McpServerRefreshConfig {
+            mcp_servers: serde_json::to_value(config.mcp_servers.get())?,
+            mcp_oauth_credentials_store_mode: serde_json::to_value(
+                config.mcp_oauth_credentials_store_mode,
+            )?,
+        };
         let threads = self
             .state
             .threads
@@ -230,15 +236,11 @@ impl ThreadManager {
             .cloned()
             .collect::<Vec<_>>();
         for thread in threads {
-            if let Err(err) = thread
-                .submit(Op::RefreshMcpServers {
-                    config: refresh_config.clone(),
-                })
-                .await
-            {
-                warn!("failed to request MCP server refresh: {err}");
-            }
+            thread
+                .queue_trusted_mcp_refresh(refresh.clone(), config.mcp_servers.clone())
+                .await;
         }
+        Ok(())
     }
 
     pub fn subscribe_thread_created(&self) -> broadcast::Receiver<ThreadId> {

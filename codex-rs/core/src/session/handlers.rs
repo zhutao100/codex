@@ -764,6 +764,7 @@ pub async fn get_history_entry_request(
 }
 
 pub async fn refresh_mcp_servers(sess: &Arc<Session>, refresh_config: McpServerRefreshConfig) {
+    let _admission = sess.refreshed_mcp_constraints.write().await;
     let mut guard = sess.pending_mcp_server_refresh_config.lock().await;
     *guard = Some(refresh_config);
 }

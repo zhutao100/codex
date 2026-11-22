@@ -15,6 +15,8 @@ pub(crate) struct Session {
     /// session.
     pub(super) features: Features,
     pub(super) pending_mcp_server_refresh_config: Mutex<Option<McpServerRefreshConfig>>,
+    pub(crate) refreshed_mcp_constraints:
+        tokio::sync::RwLock<Option<crate::mcp::ServerConstraints>>,
     pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
     pub(crate) compaction_installation: Arc<Mutex<()>>,
     pub(crate) completion_review_installation: Arc<Mutex<()>>,
@@ -451,6 +453,7 @@ impl Session {
             state: Mutex::new(state),
             features: config.features.clone(),
             pending_mcp_server_refresh_config: Mutex::new(None),
+            refreshed_mcp_constraints: Default::default(),
             active_turn: Mutex::new(None),
             compaction_installation: Arc::new(Mutex::new(())),
             completion_review_installation: Arc::new(Mutex::new(())),

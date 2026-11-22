@@ -35,6 +35,16 @@ pub struct CodexThread {
 /// Conduit for the bidirectional stream of messages that compose a thread
 /// (formerly called a conversation) in Codex.
 impl CodexThread {
+    pub(crate) async fn queue_trusted_mcp_refresh(
+        &self,
+        refresh: codex_protocol::protocol::McpServerRefreshConfig,
+        constraints: crate::mcp::ServerConstraints,
+    ) {
+        self.codex
+            .session
+            .queue_trusted_mcp_refresh(refresh, constraints)
+            .await;
+    }
     pub(crate) fn new(codex: Codex, rollout_path: Option<PathBuf>) -> Self {
         Self {
             codex,
