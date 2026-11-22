@@ -116,7 +116,6 @@ use crate::compact::collect_user_messages;
 use crate::config::Config;
 use crate::config::Constrained;
 use crate::config::ConstraintResult;
-use crate::config::GhostSnapshotConfig;
 use crate::config::resolve_web_search_mode_for_turn;
 use crate::config::types::McpServerConfig;
 use crate::config::types::ShellEnvironmentPolicy;
@@ -197,12 +196,10 @@ use crate::skills::SkillInjections;
 use crate::skills::SkillMetadata;
 use crate::skills::SkillsManager;
 use crate::skills::build_skill_injections;
-use crate::skills::collect_env_var_dependencies;
 use crate::skills::collect_explicit_skill_mentions;
 use crate::skills::injection::ToolMentionKind;
 use crate::skills::injection::app_id_from_path;
 use crate::skills::injection::tool_kind_for_path;
-use crate::skills::resolve_skill_dependencies_for_turn;
 use crate::state::ActiveTurn;
 use crate::state::CompletedTurnForReview;
 use crate::state::PendingContinuation;
@@ -212,13 +209,10 @@ use crate::state::SessionServices;
 use crate::state::SessionState;
 use crate::state::TurnState;
 use crate::state_db;
-use crate::tasks::GhostSnapshotTask;
 use crate::tasks::PostTurnCompletionReviewTask;
 use crate::tasks::ReviewDelegateConfigParams;
 use crate::tasks::ReviewDelegateInstructionProfile;
 use crate::tasks::ReviewTask;
-use crate::tasks::SessionTask;
-use crate::tasks::SessionTaskContext;
 use crate::tasks::configure_review_delegate_config;
 use crate::tools::ToolRouter;
 use crate::tools::context::SharedTurnDiffTracker;
@@ -249,8 +243,6 @@ use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::NonSteerableTurnKind;
 use codex_protocol::user_input::UserInput;
-use codex_utils_readiness::Readiness;
-use codex_utils_readiness::ReadinessFlag;
 use tokio::sync::watch;
 
 mod completion_review;
@@ -389,7 +381,7 @@ impl Codex {
         let enabled_skills = loaded_skills.enabled_skills();
         let user_instructions = get_user_instructions(&config, Some(&enabled_skills)).await;
 
-        let exec_policy = ExecPolicyManager::load(&config.features, &config.config_layer_stack)
+        let exec_policy = ExecPolicyManager::load(&config.config_layer_stack)
             .await
             .map_err(|err| CodexErr::Fatal(format!("failed to load rules: {err}")))?;
 
@@ -424,9 +416,7 @@ impl Codex {
 
         // Respect thread-start tools. When missing (resumed/forked threads), read from the db
         // first, then fall back to rollout-file tools.
-        let persisted_tools = if dynamic_tools.is_empty()
-            && config.features.enabled(Feature::Sqlite)
-        {
+        let persisted_tools = if dynamic_tools.is_empty() && !config.ephemeral {
             let thread_id = match &conversation_history {
                 InitialHistory::Resumed(resumed) => Some(resumed.conversation_id),
                 InitialHistory::Forked(_) => conversation_history.forked_from_id(),
@@ -626,6 +616,12 @@ fn base_instruction_settings_changed(
         || previous.personality != next.personality
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ThreadNameSource {
+    Explicit,
+    Automatic,
+}
+
 impl Session {
     /// Builds the `x-codex-beta-features` header value for this session.
     ///
@@ -637,7 +633,7 @@ impl Session {
             .iter()
             .filter_map(|spec| {
                 if (spec.stage.experimental_menu_description().is_some()
-                    || spec.id == Feature::RemoteCompactionV2)
+                    || spec.id == Feature::Collab)
                     && config.features.enabled(spec.id)
                 {
                     Some(spec.key)
@@ -645,14 +641,10 @@ impl Session {
                     None
                 }
             })
+            .chain(std::iter::once("remote_compaction_v2"))
             .collect::<Vec<_>>()
             .join(",");
-
-        if beta_features_header.is_empty() {
-            None
-        } else {
-            Some(beta_features_header)
-        }
+        Some(beta_features_header)
     }
 
     pub(crate) async fn codex_home(&self) -> PathBuf {
@@ -774,11 +766,31 @@ impl Session {
         true
     }
 
-    pub(crate) async fn set_thread_name(&self, name: String) -> std::io::Result<()> {
+    pub(crate) async fn publish_thread_name(
+        &self,
+        sub_id: &str,
+        name: String,
+        source: ThreadNameSource,
+    ) -> std::io::Result<()> {
         let Some(name) = crate::util::normalize_thread_name(&name) else {
             return Err(std::io::Error::other("thread name cannot be empty"));
         };
 
+        // Serialize the conditional save, index append and notification with explicit renames.
+        // The session state lock need not span file or event I/O.
+        let _publication = self.title_publication.lock().await;
+        if source == ThreadNameSource::Automatic
+            && (self.automatic_title_cancel.is_cancelled()
+                || self
+                    .state
+                    .lock()
+                    .await
+                    .session_configuration
+                    .thread_name
+                    .is_some())
+        {
+            return Ok(());
+        }
         let persistence_enabled = {
             let rollout = self.services.rollout.lock().await;
             rollout.is_some()
@@ -790,10 +802,26 @@ impl Session {
         }
 
         let codex_home = self.codex_home().await;
-        session_index::append_thread_name(&codex_home, self.conversation_id, &name).await?;
+        let name = session_index::append_thread_name(
+            &codex_home,
+            self.conversation_id,
+            &name,
+            source == ThreadNameSource::Automatic,
+        )
+        .await?;
 
-        let mut state = self.state.lock().await;
-        state.session_configuration.thread_name = Some(name);
+        self.state.lock().await.session_configuration.thread_name = Some(name.clone());
+        if source == ThreadNameSource::Explicit {
+            self.automatic_title_cancel.cancel();
+        }
+        self.send_event_raw(Event {
+            id: sub_id.to_owned(),
+            msg: EventMsg::ThreadNameUpdated(crate::protocol::ThreadNameUpdatedEvent {
+                thread_id: self.conversation_id,
+                thread_name: Some(name),
+            }),
+        })
+        .await;
         Ok(())
     }
 
@@ -1040,7 +1068,6 @@ impl Session {
                 &next.sandbox_policy,
                 next.approval_policy,
                 self.services.exec_policy.current().as_ref(),
-                self.features.enabled(Feature::RequestRule),
                 &next.cwd,
             )
             .into(),
@@ -1075,46 +1102,6 @@ impl Session {
             }
             .into()
         })
-    }
-
-    fn build_personality_update_item(
-        &self,
-        previous: &TurnContextItem,
-        previous_turn_settings: Option<&PreviousTurnSettings>,
-        next: &TurnContext,
-    ) -> Option<ResponseItem> {
-        if !self.features.enabled(Feature::Personality) {
-            return None;
-        }
-        if next.final_instruction_override.is_some() {
-            return None;
-        }
-        let previous_model = previous_turn_settings
-            .map(|settings| settings.model.as_str())
-            .unwrap_or(previous.model.as_str());
-        if next.model_info.slug != previous_model {
-            return None;
-        }
-
-        if let Some(personality) = next.personality
-            && next.personality != previous.personality
-        {
-            let model_info = &next.model_info;
-            let personality_message = Self::personality_message_for(model_info, personality);
-            personality_message.map(|personality_message| {
-                DeveloperInstructions::personality_spec_message(personality_message).into()
-            })
-        } else {
-            None
-        }
-    }
-
-    fn personality_message_for(model_info: &ModelInfo, personality: Personality) -> Option<String> {
-        model_info
-            .model_messages
-            .as_ref()
-            .and_then(|spec| spec.get_personality_message(Some(personality)))
-            .filter(|message| !message.is_empty())
     }
 
     fn build_collaboration_mode_update_item(
@@ -1186,13 +1173,6 @@ impl Session {
             self.build_collaboration_mode_update_item(previous_context, current_context)
         {
             update_items.push(collaboration_mode_item);
-        }
-        if let Some(personality_item) = self.build_personality_update_item(
-            previous_context,
-            previous_turn_settings,
-            current_context,
-        ) {
-            update_items.push(personality_item);
         }
         if let Some(user_instructions_item) =
             Self::build_user_instructions_update_item(previous_context, current_context)
@@ -1356,7 +1336,6 @@ impl Session {
         &self,
         amendment: &ExecPolicyAmendment,
     ) -> Result<(), ExecPolicyUpdateError> {
-        let features = self.features.clone();
         let codex_home = self
             .state
             .lock()
@@ -1364,11 +1343,6 @@ impl Session {
             .session_configuration
             .codex_home()
             .clone();
-
-        if !features.enabled(Feature::ExecPolicy) {
-            error!("attempted to append execpolicy rule while execpolicy feature is disabled");
-            return Err(ExecPolicyUpdateError::FeatureDisabled);
-        }
 
         self.services
             .exec_policy
@@ -1654,21 +1628,6 @@ impl Session {
         self.send_raw_response_items(turn_context, items).await;
     }
 
-    pub(crate) async fn record_ghost_snapshot(
-        &self,
-        turn_context: &TurnContext,
-        ghost_commit: &codex_git::GhostCommit,
-    ) {
-        let _installation = self.compaction_installation.lock().await;
-        self.record_conversation_items(
-            turn_context,
-            &[ResponseItem::GhostSnapshot {
-                ghost_commit: ghost_commit.clone(),
-            }],
-        )
-        .await;
-    }
-
     /// Append ResponseItems to the in-memory conversation history only.
     pub(crate) async fn record_into_history(
         &self,
@@ -1872,14 +1831,6 @@ impl Session {
         self.persist_rollout_items(&rollout_items).await;
     }
 
-    pub fn enabled(&self, feature: Feature) -> bool {
-        self.features.enabled(feature)
-    }
-
-    pub(crate) fn features(&self) -> Features {
-        self.features.clone()
-    }
-
     pub(crate) async fn collaboration_mode(&self) -> CollaborationMode {
         let state = self.state.lock().await;
         state.session_configuration.collaboration_mode.clone()
@@ -1906,7 +1857,6 @@ impl Session {
                 &turn_context.sandbox_policy,
                 turn_context.approval_policy,
                 self.services.exec_policy.current().as_ref(),
-                self.features.enabled(Feature::RequestRule),
                 &turn_context.cwd,
             )
             .into(),
@@ -1915,33 +1865,17 @@ impl Session {
             items.push(DeveloperInstructions::new(developer_instructions.to_string()).into());
         }
         // Add developer instructions from collaboration_mode if they exist and are non-empty
-        let (collaboration_mode, base_instructions) = {
-            let state = self.state.lock().await;
-            (
-                state.session_configuration.collaboration_mode.clone(),
-                state.session_configuration.base_instructions.clone(),
-            )
-        };
+        let collaboration_mode = self
+            .state
+            .lock()
+            .await
+            .session_configuration
+            .collaboration_mode
+            .clone();
         if let Some(collab_instructions) =
             DeveloperInstructions::from_collaboration_mode(&collaboration_mode)
         {
             items.push(collab_instructions.into());
-        }
-        if self.features.enabled(Feature::Personality)
-            && let Some(personality) = turn_context.personality
-            && turn_context.final_instruction_override.is_none()
-        {
-            let model_info = turn_context.model_info.clone();
-            let has_baked_personality = model_info.supports_personality()
-                && base_instructions == model_info.get_model_instructions(Some(personality));
-            if !has_baked_personality
-                && let Some(personality_message) =
-                    Self::personality_message_for(&model_info, personality)
-            {
-                items.push(
-                    DeveloperInstructions::personality_spec_message(personality_message).into(),
-                );
-            }
         }
         if let Some(user_instructions) = turn_context.user_instructions.as_deref() {
             items.push(
@@ -2128,16 +2062,6 @@ impl Session {
         state.record_mcp_dependency_prompted(names);
     }
 
-    pub async fn dependency_env(&self) -> HashMap<String, String> {
-        let state = self.state.lock().await;
-        state.dependency_env()
-    }
-
-    pub async fn set_dependency_env(&self, values: HashMap<String, String>) {
-        let mut state = self.state.lock().await;
-        state.set_dependency_env(values);
-    }
-
     async fn send_token_count_event(&self, turn_context: &TurnContext) {
         let (info, rate_limits) = {
             let state = self.state.lock().await;
@@ -2266,34 +2190,6 @@ impl Session {
             additional_details: Some(additional_details),
         });
         self.send_event(turn_context, event).await;
-    }
-
-    async fn maybe_start_ghost_snapshot(
-        self: &Arc<Self>,
-        turn_context: Arc<TurnContext>,
-        cancellation_token: CancellationToken,
-    ) {
-        if !self.enabled(Feature::GhostCommit) {
-            return;
-        }
-        let token = match turn_context.tool_call_gate.subscribe().await {
-            Ok(token) => token,
-            Err(err) => {
-                warn!("failed to subscribe to ghost snapshot readiness: {err}");
-                return;
-            }
-        };
-
-        info!("spawning ghost snapshot task");
-        let task = GhostSnapshotTask::new(token);
-        Arc::new(task)
-            .run(
-                Arc::new(SessionTaskContext::new(self.clone())),
-                turn_context.clone(),
-                Vec::new(),
-                cancellation_token,
-            )
-            .await;
     }
 
     /// Inject additional user input into the currently active regular turn.

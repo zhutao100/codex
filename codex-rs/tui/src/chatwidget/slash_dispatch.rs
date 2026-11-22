@@ -419,17 +419,7 @@ impl ChatWidget {
             SlashCommand::Model => {
                 self.open_model_popup();
             }
-            SlashCommand::Personality => {
-                self.open_personality_popup();
-            }
             SlashCommand::Plan => {
-                if !self.collaboration_modes_enabled() {
-                    self.add_info_message(
-                        "Collaboration modes are disabled.".to_string(),
-                        Some("Enable collaboration modes to use /plan.".to_string()),
-                    );
-                    return;
-                }
                 if let Some(mask) = collaboration_modes::plan_mask(self.models_manager.as_ref()) {
                     self.set_collaboration_mask(mask);
                 } else {
@@ -437,13 +427,6 @@ impl ChatWidget {
                 }
             }
             SlashCommand::Collab => {
-                if !self.collaboration_modes_enabled() {
-                    self.add_info_message(
-                        "Collaboration modes are disabled.".to_string(),
-                        Some("Enable collaboration modes to use /collab.".to_string()),
-                    );
-                    return;
-                }
                 self.open_collaboration_modes_popup();
             }
             SlashCommand::Agent => {
@@ -977,7 +960,6 @@ impl ChatWidget {
             | SlashCommand::Rename
             | SlashCommand::Export
             | SlashCommand::Model
-            | SlashCommand::Personality
             | SlashCommand::Plan
             | SlashCommand::Collab
             | SlashCommand::Agent
@@ -1019,13 +1001,7 @@ impl ChatWidget {
         #[cfg(not(target_os = "windows"))]
         let allow_elevate_sandbox = false;
 
-        find_builtin_command(
-            name,
-            self.collaboration_modes_enabled(),
-            self.connectors_enabled(),
-            self.config.features.enabled(Feature::Personality),
-            allow_elevate_sandbox,
-        )
+        find_builtin_command(name, self.connectors_enabled(), allow_elevate_sandbox)
     }
 
     fn queued_command_drain_result(&self, cmd: SlashCommand) -> QueueDrain {
@@ -1062,7 +1038,6 @@ impl ChatWidget {
             | SlashCommand::ReviewCompletedTurn
             | SlashCommand::Export
             | SlashCommand::Model
-            | SlashCommand::Personality
             | SlashCommand::Plan
             | SlashCommand::Collab
             | SlashCommand::Agent

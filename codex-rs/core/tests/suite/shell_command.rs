@@ -1,7 +1,6 @@
 use std::time::Duration;
 
 use anyhow::Result;
-use codex_core::features::Feature;
 use core_test_support::assert_regex_match;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -245,12 +244,7 @@ async fn shell_command_times_out_with_timeout_ms() -> anyhow::Result<()> {
 async fn unicode_output(login: bool) -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
-    let harness = shell_command_harness_with(|builder| {
-        builder.with_model("gpt-5.2").with_config(|config| {
-            config.features.enable(Feature::PowershellUtf8);
-        })
-    })
-    .await?;
+    let harness = shell_command_harness_with(|builder| builder.with_model("gpt-5.2")).await?;
 
     let call_id = "unicode_output";
     mount_shell_responses_with_timeout(
@@ -275,12 +269,7 @@ async fn unicode_output(login: bool) -> anyhow::Result<()> {
 async fn unicode_output_with_newlines(login: bool) -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
-    let harness = shell_command_harness_with(|builder| {
-        builder.with_model("gpt-5.2").with_config(|config| {
-            config.features.enable(Feature::PowershellUtf8);
-        })
-    })
-    .await?;
+    let harness = shell_command_harness_with(|builder| builder.with_model("gpt-5.2")).await?;
 
     let call_id = "unicode_output";
     mount_shell_responses_with_timeout(

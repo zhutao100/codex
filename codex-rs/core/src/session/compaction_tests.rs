@@ -317,17 +317,16 @@ async fn compaction_usage_counts_preserved_notes_once_after_installation_and_res
 async fn stable_compaction_feature_is_advertised_without_displacing_other_flags() {
     let home = tempfile::tempdir().unwrap();
     let mut config = build_test_config(home.path()).await;
+    config.features.enable(Feature::Apps);
+    config.features.enable(Feature::Collab);
     let header = Session::build_model_client_beta_features_header(&config).unwrap();
     assert!(header.split(',').any(|key| key == "remote_compaction_v2"));
-    config.features.disable(Feature::RemoteCompactionV2);
-    let disabled = Session::build_model_client_beta_features_header(&config).unwrap_or_default();
+    assert!(header.split(',').any(|key| key == "apps"));
+    assert!(header.split(',').any(|key| key == "collab"));
+    config.compaction_mode = crate::config::types::CompactionMode::Unary;
     assert_eq!(
-        header
-            .split(',')
-            .filter(|key| *key != "remote_compaction_v2")
-            .collect::<Vec<_>>()
-            .join(","),
-        disabled,
+        Session::build_model_client_beta_features_header(&config),
+        Some(header)
     );
 }
 
@@ -722,36 +721,25 @@ fn continuation_trims_dangling_work_after_encrypted_compaction_and_keeps_undo() 
 }
 
 #[tokio::test]
-async fn selection_preserves_master_override_and_provider_boundary() {
-    let (mut session, mut context) = make_session_and_context().await;
-    assert!(session.enabled(Feature::RemoteCompactionV2));
+async fn selection_respects_provider_and_explicit_compaction_mode() {
+    use crate::config::types::CompactionMode;
+    let (_, mut context) = make_session_and_context().await;
     for eligible in [false, true] {
         context.provider.name = if eligible { "OpenAI" } else { "Other" }.into();
-        context.provider.base_url = Some("http://127.0.0.1/custom/backend-api/codex".into());
-        for master in [false, true] {
-            for v2 in [false, true] {
-                if master {
-                    session.features.enable(Feature::RemoteCompaction);
+        for (mode, supported) in [
+            (CompactionMode::Auto, CompactionImplementation::RemoteV2),
+            (CompactionMode::Unary, CompactionImplementation::Remote),
+            (CompactionMode::Local, CompactionImplementation::Local),
+        ] {
+            Arc::make_mut(&mut context.config).compaction_mode = mode;
+            assert_eq!(
+                compaction_implementation(&context),
+                if eligible {
+                    supported
                 } else {
-                    session.features.disable(Feature::RemoteCompaction);
-                }
-                if v2 {
-                    session.features.enable(Feature::RemoteCompactionV2);
-                } else {
-                    session.features.disable(Feature::RemoteCompactionV2);
-                }
-                let expected = if !eligible || !master {
                     CompactionImplementation::Local
-                } else if v2 {
-                    CompactionImplementation::RemoteV2
-                } else {
-                    CompactionImplementation::Remote
-                };
-                assert_eq!(
-                    compaction_implementation(&session, &context.provider),
-                    expected
-                );
-            }
+                }
+            );
         }
     }
 }

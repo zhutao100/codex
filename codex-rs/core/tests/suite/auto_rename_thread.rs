@@ -34,6 +34,94 @@ const EXPECTED_THREAD_NAME_BASE_INSTRUCTIONS: &str = "You generate short convers
 const THREAD_NAME_MODEL: &str = "gpt-6-luna";
 const PREVIOUS_LUNA_MODEL: &str = "gpt-5.6-luna";
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_title_wins_while_automatic_generation_is_blocked() -> Result<()> {
+    use codex_core::AuthManager;
+    use codex_core::ThreadManager;
+    use codex_core::protocol::SessionSource;
+    use codex_protocol::user_input::UserInput;
+    use core_test_support::streaming_sse::StreamingSseChunk;
+    use core_test_support::streaming_sse::start_streaming_sse_server;
+
+    skip_if_no_network_unless_localhost!(Ok(()));
+    let (release, gate) = tokio::sync::oneshot::channel();
+    let response = |id, text| {
+        sse(vec![
+            ev_response_created(id),
+            ev_assistant_message("msg", text),
+            ev_completed(id),
+        ])
+    };
+    let (server, _) = start_streaming_sse_server(vec![
+        vec![StreamingSseChunk {
+            gate: None,
+            body: response("turn", "done"),
+        }],
+        vec![StreamingSseChunk {
+            gate: Some(gate),
+            body: response("title", "Generated name"),
+        }],
+    ])
+    .await;
+    let home = TempDir::new()?;
+    let mut config = core_test_support::load_default_config_for_test(&home).await;
+    config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
+    config.model_provider.supports_websockets = false;
+    config.features.enable(Feature::AutoRenameThread);
+    let auth = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("test"));
+    let manager = ThreadManager::new(config.codex_home.clone(), auth.clone(), SessionSource::Cli);
+    let started = manager.start_thread(config.clone()).await?;
+    started
+        .thread
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "do the task".into(),
+                text_elements: vec![],
+            }],
+            final_output_json_schema: None,
+        })
+        .await?;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while server.requests().await.len() < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    started
+        .thread
+        .submit(Op::SetThreadName {
+            name: "My title".into(),
+        })
+        .await?;
+    wait_for_event(&started.thread, |msg| matches!(msg, EventMsg::ThreadNameUpdated(e) if e.thread_name.as_deref() == Some("My title"))).await;
+    let _ = release.send(());
+    started.thread.submit(Op::Shutdown).await?;
+    wait_for_event(&started.thread, |msg| {
+        matches!(msg, EventMsg::ShutdownComplete)
+    })
+    .await;
+    assert_eq!(
+        codex_core::find_thread_name_by_id(home.path(), &started.thread_id)
+            .await?
+            .as_deref(),
+        Some("My title")
+    );
+    let reopened = manager
+        .resume_thread_from_rollout(config, started.thread.rollout_path().unwrap(), auth)
+        .await?;
+    assert_eq!(
+        reopened.session_configured.thread_name.as_deref(),
+        Some("My title")
+    );
+    reopened.thread.submit(Op::Shutdown).await?;
+    wait_for_event(&reopened.thread, |msg| {
+        matches!(msg, EventMsg::ShutdownComplete)
+    })
+    .await;
+    server.shutdown().await;
+    Ok(())
+}
+
 fn b64_json(value: &serde_json::Value) -> Result<String> {
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(value)?))
 }
@@ -303,7 +391,6 @@ async fn auto_rename_thread_uses_latest_luna_for_chatgpt_prolite_from_models_cac
         .with_home(home)
         .with_auth(auth)
         .with_config(|config| {
-            config.features.enable(Feature::RemoteModels);
             config.model_provider.request_max_retries = Some(0);
         });
     let test = builder.build(&server).await?;
@@ -365,7 +452,6 @@ async fn auto_rename_thread_honors_cached_luna_visibility_for_chatgpt_prolite() 
         .with_auth(auth)
         .with_model("gpt-6-sol")
         .with_config(|config| {
-            config.features.enable(Feature::RemoteModels);
             config.model_provider.request_max_retries = Some(0);
         });
     let test = builder.build(&server).await?;
@@ -422,7 +508,6 @@ async fn auto_rename_thread_warns_and_uses_result_on_server_model_mismatch() -> 
         .with_home(home)
         .with_auth(auth)
         .with_config(|config| {
-            config.features.enable(Feature::RemoteModels);
             config.model_provider.request_max_retries = Some(0);
         });
     let test = builder.build(&server).await?;

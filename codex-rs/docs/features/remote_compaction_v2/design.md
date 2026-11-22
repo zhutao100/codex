@@ -43,15 +43,15 @@ Failed compaction remains unfinished main work. Acknowledged steering retained d
 
 Local summarization buffers output per attempt. EOF, failure and retries discard that buffer; only a completed attempt supplies the replacement summary. Appending uncommitted summarizer output to live history would make the preceding notes transaction ambiguous and block recovery.
 
-## Installation, snapshots and replay
+## Installation and replay
 
-The replacement contains retained messages plus the encrypted summary, followed by exact notes and local snapshots. When injecting canonical context inline, place it before the last real user message, otherwise the last plaintext summary, otherwise the encrypted summary, otherwise at the end. Image-only input is a real user anchor. Notes intentionally follow the encrypted summary to preserve explicit carryover.
+The replacement contains retained messages plus the encrypted summary, followed by exact notes. When injecting canonical context inline, place it before the last real user message, otherwise the last plaintext summary, otherwise the encrypted summary, otherwise at the end. Image-only input is a real user anchor. Notes intentionally follow the encrypted summary to preserve explicit carryover.
 
 `replace_compacted_history` writes the exact replacement and appropriate adjacent reference context and recomputes usage once. The full local baseline covers all installed items, including notes and retained reasoning; persist its covered-item count so live accounting and replay add only later items. See the shared [usage contract](../post_turn_completion_review/budget_accounting.md).
 
 Before installation, cancellation leaves live history intact. Once installation starts, an owned task holds the installation guard through memory replacement, persistence and completion notification; task-stop joins it before building stopped state. This prevents cancellation from splitting that operation, not power-loss atomicity.
 
-Background snapshot recording uses the same guard. Snapshots completed during the remote request enter the replacement; later writers append after its checkpoint. Snapshots stay out of model requests.
+Legacy worktree snapshots are readable from older rollouts but excluded from model requests. There is no background snapshot producer to join during installation.
 
 After successful installation, clear logical WebSocket continuation and retain only a healthy completed physical connection. Failed/cancelled requests must remain marked unfinished; a different local/unary request must not accidentally make an unfinished notes socket cacheable.
 

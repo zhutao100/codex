@@ -1,5 +1,4 @@
 use codex_core::compact::SUMMARIZATION_PROMPT;
-use codex_core::features::Feature;
 use codex_core::protocol::EventMsg;
 use codex_core::protocol::Op;
 use codex_protocol::items::TurnItem;
@@ -505,9 +504,9 @@ async fn assert_pending_input_after_compaction(remote_v2: bool) -> anyhow::Resul
             config.model_context_window = Some(if remote_v2 { 200_000 } else { 100 });
             config.model_auto_compact_token_limit = Some(if remote_v2 { 90_000 } else { 90 });
             if remote_v2 {
-                config.features.enable(Feature::RemoteCompaction);
+                config.compaction_mode = codex_core::config::types::CompactionMode::Auto;
             } else {
-                config.features.disable(Feature::RemoteCompaction);
+                config.compaction_mode = codex_core::config::types::CompactionMode::Local;
             }
         })
         .build_with_streaming_server(&server)

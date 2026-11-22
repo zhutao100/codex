@@ -7,7 +7,6 @@ builds a CommandSpec, and runs it under the current SandboxAttempt.
 use crate::exec::ExecToolCallOutput;
 use crate::exec::execute_captured_exec_env;
 use crate::exec_output::OutputCapture;
-use crate::features::Feature;
 use crate::powershell::prefix_powershell_script_with_utf8;
 use crate::sandboxing::SandboxPermissions;
 use crate::shell::ShellType;
@@ -149,10 +148,12 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
     ) -> Result<ExecToolCallOutput, ToolError> {
         let base_command = &req.command;
         let session_shell = ctx.session.user_shell();
-        let command = maybe_wrap_shell_lc_with_snapshot(base_command, session_shell.as_ref());
-        let command = if matches!(session_shell.shell_type, ShellType::PowerShell)
-            && ctx.session.features().enabled(Feature::PowershellUtf8)
-        {
+        let command = maybe_wrap_shell_lc_with_snapshot(
+            base_command,
+            session_shell.as_ref(),
+            &ctx.turn.shell_environment_policy,
+        );
+        let command = if matches!(session_shell.shell_type, ShellType::PowerShell) {
             prefix_powershell_script_with_utf8(&command)
         } else {
             command

@@ -72,8 +72,6 @@ impl Stage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Feature {
     // Stable.
-    /// Create a ghost commit at each turn.
-    GhostCommit,
     /// Enable the default shell tool.
     ShellTool,
 
@@ -88,41 +86,23 @@ pub enum Feature {
     RecoverableExecOutput,
     /// Let a turn explicitly await terminal unified-exec outcomes.
     ExecJobCompletion,
-    /// Include the freeform apply_patch tool.
-    ApplyPatchFreeform,
     /// Allow the model to request web searches that fetch live content.
     WebSearchRequest,
     /// Allow the model to request web searches that fetch cached content.
     /// Takes precedence over `WebSearchRequest`.
     WebSearchCached,
-    /// Gate the execpolicy enforcement for shell/unified exec.
-    ExecPolicy,
     /// Use the bubblewrap-based Linux sandbox pipeline.
     UseLinuxSandboxBwrap,
-    /// Allow the model to request approval and propose exec rules.
-    RequestRule,
     /// Enable Windows sandbox (restricted token) on Windows.
     WindowsSandbox,
     /// Use the elevated Windows sandbox pipeline (setup + runner).
     WindowsSandboxElevated,
-    /// Enable remote compaction for configured OpenAI providers.
-    RemoteCompaction,
-    /// Compact through the normal Responses stream.
-    RemoteCompactionV2,
-    /// Refresh remote models and emit AppReady once the list is available.
-    RemoteModels,
     /// Experimental shell snapshotting.
     ShellSnapshot,
     /// Enable runtime metrics snapshots via a manual reader.
     RuntimeMetrics,
-    /// Persist rollout metadata to a local SQLite database.
-    Sqlite,
     /// Enable the get_memory tool backed by SQLite thread memories.
     MemoryTool,
-    /// Append additional AGENTS.md guidance to user instructions.
-    ChildAgentsMd,
-    /// Enforce UTF8 output in Powershell.
-    PowershellUtf8,
     /// Compress request bodies (zstd) when sending streaming requests to codex-backend.
     EnableRequestCompression,
     /// Enable collab tools.
@@ -131,18 +111,6 @@ pub enum Feature {
     Apps,
     /// Allow prompting and installing missing MCP dependencies.
     SkillMcpDependencyInstall,
-    /// Prompt for missing skill env var dependencies.
-    SkillEnvVarDependencyPrompt,
-    /// Steer feature flag - when enabled, Enter submits immediately instead of queuing.
-    Steer,
-    /// Enable collaboration modes (Plan, Default).
-    CollaborationModes,
-    /// Enable personality selection in the TUI.
-    Personality,
-    /// Use the Responses API WebSocket transport for OpenAI by default.
-    ResponsesWebsockets,
-    /// Use the v2 Responses API WebSocket request protocol.
-    ResponsesWebsocketsV2,
     /// Request encrypted sampled output for full-history replay on OpenAI.
     OutputTokenReplay,
 }
@@ -171,7 +139,6 @@ impl Feature {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct LegacyFeatureUsage {
     pub alias: String,
-    pub feature: Feature,
     pub summary: String,
     pub details: Option<String>,
 }
@@ -185,14 +152,12 @@ pub struct Features {
 
 #[derive(Debug, Clone, Default)]
 pub struct FeatureOverrides {
-    pub include_apply_patch_tool: Option<bool>,
     pub web_search_request: Option<bool>,
 }
 
 impl FeatureOverrides {
     fn apply(self, features: &mut Features) {
         LegacyFeatureToggles {
-            include_apply_patch_tool: self.include_apply_patch_tool,
             tools_web_search: self.web_search_request,
             ..Default::default()
         }
@@ -233,7 +198,6 @@ impl Features {
         let (summary, details) = legacy_usage_notice(alias, feature);
         self.legacy_usages.insert(LegacyFeatureUsage {
             alias: alias.to_string(),
-            feature,
             summary,
             details,
         });
@@ -269,6 +233,12 @@ impl Features {
     pub fn apply_map(&mut self, m: &BTreeMap<String, bool>) {
         for (k, v) in m {
             match k.as_str() {
+                "collab" => self.record_legacy_usage_force("features.collab", Feature::Collab),
+                "experimental_windows_sandbox" | "elevated_windows_sandbox" => {
+                    if let Some(feature) = feature_for_key(k) {
+                        self.record_legacy_usage_force(&format!("features.{k}"), feature);
+                    }
+                }
                 "web_search_request" => {
                     self.record_legacy_usage_force(
                         "features.web_search_request",
@@ -295,7 +265,15 @@ impl Features {
                     }
                 }
                 None => {
-                    tracing::warn!("unknown feature key in config: {k}");
+                    if let Some(details) = retired_feature_guidance(k) {
+                        self.legacy_usages.insert(LegacyFeatureUsage {
+                            alias: k.clone(),
+                            summary: format!("`features.{k}` has been retired."),
+                            details: Some(details.into()),
+                        });
+                    } else {
+                        tracing::warn!("unknown feature key in config: {k}");
+                    }
                 }
             }
         }
@@ -309,10 +287,8 @@ impl Features {
         let mut features = Features::with_defaults();
 
         let base_legacy = LegacyFeatureToggles {
-            experimental_use_freeform_apply_patch: cfg.experimental_use_freeform_apply_patch,
             experimental_use_unified_exec_tool: cfg.experimental_use_unified_exec_tool,
             tools_web_search: cfg.tools.as_ref().and_then(|t| t.web_search),
-            ..Default::default()
         };
         base_legacy.apply(&mut features);
 
@@ -321,10 +297,6 @@ impl Features {
         }
 
         let profile_legacy = LegacyFeatureToggles {
-            include_apply_patch_tool: config_profile.include_apply_patch_tool,
-            experimental_use_freeform_apply_patch: config_profile
-                .experimental_use_freeform_apply_patch,
-
             experimental_use_unified_exec_tool: config_profile.experimental_use_unified_exec_tool,
             tools_web_search: config_profile.tools_web_search,
         };
@@ -334,6 +306,13 @@ impl Features {
         }
 
         overrides.apply(&mut features);
+        if let Some(enabled) = cfg.agents.as_ref().and_then(|agents| agents.enabled) {
+            if enabled {
+                features.enable(Feature::Collab);
+            } else {
+                features.disable(Feature::Collab);
+            }
+        }
 
         features
     }
@@ -343,9 +322,51 @@ impl Features {
     }
 }
 
+fn retired_feature_guidance(key: &str) -> Option<&'static str> {
+    Some(match key {
+        "remote_compaction" | "remote_compaction_v2" => {
+            "Set `compaction_mode` to `auto`, `local`, or `unary` instead."
+        }
+        "responses_websockets" | "responses_websockets_v2" => {
+            "Set `responses_transport` to `auto` or `http` instead."
+        }
+        "exec_policy" | "request_rule" => {
+            "Execution rules and approval parameters are always active."
+        }
+        "steer" | "collaboration_modes" => {
+            "Steering and Plan/Default modes are always available. Use Tab to queue input during a turn."
+        }
+        "sqlite" => {
+            "Persistent sessions maintain a SQLite metadata index. Rollout recovery still works without a usable index."
+        }
+        "undo" | "child_agents_md" | "skill_env_var_dependency_prompt" => {
+            "This experiment no longer runs. Remove the setting."
+        }
+        "remote_models" => "Model discovery follows the selected provider and authentication.",
+        "powershell_utf8" => "UTF-8 handling follows the selected shell.",
+        "apply_patch_freeform"
+        | "include_apply_patch_tool"
+        | "experimental_use_freeform_apply_patch" => {
+            "Set `apply_patch_tool_type` in the model overlay instead."
+        }
+        "personality" => {
+            "Style selection has been retired. Use top-level `personality = \"none\"` to omit the catalog template's Personality section."
+        }
+        _ => return None,
+    })
+}
+
 fn legacy_usage_notice(alias: &str, feature: Feature) -> (String, Option<String>) {
     let canonical = feature.key();
     match feature {
+        Feature::WindowsSandbox | Feature::WindowsSandboxElevated => (
+            format!("`{alias}` is deprecated. Use `[windows].sandbox` instead."),
+            None,
+        ),
+        Feature::Collab => (
+            format!("`{alias}` is deprecated. Use `[agents].enabled` instead."),
+            None,
+        ),
         Feature::WebSearchRequest | Feature::WebSearchCached => {
             let label = match alias {
                 "web_search" => "[features].web_search",
@@ -413,12 +434,6 @@ pub struct FeatureSpec {
 pub const FEATURES: &[FeatureSpec] = &[
     // Stable features.
     FeatureSpec {
-        id: Feature::GhostCommit,
-        key: "undo",
-        stage: Stage::Stable,
-        default_enabled: false,
-    },
-    FeatureSpec {
         id: Feature::ShellTool,
         key: "shell_tool",
         stage: Stage::Stable,
@@ -484,34 +499,10 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
-        id: Feature::Sqlite,
-        key: "sqlite",
-        stage: Stage::UnderDevelopment,
-        default_enabled: false,
-    },
-    FeatureSpec {
         id: Feature::MemoryTool,
         key: "memory_tool",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
-    },
-    FeatureSpec {
-        id: Feature::ChildAgentsMd,
-        key: "child_agents_md",
-        stage: Stage::UnderDevelopment,
-        default_enabled: false,
-    },
-    FeatureSpec {
-        id: Feature::ApplyPatchFreeform,
-        key: "apply_patch_freeform",
-        stage: Stage::UnderDevelopment,
-        default_enabled: false,
-    },
-    FeatureSpec {
-        id: Feature::ExecPolicy,
-        key: "exec_policy",
-        stage: Stage::UnderDevelopment,
-        default_enabled: true,
     },
     FeatureSpec {
         id: Feature::UseLinuxSandboxBwrap,
@@ -520,51 +511,15 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
-        id: Feature::RequestRule,
-        key: "request_rule",
-        stage: Stage::Stable,
-        default_enabled: true,
-    },
-    FeatureSpec {
         id: Feature::WindowsSandbox,
         key: "experimental_windows_sandbox",
-        stage: Stage::UnderDevelopment,
+        stage: Stage::Deprecated,
         default_enabled: false,
     },
     FeatureSpec {
         id: Feature::WindowsSandboxElevated,
         key: "elevated_windows_sandbox",
-        stage: Stage::UnderDevelopment,
-        default_enabled: false,
-    },
-    FeatureSpec {
-        id: Feature::RemoteCompaction,
-        key: "remote_compaction",
-        stage: Stage::UnderDevelopment,
-        default_enabled: true,
-    },
-    FeatureSpec {
-        id: Feature::RemoteCompactionV2,
-        key: "remote_compaction_v2",
-        stage: Stage::Stable,
-        default_enabled: true,
-    },
-    FeatureSpec {
-        id: Feature::RemoteModels,
-        key: "remote_models",
-        stage: Stage::UnderDevelopment,
-        default_enabled: true,
-    },
-    FeatureSpec {
-        id: Feature::PowershellUtf8,
-        key: "powershell_utf8",
-        #[cfg(windows)]
-        stage: Stage::Stable,
-        #[cfg(windows)]
-        default_enabled: true,
-        #[cfg(not(windows))]
-        stage: Stage::UnderDevelopment,
-        #[cfg(not(windows))]
+        stage: Stage::Deprecated,
         default_enabled: false,
     },
     FeatureSpec {
@@ -576,11 +531,7 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::Collab,
         key: "collab",
-        stage: Stage::Experimental {
-            name: "Sub-agents",
-            menu_description: "Ask Codex to spawn multiple agents to parallelize the work and win in efficiency.",
-            announcement: "NEW: Sub-agents can now be spawned by Codex. Enable in /experimental and restart Codex!",
-        },
+        stage: Stage::Deprecated,
         default_enabled: false,
     },
     FeatureSpec {
@@ -598,42 +549,6 @@ pub const FEATURES: &[FeatureSpec] = &[
         key: "skill_mcp_dependency_install",
         stage: Stage::Stable,
         default_enabled: true,
-    },
-    FeatureSpec {
-        id: Feature::SkillEnvVarDependencyPrompt,
-        key: "skill_env_var_dependency_prompt",
-        stage: Stage::UnderDevelopment,
-        default_enabled: false,
-    },
-    FeatureSpec {
-        id: Feature::Steer,
-        key: "steer",
-        stage: Stage::Stable,
-        default_enabled: true,
-    },
-    FeatureSpec {
-        id: Feature::CollaborationModes,
-        key: "collaboration_modes",
-        stage: Stage::Stable,
-        default_enabled: true,
-    },
-    FeatureSpec {
-        id: Feature::Personality,
-        key: "personality",
-        stage: Stage::Stable,
-        default_enabled: true,
-    },
-    FeatureSpec {
-        id: Feature::ResponsesWebsockets,
-        key: "responses_websockets",
-        stage: Stage::UnderDevelopment,
-        default_enabled: false,
-    },
-    FeatureSpec {
-        id: Feature::ResponsesWebsocketsV2,
-        key: "responses_websockets_v2",
-        stage: Stage::UnderDevelopment,
-        default_enabled: false,
     },
     FeatureSpec {
         id: Feature::OutputTokenReplay,

@@ -160,7 +160,7 @@ async fn returns_config_error_for_schema_error_in_user_config() {
 #[test]
 fn schema_error_points_to_feature_value() {
     let tmp = tempdir().expect("tempdir");
-    let contents = "[features]\ncollaboration_modes = \"true\"";
+    let contents = "[features]\nunified_exec = \"true\"";
     let config_path = tmp.path().join(CONFIG_TOML_FILE);
     std::fs::write(&config_path, contents).expect("write config");
 

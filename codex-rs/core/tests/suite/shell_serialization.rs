@@ -111,7 +111,6 @@ fn configure_shell_model(
 ) -> TestCodexBuilder {
     builder.with_config(move |config| {
         config.features.disable(Feature::UnifiedExec);
-        config.features.disable(Feature::ApplyPatchFreeform);
         let mut overlay = ModelOverlay::default();
         overlay.cross_model.shell_type = Some(match output_type {
             ShellModelOutput::Shell => ConfigShellToolType::Default,

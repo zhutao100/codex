@@ -46,9 +46,9 @@ async def main():
         state.joinpath("config.toml").write_text(
             f"model = {json.dumps(model)}\nmodel_reasoning_effort = 'low'\n"
             "base_instructions = 'Answer concisely.'\napproval_policy = 'never'\nsandbox_mode = 'read-only'\n"
-            "[features]\nremote_models = false\nshell_tool = false\nundo = false\n"
+            f"responses_transport = '{'auto' if args.websocket else 'http'}'\n"
+            "[features]\nshell_tool = false\n"
             "auto_rename_thread = false\nauto_post_turn_completion_review = false\n"
-            f"responses_websockets_v2 = {str(args.websocket).lower()}\n"
         )
         env = os.environ.copy()
         env["CODEX_HOME"] = str(state)

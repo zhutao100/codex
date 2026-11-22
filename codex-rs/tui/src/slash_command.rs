@@ -61,7 +61,6 @@ pub enum SlashCommand {
     Feedback,
     Rollout,
     Ps,
-    Personality,
     TestApproval,
 }
 
@@ -103,7 +102,6 @@ impl SlashCommand {
             SlashCommand::LegendMode => "set progress timeline legend mode",
             SlashCommand::Ps => "list background terminals",
             SlashCommand::Model => "choose what model and reasoning effort to use",
-            SlashCommand::Personality => "choose a communication style for Codex",
             SlashCommand::Plan => "switch to Plan mode",
             SlashCommand::Collab => "change collaboration mode (experimental)",
             SlashCommand::Agent => "switch the active agent thread",
@@ -153,7 +151,6 @@ impl SlashCommand {
             | SlashCommand::Init
             | SlashCommand::Compact
             // | SlashCommand::Undo
-            | SlashCommand::Personality
             | SlashCommand::Approvals
             | SlashCommand::Permissions
             | SlashCommand::ElevateSandbox

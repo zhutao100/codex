@@ -214,13 +214,6 @@ pub async fn run_main(
         }
     };
 
-    if let Err(err) =
-        codex_core::personality_migration::maybe_migrate_personality(&codex_home, &config_toml)
-            .await
-    {
-        tracing::warn!(error = %err, "failed to run personality migration");
-    }
-
     let cloud_auth_manager = AuthManager::shared(
         codex_home.to_path_buf(),
         false,
@@ -959,7 +952,7 @@ mod tests {
         let mut config = build_config(&temp_dir).await?;
         config.did_user_set_custom_approval_policy_or_sandbox_mode = false;
         config.active_project = ProjectConfig { trust_level: None };
-        config.set_windows_sandbox_enabled(false);
+        config.set_windows_sandbox_level(WindowsSandboxLevel::Disabled);
 
         let should_show = should_show_trust_screen(&config);
         if cfg!(target_os = "windows") {
@@ -982,7 +975,7 @@ mod tests {
         let mut config = build_config(&temp_dir).await?;
         config.did_user_set_custom_approval_policy_or_sandbox_mode = false;
         config.active_project = ProjectConfig { trust_level: None };
-        config.set_windows_sandbox_enabled(true);
+        config.set_windows_sandbox_level(WindowsSandboxLevel::RestrictedToken);
 
         let should_show = should_show_trust_screen(&config);
         if cfg!(target_os = "windows") {

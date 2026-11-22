@@ -4,7 +4,7 @@ Read this when changing request construction, client lifetime, retry/fallback, o
 
 ## Activation and wire contract
 
-WebSockets require a Responses provider with `supports_websockets` and either `features.responses_websockets` or `features.responses_websockets_v2`. Both feature keys select the same transport implementation and default to disabled. An SSE fixture disables WebSockets. These flags do not change `wire_api`.
+`responses_transport = "auto"` (default) uses WebSockets only when the selected provider declares `supports_websockets`. Set `responses_transport = "http"` globally or in the active profile for HTTP/SSE only. An SSE fixture also disables WebSockets. The session retains its existing fallback state; selecting transport does not change `wire_api`. The [configuration migration](feature-controls.md) preserves explicitly configured legacy opt-outs.
 
 The outbound operation is `response.create`. Requests are serialized directly to the wire string; there is no `response.append` or `response.processed` path. Complete local history remains available for full requests and HTTP fallback.
 
@@ -50,7 +50,7 @@ Create a fresh `ModelClientSession` for each logical turn. Reuse it for sampling
 
 A connection is cacheable only when no request is outstanding or its completion receiver yields a finished response. Both an empty receiver and a closed receiver without a result are non-cacheable. Transport completion makes socket reuse possible; it does not prove task finalization or rollout persistence succeeded.
 
-The endpoint handles bounded sends, idle ping/pong, per-message deflate, server-model and verification events, and immediate terminal-error propagation. The common response parser also handles incomplete responses; do not bypass it when modifying the WebSocket path.
+The [socket pump](../../codex-api/src/endpoint/responses_websocket/pump.rs) reads during blocked writes and flushes automatic Pongs while idle. Small requests can use negotiated per-message deflate. Requests larger than 1 MiB use bounded, uncompressed continuation frames that form one text message. Upload read-ahead is bounded; if an upload started and then failed, already-received peer responses are processed before a local write error. A failed send retires the socket. Replies received before a request starts cannot complete that request.
 
 ## Known configuration limits
 

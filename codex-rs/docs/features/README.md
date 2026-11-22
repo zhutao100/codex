@@ -6,6 +6,7 @@ Choose the feature being changed. Each page states current behavior, non-obvious
 
 |Change|Read|
 |---|---|
+|Migrate a retired switch or check the current configuration owner|[Feature controls](feature-controls.md)|
 |Pause, interrupt, continue or resume unfinished work|[Pause and continue](pause-continue.md)|
 |Accept mid-turn input or manage queued messages|[Steering and queue](steering-and-queue.md)|
 |Capture exact work notes around compaction|[Session work notes](session-work-notes.md)|

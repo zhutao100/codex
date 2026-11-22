@@ -9,7 +9,6 @@ use codex_core::CodexAuth;
 use codex_core::ModelProviderInfo;
 use codex_core::built_in_model_providers;
 use codex_core::config::Config;
-use codex_core::features::Feature;
 use codex_core::models_manager::manager::ModelsManager;
 use codex_core::models_manager::manager::RefreshStrategy;
 use codex_core::protocol::AskForApproval;
@@ -107,7 +106,6 @@ async fn remote_models_remote_model_uses_unified_exec() -> Result<()> {
     let mut builder = test_codex()
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_config(|config| {
-            config.features.enable(Feature::RemoteModels);
             config.model = Some("gpt-5.1".to_string());
         });
     let TestCodex {
@@ -231,7 +229,6 @@ async fn remote_models_truncation_policy_without_override_preserves_remote() -> 
     let mut builder = test_codex()
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_config(|config| {
-            config.features.enable(Feature::RemoteModels);
             config.model = Some("gpt-5.1".to_string());
         });
     let test = builder.build(&server).await?;
@@ -276,7 +273,6 @@ async fn remote_models_truncation_policy_with_tool_output_override() -> Result<(
     let mut builder = test_codex()
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_config(|config| {
-            config.features.enable(Feature::RemoteModels);
             config.model = Some("gpt-5.1".to_string());
             config.tool_output_token_limit = Some(50);
         });
@@ -357,7 +353,6 @@ async fn remote_models_apply_remote_base_instructions() -> Result<()> {
     let mut builder = test_codex()
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_config(|config| {
-            config.features.enable(Feature::RemoteModels);
             config.model = Some("gpt-5.1".to_string());
         });
     let TestCodex {
@@ -430,8 +425,7 @@ async fn remote_models_preserve_builtin_presets() -> Result<()> {
     .await;
 
     let codex_home = TempDir::new()?;
-    let mut config = load_default_config_for_test(&codex_home).await;
-    config.features.enable(Feature::RemoteModels);
+    let config = load_default_config_for_test(&codex_home).await;
 
     let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
     let provider = ModelProviderInfo {
@@ -495,8 +489,7 @@ async fn remote_models_merge_adds_new_high_priority_first() -> Result<()> {
     .await;
 
     let codex_home = TempDir::new()?;
-    let mut config = load_default_config_for_test(&codex_home).await;
-    config.features.enable(Feature::RemoteModels);
+    let config = load_default_config_for_test(&codex_home).await;
 
     let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
     let provider = ModelProviderInfo {
@@ -544,8 +537,7 @@ async fn remote_models_merge_replaces_overlapping_model() -> Result<()> {
     .await;
 
     let codex_home = TempDir::new()?;
-    let mut config = load_default_config_for_test(&codex_home).await;
-    config.features.enable(Feature::RemoteModels);
+    let config = load_default_config_for_test(&codex_home).await;
 
     let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
     let provider = ModelProviderInfo {
@@ -590,8 +582,7 @@ async fn remote_models_merge_preserves_bundled_models_on_empty_response() -> Res
     let models_mock = mount_models_once(&server, ModelsResponse { models: Vec::new() }).await;
 
     let codex_home = TempDir::new()?;
-    let mut config = load_default_config_for_test(&codex_home).await;
-    config.features.enable(Feature::RemoteModels);
+    let config = load_default_config_for_test(&codex_home).await;
 
     let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
     let provider = ModelProviderInfo {
@@ -638,8 +629,7 @@ async fn remote_models_request_times_out_after_5s() -> Result<()> {
     .await;
 
     let codex_home = TempDir::new()?;
-    let mut config = load_default_config_for_test(&codex_home).await;
-    config.features.enable(Feature::RemoteModels);
+    let config = load_default_config_for_test(&codex_home).await;
 
     let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
     let provider = ModelProviderInfo {
@@ -706,8 +696,7 @@ async fn remote_models_hide_picker_only_models() -> Result<()> {
     .await;
 
     let codex_home = TempDir::new()?;
-    let mut config = load_default_config_for_test(&codex_home).await;
-    config.features.enable(Feature::RemoteModels);
+    let config = load_default_config_for_test(&codex_home).await;
 
     let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
     let provider = ModelProviderInfo {

@@ -4,8 +4,8 @@ Select tests by the affected contract. The linked suites are regression entry po
 
 |Area|Source and cases to preserve|
 |---|---|
-|Selection and protocol|[Compaction session tests](../../../core/src/session/compaction_tests.rs): provider/master/v2 selection; request-only trigger serialization/exclusion; feature header and applicable schemas.|
-|Collector and installation|[V2 unit tests](../../../core/src/compact_remote_v2_tests.rs): singleton completed summary, unrelated output, invalid cardinality, EOF/failure, usage, cancellation and snapshots arriving during the stream.|
+|Selection and protocol|[Compaction session tests](../../../core/src/session/compaction_tests.rs): provider/mode selection; request-only trigger serialization/exclusion; capability header and applicable schemas.|
+|Collector and installation|[V2 unit tests](../../../core/src/compact_remote_v2_tests.rs): singleton completed summary, unrelated output, invalid cardinality, EOF/failure, usage and cancellation.|
 |Retention|[History tests](../../../core/src/compact_remote_v2_history_tests.rs): stale context, summaries, Unicode/escaping, newest-first boundaries, image-only messages, atomic labels, no older backfill and intact base64.|
 |HTTP transport|[V2 integration](../../../core/tests/suite/compact_remote_v2.rs): ChatGPT/API-key settings, ordinary path/tools/cache parity, retry limits, manual/automatic follow-up, notes and real request counts.|
 |Downshift and restart|[Downshift suite](../../../core/tests/suite/compact_remote_v2_downshift.rs): distinct source/destination providers and instructions, failed/paused capture, acknowledged input, explicit recovery selection and durable reference context.|
@@ -21,7 +21,7 @@ CODEX_SANDBOX_NETWORK_DISABLED=1 cargo-local test -p codex-core --lib compact --
 CODEX_SANDBOX_NETWORK_DISABLED=1 cargo-local test -p codex-core --test all compact_remote_v2 -- --test-threads=2
 ```
 
-Use shared wrappers and the existing `skip_if_no_network_unless_localhost!` guard for mock transport. Let the wrapper supply its loopback capability. Do not count an early-return network guard as transport execution. Explicit unary fixtures must disable `RemoteCompactionV2`; otherwise they exercise a different request/response contract.
+Use shared wrappers and the existing `skip_if_no_network_unless_localhost!` guard for mock transport. Let the wrapper supply its loopback capability. Do not count an early-return network guard as transport execution. Select `compaction_mode = "unary"` in unary fixtures; the default for an eligible provider exercises a different request/response contract.
 
 Regenerate the affected config/protocol artifacts only when their source schemas change. Expand to related suites when changing shared output handling, usage accounting, pause/resume or task-stop behavior.
 
@@ -32,7 +32,7 @@ Regenerate the affected config/protocol artifacts only when their source schemas
 - Rejected tool outputs after notes, interruption before rejection recording, and later acknowledged user input outside the bounded capture.
 - Failed local summarization attempts followed by Continue/new input and restart; failed output must be absent from recovery requests and replacements.
 - Downshift notes reporting little usage, followed by failure/pause and a new recovery destination; compaction still uses the original source while replacement fits the destination.
-- Snapshot completion during the remote stream or installation; compare live/replayed history and adjacent reference context.
+- Replay an older rollout containing a worktree snapshot; check it does not become model input.
 - A real recorder blocked after memory replacement, stopped through actual pause/interrupt handlers; stopping must wait for installation. Read the durable file without a test-side flush and replay it.
 - Long retained notes and local recomputation after restart; the notes must not be charged twice or trigger a spurious repeat compaction.
 - Standalone compaction during paused/interrupted review-derived work; `/continue` must preserve the owner, exact review frame and selected model.

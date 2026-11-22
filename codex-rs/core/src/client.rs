@@ -111,7 +111,7 @@ struct ModelClientState {
     provider: ModelProviderInfo,
     session_source: SessionSource,
     model_verbosity: Option<VerbosityConfig>,
-    enable_responses_websockets: bool,
+    responses_transport: crate::config::types::ResponsesTransport,
     enable_request_compression: bool,
     include_timing_metrics: bool,
     output_token_replay_enabled: bool,
@@ -220,15 +220,12 @@ impl ModelClient {
         provider: ModelProviderInfo,
         session_source: SessionSource,
         model_verbosity: Option<VerbosityConfig>,
-        enable_responses_websockets: bool,
-        enable_responses_websockets_v2: bool,
+        responses_transport: crate::config::types::ResponsesTransport,
         enable_request_compression: bool,
         include_timing_metrics: bool,
         beta_features_header: Option<String>,
         output_token_replay_enabled: bool,
     ) -> Self {
-        let enable_responses_websockets =
-            enable_responses_websockets || enable_responses_websockets_v2;
         Self {
             restored_history: false,
             state: Arc::new(ModelClientState {
@@ -237,7 +234,7 @@ impl ModelClient {
                 provider,
                 session_source,
                 model_verbosity,
-                enable_responses_websockets,
+                responses_transport,
                 enable_request_compression,
                 include_timing_metrics,
                 output_token_replay_enabled,
@@ -541,7 +538,8 @@ impl ModelClientSession {
 
     fn responses_websocket_enabled(&self) -> bool {
         self.provider.supports_websockets
-            && self.client.state.enable_responses_websockets
+            && self.client.state.responses_transport
+                == crate::config::types::ResponsesTransport::Auto
             && (*CODEX_RS_SSE_FIXTURE).is_none()
     }
 
@@ -2011,8 +2009,7 @@ mod tests {
             provider,
             SessionSource::Exec,
             None,
-            true,
-            false,
+            crate::config::types::ResponsesTransport::Auto,
             false,
             false,
             None,
@@ -2051,8 +2048,7 @@ mod tests {
             provider,
             SessionSource::Exec,
             None,
-            true,
-            false,
+            crate::config::types::ResponsesTransport::Auto,
             false,
             false,
             None,

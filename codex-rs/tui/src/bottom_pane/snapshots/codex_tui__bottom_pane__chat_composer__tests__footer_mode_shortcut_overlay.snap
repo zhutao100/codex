@@ -17,5 +17,5 @@ expression: terminal.backend()
 "  ⌘ + v to paste from clipboard                      ⌃ + r to copy last output                      "
 "  ⌃ + b to copy code block                           ⌃ + l to copy prompt                           "
 "  ⌃ + g to edit in external editor                   esc again to edit or branch previous message   "
-"  ⌃ + c to exit                                                                                     "
-"  ⌃ + t to view transcript                                                                          "
+"  ⌃ + c to exit                                      ⇧ + tab to change mode                         "
+"                                                     ⌃ + t to view transcript                       "

@@ -113,10 +113,9 @@ def main() -> None:
                 f"model = {json.dumps(model)}\nmodel_reasoning_effort = 'low'\n"
                 f"model_instructions_file = {json.dumps(str(instructions_path))}\n"
                 "approval_policy = 'never'\nsandbox_mode = 'read-only'\nweb_search = 'disabled'\n"
-                "[features]\nremote_models = false\nundo = false\ncollab = false\n"
+                "responses_transport = 'http'\n[agents]\nenabled = false\n[features]\n"
                 "apps = false\nauto_rename_thread = false\n"
                 "auto_post_turn_completion_review = false\n"
-                "responses_websockets = false\nresponses_websockets_v2 = false\n"
             )
             output_path = root / f"{label}.answer"
             events = run(

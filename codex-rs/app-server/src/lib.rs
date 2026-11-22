@@ -279,23 +279,6 @@ pub async fn run_main_with_transport(
         .await
     {
         Ok(config) => {
-            let effective_toml = config.config_layer_stack.effective_config();
-            match effective_toml.try_into() {
-                Ok(config_toml) => {
-                    if let Err(err) = codex_core::personality_migration::maybe_migrate_personality(
-                        &config.codex_home,
-                        &config_toml,
-                    )
-                    .await
-                    {
-                        warn!(error = %err, "Failed to run personality migration");
-                    }
-                }
-                Err(err) => {
-                    warn!(error = %err, "Failed to deserialize config for personality migration");
-                }
-            }
-
             let auth_manager = AuthManager::shared(
                 config.codex_home.clone(),
                 false,
@@ -331,9 +314,7 @@ pub async fn run_main_with_transport(
         }
     };
 
-    if let Ok(Some(err)) =
-        check_execpolicy_for_warnings(&config.features, &config.config_layer_stack).await
-    {
+    if let Ok(Some(err)) = check_execpolicy_for_warnings(&config.config_layer_stack).await {
         let (path, range) = exec_policy_warning_location(&err);
         let message = ConfigWarningNotification {
             summary: "Error parsing rules; custom rules not applied.".to_string(),

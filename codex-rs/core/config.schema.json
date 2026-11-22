@@ -9,6 +9,10 @@
     "AgentsToml": {
       "additionalProperties": false,
       "properties": {
+        "enabled": {
+          "description": "Enable subagent tools. Role, depth, and managed restrictions still apply.",
+          "type": "boolean"
+        },
         "max_threads": {
           "description": "Maximum number of agent threads that can be open concurrently. When unset, no limit is enforced.",
           "format": "uint",
@@ -128,6 +132,15 @@
         }
       ]
     },
+    "CompactionMode": {
+      "description": "Remote compaction requires an eligible provider; unsupported providers always compact locally.",
+      "enum": [
+        "auto",
+        "local",
+        "unary"
+      ],
+      "type": "string"
+    },
     "ConfigProfile": {
       "additionalProperties": false,
       "description": "Collection of common configuration options that a user can define as a unit in `config.toml`.",
@@ -141,11 +154,11 @@
         "chatgpt_base_url": {
           "type": "string"
         },
+        "compaction_mode": {
+          "$ref": "#/definitions/CompactionMode"
+        },
         "experimental_compact_prompt_file": {
           "$ref": "#/definitions/AbsolutePathBuf"
-        },
-        "experimental_use_freeform_apply_patch": {
-          "type": "boolean"
         },
         "experimental_use_unified_exec_tool": {
           "type": "boolean"
@@ -155,9 +168,6 @@
           "default": null,
           "description": "Optional feature toggles scoped to this profile.",
           "properties": {
-            "apply_patch_freeform": {
-              "type": "boolean"
-            },
             "apps": {
               "type": "boolean"
             },
@@ -167,13 +177,7 @@
             "auto_rename_thread": {
               "type": "boolean"
             },
-            "child_agents_md": {
-              "type": "boolean"
-            },
             "collab": {
-              "type": "boolean"
-            },
-            "collaboration_modes": {
               "type": "boolean"
             },
             "connectors": {
@@ -191,19 +195,10 @@
             "exec_job_completion": {
               "type": "boolean"
             },
-            "exec_policy": {
-              "type": "boolean"
-            },
-            "experimental_use_freeform_apply_patch": {
-              "type": "boolean"
-            },
             "experimental_use_unified_exec_tool": {
               "type": "boolean"
             },
             "experimental_windows_sandbox": {
-              "type": "boolean"
-            },
-            "include_apply_patch_tool": {
               "type": "boolean"
             },
             "memory_tool": {
@@ -212,31 +207,7 @@
             "output_token_replay": {
               "type": "boolean"
             },
-            "personality": {
-              "type": "boolean"
-            },
-            "powershell_utf8": {
-              "type": "boolean"
-            },
             "recoverable_exec_output": {
-              "type": "boolean"
-            },
-            "remote_compaction": {
-              "type": "boolean"
-            },
-            "remote_compaction_v2": {
-              "type": "boolean"
-            },
-            "remote_models": {
-              "type": "boolean"
-            },
-            "request_rule": {
-              "type": "boolean"
-            },
-            "responses_websockets": {
-              "type": "boolean"
-            },
-            "responses_websockets_v2": {
               "type": "boolean"
             },
             "runtime_metrics": {
@@ -248,19 +219,7 @@
             "shell_tool": {
               "type": "boolean"
             },
-            "skill_env_var_dependency_prompt": {
-              "type": "boolean"
-            },
             "skill_mcp_dependency_install": {
-              "type": "boolean"
-            },
-            "sqlite": {
-              "type": "boolean"
-            },
-            "steer": {
-              "type": "boolean"
-            },
-            "undo": {
               "type": "boolean"
             },
             "unified_exec": {
@@ -280,9 +239,6 @@
             }
           },
           "type": "object"
-        },
-        "include_apply_patch_tool": {
-          "type": "boolean"
         },
         "model": {
           "type": "string"
@@ -314,6 +270,9 @@
         "personality": {
           "$ref": "#/definitions/Personality"
         },
+        "responses_transport": {
+          "$ref": "#/definitions/ResponsesTransport"
+        },
         "sandbox_mode": {
           "$ref": "#/definitions/SandboxMode"
         },
@@ -329,6 +288,9 @@
         },
         "web_search": {
           "$ref": "#/definitions/WebSearchMode"
+        },
+        "windows": {
+          "$ref": "#/definitions/WindowsConfig"
         }
       },
       "type": "object"
@@ -376,26 +338,6 @@
         "api"
       ],
       "type": "string"
-    },
-    "GhostSnapshotToml": {
-      "additionalProperties": false,
-      "properties": {
-        "disable_warnings": {
-          "description": "Disable all ghost snapshot warning events.",
-          "type": "boolean"
-        },
-        "ignore_large_untracked_dirs": {
-          "description": "Ignore untracked directories that contain this many files or more. (Still emits a warning unless warnings are disabled.)",
-          "format": "int64",
-          "type": "integer"
-        },
-        "ignore_large_untracked_files": {
-          "description": "Exclude untracked files larger than this many bytes from ghost snapshots.",
-          "format": "int64",
-          "type": "integer"
-        }
-      },
-      "type": "object"
     },
     "History": {
       "additionalProperties": false,
@@ -1378,6 +1320,14 @@
         }
       ]
     },
+    "ResponsesTransport": {
+      "description": "Selection applies only to providers that support Responses WebSockets.",
+      "enum": [
+        "auto",
+        "http"
+      ],
+      "type": "string"
+    },
     "SandboxMode": {
       "enum": [
         "read-only",
@@ -1709,6 +1659,23 @@
       ],
       "type": "string"
     },
+    "WindowsConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "sandbox": {
+          "$ref": "#/definitions/WindowsSandboxLevel"
+        }
+      },
+      "type": "object"
+    },
+    "WindowsSandboxLevel": {
+      "enum": [
+        "disabled",
+        "restricted-token",
+        "elevated"
+      ],
+      "type": "string"
+    },
     "WireApi": {
       "description": "Wire protocol that the provider speaks.",
       "oneOf": [
@@ -1769,6 +1736,9 @@
       "description": "Compact prompt used for history compaction.",
       "type": "string"
     },
+    "compaction_mode": {
+      "$ref": "#/definitions/CompactionMode"
+    },
     "developer_instructions": {
       "default": null,
       "description": "Developer instructions inserted as a `developer` role message.",
@@ -1781,9 +1751,6 @@
     "experimental_compact_prompt_file": {
       "$ref": "#/definitions/AbsolutePathBuf"
     },
-    "experimental_use_freeform_apply_patch": {
-      "type": "boolean"
-    },
     "experimental_use_unified_exec_tool": {
       "type": "boolean"
     },
@@ -1792,9 +1759,6 @@
       "default": null,
       "description": "Centralized feature flags (new). Prefer this over individual toggles.",
       "properties": {
-        "apply_patch_freeform": {
-          "type": "boolean"
-        },
         "apps": {
           "type": "boolean"
         },
@@ -1804,13 +1768,7 @@
         "auto_rename_thread": {
           "type": "boolean"
         },
-        "child_agents_md": {
-          "type": "boolean"
-        },
         "collab": {
-          "type": "boolean"
-        },
-        "collaboration_modes": {
           "type": "boolean"
         },
         "connectors": {
@@ -1828,19 +1786,10 @@
         "exec_job_completion": {
           "type": "boolean"
         },
-        "exec_policy": {
-          "type": "boolean"
-        },
-        "experimental_use_freeform_apply_patch": {
-          "type": "boolean"
-        },
         "experimental_use_unified_exec_tool": {
           "type": "boolean"
         },
         "experimental_windows_sandbox": {
-          "type": "boolean"
-        },
-        "include_apply_patch_tool": {
           "type": "boolean"
         },
         "memory_tool": {
@@ -1849,31 +1798,7 @@
         "output_token_replay": {
           "type": "boolean"
         },
-        "personality": {
-          "type": "boolean"
-        },
-        "powershell_utf8": {
-          "type": "boolean"
-        },
         "recoverable_exec_output": {
-          "type": "boolean"
-        },
-        "remote_compaction": {
-          "type": "boolean"
-        },
-        "remote_compaction_v2": {
-          "type": "boolean"
-        },
-        "remote_models": {
-          "type": "boolean"
-        },
-        "request_rule": {
-          "type": "boolean"
-        },
-        "responses_websockets": {
-          "type": "boolean"
-        },
-        "responses_websockets_v2": {
           "type": "boolean"
         },
         "runtime_metrics": {
@@ -1885,19 +1810,7 @@
         "shell_tool": {
           "type": "boolean"
         },
-        "skill_env_var_dependency_prompt": {
-          "type": "boolean"
-        },
         "skill_mcp_dependency_install": {
-          "type": "boolean"
-        },
-        "sqlite": {
-          "type": "boolean"
-        },
-        "steer": {
-          "type": "boolean"
-        },
-        "undo": {
           "type": "boolean"
         },
         "unified_exec": {
@@ -1947,15 +1860,6 @@
       ],
       "default": null,
       "description": "When set, restricts the login mechanism users may use."
-    },
-    "ghost_snapshot": {
-      "allOf": [
-        {
-          "$ref": "#/definitions/GhostSnapshotToml"
-        }
-      ],
-      "default": null,
-      "description": "Settings for ghost snapshots (used for undo)."
     },
     "hide_agent_reasoning": {
       "description": "When set to `true`, `AgentReasoning` events will be hidden from the UI/output. Defaults to `false`.",
@@ -2180,6 +2084,9 @@
       },
       "type": "object"
     },
+    "responses_transport": {
+      "$ref": "#/definitions/ResponsesTransport"
+    },
     "review_agents_filename": {
       "description": "Generic-review host-level AGENTS filename under the Codex home directory.",
       "type": "string"
@@ -2292,6 +2199,9 @@
         }
       ],
       "description": "Controls the web search tool mode: disabled, cached, or live."
+    },
+    "windows": {
+      "$ref": "#/definitions/WindowsConfig"
     },
     "windows_wsl_setup_acknowledged": {
       "description": "Tracks whether the Windows onboarding screen has been acknowledged.",

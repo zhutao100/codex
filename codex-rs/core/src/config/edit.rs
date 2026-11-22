@@ -5,7 +5,6 @@ use crate::config::types::ProgressLegendMode;
 use crate::path_utils::resolve_symlink_write_paths;
 use crate::path_utils::write_atomically;
 use anyhow::Context;
-use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::TrustLevel;
 use codex_protocol::openai_models::ReasoningEffort;
@@ -28,9 +27,9 @@ pub enum ConfigEdit {
         effort: Option<ReasoningEffort>,
     },
     /// Update the service tier preference for future turns.
-    SetServiceTier { service_tier: Option<String> },
-    /// Update the active (or default) model personality.
-    SetModelPersonality { personality: Option<Personality> },
+    SetServiceTier {
+        service_tier: Option<String>,
+    },
     /// Toggle the acknowledgement flag under `[notice]`.
     SetNoticeHideFullAccessWarning(bool),
     /// Toggle the Windows world-writable directories warning acknowledgement flag.
@@ -39,24 +38,36 @@ pub enum ConfigEdit {
     SetNoticeHideRateLimitModelNudge(bool),
     /// Toggle the Windows onboarding acknowledgement flag.
     SetWindowsWslSetupAcknowledged(bool),
+    SetWindowsSandbox(codex_protocol::config_types::WindowsSandboxLevel),
     /// Toggle the model migration prompt acknowledgement flag.
     SetNoticeHideModelMigrationPrompt(String, bool),
     /// Record that a migration prompt was shown for an old->new model mapping.
-    RecordModelMigrationSeen { from: String, to: String },
+    RecordModelMigrationSeen {
+        from: String,
+        to: String,
+    },
     /// Replace the entire `[mcp_servers]` table.
     ReplaceMcpServers(BTreeMap<String, McpServerConfig>),
     /// Set or clear a skill config entry under `[[skills.config]]`.
-    SetSkillConfig { path: PathBuf, enabled: bool },
+    SetSkillConfig {
+        path: PathBuf,
+        enabled: bool,
+    },
     /// Set trust_level under `[projects."<path>"]`,
     /// migrating inline tables to explicit tables.
-    SetProjectTrustLevel { path: PathBuf, level: TrustLevel },
+    SetProjectTrustLevel {
+        path: PathBuf,
+        level: TrustLevel,
+    },
     /// Set the value stored at the exact dotted path.
     SetPath {
         segments: Vec<String>,
         value: TomlItem,
     },
     /// Remove the value stored at the exact dotted path.
-    ClearPath { segments: Vec<String> },
+    ClearPath {
+        segments: Vec<String>,
+    },
 }
 
 pub fn status_line_items_edit(items: &[String]) -> ConfigEdit {
@@ -288,6 +299,10 @@ impl ConfigDocument {
 
     fn apply(&mut self, edit: &ConfigEdit) -> anyhow::Result<bool> {
         match edit {
+            ConfigEdit::SetWindowsSandbox(level) => {
+                Ok(self
+                    .write_profile_value(&["windows", "sandbox"], Some(value(level.to_string()))))
+            }
             ConfigEdit::SetModel { model, effort } => Ok({
                 let mut mutated = false;
                 mutated |= self.write_profile_value(
@@ -306,10 +321,6 @@ impl ConfigDocument {
                     .as_deref()
                     .map(ServiceTier::normalize_config_value)
                     .map(value),
-            )),
-            ConfigEdit::SetModelPersonality { personality } => Ok(self.write_profile_value(
-                &["personality"],
-                personality.map(|personality| value(personality.to_string())),
             )),
             ConfigEdit::SetNoticeHideFullAccessWarning(acknowledged) => Ok(self.write_value(
                 Scope::Global,
@@ -756,12 +767,6 @@ impl ConfigEditsBuilder {
 
     pub fn set_service_tier(mut self, service_tier: Option<String>) -> Self {
         self.edits.push(ConfigEdit::SetServiceTier { service_tier });
-        self
-    }
-
-    pub fn set_personality(mut self, personality: Option<Personality>) -> Self {
-        self.edits
-            .push(ConfigEdit::SetModelPersonality { personality });
         self
     }
 

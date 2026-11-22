@@ -74,7 +74,7 @@ mod tests {
     use crate::ModelProviderInfo;
     use crate::WireApi;
     use crate::config::ConfigBuilder;
-    use crate::features::Feature;
+
     use crate::models_manager::cache::ModelsCache;
     use anyhow::Result;
     use codex_protocol::openai_models::ModelsResponse;
@@ -177,11 +177,10 @@ mod tests {
         let cache_path = codex_home.path().join(CACHE_FILE);
         tokio::fs::write(&cache_path, "").await?;
 
-        let mut config = ConfigBuilder::default()
+        let config = ConfigBuilder::default()
             .codex_home(codex_home.path().to_path_buf())
             .build()
             .await?;
-        config.features.enable(Feature::RemoteModels);
 
         let manager = Arc::new(ModelsManager::with_provider(
             codex_home.path().to_path_buf(),

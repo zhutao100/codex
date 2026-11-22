@@ -47,7 +47,6 @@ members = [
     "utils/json-to-toml",
     "utils/home-dir",
     "utils/pty",
-    "utils/readiness",
     "utils/string",
     "codex-client",
     "codex-api",
@@ -113,7 +112,6 @@ codex-utils-image = { path = "utils/image" }
 codex-utils-json-to-toml = { path = "utils/json-to-toml" }
 codex-utils-home-dir = { path = "utils/home-dir" }
 codex-utils-pty = { path = "utils/pty" }
-codex-utils-readiness = { path = "utils/readiness" }
 codex-utils-string = { path = "utils/string" }
 codex-windows-sandbox = { path = "windows-sandbox-rs" }
 core_test_support = { path = "core/tests/common" }
@@ -303,7 +301,7 @@ unwrap_used = "deny"
 # cargo-shear cannot see the platform-specific openssl-sys usage, so we
 # silence the false positive here instead of deleting a real dependency.
 [workspace.metadata.cargo-shear]
-ignored = ["icu_provider", "openssl-sys", "codex-utils-readiness", "codex-secrets"]
+ignored = ["icu_provider", "openssl-sys", "codex-secrets"]
 
 [profile.dev]
 # Keep line tables/backtraces while avoiding expensive full variable debug info

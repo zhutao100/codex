@@ -9,6 +9,8 @@ pub(crate) struct Session {
     pub(super) tx_event: Sender<Event>,
     pub(super) agent_status: watch::Sender<AgentStatus>,
     pub(super) state: Mutex<SessionState>,
+    pub(super) title_publication: Mutex<()>,
+    pub(crate) automatic_title_cancel: CancellationToken,
     /// The set of enabled features should be invariant for the lifetime of the
     /// session.
     pub(super) features: Features,
@@ -226,7 +228,7 @@ impl Session {
             if config.ephemeral {
                 Ok::<_, anyhow::Error>((None, None))
             } else {
-                let state_db_ctx = state_db::init_if_enabled(&config, None).await;
+                let state_db_ctx = state_db::init_for_rollout(&config, None).await;
                 let rollout_recorder = RolloutRecorder::new(
                     &config,
                     rollout_params,
@@ -345,6 +347,7 @@ impl Session {
                 config.codex_home.clone(),
                 conversation_id,
                 &mut default_shell,
+                config.shell_environment_policy.clone(),
                 otel_manager.clone(),
             );
         }
@@ -389,6 +392,7 @@ impl Session {
                             &config.codex_home,
                             conversation_id,
                             &derived_name,
+                            false,
                         )
                         .await
                     {
@@ -430,8 +434,7 @@ impl Session {
                 session_configuration.provider.clone(),
                 session_configuration.session_source.clone(),
                 config.model_verbosity,
-                config.features.enabled(Feature::ResponsesWebsockets),
-                config.features.enabled(Feature::ResponsesWebsocketsV2),
+                config.responses_transport,
                 config.features.enabled(Feature::EnableRequestCompression),
                 config.features.enabled(Feature::RuntimeMetrics),
                 Self::build_model_client_beta_features_header(config.as_ref()),
@@ -454,6 +457,8 @@ impl Session {
             task_lifecycle: Mutex::new(()),
             services,
             next_internal_sub_id: AtomicU64::new(0),
+            title_publication: Mutex::new(()),
+            automatic_title_cancel: CancellationToken::new(),
         });
 
         // Dispatch the SessionConfiguredEvent first and then report any errors.

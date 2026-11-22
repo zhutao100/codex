@@ -38,8 +38,7 @@ fn configure_recovery_models(config: &mut Config) {
 fn configure_recovery_models_with_limit(config: &mut Config, auto_compact_limit: i64) {
     config.model = Some("completion-recovery-small".into());
     config.review_model = Some("completion-recovery-large".into());
-    config.features.enable(Feature::RemoteCompaction);
-    config.features.enable(Feature::RemoteCompactionV2);
+    config.compaction_mode = codex_core::config::types::CompactionMode::Auto;
     config.model_overlay = Some(ModelOverlay {
         models: [
             ("completion-recovery-small", 24_000),
@@ -632,9 +631,7 @@ async fn human_clarification_prevents_an_incomplete_request_from_being_declared_
     ]);
     let requests = mount_sse_sequence(&server, responses).await;
     let home = Arc::new(TempDir::new()?);
-    let mut builder = test_codex().with_home(home).with_config(|config| {
-        config.features.enable(Feature::CollaborationModes);
-    });
+    let mut builder = test_codex().with_home(home).with_config(|_config| {});
     let test = builder.build(&server).await?;
     let codex = Arc::clone(&test.codex);
     codex

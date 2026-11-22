@@ -18,7 +18,6 @@ use codex_protocol::protocol::USER_MESSAGE_BEGIN;
 use serde::Deserialize;
 use serde::Serialize;
 use tokio::io::AsyncBufReadExt;
-use tokio::io::AsyncWriteExt;
 
 const SESSION_INDEX_FILE: &str = "session_index.jsonl";
 const READ_CHUNK_SIZE: usize = 8192;
@@ -32,12 +31,13 @@ pub struct SessionIndexEntry {
 }
 
 /// Append a thread name update to the session index.
-/// The index is append-only; the most recent entry wins when resolving names or ids.
+/// Explicit updates append; an automatic update returns the existing name if another writer won.
 pub async fn append_thread_name(
     codex_home: &Path,
     thread_id: ThreadId,
     name: &str,
-) -> std::io::Result<()> {
+    only_if_unnamed: bool,
+) -> std::io::Result<String> {
     use time::OffsetDateTime;
     use time::format_description::well_known::Rfc3339;
 
@@ -52,26 +52,29 @@ pub async fn append_thread_name(
         thread_name: name,
         updated_at,
     };
-    append_session_index_entry(codex_home, &entry).await
-}
-
-/// Append a raw session index entry to `session_index.jsonl`.
-/// The file is append-only; consumers scan from the end to find the newest match.
-pub async fn append_session_index_entry(
-    codex_home: &Path,
-    entry: &SessionIndexEntry,
-) -> std::io::Result<()> {
     let path = session_index_path(codex_home);
-    let mut file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .await?;
-    let mut line = serde_json::to_string(entry).map_err(std::io::Error::other)?;
-    line.push('\n');
-    file.write_all(line.as_bytes()).await?;
-    file.flush().await?;
-    Ok(())
+    tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+        let mut file = File::options()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(path)?;
+        // A second process can resume the same thread. Check and append on one
+        // locked file descriptor, not two separately opened views of the index.
+        file.lock()?;
+        if only_if_unnamed
+            && let Some(saved) = scan_open_index_from_end(&mut file, |saved| saved.id == thread_id)?
+        {
+            return Ok(saved.thread_name);
+        }
+        let mut line = serde_json::to_vec(&entry).map_err(std::io::Error::other)?;
+        line.push(b'\n');
+        file.write_all(&line)?;
+        Ok(entry.thread_name)
+    })
+    .await
+    .map_err(std::io::Error::other)?
 }
 
 /// Find the latest thread name for a thread id, if any.
@@ -402,14 +405,20 @@ fn scan_index_from_end_by_name(
     })
 }
 
-fn scan_index_from_end<F>(
-    path: &Path,
+fn scan_index_from_end<F>(path: &Path, predicate: F) -> std::io::Result<Option<SessionIndexEntry>>
+where
+    F: FnMut(&SessionIndexEntry) -> bool,
+{
+    scan_open_index_from_end(&mut File::open(path)?, predicate)
+}
+
+fn scan_open_index_from_end<F>(
+    file: &mut File,
     mut predicate: F,
 ) -> std::io::Result<Option<SessionIndexEntry>>
 where
     F: FnMut(&SessionIndexEntry) -> bool,
 {
-    let mut file = File::open(path)?;
     let mut remaining = file.metadata()?.len();
     let mut line_rev: Vec<u8> = Vec::new();
     let mut buf = vec![0u8; READ_CHUNK_SIZE];
@@ -488,6 +497,27 @@ mod tests {
             out.push('\n');
         }
         std::fs::write(path, out)
+    }
+
+    #[tokio::test]
+    async fn automatic_title_cannot_replace_another_writers_explicit_name() -> std::io::Result<()> {
+        let home = TempDir::new()?;
+        let id = ThreadId::new();
+        let (auto, explicit) = tokio::join!(
+            append_thread_name(home.path(), id, "Automatic", true),
+            append_thread_name(home.path(), id, "Manual", false)
+        );
+        auto?;
+        explicit?;
+        assert_eq!(
+            append_thread_name(home.path(), id, "Late", true).await?,
+            "Manual"
+        );
+        assert_eq!(
+            find_thread_name_by_id(home.path(), &id).await?,
+            Some("Manual".to_owned())
+        );
+        Ok(())
     }
 
     #[test]

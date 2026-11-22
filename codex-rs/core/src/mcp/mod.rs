@@ -114,7 +114,10 @@ pub(crate) fn with_codex_apps_mcp(
     auth: Option<&CodexAuth>,
     config: &Config,
 ) -> HashMap<String, McpServerConfig> {
-    if connectors_enabled {
+    if connectors_enabled
+        && (auth.is_some_and(CodexAuth::is_chatgpt_auth)
+            || codex_apps_mcp_bearer_token_env_var().is_some())
+    {
         servers.insert(
             CODEX_APPS_MCP_SERVER_NAME.to_string(),
             codex_apps_mcp_server_config(config, auth),

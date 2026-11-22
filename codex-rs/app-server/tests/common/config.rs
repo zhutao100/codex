@@ -13,16 +13,12 @@ pub fn write_mock_responses_config_toml(
     compact_prompt: &str,
 ) -> std::io::Result<()> {
     // Phase 1: build the features block for config.toml.
-    let mut features = BTreeMap::from([(Feature::RemoteModels, false)]);
-    for (feature, enabled) in feature_flags {
-        features.insert(*feature, *enabled);
-    }
-    let feature_entries = features
-        .into_iter()
+    let feature_entries = feature_flags
+        .iter()
         .map(|(feature, enabled)| {
             let key = FEATURES
                 .iter()
-                .find(|spec| spec.id == feature)
+                .find(|spec| spec.id == *feature)
                 .map(|spec| spec.key)
                 .unwrap_or_else(|| panic!("missing feature key for {feature:?}"));
             format!("{key} = {enabled}")

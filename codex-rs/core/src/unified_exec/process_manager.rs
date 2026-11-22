@@ -5,7 +5,6 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Notify;
-use tokio::sync::mpsc;
 use tokio::time::Duration;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -67,7 +66,9 @@ fn apply_unified_exec_env(mut env: HashMap<String, String>) -> HashMap<String, S
 }
 
 struct PreparedProcessHandles {
-    writer_tx: mpsc::Sender<Vec<u8>>,
+    process: Arc<UnifiedExecProcess>,
+    authority: super::StdinAuthority,
+    launch_cwd: PathBuf,
     output_buffer: OutputBuffer,
     output_notify: Arc<Notify>,
     cancellation_token: CancellationToken,
@@ -275,11 +276,14 @@ impl UnifiedExecProcessManager {
     pub(crate) async fn write_stdin(
         &self,
         request: WriteStdinRequest<'_>,
+        context: &UnifiedExecContext,
     ) -> Result<UnifiedExecResponse, UnifiedExecError> {
         let process_id = request.process_id.to_string();
 
         let PreparedProcessHandles {
-            writer_tx,
+            process,
+            authority,
+            launch_cwd,
             output_buffer,
             output_notify,
             cancellation_token,
@@ -294,7 +298,49 @@ impl UnifiedExecProcessManager {
             if !tty {
                 return Err(UnifiedExecError::StdinClosed);
             }
-            Self::send_input(&writer_tx, request.input.as_bytes()).await?;
+            if !authority.covers_write(process.sandbox_type(), &context.turn) {
+                use crate::protocol::AskForApproval;
+                use crate::protocol::ReviewDecision;
+                if matches!(
+                    context.turn.approval_policy,
+                    AskForApproval::Never | AskForApproval::OnFailure
+                ) || request.input.contains('\0')
+                {
+                    return Err(UnifiedExecError::StdinNotAuthorized);
+                }
+                let decision = context.session.request_command_approval(
+                    &context.turn,
+                    context.call_id.clone(),
+                    vec!["write_stdin".into(), process_id.clone(), request.input.into()],
+                    launch_cwd,
+                    Some("Send these bytes to an existing terminal with different launch permissions? The directory shown is its launch directory.".into()),
+                    None,
+                ).await;
+                if !matches!(
+                    decision,
+                    ReviewDecision::Approved | ReviewDecision::ApprovedForSession
+                ) {
+                    return Err(UnifiedExecError::StdinNotAuthorized);
+                }
+            }
+            let writer = process.writer_sender();
+            let permit = writer
+                .reserve()
+                .await
+                .map_err(|_| UnifiedExecError::WriteToStdin)?;
+            {
+                // Approval and channel capacity can both wait. Check identity under the store lock
+                // immediately before enqueueing, never just compare a recyclable numeric id.
+                let store = self.process_store.lock().await;
+                if !store
+                    .processes
+                    .get(&process_id)
+                    .is_some_and(|entry| Arc::ptr_eq(&entry.process, &process))
+                {
+                    return Err(UnifiedExecError::UnknownProcessId { process_id });
+                }
+                permit.send(request.input.as_bytes().to_vec());
+            }
             // Give the remote process a brief window to react so that we are
             // more likely to capture its output in the poll below.
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -324,7 +370,9 @@ impl UnifiedExecProcessManager {
         // still alive or has exited and been removed from the store; we thread
         // that through so the handler can tag TerminalInteraction with an
         // appropriate process_id and exit_code.
-        let status = self.refresh_process_state(process_id.as_str()).await;
+        let status = self
+            .refresh_process_state(process_id.as_str(), &process)
+            .await;
         let (process_id, exit_code, event_call_id) = match status {
             ProcessStatus::Alive {
                 exit_code,
@@ -361,11 +409,18 @@ impl UnifiedExecProcessManager {
         Ok(response)
     }
 
-    async fn refresh_process_state(&self, process_id: &str) -> ProcessStatus {
+    async fn refresh_process_state(
+        &self,
+        process_id: &str,
+        process: &Arc<UnifiedExecProcess>,
+    ) -> ProcessStatus {
         let mut store = self.process_store.lock().await;
         let Some(entry) = store.processes.get(process_id) else {
             return ProcessStatus::Unknown;
         };
+        if !Arc::ptr_eq(&entry.process, process) {
+            return ProcessStatus::Unknown;
+        }
 
         let exit_code = entry.process.exit_code();
         let process_id = entry.process_id.clone();
@@ -410,7 +465,9 @@ impl UnifiedExecProcessManager {
         } = entry.process.output_handles();
 
         Ok(PreparedProcessHandles {
-            writer_tx: entry.process.writer_sender(),
+            process: Arc::clone(&entry.process),
+            authority: entry.stdin_authority.clone(),
+            launch_cwd: entry.launch_cwd.clone(),
             output_buffer,
             output_notify,
             cancellation_token,
@@ -419,16 +476,6 @@ impl UnifiedExecProcessManager {
             tty: entry.tty,
             capture: entry.process.capture.clone(),
         })
-    }
-
-    async fn send_input(
-        writer_tx: &mpsc::Sender<Vec<u8>>,
-        data: &[u8],
-    ) -> Result<(), UnifiedExecError> {
-        writer_tx
-            .send(data.to_vec())
-            .await
-            .map_err(|_| UnifiedExecError::WriteToStdin)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -446,6 +493,8 @@ impl UnifiedExecProcessManager {
     ) {
         let entry = ProcessEntry {
             process: Arc::clone(&process),
+            stdin_authority: super::StdinAuthority::from_turn(&context.turn),
+            launch_cwd: cwd.clone(),
             call_id: context.call_id.clone(),
             process_id: process_id.clone(),
             command: command.to_vec(),
@@ -545,7 +594,6 @@ impl UnifiedExecProcessManager {
             &context.turn.shell_environment_policy,
             Some(context.session.conversation_id),
         ));
-        let features = context.session.features();
         let mut orchestrator = ToolOrchestrator::new();
         let mut runtime = UnifiedExecRuntime::new(self);
         let exec_approval_requirement = context
@@ -553,7 +601,6 @@ impl UnifiedExecProcessManager {
             .services
             .exec_policy
             .create_exec_approval_requirement_for_command(ExecApprovalRequest {
-                features: &features,
                 command: &request.command,
                 approval_policy: context.turn.approval_policy,
                 sandbox_policy: &context.turn.sandbox_policy,

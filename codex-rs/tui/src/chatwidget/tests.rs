@@ -29,11 +29,6 @@ use codex_core::config::types::ProgressLegendMode;
 use codex_core::config_loader::RequirementSource;
 use codex_core::features::Feature;
 use codex_core::models_manager::manager::ModelsManager;
-use codex_core::models_manager::overlay::ModelInfoPatch;
-use codex_core::models_manager::overlay::ModelInstructionsVariablesPatch;
-use codex_core::models_manager::overlay::ModelMessagesPatch;
-use codex_core::models_manager::overlay::ModelOverlay;
-use codex_core::models_manager::overlay::ModelOverlayEntry;
 use codex_core::protocol::AgentMessageDeltaEvent;
 use codex_core::protocol::AgentMessageEvent;
 use codex_core::protocol::AgentReasoningDeltaEvent;
@@ -89,7 +84,6 @@ use codex_protocol::ThreadId;
 use codex_protocol::account::PlanType;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
-use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::Settings;
 use codex_protocol::custom_prompts::CustomPrompt;
 use codex_protocol::items::PlanItem;
@@ -998,8 +992,6 @@ async fn make_chatwidget_manual(
         skills: None,
     });
     bottom.set_keybindings(keybindings.clone());
-    bottom.set_steer_enabled(true);
-    bottom.set_collaboration_modes_enabled(cfg.features.enabled(Feature::CollaborationModes));
     let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("test"));
     let codex_home = cfg.codex_home.clone();
     let models_manager = Arc::new(ModelsManager::new(codex_home, auth_manager.clone()));
@@ -1013,6 +1005,7 @@ async fn make_chatwidget_manual(
         },
     };
     let current_collaboration_mode = base_mode;
+    let active_collaboration_mask = collaboration_modes::default_mask(models_manager.as_ref());
     let mut widget = ChatWidget {
         app_event_tx,
         codex_op_tx: op_tx,
@@ -1022,7 +1015,7 @@ async fn make_chatwidget_manual(
         config: cfg,
         keybindings,
         current_collaboration_mode,
-        active_collaboration_mask: None,
+        active_collaboration_mask,
         auth_manager,
         models_manager,
         otel_manager,
@@ -1905,7 +1898,6 @@ async fn plan_implementation_popup_yes_emits_submit_message_event() {
 async fn submit_user_message_with_mode_sets_coding_collaboration_mode() {
     let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(Some("gpt-6-luna")).await;
     chat.thread_id = Some(ThreadId::new());
-    chat.set_feature_enabled(Feature::CollaborationModes, true);
 
     let default_mode = collaboration_modes::default_mode_mask(chat.models_manager.as_ref())
         .expect("expected default collaboration mode");
@@ -1959,7 +1951,6 @@ async fn submit_user_message_carries_configured_service_tier() {
 #[tokio::test]
 async fn plan_implementation_popup_skips_replayed_turn_complete() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-6.1-sol")).await;
-    chat.set_feature_enabled(Feature::CollaborationModes, true);
     let plan_mask =
         collaboration_modes::mask_for_kind(chat.models_manager.as_ref(), ModeKind::Plan)
             .expect("expected plan collaboration mask");
@@ -1979,7 +1970,6 @@ async fn plan_implementation_popup_skips_replayed_turn_complete() {
 #[tokio::test]
 async fn plan_implementation_popup_shows_once_when_replay_precedes_live_turn_complete() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-6.1-sol")).await;
-    chat.set_feature_enabled(Feature::CollaborationModes, true);
     let plan_mask =
         collaboration_modes::mask_for_kind(chat.models_manager.as_ref(), ModeKind::Plan)
             .expect("expected plan collaboration mask");
@@ -2034,7 +2024,6 @@ async fn plan_implementation_popup_shows_once_when_replay_precedes_live_turn_com
 #[tokio::test]
 async fn plan_implementation_popup_skips_when_messages_queued() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-6.1-sol")).await;
-    chat.set_feature_enabled(Feature::CollaborationModes, true);
     let plan_mask =
         collaboration_modes::mask_for_kind(chat.models_manager.as_ref(), ModeKind::Plan)
             .expect("expected plan collaboration mask");
@@ -2054,7 +2043,6 @@ async fn plan_implementation_popup_skips_when_messages_queued() {
 #[tokio::test]
 async fn plan_implementation_popup_skips_without_proposed_plan() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-6.1-sol")).await;
-    chat.set_feature_enabled(Feature::CollaborationModes, true);
     let plan_mask =
         collaboration_modes::mask_for_kind(chat.models_manager.as_ref(), ModeKind::Plan)
             .expect("expected plan collaboration mask");
@@ -2080,7 +2068,6 @@ async fn plan_implementation_popup_skips_without_proposed_plan() {
 #[tokio::test]
 async fn plan_implementation_popup_shows_after_proposed_plan_output() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-6.1-sol")).await;
-    chat.set_feature_enabled(Feature::CollaborationModes, true);
     let plan_mask =
         collaboration_modes::mask_for_kind(chat.models_manager.as_ref(), ModeKind::Plan)
             .expect("expected plan collaboration mask");
@@ -2103,7 +2090,6 @@ async fn plan_implementation_popup_skips_when_rate_limit_prompt_pending() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-6.1-sol")).await;
     chat.auth_manager =
         AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
-    chat.set_feature_enabled(Feature::CollaborationModes, true);
     let plan_mask =
         collaboration_modes::mask_for_kind(chat.models_manager.as_ref(), ModeKind::Plan)
             .expect("expected plan collaboration mask");
@@ -3585,17 +3571,10 @@ async fn slash_init_skips_when_project_doc_exists() {
 }
 
 #[tokio::test]
-async fn collab_mode_shift_tab_cycles_only_when_enabled_and_idle() {
+async fn collab_mode_shift_tab_cycles_only_when_idle() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
-    chat.set_feature_enabled(Feature::CollaborationModes, false);
 
     let initial = chat.current_collaboration_mode().clone();
-    chat.handle_key_event(KeyEvent::from(KeyCode::BackTab));
-    assert_eq!(chat.current_collaboration_mode(), &initial);
-    assert_eq!(chat.active_collaboration_mode_kind(), ModeKind::Default);
-
-    chat.set_feature_enabled(Feature::CollaborationModes, true);
-
     chat.handle_key_event(KeyEvent::from(KeyCode::BackTab));
     assert_eq!(chat.active_collaboration_mode_kind(), ModeKind::Plan);
     assert_eq!(chat.current_collaboration_mode(), &initial);
@@ -3614,7 +3593,6 @@ async fn collab_mode_shift_tab_cycles_only_when_enabled_and_idle() {
 async fn collab_slash_command_opens_picker_and_updates_mode() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(None).await;
     chat.thread_id = Some(ThreadId::new());
-    chat.set_feature_enabled(Feature::CollaborationModes, true);
 
     chat.dispatch_command(SlashCommand::Collab);
     let popup = render_bottom_popup(&chat, 80);
@@ -3668,7 +3646,6 @@ async fn collab_slash_command_opens_picker_and_updates_mode() {
 #[tokio::test]
 async fn plan_slash_command_switches_to_plan_mode() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
-    chat.set_feature_enabled(Feature::CollaborationModes, true);
     let initial = chat.current_collaboration_mode().clone();
 
     chat.dispatch_command(SlashCommand::Plan);
@@ -3681,7 +3658,6 @@ async fn plan_slash_command_switches_to_plan_mode() {
 #[tokio::test]
 async fn plan_slash_command_with_args_submits_prompt_in_plan_mode() {
     let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(None).await;
-    chat.set_feature_enabled(Feature::CollaborationModes, true);
 
     let configured = codex_core::protocol::SessionConfiguredEvent {
         session_id: ThreadId::new(),
@@ -3812,7 +3788,6 @@ async fn experimental_mode_plan_applies_on_startup() {
 #[tokio::test]
 async fn set_model_updates_active_collaboration_mask() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-6.1-sol")).await;
-    chat.set_feature_enabled(Feature::CollaborationModes, true);
     let plan_mask =
         collaboration_modes::mask_for_kind(chat.models_manager.as_ref(), ModeKind::Plan)
             .expect("expected plan collaboration mask");
@@ -3827,7 +3802,6 @@ async fn set_model_updates_active_collaboration_mask() {
 #[tokio::test]
 async fn set_reasoning_effort_updates_active_collaboration_mask() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-6.1-sol")).await;
-    chat.set_feature_enabled(Feature::CollaborationModes, true);
     let plan_mask =
         collaboration_modes::mask_for_kind(chat.models_manager.as_ref(), ModeKind::Plan)
             .expect("expected plan collaboration mask");
@@ -3843,7 +3817,6 @@ async fn set_reasoning_effort_updates_active_collaboration_mask() {
 async fn collab_mode_is_sent_after_enabling() {
     let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(None).await;
     chat.thread_id = Some(ThreadId::new());
-    chat.set_feature_enabled(Feature::CollaborationModes, true);
 
     chat.bottom_pane
         .set_composer_text("hello".to_string(), Vec::new(), Vec::new());
@@ -3864,25 +3837,12 @@ async fn collab_mode_is_sent_after_enabling() {
 }
 
 #[tokio::test]
-async fn collab_mode_toggle_on_applies_default_preset() {
+async fn first_submission_includes_the_default_mode() {
     let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(None).await;
     chat.thread_id = Some(ThreadId::new());
 
     chat.bottom_pane
-        .set_composer_text("before toggle".to_string(), Vec::new(), Vec::new());
-    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
-    match next_submit_op(&mut op_rx) {
-        Op::UserTurn {
-            collaboration_mode: None,
-            ..
-        } => {}
-        other => panic!("expected Op::UserTurn without collaboration_mode, got {other:?}"),
-    }
-
-    chat.set_feature_enabled(Feature::CollaborationModes, true);
-
-    chat.bottom_pane
-        .set_composer_text("after toggle".to_string(), Vec::new(), Vec::new());
+        .set_composer_text("first submission".to_string(), Vec::new(), Vec::new());
     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
     match next_submit_op(&mut op_rx) {
         Op::UserTurn {
@@ -3900,27 +3860,6 @@ async fn collab_mode_toggle_on_applies_default_preset() {
 
     assert_eq!(chat.active_collaboration_mode_kind(), ModeKind::Default);
     assert_eq!(chat.current_collaboration_mode().mode, ModeKind::Default);
-}
-
-#[tokio::test]
-async fn user_turn_includes_personality_from_config() {
-    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(Some("personality-test-model")).await;
-    enable_test_model_personality(&mut chat);
-    chat.set_feature_enabled(Feature::Personality, true);
-    chat.thread_id = Some(ThreadId::new());
-    chat.set_model("personality-test-model");
-    chat.set_personality(Personality::Friendly);
-
-    chat.bottom_pane
-        .set_composer_text("hello".to_string(), Vec::new(), Vec::new());
-    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
-    match next_submit_op(&mut op_rx) {
-        Op::UserTurn {
-            personality: Some(Personality::Friendly),
-            ..
-        } => {}
-        other => panic!("expected Op::UserTurn with friendly personality, got {other:?}"),
-    }
 }
 
 #[tokio::test]
@@ -4568,9 +4507,9 @@ async fn experimental_features_popup_snapshot() {
 
     let features = vec![
         ExperimentalFeatureItem {
-            feature: Feature::GhostCommit,
-            name: "Ghost snapshots".to_string(),
-            description: "Capture undo snapshots each turn.".to_string(),
+            feature: Feature::RecoverableExecOutput,
+            name: "Recoverable output".to_string(),
+            description: "Retain command output for later retrieval.".to_string(),
             enabled: false,
         },
         ExperimentalFeatureItem {
@@ -4591,12 +4530,12 @@ async fn experimental_features_popup_snapshot() {
 async fn experimental_features_toggle_saves_on_exit() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
 
-    let expected_feature = Feature::GhostCommit;
+    let expected_feature = Feature::RecoverableExecOutput;
     let view = ExperimentalFeaturesView::new(
         vec![ExperimentalFeatureItem {
             feature: expected_feature,
-            name: "Ghost snapshots".to_string(),
-            description: "Capture undo snapshots each turn.".to_string(),
+            name: "Recoverable output".to_string(),
+            description: "Retain command output for later retrieval.".to_string(),
             enabled: false,
         }],
         chat.app_event_tx.clone(),
@@ -4635,39 +4574,6 @@ async fn model_selection_popup_snapshot() {
 
     let popup = render_bottom_popup(&chat, 80);
     assert_snapshot!("model_selection_popup", popup);
-}
-
-#[tokio::test]
-async fn personality_selection_popup_snapshot() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("personality-test-model")).await;
-    enable_test_model_personality(&mut chat);
-    chat.thread_id = Some(ThreadId::new());
-    chat.open_personality_popup();
-
-    let popup = render_bottom_popup(&chat, 80);
-    assert_snapshot!("personality_selection_popup", popup);
-}
-
-fn enable_test_model_personality(chat: &mut ChatWidget) {
-    chat.config.model_overlay = Some(ModelOverlay {
-        models: vec![ModelOverlayEntry {
-            slug: chat.current_model().to_string(),
-            model_provider: None,
-            patch: ModelInfoPatch {
-                model_messages: Some(ModelMessagesPatch {
-                    instructions_template: Some("{{ personality }}".to_string()),
-                    instructions_variables: Some(ModelInstructionsVariablesPatch {
-                        personality_default: Some(String::new()),
-                        personality_friendly: Some("Friendly".to_string()),
-                        personality_pragmatic: Some("Pragmatic".to_string()),
-                    }),
-                }),
-                ..Default::default()
-            },
-            final_instruction_override: None,
-        }],
-        ..Default::default()
-    });
 }
 
 #[tokio::test]
@@ -4850,8 +4756,7 @@ async fn approvals_selection_popup_snapshot_windows_degraded_sandbox() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
 
     chat.config.notices.hide_full_access_warning = None;
-    chat.set_feature_enabled(Feature::WindowsSandbox, true);
-    chat.set_feature_enabled(Feature::WindowsSandboxElevated, false);
+    chat.set_windows_sandbox_level(WindowsSandboxLevel::RestrictedToken);
 
     chat.open_approvals_popup();
 
@@ -4921,8 +4826,7 @@ async fn windows_auto_mode_prompt_requests_enabling_sandbox_feature() {
 async fn startup_prompts_for_windows_sandbox_when_agent_requested() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
 
-    chat.set_feature_enabled(Feature::WindowsSandbox, false);
-    chat.set_feature_enabled(Feature::WindowsSandboxElevated, false);
+    chat.set_windows_sandbox_level(WindowsSandboxLevel::Disabled);
     chat.config.forced_auto_mode_downgraded_on_windows = true;
 
     chat.maybe_prompt_windows_sandbox_enable();
@@ -5899,7 +5803,6 @@ async fn queue_autosend_suppression_blocks_intermediate_drain() {
 async fn submitted_input_queues_while_plan_stream_is_still_rendering() {
     let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(None).await;
     chat.thread_id = Some(ThreadId::new());
-    chat.bottom_pane.set_steer_enabled(true);
     chat.bottom_pane.set_task_running(true);
     chat.plan_stream_controller = Some(crate::streaming::controller::PlanStreamController::new(
         None,
@@ -5923,7 +5826,6 @@ async fn submitted_input_queues_while_only_user_shell_is_running() {
     chat.thread_id = Some(ThreadId::new());
     chat.active_turn_id = Some("turn-1".to_string());
     chat.agent_turn_running = true;
-    chat.bottom_pane.set_steer_enabled(true);
     chat.bottom_pane.set_task_running(true);
     chat.running_commands.insert(
         "shell-1".to_string(),
@@ -5954,7 +5856,6 @@ async fn user_shell_prompt_still_runs_while_user_shell_is_running() {
     chat.thread_id = Some(ThreadId::new());
     chat.active_turn_id = Some("turn-1".to_string());
     chat.agent_turn_running = true;
-    chat.bottom_pane.set_steer_enabled(true);
     chat.bottom_pane.set_task_running(true);
     chat.running_commands.insert(
         "shell-1".to_string(),
@@ -7844,7 +7745,6 @@ async fn markdown_fence_and_plan_prose_stay_visible_while_provisional() {
     assert_eq!(drain_insert_history(&mut rx).len(), 1);
     assert!(chat.active_cell_transcript_lines(80).is_none());
 
-    chat.set_feature_enabled(Feature::CollaborationModes, true);
     let plan_mask =
         collaboration_modes::mask_for_kind(chat.models_manager.as_ref(), ModeKind::Plan)
             .expect("plan collaboration mask");
@@ -7978,7 +7878,6 @@ async fn plan_and_review_markdown_tables_fit_the_insertion_width() {
 
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-6.1-sol")).await;
     let fenced = "```md\n|Name|Status|\n|---|---|\n|alpha|OK|\n```\n";
-    chat.set_feature_enabled(Feature::CollaborationModes, true);
     let plan_mask =
         collaboration_modes::mask_for_kind(chat.models_manager.as_ref(), ModeKind::Plan)
             .expect("plan collaboration mask");

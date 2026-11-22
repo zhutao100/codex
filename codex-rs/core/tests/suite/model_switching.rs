@@ -3,7 +3,6 @@ use codex_core::ModelProviderInfo;
 use codex_core::WireApi;
 use codex_core::compact::SUMMARIZATION_PROMPT;
 use codex_core::config::types::Personality;
-use codex_core::features::Feature;
 use codex_core::models_manager::manager::ModelsManager;
 use codex_core::models_manager::overlay::ModelInfoPatch;
 use codex_core::models_manager::overlay::ModelOverlay;
@@ -474,9 +473,7 @@ async fn model_downshift_uses_previous_model_for_pre_sampling_compaction() -> Re
     let mut builder = test_codex()
         .with_model(large_model)
         .with_config(move |config| {
-            config
-                .features
-                .disable(codex_core::features::Feature::RemoteCompactionV2);
+            config.compaction_mode = codex_core::config::types::CompactionMode::Unary;
             config.compact_prompt = Some(SUMMARIZATION_PROMPT.to_string());
             config.model_overlay = Some(ModelOverlay {
                 models: vec![
@@ -626,11 +623,7 @@ async fn model_and_personality_change_only_appends_model_instructions() -> Resul
     )
     .await;
 
-    let mut builder = test_codex()
-        .with_model("gpt-5.2-codex")
-        .with_config(|config| {
-            config.features.enable(Feature::Personality);
-        });
+    let mut builder = test_codex().with_model("gpt-5.2-codex");
     let test = builder.build(&server).await?;
     let next_model = "exp-codex-personality";
 

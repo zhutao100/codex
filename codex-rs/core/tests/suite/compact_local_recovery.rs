@@ -3,7 +3,7 @@ use codex_core::config::Config;
 use pretty_assertions::assert_eq;
 
 fn local_compaction(config: &mut Config) {
-    config.features.disable(Feature::RemoteCompaction);
+    config.compaction_mode = codex_core::config::types::CompactionMode::Local;
     config.model_provider.request_max_retries = Some(0);
     config.model_provider.stream_max_retries = Some(1);
 }

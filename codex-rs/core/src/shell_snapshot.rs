@@ -6,10 +6,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::SystemTime;
 
+use crate::config::types::ShellEnvironmentPolicy;
 use crate::rollout::list::find_thread_path_by_id_str;
 use crate::shell::Shell;
 use crate::shell::ShellType;
-use crate::shell::get_shell;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
@@ -23,21 +23,22 @@ use tokio::time::timeout;
 use tracing::Instrument;
 use tracing::info_span;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub struct ShellSnapshot {
     pub path: PathBuf,
+    pub(crate) policy: ShellEnvironmentPolicy,
 }
 
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
 const SNAPSHOT_RETENTION: Duration = Duration::from_secs(60 * 60 * 24 * 3); // 3 days retention.
 const SNAPSHOT_DIR: &str = "shell_snapshots";
-const EXCLUDED_EXPORT_VARS: &[&str] = &["PWD", "OLDPWD"];
 
 impl ShellSnapshot {
     pub fn start_snapshotting(
         codex_home: PathBuf,
         session_id: ThreadId,
         shell: &mut Shell,
+        policy: ShellEnvironmentPolicy,
         otel_manager: OtelManager,
     ) {
         let (shell_snapshot_tx, shell_snapshot_rx) = watch::channel(None);
@@ -49,10 +50,14 @@ impl ShellSnapshot {
         tokio::spawn(
             async move {
                 let timer = otel_manager.start_timer("codex.shell_snapshot.duration_ms", &[]);
-                let snapshot =
-                    ShellSnapshot::try_new(&codex_home, snapshot_session_id, &snapshot_shell)
-                        .await
-                        .map(Arc::new);
+                let snapshot = ShellSnapshot::try_new(
+                    &codex_home,
+                    snapshot_session_id,
+                    &snapshot_shell,
+                    &policy,
+                )
+                .await
+                .map(Arc::new);
                 let success = if snapshot.is_some() { "true" } else { "false" };
                 let _ = timer.map(|timer| timer.record(&[("success", success)]));
                 otel_manager.counter("codex.shell_snapshot", 1, &[("success", success)]);
@@ -62,15 +67,15 @@ impl ShellSnapshot {
         );
     }
 
-    async fn try_new(codex_home: &Path, session_id: ThreadId, shell: &Shell) -> Option<Self> {
-        // File to store the snapshot
-        let extension = match shell.shell_type {
-            ShellType::PowerShell => "ps1",
-            _ => "sh",
-        };
+    async fn try_new(
+        codex_home: &Path,
+        session_id: ThreadId,
+        shell: &Shell,
+        policy: &ShellEnvironmentPolicy,
+    ) -> Option<Self> {
         let path = codex_home
             .join(SNAPSHOT_DIR)
-            .join(format!("{session_id}.{extension}"));
+            .join(format!("{session_id}.{}.sh", uuid::Uuid::new_v4()));
 
         // Clean the (unlikely) leaked snapshot files.
         let codex_home = codex_home.to_path_buf();
@@ -82,10 +87,13 @@ impl ShellSnapshot {
         });
 
         // Make the new snapshot.
-        let snapshot = match write_shell_snapshot(shell.shell_type.clone(), &path).await {
+        let snapshot = match write_shell_snapshot(shell, &path, policy).await {
             Ok(path) => {
                 tracing::info!("Shell snapshot successfully created: {}", path.display());
-                Some(Self { path })
+                Some(Self {
+                    path,
+                    policy: policy.clone(),
+                })
             }
             Err(err) => {
                 tracing::warn!(
@@ -97,7 +105,7 @@ impl ShellSnapshot {
         };
 
         if let Some(snapshot) = snapshot.as_ref()
-            && let Err(err) = validate_snapshot(shell, &snapshot.path).await
+            && let Err(err) = validate_snapshot(shell, &snapshot.path, policy).await
         {
             tracing::error!("Shell snapshot validation failed: {err:?}");
             return None;
@@ -118,15 +126,21 @@ impl Drop for ShellSnapshot {
     }
 }
 
-async fn write_shell_snapshot(shell_type: ShellType, output_path: &Path) -> Result<PathBuf> {
-    if shell_type == ShellType::PowerShell || shell_type == ShellType::Cmd {
-        bail!("Shell snapshot not supported yet for {shell_type:?}");
-    }
-    let shell = get_shell(shell_type.clone(), None)
-        .with_context(|| format!("No available shell for {shell_type:?}"))?;
-
-    let raw_snapshot = capture_snapshot(&shell).await?;
-    let snapshot = strip_snapshot_preamble(&raw_snapshot)?;
+async fn write_shell_snapshot(
+    shell: &Shell,
+    output_path: &Path,
+    policy: &ShellEnvironmentPolicy,
+) -> Result<PathBuf> {
+    let script = match shell.shell_type {
+        ShellType::Bash => bash_snapshot_script(),
+        ShellType::Zsh => zsh_snapshot_script(),
+        ShellType::Sh => sh_snapshot_script(),
+        ShellType::PowerShell | ShellType::Cmd => {
+            bail!("Snapshot not supported for {:?}", shell.shell_type)
+        }
+    };
+    let raw = run_script_with_timeout(shell, script, SNAPSHOT_TIMEOUT, true, policy).await?;
+    let snapshot = render_snapshot(&raw, policy)?;
 
     if let Some(parent) = output_path.parent() {
         let parent_display = parent.display();
@@ -136,22 +150,41 @@ async fn write_shell_snapshot(shell_type: ShellType, output_path: &Path) -> Resu
     }
 
     let snapshot_path = output_path.display();
-    fs::write(output_path, snapshot)
-        .await
+    // tempfile creates a private file. Publish only after the complete script has been written.
+    let mut file =
+        tempfile::NamedTempFile::new_in(output_path.parent().context("no snapshot directory")?)?;
+    std::io::Write::write_all(&mut file, snapshot.as_bytes())?;
+    file.persist(output_path)
         .with_context(|| format!("Failed to write snapshot to {snapshot_path}"))?;
 
     Ok(output_path.to_path_buf())
 }
 
-async fn capture_snapshot(shell: &Shell) -> Result<String> {
-    let shell_type = shell.shell_type.clone();
-    match shell_type {
-        ShellType::Zsh => run_shell_script(shell, &zsh_snapshot_script()).await,
-        ShellType::Bash => run_shell_script(shell, &bash_snapshot_script()).await,
-        ShellType::Sh => run_shell_script(shell, &sh_snapshot_script()).await,
-        ShellType::PowerShell => run_shell_script(shell, powershell_snapshot_script()).await,
-        ShellType::Cmd => bail!("Shell snapshotting is not yet supported for {shell_type:?}"),
+fn render_snapshot(raw: &str, policy: &ShellEnvironmentPolicy) -> Result<String> {
+    use std::fmt::Write;
+    let (script, exports) = raw
+        .split_once('\0')
+        .context("missing snapshot environment")?;
+    let mut snapshot = strip_snapshot_preamble(script)?;
+    let vars = exports
+        .split_terminator('\0')
+        .filter_map(|entry| entry.split_once('='))
+        .map(|(name, value)| (name.to_owned(), value.to_owned()));
+    let mut exports = crate::exec_env::populate_env(vars, policy, None).into_iter().filter(|(name, _)| {
+        let mut bytes = name.bytes();
+        bytes.next().is_some_and(|b| b == b'_' || b.is_ascii_alphabetic())
+            && bytes.all(|b| b == b'_' || b.is_ascii_alphanumeric())
+            && !matches!(name.as_str(), "PWD" | "OLDPWD" | crate::exec_env::CODEX_THREAD_ID_ENV_VAR)
+            // Explicit overrides are supplied live for each command; do not bake them into a file.
+            && !policy.r#set.contains_key(name)
+            && !["KEY", "TOKEN", "SECRET", "PASSWORD"].iter().any(|word| name.to_ascii_uppercase().contains(word))
+    }).collect::<Vec<_>>();
+    exports.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    writeln!(snapshot, "\n# exports {}", exports.len())?;
+    for (name, value) in exports {
+        writeln!(snapshot, "export {name}={}", shlex::try_quote(&value)?)?;
     }
+    Ok(snapshot)
 }
 
 fn strip_snapshot_preamble(snapshot: &str) -> Result<String> {
@@ -163,16 +196,17 @@ fn strip_snapshot_preamble(snapshot: &str) -> Result<String> {
     Ok(snapshot[start..].to_string())
 }
 
-async fn validate_snapshot(shell: &Shell, snapshot_path: &Path) -> Result<()> {
-    let snapshot_path_display = snapshot_path.display();
-    let script = format!("set -e; . \"{snapshot_path_display}\"");
-    run_script_with_timeout(shell, &script, SNAPSHOT_TIMEOUT, false)
+async fn validate_snapshot(
+    shell: &Shell,
+    snapshot_path: &Path,
+    policy: &ShellEnvironmentPolicy,
+) -> Result<()> {
+    let snapshot_path =
+        shlex::try_quote(snapshot_path.to_str().context("non-UTF-8 snapshot path")?)?;
+    let script = format!("set -e; . {snapshot_path}");
+    run_script_with_timeout(shell, &script, SNAPSHOT_TIMEOUT, false, policy)
         .await
         .map(|_| ())
-}
-
-async fn run_shell_script(shell: &Shell, script: &str) -> Result<String> {
-    run_script_with_timeout(shell, script, SNAPSHOT_TIMEOUT, true).await
 }
 
 async fn run_script_with_timeout(
@@ -180,6 +214,7 @@ async fn run_script_with_timeout(
     script: &str,
     snapshot_timeout: Duration,
     use_login_shell: bool,
+    policy: &ShellEnvironmentPolicy,
 ) -> Result<String> {
     let args = shell.derive_exec_args(script, use_login_shell);
     let shell_name = shell.name();
@@ -187,6 +222,9 @@ async fn run_script_with_timeout(
     // Handler is kept as guard to control the drop. The `mut` pattern is required because .args()
     // returns a ref of handler.
     let mut handler = Command::new(&args[0]);
+    handler
+        .env_clear()
+        .envs(crate::exec_env::create_env(policy, None));
     handler.args(&args[1..]);
     handler.stdin(Stdio::null());
     #[cfg(unix)]
@@ -211,13 +249,8 @@ async fn run_script_with_timeout(
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-fn excluded_exports_regex() -> String {
-    EXCLUDED_EXPORT_VARS.join("|")
-}
-
-fn zsh_snapshot_script() -> String {
-    let excluded = excluded_exports_regex();
-    let script = r##"if [[ -n "$ZDOTDIR" ]]; then
+fn zsh_snapshot_script() -> &'static str {
+    r##"if [[ -n "$ZDOTDIR" ]]; then
   rc="$ZDOTDIR/.zshrc"
 else
   rc="$HOME/.zshrc"
@@ -237,31 +270,13 @@ alias_count=$(alias -L | wc -l | tr -d ' ')
 print "# aliases $alias_count"
 alias -L
 print ''
-export_lines=$(export -p | awk '
-/^(export|declare -x|typeset -x) / {
-  line=$0
-  name=line
-  sub(/^(export|declare -x|typeset -x) /, "", name)
-  sub(/=.*/, "", name)
-  if (name ~ /^(EXCLUDED_EXPORTS)$/) {
-    next
-  }
-  if (name ~ /^[A-Za-z_][A-Za-z0-9_]*$/) {
-    print line
-  }
-}')
-export_count=$(printf '%s\n' "$export_lines" | sed '/^$/d' | wc -l | tr -d ' ')
-print "# exports $export_count"
-if [[ -n "$export_lines" ]]; then
-  print -r -- "$export_lines"
-fi
-"##;
-    script.replace("EXCLUDED_EXPORTS", &excluded)
+printf '\0'
+/usr/bin/env -0
+"##
 }
 
-fn bash_snapshot_script() -> String {
-    let excluded = excluded_exports_regex();
-    let script = r##"if [ -z "$BASH_ENV" ] && [ -r "$HOME/.bashrc" ]; then
+fn bash_snapshot_script() -> &'static str {
+    r##"if [ -z "$BASH_ENV" ] && [ -r "$HOME/.bashrc" ]; then
   . "$HOME/.bashrc"
 fi
 echo '# Snapshot file'
@@ -281,31 +296,13 @@ alias_count=$(alias -p | wc -l | tr -d ' ')
 echo "# aliases $alias_count"
 alias -p
 echo ''
-export_lines=$(export -p | awk '
-/^(export|declare -x|typeset -x) / {
-  line=$0
-  name=line
-  sub(/^(export|declare -x|typeset -x) /, "", name)
-  sub(/=.*/, "", name)
-  if (name ~ /^(EXCLUDED_EXPORTS)$/) {
-    next
-  }
-  if (name ~ /^[A-Za-z_][A-Za-z0-9_]*$/) {
-    print line
-  }
-}')
-export_count=$(printf '%s\n' "$export_lines" | sed '/^$/d' | wc -l | tr -d ' ')
-echo "# exports $export_count"
-if [ -n "$export_lines" ]; then
-  printf '%s\n' "$export_lines"
-fi
-"##;
-    script.replace("EXCLUDED_EXPORTS", &excluded)
+printf '\0'
+/usr/bin/env -0
+"##
 }
 
-fn sh_snapshot_script() -> String {
-    let excluded = excluded_exports_regex();
-    let script = r##"if [ -n "$ENV" ] && [ -r "$ENV" ]; then
+fn sh_snapshot_script() -> &'static str {
+    r##"if [ -n "$ENV" ] && [ -r "$ENV" ]; then
   . "$ENV"
 fi
 echo '# Snapshot file'
@@ -337,68 +334,13 @@ if alias >/dev/null 2>&1; then
 else
   echo '# aliases 0'
 fi
-if export -p >/dev/null 2>&1; then
-  export_lines=$(export -p | awk '
-/^(export|declare -x|typeset -x) / {
-  line=$0
-  name=line
-  sub(/^(export|declare -x|typeset -x) /, "", name)
-  sub(/=.*/, "", name)
-  if (name ~ /^(EXCLUDED_EXPORTS)$/) {
-    next
-  }
-  if (name ~ /^[A-Za-z_][A-Za-z0-9_]*$/) {
-    print line
-  }
-}')
-  export_count=$(printf '%s\n' "$export_lines" | sed '/^$/d' | wc -l | tr -d ' ')
-  echo "# exports $export_count"
-  if [ -n "$export_lines" ]; then
-    printf '%s\n' "$export_lines"
-  fi
-else
-  export_count=$(env | sort | awk -F= '$1 ~ /^[A-Za-z_][A-Za-z0-9_]*$/ { count++ } END { print count }')
-  echo "# exports $export_count"
-  env | sort | while IFS='=' read -r key value; do
-    case "$key" in
-      ""|[0-9]*|*[!A-Za-z0-9_]*|EXCLUDED_EXPORTS) continue ;;
-    esac
-    escaped=$(printf "%s" "$value" | sed "s/'/'\"'\"'/g")
-    printf "export %s='%s'\n" "$key" "$escaped"
-  done
-fi
-"##;
-    script.replace("EXCLUDED_EXPORTS", &excluded)
-}
-
-fn powershell_snapshot_script() -> &'static str {
-    r##"$ErrorActionPreference = 'Stop'
-Write-Output '# Snapshot file'
-Write-Output '# Unset all aliases to avoid conflicts with functions'
-Write-Output 'Remove-Item Alias:* -ErrorAction SilentlyContinue'
-Write-Output '# Functions'
-Get-ChildItem Function: | ForEach-Object {
-    "function {0} {{`n{1}`n}}" -f $_.Name, $_.Definition
-}
-Write-Output ''
-$aliases = Get-Alias
-Write-Output ("# aliases " + $aliases.Count)
-$aliases | ForEach-Object {
-    "Set-Alias -Name {0} -Value {1}" -f $_.Name, $_.Definition
-}
-Write-Output ''
-$envVars = Get-ChildItem Env:
-Write-Output ("# exports " + $envVars.Count)
-$envVars | ForEach-Object {
-    $escaped = $_.Value -replace "'", "''"
-    "`$env:{0}='{1}'" -f $_.Name, $escaped
-}
+printf '\0'
+/usr/bin/env -0
 "##
 }
 
-/// Removes shell snapshots that either lack a matching session rollout file or
-/// whose rollouts have not been updated within the retention window.
-/// The active session id is exempt from cleanup.
+/// Use rollout age for persistent sessions and file age for orphaned snapshots.
+/// The active session is exempt even when a second process has resumed it.
 pub async fn cleanup_stale_snapshots(codex_home: &Path, active_session_id: ThreadId) -> Result<()> {
     let snapshot_dir = codex_home.join(SNAPSHOT_DIR);
 
@@ -420,7 +362,10 @@ pub async fn cleanup_stale_snapshots(codex_home: &Path, active_session_id: Threa
 
         let file_name = entry.file_name();
         let file_name = file_name.to_string_lossy();
-        let (session_id, _) = match file_name.rsplit_once('.') {
+        if file_name.starts_with('.') {
+            continue;
+        }
+        let (session_id, _) = match file_name.split_once('.') {
             Some((stem, ext)) => (stem, ext),
             None => {
                 remove_snapshot_file(&path).await;
@@ -432,16 +377,14 @@ pub async fn cleanup_stale_snapshots(codex_home: &Path, active_session_id: Threa
         }
 
         let rollout_path = find_thread_path_by_id_str(codex_home, session_id).await?;
-        let Some(rollout_path) = rollout_path else {
-            remove_snapshot_file(&path).await;
-            continue;
-        };
-
-        let modified = match fs::metadata(&rollout_path).await.and_then(|m| m.modified()) {
+        // A young snapshot can belong to an ephemeral session or to one whose first
+        // rollout record is not yet visible. Its owner will unlink it on drop.
+        let age_source = rollout_path.as_deref().unwrap_or(&path);
+        let modified = match fs::metadata(age_source).await.and_then(|m| m.modified()) {
             Ok(modified) => modified,
             Err(err) => {
                 tracing::warn!(
-                    "Failed to check rollout age for snapshot {}: {err:?}",
+                    "Failed to check retention age for snapshot {}: {err:?}",
                     path.display()
                 );
                 continue;
@@ -550,7 +493,8 @@ mod tests {
     async fn get_snapshot(shell_type: ShellType) -> Result<String> {
         let dir = tempdir()?;
         let path = dir.path().join("snapshot.sh");
-        write_shell_snapshot(shell_type, &path).await?;
+        let shell = crate::shell::get_shell(shell_type, None).context("shell unavailable")?;
+        write_shell_snapshot(&shell, &path, &ShellEnvironmentPolicy::default()).await?;
         let content = fs::read_to_string(&path).await?;
         Ok(content)
     }
@@ -576,6 +520,7 @@ mod tests {
             .arg(bash_snapshot_script())
             .env("BASH_ENV", "/dev/null")
             .env("VALID_NAME", "ok")
+            .env("EXAMPLE_SECRET", "not-on-disk")
             .env("PWD", "/tmp/stale")
             .env("NEXTEST_BIN_EXE_codex-write-config-schema", "/path/to/bin")
             .env("BAD-NAME", "broken")
@@ -583,8 +528,12 @@ mod tests {
 
         assert!(output.status.success());
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.contains("VALID_NAME"));
+        let stdout = render_snapshot(
+            &String::from_utf8_lossy(&output.stdout),
+            &ShellEnvironmentPolicy::default(),
+        )?;
+        assert!(stdout.contains("VALID_NAME=ok"));
+        assert!(!stdout.contains("not-on-disk"));
         assert!(!stdout.contains("PWD=/tmp/stale"));
         assert!(!stdout.contains("NEXTEST_BIN_EXE_codex-write-config-schema"));
         assert!(!stdout.contains("BAD-NAME"));
@@ -602,9 +551,14 @@ mod tests {
             shell_snapshot: crate::shell::empty_shell_snapshot_receiver(),
         };
 
-        let snapshot = ShellSnapshot::try_new(dir.path(), ThreadId::new(), &shell)
-            .await
-            .expect("snapshot should be created");
+        let snapshot = ShellSnapshot::try_new(
+            dir.path(),
+            ThreadId::new(),
+            &shell,
+            &ShellEnvironmentPolicy::default(),
+        )
+        .await
+        .expect("snapshot should be created");
         let path = snapshot.path.clone();
         assert!(path.exists());
 
@@ -635,9 +589,15 @@ mod tests {
             "HOME=\"{home_display}\"; export HOME; {}",
             bash_snapshot_script()
         );
-        let output = run_script_with_timeout(&shell, &script, Duration::from_secs(2), true)
-            .await
-            .context("run snapshot command")?;
+        let output = run_script_with_timeout(
+            &shell,
+            &script,
+            Duration::from_secs(2),
+            true,
+            &ShellEnvironmentPolicy::default(),
+        )
+        .await
+        .context("run snapshot command")?;
 
         assert!(
             output.contains("# Snapshot file"),
@@ -665,9 +625,15 @@ mod tests {
             shell_snapshot: crate::shell::empty_shell_snapshot_receiver(),
         };
 
-        let err = run_script_with_timeout(&shell, &script, Duration::from_secs(1), true)
-            .await
-            .expect_err("snapshot shell should time out");
+        let err = run_script_with_timeout(
+            &shell,
+            &script,
+            Duration::from_secs(1),
+            true,
+            &ShellEnvironmentPolicy::default(),
+        )
+        .await
+        .expect_err("snapshot shell should time out");
         assert!(
             err.to_string().contains("timed out"),
             "expected timeout error, got {err:?}"
@@ -723,14 +689,22 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(target_os = "windows")]
-    #[ignore]
     #[tokio::test]
-    async fn windows_powershell_snapshot_includes_sections() -> Result<()> {
-        let snapshot = get_snapshot(ShellType::PowerShell).await?;
-        assert!(snapshot.contains("# Snapshot file"));
-        assert!(snapshot.contains("aliases "));
-        assert!(snapshot.contains("exports "));
+    async fn unsupported_shells_do_not_publish_a_snapshot() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("snapshot");
+        for shell_type in [ShellType::PowerShell, ShellType::Cmd] {
+            let shell = Shell {
+                shell_type,
+                shell_path: dir.path().join("unused"),
+                shell_snapshot: crate::shell::empty_shell_snapshot_receiver(),
+            };
+            let error = write_shell_snapshot(&shell, &path, &ShellEnvironmentPolicy::default())
+                .await
+                .unwrap_err();
+            assert!(error.to_string().starts_with("Snapshot not supported"));
+            assert!(!path.exists());
+        }
         Ok(())
     }
 
@@ -747,7 +721,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup_stale_snapshots_removes_orphans_and_keeps_live() -> Result<()> {
+    async fn cleanup_keeps_recent_snapshots_with_or_without_a_rollout() -> Result<()> {
         let dir = tempdir()?;
         let codex_home = dir.path();
         let snapshot_dir = codex_home.join(SNAPSHOT_DIR);
@@ -767,8 +741,8 @@ mod tests {
         cleanup_stale_snapshots(codex_home, ThreadId::new()).await?;
 
         assert_eq!(live_snapshot.exists(), true);
-        assert_eq!(orphan_snapshot.exists(), false);
-        assert_eq!(invalid_snapshot.exists(), false);
+        assert!(orphan_snapshot.exists());
+        assert!(invalid_snapshot.exists());
         Ok(())
     }
 

@@ -186,17 +186,10 @@ impl ChatWidget {
             .bottom_pane
             .set_keybindings(widget.keybindings.clone());
         widget.prefetch_rate_limits();
-        widget
-            .bottom_pane
-            .set_steer_enabled(widget.config.features.enabled(Feature::Steer));
         let status_line_enabled = !widget.status_line_items_with_invalids().0.is_empty();
         widget
             .bottom_pane
             .set_status_line_enabled(status_line_enabled);
-        widget.bottom_pane.set_collaboration_modes_enabled(
-            widget.config.features.enabled(Feature::CollaborationModes),
-        );
-        widget.sync_personality_command_enabled();
         #[cfg(target_os = "windows")]
         widget.bottom_pane.set_windows_degraded_sandbox_active(
             codex_core::windows_sandbox::ELEVATED_SANDBOX_NUX_ENABLED
@@ -389,17 +382,10 @@ impl ChatWidget {
             .bottom_pane
             .set_keybindings(widget.keybindings.clone());
         widget.prefetch_rate_limits();
-        widget
-            .bottom_pane
-            .set_steer_enabled(widget.config.features.enabled(Feature::Steer));
         let status_line_enabled = !widget.status_line_items_with_invalids().0.is_empty();
         widget
             .bottom_pane
             .set_status_line_enabled(status_line_enabled);
-        widget.bottom_pane.set_collaboration_modes_enabled(
-            widget.config.features.enabled(Feature::CollaborationModes),
-        );
-        widget.sync_personality_command_enabled();
         widget.refresh_status_line();
 
         widget
@@ -580,17 +566,10 @@ impl ChatWidget {
             .bottom_pane
             .set_keybindings(widget.keybindings.clone());
         widget.prefetch_rate_limits();
-        widget
-            .bottom_pane
-            .set_steer_enabled(widget.config.features.enabled(Feature::Steer));
         let status_line_enabled = !widget.status_line_items_with_invalids().0.is_empty();
         widget
             .bottom_pane
             .set_status_line_enabled(status_line_enabled);
-        widget.bottom_pane.set_collaboration_modes_enabled(
-            widget.config.features.enabled(Feature::CollaborationModes),
-        );
-        widget.sync_personality_command_enabled();
         #[cfg(target_os = "windows")]
         widget.bottom_pane.set_windows_degraded_sandbox_active(
             codex_core::windows_sandbox::ELEVATED_SANDBOX_NUX_ENABLED

@@ -8,7 +8,6 @@ use crate::exec::ExecParams;
 use crate::exec_env::create_env;
 use crate::exec_policy::ExecApprovalRequest;
 use crate::function_tool::FunctionCallError;
-use crate::is_safe_command::is_known_safe_command;
 use crate::protocol::ExecCommandSource;
 use crate::session::turn_context::TurnContext;
 use crate::shell::Shell;
@@ -100,18 +99,6 @@ impl ToolHandler for ShellHandler {
         )
     }
 
-    async fn is_mutating(&self, invocation: &ToolInvocation) -> bool {
-        match &invocation.payload {
-            ToolPayload::Function { arguments } => {
-                serde_json::from_str::<ShellToolCallParams>(arguments)
-                    .map(|params| !is_known_safe_command(&params.command))
-                    .unwrap_or(true)
-            }
-            ToolPayload::LocalShell { params } => !is_known_safe_command(&params.command),
-            _ => true, // unknown payloads => assume mutating
-        }
-    }
-
     async fn handle(&self, invocation: ToolInvocation) -> Result<ToolOutput, FunctionCallError> {
         let ToolInvocation {
             session,
@@ -169,20 +156,6 @@ impl ToolHandler for ShellCommandHandler {
 
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
         matches!(payload, ToolPayload::Function { .. })
-    }
-
-    async fn is_mutating(&self, invocation: &ToolInvocation) -> bool {
-        let ToolPayload::Function { arguments } = &invocation.payload else {
-            return true;
-        };
-
-        serde_json::from_str::<ShellCommandToolCallParams>(arguments)
-            .map(|params| {
-                let shell = invocation.session.user_shell();
-                let command = Self::base_command(shell.as_ref(), &params.command, params.login);
-                !is_known_safe_command(&command)
-            })
-            .unwrap_or(true)
     }
 
     async fn handle(&self, invocation: ToolInvocation) -> Result<ToolOutput, FunctionCallError> {
@@ -247,20 +220,6 @@ impl ShellHandler {
                 "Output budget too small; command not executed.".into(),
             ));
         }
-        let features = session.features();
-        let request_rule_enabled = features.enabled(crate::features::Feature::RequestRule);
-        let prefix_rule = if request_rule_enabled {
-            prefix_rule
-        } else {
-            None
-        };
-
-        let mut exec_params = exec_params;
-        let dependency_env = session.dependency_env().await;
-        if !dependency_env.is_empty() {
-            exec_params.env.extend(dependency_env);
-        }
-
         // Approval policy guard for explicit escalation in non-OnRequest modes.
         if exec_params
             .sandbox_permissions
@@ -306,7 +265,6 @@ impl ShellHandler {
             .services
             .exec_policy
             .create_exec_approval_requirement_for_command(ExecApprovalRequest {
-                features: &features,
                 command: &exec_params.command,
                 approval_policy: turn.approval_policy,
                 sandbox_policy: &turn.sandbox_policy,
@@ -460,8 +418,10 @@ mod tests {
 
     #[test]
     fn shell_command_handler_respects_explicit_login_flag() {
+        let home = tempfile::tempdir().unwrap();
         let (_tx, shell_snapshot) = watch::channel(Some(Arc::new(ShellSnapshot {
-            path: PathBuf::from("/tmp/snapshot.sh"),
+            path: home.path().join("snapshot.sh"),
+            policy: Default::default(),
         })));
         let shell = Shell {
             shell_type: ShellType::Bash,

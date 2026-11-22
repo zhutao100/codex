@@ -26,6 +26,10 @@ pub(super) async fn spawn_review_thread(
             .clone()
             .or_else(|| Some(parent_turn_context.model_info.slug.clone()));
         fallback.web_search_mode = Some(WebSearchMode::Disabled);
+        fallback.resolve_child_model_limits(
+            Some(&parent_turn_context.model_info.slug),
+            &parent_turn_context.model_provider_id,
+        );
         fallback
             .features
             .disable(Feature::WebSearchRequest)
@@ -86,7 +90,6 @@ pub(super) async fn spawn_review_thread(
         session_source,
         tools_config,
         features: review_features,
-        ghost_snapshot: parent_turn_context.ghost_snapshot.clone(),
         developer_instructions: None,
         user_instructions: None,
         compact_prompt: parent_turn_context.compact_prompt.clone(),
@@ -100,7 +103,6 @@ pub(super) async fn spawn_review_thread(
         cwd: parent_turn_context.cwd.clone(),
         final_output_json_schema: None,
         codex_linux_sandbox_exe: parent_turn_context.codex_linux_sandbox_exe.clone(),
-        tool_call_gate: Arc::new(ReadinessFlag::new()),
         dynamic_tools: parent_turn_context.dynamic_tools.clone(),
         truncation_policy: model_info.truncation_policy.into(),
         turn_metadata_header: parent_turn_context.turn_metadata_header.clone(),

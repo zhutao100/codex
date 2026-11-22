@@ -5,7 +5,6 @@ mod recovery;
 
 use anyhow::Result;
 use codex_core::CodexAuth;
-use codex_core::features::Feature;
 use codex_core::protocol::EventMsg;
 use codex_core::protocol::Op;
 use codex_core::protocol::RolloutItem;
@@ -723,7 +722,7 @@ async fn master_override_runs_local_compaction_without_a_trigger() -> Result<()>
     .await;
     let test = test_codex()
         .with_config(|config| {
-            config.features.disable(Feature::RemoteCompaction);
+            config.compaction_mode = codex_core::config::types::CompactionMode::Local;
         })
         .build(&server)
         .await?;

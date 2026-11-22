@@ -1090,3 +1090,27 @@ mod tests {
         );
     }
 }
+/// Selection applies only to providers that support Responses WebSockets.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponsesTransport {
+    #[default]
+    Auto,
+    Http,
+}
+
+/// Remote compaction requires an eligible provider; unsupported providers always compact locally.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionMode {
+    #[default]
+    Auto,
+    Local,
+    Unary,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct WindowsConfig {
+    pub sandbox: Option<codex_protocol::config_types::WindowsSandboxLevel>,
+}

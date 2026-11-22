@@ -146,18 +146,10 @@ impl ChatWidget {
                 effective_mode.reasoning_effort()
             }
         });
-        let collaboration_mode = if self.collaboration_modes_enabled() {
-            self.active_collaboration_mask
-                .as_ref()
-                .map(|_| effective_mode.clone())
-        } else {
-            None
-        };
-        let personality = self
-            .config
-            .personality
-            .filter(|_| self.config.features.enabled(Feature::Personality))
-            .filter(|_| self.current_model_supports_personality());
+        let collaboration_mode = self
+            .active_collaboration_mask
+            .as_ref()
+            .map(|_| effective_mode.clone());
         let render_in_history = !self.agent_turn_running;
         let history_record = UserMessageHistoryRecord::UserMessageText;
         let submitted_user_message = UserMessage {
@@ -180,7 +172,7 @@ impl ChatWidget {
                     summary: self.config.model_reasoning_summary,
                     final_output_json_schema: None,
                     collaboration_mode,
-                    personality,
+                    personality: self.config.personality,
                     service_tier: self.config.service_tier.clone(),
                 },
                 None,

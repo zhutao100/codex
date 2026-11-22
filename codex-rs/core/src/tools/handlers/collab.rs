@@ -139,6 +139,7 @@ mod spawn {
         agent_role
             .apply_to_config(&mut config)
             .map_err(FunctionCallError::RespondToModel)?;
+        config.resolve_child_model_limits(Some(&turn.model_info.slug), &turn.model_provider_id);
 
         let result = session
             .services

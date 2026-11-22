@@ -1979,11 +1979,13 @@ fn text_block(s: &str) -> serde_json::Value {
 }
 
 async fn build_test_config(codex_home: &Path) -> Config {
-    ConfigBuilder::default()
+    let mut config = ConfigBuilder::default()
         .codex_home(codex_home.to_path_buf())
         .build()
         .await
-        .expect("load default test config")
+        .expect("load default test config");
+    config.responses_transport = crate::config::types::ResponsesTransport::Http;
+    config
 }
 
 fn otel_manager(
@@ -2104,8 +2106,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
             session_configuration.provider.clone(),
             session_configuration.session_source.clone(),
             config.model_verbosity,
-            config.features.enabled(Feature::ResponsesWebsockets),
-            config.features.enabled(Feature::ResponsesWebsocketsV2),
+            config.responses_transport,
             config.features.enabled(Feature::EnableRequestCompression),
             config.features.enabled(Feature::RuntimeMetrics),
             Session::build_model_client_beta_features_header(config.as_ref()),
@@ -2138,6 +2139,8 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         task_lifecycle: Mutex::new(()),
         services,
         next_internal_sub_id: AtomicU64::new(0),
+        title_publication: Mutex::new(()),
+        automatic_title_cancel: CancellationToken::new(),
     };
 
     (session, turn_context)
@@ -2248,8 +2251,7 @@ pub(crate) async fn make_session_and_context_with_rx() -> (
             session_configuration.provider.clone(),
             session_configuration.session_source.clone(),
             config.model_verbosity,
-            config.features.enabled(Feature::ResponsesWebsockets),
-            config.features.enabled(Feature::ResponsesWebsocketsV2),
+            config.responses_transport,
             config.features.enabled(Feature::EnableRequestCompression),
             config.features.enabled(Feature::RuntimeMetrics),
             Session::build_model_client_beta_features_header(config.as_ref()),
@@ -2282,6 +2284,8 @@ pub(crate) async fn make_session_and_context_with_rx() -> (
         task_lifecycle: Mutex::new(()),
         services,
         next_internal_sub_id: AtomicU64::new(0),
+        title_publication: Mutex::new(()),
+        automatic_title_cancel: CancellationToken::new(),
     });
 
     (session, turn_context, rx_event)

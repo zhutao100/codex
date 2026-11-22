@@ -48,9 +48,7 @@ pub(crate) struct ToolsConfig {
     pub apply_patch_tool_type: Option<ApplyPatchToolType>,
     pub web_search_mode: Option<WebSearchMode>,
     pub collab_tools: bool,
-    pub collaboration_modes_tools: bool,
     pub memory_tools: bool,
-    pub request_rule_enabled: bool,
     pub view_image_tool: bool,
     pub experimental_supported_tools: Vec<String>,
 }
@@ -68,14 +66,13 @@ impl ToolsConfig {
             features,
             web_search_mode,
         } = params;
-        let include_apply_patch_tool = features.enabled(Feature::ApplyPatchFreeform);
         let include_collab_tools = features.enabled(Feature::Collab);
-        let include_collaboration_modes_tools = features.enabled(Feature::CollaborationModes);
         let include_memory_tools = features.enabled(Feature::MemoryTool);
-        let request_rule_enabled = features.enabled(Feature::RequestRule);
         let include_view_image_tool = model_info.input_modalities.contains(&InputModality::Image);
 
-        let shell_type = if !features.enabled(Feature::ShellTool) {
+        let shell_type = if !features.enabled(Feature::ShellTool)
+            || model_info.shell_type == ConfigShellToolType::Disabled
+        {
             ConfigShellToolType::Disabled
         } else if features.enabled(Feature::UnifiedExec) {
             // If ConPTY not supported (for old Windows versions), fallback on ShellCommand.
@@ -88,29 +85,15 @@ impl ToolsConfig {
             model_info.shell_type
         };
 
-        let apply_patch_tool_type = match model_info.apply_patch_tool_type {
-            Some(ApplyPatchToolType::Freeform) => Some(ApplyPatchToolType::Freeform),
-            Some(ApplyPatchToolType::Function) => Some(ApplyPatchToolType::Function),
-            None => {
-                if include_apply_patch_tool {
-                    Some(ApplyPatchToolType::Freeform)
-                } else {
-                    None
-                }
-            }
-        };
-
         Self {
             bounded_explorer: false,
             recoverable_exec_output: features.enabled(Feature::RecoverableExecOutput),
             exec_job_completion: features.enabled(Feature::ExecJobCompletion),
             shell_type,
-            apply_patch_tool_type,
+            apply_patch_tool_type: model_info.apply_patch_tool_type.clone(),
             web_search_mode: *web_search_mode,
             collab_tools: include_collab_tools,
-            collaboration_modes_tools: include_collaboration_modes_tools,
             memory_tools: include_memory_tools,
-            request_rule_enabled,
             view_image_tool: include_view_image_tool,
             experimental_supported_tools: model_info.experimental_supported_tools.clone(),
         }
@@ -173,7 +156,7 @@ impl From<JsonSchema> for AdditionalProperties {
     }
 }
 
-fn create_approval_parameters(include_prefix_rule: bool) -> BTreeMap<String, JsonSchema> {
+fn create_approval_parameters() -> BTreeMap<String, JsonSchema> {
     let mut properties = BTreeMap::from([
         (
             "sandbox_permissions".to_string(),
@@ -189,20 +172,18 @@ fn create_approval_parameters(include_prefix_rule: bool) -> BTreeMap<String, Jso
         ),
     ]);
 
-    if include_prefix_rule {
-        properties.insert(
-            "prefix_rule".to_string(),
-            JsonSchema::Array {
-                items: Box::new(JsonSchema::String { description: None }),
-                description: Some(PREFIX_RULE_DESCRIPTION.to_string()),
-            },
-        );
-    }
+    properties.insert(
+        "prefix_rule".to_string(),
+        JsonSchema::Array {
+            items: Box::new(JsonSchema::String { description: None }),
+            description: Some(PREFIX_RULE_DESCRIPTION.to_string()),
+        },
+    );
 
     properties
 }
 
-fn create_exec_command_tool(include_prefix_rule: bool, include_job_completion: bool) -> ToolSpec {
+fn create_exec_command_tool(include_job_completion: bool) -> ToolSpec {
     let mut properties = BTreeMap::from([
         (
             "cmd".to_string(),
@@ -260,7 +241,7 @@ fn create_exec_command_tool(include_prefix_rule: bool, include_job_completion: b
             },
         ),
     ]);
-    properties.extend(create_approval_parameters(include_prefix_rule));
+    properties.extend(create_approval_parameters());
     if include_job_completion {
         properties.insert(
             "wait_for_completion".into(),
@@ -332,7 +313,7 @@ fn create_write_stdin_tool() -> ToolSpec {
     })
 }
 
-fn create_shell_tool(include_prefix_rule: bool) -> ToolSpec {
+fn create_shell_tool() -> ToolSpec {
     let mut properties = BTreeMap::from([
         (
             "command".to_string(),
@@ -354,7 +335,7 @@ fn create_shell_tool(include_prefix_rule: bool) -> ToolSpec {
             },
         ),
     ]);
-    properties.extend(create_approval_parameters(include_prefix_rule));
+    properties.extend(create_approval_parameters());
 
     let description  = if cfg!(windows) {
         r#"Runs a Powershell command (Windows) and returns its output. Arguments to `shell` will be passed to CreateProcessW(). Most commands should be prefixed with ["powershell.exe", "-Command"].
@@ -385,7 +366,7 @@ Examples of valid command strings:
     })
 }
 
-fn create_shell_command_tool(include_prefix_rule: bool) -> ToolSpec {
+fn create_shell_command_tool() -> ToolSpec {
     let mut properties = BTreeMap::from([
         (
             "command".to_string(),
@@ -417,7 +398,7 @@ fn create_shell_command_tool(include_prefix_rule: bool) -> ToolSpec {
             },
         ),
     ]);
-    properties.extend(create_approval_parameters(include_prefix_rule));
+    properties.extend(create_approval_parameters());
 
     let description = if cfg!(windows) {
         r#"Runs a Powershell command (Windows) and returns its output.
@@ -1397,17 +1378,14 @@ pub(crate) fn build_specs(
 
     match &config.shell_type {
         ConfigShellToolType::Default => {
-            builder.push_spec_with_parallel_support(
-                create_shell_tool(config.request_rule_enabled),
-                true,
-            );
+            builder.push_spec_with_parallel_support(create_shell_tool(), true);
         }
         ConfigShellToolType::Local => {
             builder.push_spec_with_parallel_support(ToolSpec::LocalShell {}, true);
         }
         ConfigShellToolType::UnifiedExec => {
             builder.push_spec_with_parallel_support(
-                create_exec_command_tool(config.request_rule_enabled, config.exec_job_completion),
+                create_exec_command_tool(config.exec_job_completion),
                 true,
             );
             builder.push_spec(create_write_stdin_tool());
@@ -1418,10 +1396,7 @@ pub(crate) fn build_specs(
             // Do nothing.
         }
         ConfigShellToolType::ShellCommand => {
-            builder.push_spec_with_parallel_support(
-                create_shell_command_tool(config.request_rule_enabled),
-                true,
-            );
+            builder.push_spec_with_parallel_support(create_shell_command_tool(), true);
         }
     }
 
@@ -1445,10 +1420,8 @@ pub(crate) fn build_specs(
     builder.push_spec(PLAN_TOOL.clone());
     builder.register_handler("update_plan", plan_handler);
 
-    if config.collaboration_modes_tools {
-        builder.push_spec(create_request_user_input_tool());
-        builder.register_handler("request_user_input", request_user_input_handler);
-    }
+    builder.push_spec(create_request_user_input_tool());
+    builder.register_handler("request_user_input", request_user_input_handler);
 
     if config.memory_tools {
         builder.push_spec(create_get_memory_tool());
@@ -1602,7 +1575,7 @@ mod tests {
     #[test]
     fn approval_parameter_descriptions_serialize_cleanly() {
         let parameters =
-            serde_json::to_value(create_approval_parameters(true)).expect("serialize schema");
+            serde_json::to_value(create_approval_parameters()).expect("serialize schema");
 
         assert_eq!(
             parameters,
@@ -1741,7 +1714,6 @@ mod tests {
         let model_info = ModelsManager::construct_model_info_offline("gpt-5-codex", &config);
         let mut features = Features::with_defaults();
         features.enable(Feature::UnifiedExec);
-        features.enable(Feature::CollaborationModes);
         let config = ToolsConfig::new(&ToolsConfigParams {
             model_info: &model_info,
             features: &features,
@@ -1768,7 +1740,7 @@ mod tests {
         // Build expected from the same helpers used by the builder.
         let mut expected: BTreeMap<String, ToolSpec> = BTreeMap::from([]);
         for spec in [
-            create_exec_command_tool(true, false),
+            create_exec_command_tool(false),
             create_write_stdin_tool(),
             PLAN_TOOL.clone(),
             create_request_user_input_tool(),
@@ -1802,7 +1774,6 @@ mod tests {
         let model_info = ModelsManager::construct_model_info_offline("gpt-5-codex", &config);
         let mut features = Features::with_defaults();
         features.enable(Feature::Collab);
-        features.enable(Feature::CollaborationModes);
         let tools_config = ToolsConfig::new(&ToolsConfigParams {
             model_info: &model_info,
             features: &features,
@@ -1816,23 +1787,10 @@ mod tests {
     }
 
     #[test]
-    fn request_user_input_requires_collaboration_modes_feature() {
+    fn request_user_input_is_available() {
         let config = test_config();
         let model_info = ModelsManager::construct_model_info_offline("gpt-5-codex", &config);
-        let mut features = Features::with_defaults();
-        features.disable(Feature::CollaborationModes);
-        let tools_config = ToolsConfig::new(&ToolsConfigParams {
-            model_info: &model_info,
-            features: &features,
-            web_search_mode: Some(WebSearchMode::Cached),
-        });
-        let (tools, _) = build_specs(&tools_config, None, &[]).build();
-        assert!(
-            !tools.iter().any(|t| t.spec.name() == "request_user_input"),
-            "request_user_input should be disabled when collaboration_modes feature is off"
-        );
-
-        features.enable(Feature::CollaborationModes);
+        let features = Features::with_defaults();
         let tools_config = ToolsConfig::new(&ToolsConfigParams {
             model_info: &model_info,
             features: &features,
@@ -1874,8 +1832,7 @@ mod tests {
         let config = test_config();
         let mut model_info = ModelsManager::construct_model_info_offline("gpt-5-codex", &config);
         model_info.input_modalities = vec![InputModality::Text];
-        let mut features = Features::with_defaults();
-        features.enable(Feature::CollaborationModes);
+        let features = Features::with_defaults();
         let tools_config = ToolsConfig::new(&ToolsConfigParams {
             model_info: &model_info,
             features: &features,
@@ -1927,8 +1884,7 @@ mod tests {
     fn mcp_resource_tools_are_hidden_without_mcp_servers() {
         let config = test_config();
         let model_info = ModelsManager::construct_model_info_offline("gpt-5-codex", &config);
-        let mut features = Features::with_defaults();
-        features.enable(Feature::CollaborationModes);
+        let features = Features::with_defaults();
         let tools_config = ToolsConfig::new(&ToolsConfigParams {
             model_info: &model_info,
             features: &features,
@@ -1949,8 +1905,7 @@ mod tests {
     fn mcp_resource_tools_are_included_when_mcp_servers_are_present() {
         let config = test_config();
         let model_info = ModelsManager::construct_model_info_offline("gpt-5-codex", &config);
-        let mut features = Features::with_defaults();
-        features.enable(Feature::CollaborationModes);
+        let features = Features::with_defaults();
         let tools_config = ToolsConfig::new(&ToolsConfigParams {
             model_info: &model_info,
             features: &features,
@@ -2014,8 +1969,7 @@ mod tests {
 
     #[test]
     fn test_build_specs_gpt5_6_terra_default() {
-        let mut features = Features::with_defaults();
-        features.enable(Feature::CollaborationModes);
+        let features = Features::with_defaults();
         assert_default_model_tools(
             "gpt-5.6-terra",
             &features,
@@ -2033,8 +1987,7 @@ mod tests {
 
     #[test]
     fn test_build_specs_gpt6_sol_default() {
-        let mut features = Features::with_defaults();
-        features.enable(Feature::CollaborationModes);
+        let features = Features::with_defaults();
         assert_default_model_tools(
             "gpt-6-sol",
             &features,
@@ -2054,7 +2007,6 @@ mod tests {
     fn test_build_specs_gpt6_astra_unified_exec_web_search() {
         let mut features = Features::with_defaults();
         features.enable(Feature::UnifiedExec);
-        features.enable(Feature::CollaborationModes);
         assert_model_tools(
             "gpt-6-astra",
             &features,
@@ -2073,8 +2025,7 @@ mod tests {
 
     #[test]
     fn test_gpt6_luna_defaults() {
-        let mut features = Features::with_defaults();
-        features.enable(Feature::CollaborationModes);
+        let features = Features::with_defaults();
         assert_default_model_tools(
             "gpt-6-luna",
             &features,
@@ -2092,8 +2043,7 @@ mod tests {
 
     #[test]
     fn test_gpt6_1_sol_defaults() {
-        let mut features = Features::with_defaults();
-        features.enable(Feature::CollaborationModes);
+        let features = Features::with_defaults();
         assert_default_model_tools(
             "gpt-6.1-sol",
             &features,
@@ -2107,6 +2057,39 @@ mod tests {
                 "view_image",
             ],
         );
+    }
+
+    #[test]
+    fn model_disabled_shell_is_not_registered_even_with_unified_exec() {
+        let config = test_config();
+        let mut model_info = ModelsManager::construct_model_info_offline("gpt-5-codex", &config);
+        model_info.shell_type = ConfigShellToolType::Disabled;
+        for unified in [false, true] {
+            let mut features = Features::with_defaults();
+            if unified {
+                features.enable(Feature::UnifiedExec);
+            } else {
+                features.disable(Feature::UnifiedExec);
+            }
+            let tools_config = ToolsConfig::new(&ToolsConfigParams {
+                model_info: &model_info,
+                features: &features,
+                web_search_mode: None,
+            });
+            let (specs, registry) = build_specs(&tools_config, None, &[]).build();
+            assert_eq!(tools_config.shell_type, ConfigShellToolType::Disabled);
+            for name in [
+                "shell",
+                "container.exec",
+                "local_shell",
+                "shell_command",
+                "exec_command",
+                "write_stdin",
+            ] {
+                assert!(!specs.iter().any(|tool| tool.spec.name() == name));
+                assert!(!registry.has_handler(name));
+            }
+        }
     }
 
     #[test]
@@ -2422,7 +2405,6 @@ mod tests {
         let model_info = ModelsManager::construct_model_info_offline("gpt-5-codex", &config);
         let mut features = Features::with_defaults();
         features.enable(Feature::UnifiedExec);
-        features.enable(Feature::ApplyPatchFreeform);
         let tools_config = ToolsConfig::new(&ToolsConfigParams {
             model_info: &model_info,
             features: &features,
@@ -2520,7 +2502,7 @@ mod tests {
 
     #[test]
     fn test_shell_tool() {
-        let tool = super::create_shell_tool(true);
+        let tool = super::create_shell_tool();
         let ToolSpec::Function(ResponsesApiTool {
             description, name, ..
         }) = &tool
@@ -2550,7 +2532,7 @@ Examples of valid command strings:
 
     #[test]
     fn test_shell_command_tool() {
-        let tool = super::create_shell_command_tool(true);
+        let tool = super::create_shell_command_tool();
         let ToolSpec::Function(ResponsesApiTool {
             description, name, ..
         }) = &tool

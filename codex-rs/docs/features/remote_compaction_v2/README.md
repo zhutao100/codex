@@ -10,23 +10,14 @@ Compaction over the ordinary Responses transport. Read this before changing comp
 
 ## Selection
 
-|Provider eligibility|`remote_compaction`|`remote_compaction_v2`|Implementation|
-|---|---|---|---|
-|`provider.is_openai()`|true|true|Ordinary Responses stream with a final `compaction_trigger` input item.|
-|`provider.is_openai()`|true|false|Legacy unary `responses/compact`.|
-|Any|false|Either|Local summarization.|
-|Not OpenAI|Either|Either|Local summarization.|
+|Provider|`compaction_mode`|Implementation|
+|---|---|---|
+|`provider.is_openai()`|`auto` (default)|Ordinary Responses stream with a final `compaction_trigger` input item.|
+|`provider.is_openai()`|`unary`|Explicit compatibility route using `responses/compact`.|
+|Any|`local`|Local summarization.|
+|Not OpenAI|Any|Local summarization.|
 
-Both flags default to true. Eligibility uses the existing provider-name check, not authentication mode. V2 uses the selected provider's ordinary client and URL, including ChatGPT or API-key authentication and configured WebSockets. It does not rewrite the legacy endpoint.
-
-To select local summarization explicitly:
-
-```toml
-[features]
-remote_compaction = false
-```
-
-Disabling only `remote_compaction_v2` selects the legacy route. There is no automatic v2-to-legacy or v2-to-local semantic fallback; normal WebSocket-to-HTTP transport fallback remains available.
+Set the mode at the top level or in the active profile. Eligibility uses the selected source provider's existing name check, not the authentication mode. There is no automatic streaming-to-unary or remote-to-local fallback; normal WebSocket-to-HTTP transport recovery remains available. The `remote_compaction_v2` beta capability is advertised independently of the chosen route.
 
 ## Core contracts
 
@@ -35,7 +26,7 @@ Disabling only `remote_compaction_v2` selects the legacy route. There is no auto
 - Collect privately until `Completed` contains exactly one completed encrypted compaction item. Other output items do not execute tools or enter history. Incomplete/invalid results never install a replacement.
 - Retain recent eligible user messages and plaintext summaries within an approximate budget capped at 64,000 tokens. Reserve encrypted summary, exact notes, instructions, canonical context and tools before choosing the retention allowance.
 - Keep work notes exact and outside truncatable retention. Fixed content that exceeds the destination limit rejects installation.
-- Preserve undo snapshots and the exact replacement/reference checkpoint across cancellation. Installation and background snapshot writes share a guard.
+- Preserve the exact replacement/reference checkpoint across cancellation. No task captures worktree snapshots during a turn.
 - Reset logical WebSocket continuation after replacement; only a healthy completed physical connection may be reused.
 
 ## Lifecycle constraints

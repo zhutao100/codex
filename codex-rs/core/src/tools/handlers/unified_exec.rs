@@ -1,5 +1,4 @@
 use crate::function_tool::FunctionCallError;
-use crate::is_safe_command::is_known_safe_command;
 use crate::protocol::EventMsg;
 use crate::protocol::ProgressTraceCategory;
 use crate::protocol::ProgressTraceState;
@@ -124,22 +123,6 @@ impl ToolHandler for UnifiedExecHandler {
         matches!(payload, ToolPayload::Function { .. })
     }
 
-    async fn is_mutating(&self, invocation: &ToolInvocation) -> bool {
-        let ToolPayload::Function { arguments } = &invocation.payload else {
-            tracing::error!(
-                "This should never happen, invocation payload is wrong: {:?}",
-                invocation.payload
-            );
-            return true;
-        };
-
-        let Ok(params) = serde_json::from_str::<ExecCommandArgs>(arguments) else {
-            return true;
-        };
-        let command = get_command(&params, invocation.session.user_shell());
-        !is_known_safe_command(&command)
-    }
-
     async fn handle(&self, invocation: ToolInvocation) -> Result<ToolOutput, FunctionCallError> {
         let ToolInvocation {
             session,
@@ -185,14 +168,6 @@ impl ToolHandler for UnifiedExecHandler {
                     wait_for_completion,
                     ..
                 } = args;
-
-                let features = session.features();
-                let request_rule_enabled = features.enabled(crate::features::Feature::RequestRule);
-                let prefix_rule = if request_rule_enabled {
-                    prefix_rule
-                } else {
-                    None
-                };
 
                 if sandbox_permissions.requires_escalated_permissions()
                     && !matches!(
@@ -273,12 +248,15 @@ impl ToolHandler for UnifiedExecHandler {
             "write_stdin" => {
                 let args: WriteStdinArgs = parse_arguments(&arguments)?;
                 let response = manager
-                    .write_stdin(WriteStdinRequest {
-                        process_id: &args.session_id.to_string(),
-                        input: &args.chars,
-                        yield_time_ms: args.yield_time_ms,
-                        max_output_tokens: args.max_output_tokens,
-                    })
+                    .write_stdin(
+                        WriteStdinRequest {
+                            process_id: &args.session_id.to_string(),
+                            input: &args.chars,
+                            yield_time_ms: args.yield_time_ms,
+                            max_output_tokens: args.max_output_tokens,
+                        },
+                        &context,
+                    )
                     .await
                     .map_err(|err| {
                         FunctionCallError::RespondToModel(format!("write_stdin failed: {err}"))

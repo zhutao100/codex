@@ -1571,7 +1571,6 @@ dependencies = [
  "codex-utils-cargo-bin",
  "codex-utils-home-dir",
  "codex-utils-pty",
- "codex-utils-readiness",
  "codex-utils-string",
  "codex-version",
  "codex-windows-sandbox",
@@ -1794,7 +1793,6 @@ dependencies = [
 name = "codex-git"
 version = "0.0.0"
 dependencies = [
- "assert_matches",
  "once_cell",
  "pretty_assertions",
  "regex",
@@ -1803,7 +1801,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "ts-rs",
- "walkdir",
 ]
 
 [[package]]
@@ -2268,17 +2265,6 @@ dependencies = [
  "shared_library",
  "tokio",
  "winapi",
-]
-
-[[package]]
-name = "codex-utils-readiness"
-version = "0.0.0"
-dependencies = [
- "assert_matches",
- "async-trait",
- "thiserror 2.0.18",
- "time",
- "tokio",
 ]
 
 [[package]]

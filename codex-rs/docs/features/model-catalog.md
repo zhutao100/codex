@@ -11,6 +11,8 @@
 
 ## Discovery/cache version
 
+Only the selected `openai` provider identity participates in remote discovery; fetching requires ChatGPT authentication. API-key and unauthenticated sessions may read a compatible local cache but do not fetch it. Other providers use bundled/fallback metadata and their explicit overlay; they do not inherit the OpenAI account's remote catalog or renew its ETag.
+
 [Model discovery](../../core/src/models_manager/manager.rs) uses the compiled `CODEX_VERSION_OVERRIDE`, or `CARGO_PKG_VERSION` when unset. [Version normalization](../../core/src/models_manager/mod.rs) removes prerelease and build metadata: `1.2.3-alpha.4+build.5` becomes `1.2.3`.
 
 Use this same normalized version in the `/models` query, persisted `models_cache.json` and compatibility checks. A mismatched cache is ignored and refreshed normally; no manual migration is needed. Runtime environment changes do not alter a compiled version. TTL and ETag behavior are independent of version normalization.

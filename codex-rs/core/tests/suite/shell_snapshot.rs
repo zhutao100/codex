@@ -40,10 +40,13 @@ async fn wait_for_snapshot(codex_home: &Path) -> Result<PathBuf> {
     let snapshot_dir = codex_home.join("shell_snapshots");
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        if let Ok(mut entries) = fs::read_dir(&snapshot_dir).await
-            && let Some(entry) = entries.next_entry().await?
-        {
-            return Ok(entry.path());
+        if let Ok(mut entries) = fs::read_dir(&snapshot_dir).await {
+            while let Some(entry) = entries.next_entry().await? {
+                let path = entry.path();
+                if path.extension().is_some_and(|ext| ext == "sh") {
+                    return Ok(path);
+                }
+            }
         }
 
         if Instant::now() >= deadline {
@@ -386,42 +389,6 @@ async fn macos_unified_exec_uses_shell_snapshot() -> Result<()> {
     assert!(run.snapshot_path.starts_with(&run.codex_home));
     assert_posix_snapshot_sections(&run.snapshot_content);
     assert_eq!(normalize_newlines(&run.end.stdout).trim(), "snapshot-macos");
-    assert_eq!(run.end.exit_code, 0);
-
-    Ok(())
-}
-
-// #[cfg_attr(not(target_os = "windows"), ignore)]
-#[ignore]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn windows_unified_exec_uses_shell_snapshot() -> Result<()> {
-    let command = "Write-Output snapshot-windows";
-    let run = run_snapshot_command(command).await?;
-
-    let snapshot_index = run
-        .begin
-        .command
-        .iter()
-        .position(|arg| arg.contains("shell_snapshots"))
-        .expect("snapshot argument exists");
-    assert!(run.begin.command.iter().any(|arg| arg == "-NoProfile"));
-    assert!(
-        run.begin
-            .command
-            .iter()
-            .any(|arg| arg == "param($snapshot) . $snapshot; & @args")
-    );
-    assert!(snapshot_index > 0);
-    assert_eq!(run.begin.command.last(), Some(&command.to_string()));
-
-    assert!(run.snapshot_path.starts_with(&run.codex_home));
-    assert!(run.snapshot_content.contains("# Snapshot file"));
-    assert!(run.snapshot_content.contains("# aliases "));
-    assert!(run.snapshot_content.contains("# exports "));
-    assert_eq!(
-        normalize_newlines(&run.end.stdout).trim(),
-        "snapshot-windows"
-    );
     assert_eq!(run.end.exit_code, 0);
 
     Ok(())

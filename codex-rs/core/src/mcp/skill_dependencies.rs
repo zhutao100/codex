@@ -67,8 +67,8 @@ async fn should_install_mcp_dependencies(
     missing: &HashMap<String, McpServerConfig>,
     cancellation_token: &CancellationToken,
 ) -> bool {
-    if is_full_access_mode(turn_context) {
-        return true;
+    if turn_context.approval_policy == AskForApproval::Never {
+        return is_full_access_mode(turn_context);
     }
 
     let server_list = format_missing_mcp_dependencies(missing);
@@ -149,13 +149,16 @@ pub(crate) async fn maybe_prompt_and_install_mcp_dependencies(
         return;
     }
 
-    let installed = config.mcp_servers.get().clone();
+    let installed = sess.configured_mcp_servers().await;
     let missing = collect_missing_mcp_dependencies(mentioned_skills, &installed);
     if missing.is_empty() {
         return;
     }
 
     let unprompted_missing = filter_prompted_mcp_dependencies(sess, &missing).await;
+    let auth = sess.services.auth_manager.auth().await;
+    let unprompted_missing =
+        admit_candidates(&config, auth.as_ref(), installed, unprompted_missing);
     if unprompted_missing.is_empty() {
         return;
     }
@@ -163,26 +166,52 @@ pub(crate) async fn maybe_prompt_and_install_mcp_dependencies(
     if should_install_mcp_dependencies(sess, turn_context, &unprompted_missing, cancellation_token)
         .await
     {
-        maybe_install_mcp_dependencies(sess, turn_context, config.as_ref(), mentioned_skills).await;
+        maybe_install_mcp_dependencies(sess, turn_context, unprompted_missing, cancellation_token)
+            .await;
     }
 }
 
-pub(crate) async fn maybe_install_mcp_dependencies(
+fn admit_candidates(
+    config: &Config,
+    auth: Option<&crate::CodexAuth>,
+    mut installed: HashMap<String, McpServerConfig>,
+    mut candidates: HashMap<String, McpServerConfig>,
+) -> HashMap<String, McpServerConfig> {
+    for (name, server) in config.mcp_servers.get() {
+        installed
+            .entry(name.clone())
+            .or_insert_with(|| server.clone());
+    }
+    let keys: HashSet<_> = installed
+        .iter()
+        .map(|(name, server)| canonical_mcp_server_key(name, server))
+        .collect();
+    candidates.retain(|name, server| {
+        !installed.contains_key(name) && !keys.contains(&canonical_mcp_server_key(name, server))
+    });
+    installed.extend(candidates.clone());
+    let mut staged = config.clone();
+    if let Err(err) = staged.mcp_servers.set(installed) {
+        warn!("failed to validate skill MCP dependencies: {err}");
+        return HashMap::new();
+    }
+    let effective = effective_mcp_servers(&staged, auth);
+    candidates.retain(|name, candidate| {
+        effective
+            .get(name)
+            .is_some_and(|server| server.enabled && server == candidate)
+    });
+    candidates
+}
+
+async fn maybe_install_mcp_dependencies(
     sess: &Session,
     turn_context: &TurnContext,
-    config: &Config,
-    mentioned_skills: &[SkillMetadata],
+    approved: HashMap<String, McpServerConfig>,
+    cancellation_token: &CancellationToken,
 ) {
-    if mentioned_skills.is_empty() || !config.features.enabled(Feature::SkillMcpDependencyInstall) {
-        return;
-    }
-
+    let config = &turn_context.config;
     let codex_home = config.codex_home.clone();
-    let installed = config.mcp_servers.get().clone();
-    let missing = collect_missing_mcp_dependencies(mentioned_skills, &installed);
-    if missing.is_empty() {
-        return;
-    }
 
     let mut servers = match load_global_mcp_servers(&codex_home).await {
         Ok(servers) => servers,
@@ -192,19 +221,21 @@ pub(crate) async fn maybe_install_mcp_dependencies(
         }
     };
 
-    let mut updated = false;
+    let mut installed = sess.configured_mcp_servers().await;
+    for (name, server) in &servers {
+        installed
+            .entry(name.clone())
+            .or_insert_with(|| server.clone());
+    }
+    let auth = sess.services.auth_manager.auth().await;
+    let missing = admit_candidates(config, auth.as_ref(), installed, approved);
+    if missing.is_empty() || cancellation_token.is_cancelled() {
+        return;
+    }
     let mut added = Vec::new();
     for (name, config) in missing {
-        if servers.contains_key(&name) {
-            continue;
-        }
         servers.insert(name.clone(), config.clone());
         added.push((name, config));
-        updated = true;
-    }
-
-    if !updated {
-        return;
     }
 
     if let Err(err) = ConfigEditsBuilder::new(&codex_home)
@@ -216,7 +247,7 @@ pub(crate) async fn maybe_install_mcp_dependencies(
         return;
     }
 
-    for (name, server_config) in added {
+    for (name, server_config) in &added {
         let oauth_config = match oauth_login_support(&server_config.transport).await {
             McpOAuthLoginSupport::Supported(config) => config,
             McpOAuthLoginSupport::Unsupported => continue,
@@ -235,7 +266,7 @@ pub(crate) async fn maybe_install_mcp_dependencies(
         .await;
 
         if let Err(err) = perform_oauth_login(
-            &name,
+            name,
             &oauth_config.url,
             config.mcp_oauth_credentials_store_mode,
             oauth_config.http_headers,
@@ -249,18 +280,9 @@ pub(crate) async fn maybe_install_mcp_dependencies(
         }
     }
 
-    // Refresh from the effective merged MCP map (global + repo + managed) and
-    // overlay the updated global servers so we don't drop repo-scoped servers.
-    let auth = sess.services.auth_manager.auth().await;
-    let mut refresh_servers = effective_mcp_servers(config, auth.as_ref());
-    for (name, server_config) in &servers {
-        refresh_servers
-            .entry(name.clone())
-            .or_insert_with(|| server_config.clone());
-    }
-    sess.refresh_mcp_servers_now(
+    sess.refresh_mcp_servers_after_install(
         turn_context,
-        refresh_servers,
+        added,
         config.mcp_oauth_credentials_store_mode,
     )
     .await;
@@ -432,6 +454,35 @@ mod tests {
             path: PathBuf::from("skill"),
             scope: SkillScope::User,
         }
+    }
+
+    #[test]
+    fn a_prompt_only_authorizes_candidates_still_admitted_at_installation() {
+        let mut config = crate::config::test_config();
+        let server = |command: &str| -> McpServerConfig {
+            serde_json::from_value(serde_json::json!({"command":command})).unwrap()
+        };
+        let requested = HashMap::from([
+            ("first".into(), server("one")),
+            ("second".into(), server("two")),
+        ]);
+        let offered = admit_candidates(&config, None, HashMap::new(), requested.clone());
+        assert_eq!(offered, requested);
+        config.mcp_servers = crate::config::Constrained::normalized(
+            HashMap::new(),
+            |mut servers: HashMap<String, McpServerConfig>| {
+                if let Some(server) = servers.get_mut("first") {
+                    server.enabled = false;
+                }
+                servers
+            },
+        )
+        .unwrap();
+        let installed = HashMap::from([("runtime-alias".into(), server("two"))]);
+        assert_eq!(
+            admit_candidates(&config, None, installed, offered),
+            HashMap::new()
+        );
     }
 
     #[test]

@@ -1,6 +1,5 @@
 use anyhow::Result;
 use codex_core::config::ConfigBuilder;
-use codex_core::features::Feature;
 use codex_core::plugins::PluginStore;
 use codex_core::plugins::PluginSummary;
 use codex_core::protocol::EventMsg;
@@ -42,7 +41,7 @@ async fn installed_plugin_skill_reaches_catalog_and_explicit_turn_instructions()
     let (home, plugin) = install_browser_plugin()?;
     let server = responses::start_mock_server().await;
     let mut builder = test_codex().with_home(home).with_config(|config| {
-        config.features.disable(Feature::RemoteCompactionV2);
+        config.compaction_mode = codex_core::config::types::CompactionMode::Unary;
     });
     let test = builder.build(&server).await?;
     let mock = responses::mount_sse_once(
@@ -91,7 +90,7 @@ async fn plugin_session_overrides_survive_forced_listing_and_instruction_injecti
         let server = responses::start_mock_server().await;
         let mut builder = test_codex().with_home(home).with_config(move |config| {
             config.config_layer_stack = overridden.config_layer_stack;
-            config.features.disable(Feature::RemoteCompactionV2);
+            config.compaction_mode = codex_core::config::types::CompactionMode::Unary;
         });
         let test = builder.build(&server).await?;
         let mut listed = Vec::new();

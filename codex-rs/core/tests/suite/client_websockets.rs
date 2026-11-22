@@ -730,7 +730,7 @@ async fn responses_websocket_completion_review_followup_uses_incremental_create(
     ])
     .await;
     let mut builder = test_codex().with_config(|config| {
-        config.features.enable(Feature::ResponsesWebsocketsV2);
+        config.responses_transport = codex_core::config::types::ResponsesTransport::Auto;
         config
             .features
             .disable(Feature::AutoPostTurnCompletionReview);
@@ -1111,7 +1111,7 @@ async fn responses_websocket_v2_creates_with_previous_response_id_on_prefix() {
     ]])
     .await;
 
-    let harness = websocket_harness_with_v2(&server, true).await;
+    let harness = websocket_harness(&server).await;
     let mut client_session = harness.client.new_session();
     let prompt_one = prompt_with_input(vec![message_item("hello")]);
     let prompt_two = prompt_with_input(vec![
@@ -1149,7 +1149,7 @@ async fn responses_websocket_v2_creates_without_previous_response_id_when_base_i
     ]])
     .await;
 
-    let harness = websocket_harness_with_v2(&server, true).await;
+    let harness = websocket_harness(&server).await;
     let mut client_session = harness.client.new_session();
     let prompt_one =
         prompt_with_input_and_instructions(vec![message_item("hello")], "base instructions one");
@@ -1205,7 +1205,7 @@ async fn responses_websocket_v2_after_error_uses_full_create_without_previous_re
     ])
     .await;
 
-    let harness = websocket_harness_with_v2(&server, true).await;
+    let harness = websocket_harness(&server).await;
     let mut session = harness.client.new_session();
     let prompt_one = prompt_with_input(vec![message_item("hello")]);
     let prompt_two = prompt_with_input(vec![message_item("hello"), message_item("second")]);
@@ -1267,7 +1267,7 @@ async fn responses_websocket_v2_sets_openai_beta_header() {
     ]]])
     .await;
 
-    let harness = websocket_harness_with_v2(&server, true).await;
+    let harness = websocket_harness(&server).await;
     let mut client_session = harness.client.new_session();
     let prompt = prompt_with_input(vec![message_item("hello")]);
 
@@ -1394,34 +1394,10 @@ async fn websocket_harness_with_runtime_metrics(
     server: &WebSocketTestServer,
     runtime_metrics_enabled: bool,
 ) -> WebsocketTestHarness {
-    websocket_harness_with_options(server, runtime_metrics_enabled, true, false).await
-}
-
-async fn websocket_harness_with_v2(
-    server: &WebSocketTestServer,
-    websocket_v2_enabled: bool,
-) -> WebsocketTestHarness {
-    websocket_harness_with_options(server, false, true, websocket_v2_enabled).await
-}
-
-async fn websocket_harness_with_options(
-    server: &WebSocketTestServer,
-    runtime_metrics_enabled: bool,
-    websocket_enabled: bool,
-    websocket_v2_enabled: bool,
-) -> WebsocketTestHarness {
     let provider = websocket_provider(server);
     let codex_home = TempDir::new().unwrap();
     let mut config = load_default_config_for_test(&codex_home).await;
     config.model = Some(MODEL.to_string());
-    if websocket_enabled {
-        config.features.enable(Feature::ResponsesWebsockets);
-    } else {
-        config.features.disable(Feature::ResponsesWebsockets);
-    }
-    if websocket_v2_enabled {
-        config.features.enable(Feature::ResponsesWebsocketsV2);
-    }
     if runtime_metrics_enabled {
         config.features.enable(Feature::RuntimeMetrics);
     }
@@ -1455,8 +1431,7 @@ async fn websocket_harness_with_options(
         provider.clone(),
         SessionSource::Exec,
         config.model_verbosity,
-        websocket_enabled,
-        websocket_v2_enabled,
+        codex_core::config::types::ResponsesTransport::Auto,
         false,
         runtime_metrics_enabled,
         None,

@@ -14,16 +14,12 @@
 //! 3.  We do **not** walk past the Git root.
 
 use crate::config::Config;
-use crate::features::Feature;
 use crate::skills::SkillMetadata;
 use crate::skills::render_skills_section;
 use dunce::canonicalize as normalize_path;
 use std::path::PathBuf;
 use tokio::io::AsyncReadExt;
 use tracing::error;
-
-pub(crate) const HIERARCHICAL_AGENTS_MESSAGE: &str =
-    include_str!("../hierarchical_agents_message.md");
 
 /// Default filename scanned for project-level docs.
 pub const DEFAULT_PROJECT_DOC_FILENAME: &str = "AGENTS.md";
@@ -67,13 +63,6 @@ pub(crate) async fn get_user_instructions(
             output.push_str("\n\n");
         }
         output.push_str(&skills_section);
-    }
-
-    if config.features.enabled(Feature::ChildAgentsMd) {
-        if !output.is_empty() {
-            output.push_str("\n\n");
-        }
-        output.push_str(HIERARCHICAL_AGENTS_MESSAGE);
     }
 
     if !output.is_empty() {

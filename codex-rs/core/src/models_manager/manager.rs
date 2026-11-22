@@ -7,7 +7,6 @@ use crate::config::Config;
 use crate::default_client::build_reqwest_client;
 use crate::error::CodexErr;
 use crate::error::Result as CoreResult;
-use crate::features::Feature;
 use crate::model_provider_info::ModelProviderInfo;
 use crate::models_manager::collaboration_mode_presets::builtin_collaboration_mode_presets;
 use crate::models_manager::model_info;
@@ -144,6 +143,9 @@ impl ModelsManager {
     // todo(aibrahim): look if we can tighten it to pub(crate)
     /// Look up model metadata, applying remote overrides and config adjustments.
     pub async fn get_model_info(&self, model: &str, config: &Config) -> ModelInfo {
+        if config.model_provider_id != "openai" {
+            return Self::construct_model_info_offline(model, config);
+        }
         let remote_models = self.remote_models.read().await;
         if let Some(model_info) =
             Self::find_model_info_from_candidates(model, remote_models.as_slice(), config)
@@ -152,9 +154,7 @@ impl ModelsManager {
         }
         drop(remote_models);
 
-        if config.features.enabled(Feature::RemoteModels)
-            && let Some(model_info) = self.get_model_info_from_cache(model, config).await
-        {
+        if let Some(model_info) = self.get_model_info_from_cache(model, config).await {
             return model_info;
         }
 
@@ -229,7 +229,6 @@ impl ModelsManager {
         Self::find_model_by_longest_prefix(suffix, candidates)
     }
 
-    #[cfg(any(test, feature = "test-support"))]
     fn construct_model_info_from_candidates(
         model: &str,
         candidates: &[ModelInfo],
@@ -286,6 +285,9 @@ impl ModelsManager {
     ///
     /// Uses `Online` strategy to fetch latest models when ETags differ.
     pub(crate) async fn refresh_if_new_etag(&self, etag: String, config: &Config) {
+        if config.model_provider_id != "openai" {
+            return;
+        }
         let current_etag = self.get_etag().await;
         if current_etag.clone().is_some() && current_etag.as_deref() == Some(etag.as_str()) {
             if let Err(err) = self.cache_manager.renew_cache_ttl().await {
@@ -307,10 +309,10 @@ impl ModelsManager {
         config: &Config,
         refresh_strategy: RefreshStrategy,
     ) -> CoreResult<()> {
-        if !config.features.enabled(Feature::RemoteModels) {
+        if config.model_provider_id != "openai" {
             return Ok(());
         }
-        if self.auth_manager.auth_mode() == Some(AuthMode::ApiKey) {
+        if self.auth_manager.auth_mode() != Some(AuthMode::Chatgpt) {
             if matches!(
                 refresh_strategy,
                 RefreshStrategy::Offline | RefreshStrategy::OnlineIfUncached
@@ -449,17 +451,15 @@ impl ModelsManager {
     }
 
     #[cfg(test)]
-    async fn get_remote_models(&self, config: &Config) -> Vec<ModelInfo> {
-        if config.features.enabled(Feature::RemoteModels) {
-            self.remote_models.read().await.clone()
-        } else {
-            Vec::new()
-        }
+    async fn get_remote_models(&self) -> Vec<ModelInfo> {
+        self.remote_models.read().await.clone()
     }
 
     async fn get_remote_models_for_picker(&self, config: &Config) -> Vec<ModelInfo> {
-        if config.features.enabled(Feature::RemoteModels) || config.model_overlay.is_some() {
+        if config.model_provider_id == "openai" {
             self.remote_models.read().await.clone()
+        } else if config.model_overlay.is_some() {
+            Self::load_remote_models_from_file().unwrap_or_default()
         } else {
             Vec::new()
         }
@@ -469,8 +469,10 @@ impl ModelsManager {
         &self,
         config: &Config,
     ) -> Result<Vec<ModelInfo>, TryLockError> {
-        if config.features.enabled(Feature::RemoteModels) || config.model_overlay.is_some() {
+        if config.model_provider_id == "openai" {
             Ok(self.remote_models.try_read()?.clone())
+        } else if config.model_overlay.is_some() {
+            Ok(Self::load_remote_models_from_file().unwrap_or_default())
         } else {
             Ok(Vec::new())
         }
@@ -481,7 +483,7 @@ impl ModelsManager {
         config: &Config,
     ) -> Vec<ModelInfo> {
         match config.model_overlay.as_ref() {
-            Some(overlay) if config.features.enabled(Feature::RemoteModels) => {
+            Some(overlay) if config.model_provider_id == "openai" => {
                 overlay.apply_to_candidates(&remote_models)
             }
             Some(overlay) => overlay.apply_mentioned_to_candidates(&remote_models),
@@ -523,7 +525,6 @@ impl ModelsManager {
             .unwrap_or_default()
     }
 
-    #[cfg(any(test, feature = "test-support"))]
     /// Build `ModelInfo` without consulting remote state or cache.
     pub fn construct_model_info_offline(model: &str, config: &Config) -> ModelInfo {
         let candidates = Self::load_remote_models_from_file().unwrap_or_default();
@@ -535,10 +536,9 @@ impl ModelsManager {
 mod tests {
     use super::*;
     use crate::CodexAuth;
-    use crate::auth::AuthCredentialsStoreMode;
     use crate::config::ConfigBuilder;
     use crate::config::test_config;
-    use crate::features::Feature;
+
     use crate::model_provider_info::WireApi;
     use crate::models_manager::overlay::ModelInfoPatch;
     use crate::models_manager::overlay::ModelInstructionsVariablesPatch;
@@ -633,12 +633,11 @@ mod tests {
         .await;
 
         let codex_home = tempdir().expect("temp dir");
-        let mut config = ConfigBuilder::default()
+        let config = ConfigBuilder::default()
             .codex_home(codex_home.path().to_path_buf())
             .build()
             .await
             .expect("load default test config");
-        config.features.enable(Feature::RemoteModels);
         let auth_manager =
             AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
         let provider = provider_for(server.uri());
@@ -649,7 +648,7 @@ mod tests {
             .refresh_available_models(&config, RefreshStrategy::OnlineIfUncached)
             .await
             .expect("refresh succeeds");
-        let cached_remote = manager.get_remote_models(&config).await;
+        let cached_remote = manager.get_remote_models().await;
         assert_models_contain(&cached_remote, &remote_models);
 
         let available = manager
@@ -687,17 +686,13 @@ mod tests {
         .await;
 
         let codex_home = tempdir().expect("temp dir");
-        let mut config = ConfigBuilder::default()
+        let config = ConfigBuilder::default()
             .codex_home(codex_home.path().to_path_buf())
             .build()
             .await
             .expect("load default test config");
-        config.features.enable(Feature::RemoteModels);
-        let auth_manager = Arc::new(AuthManager::new(
-            codex_home.path().to_path_buf(),
-            false,
-            AuthCredentialsStoreMode::File,
-        ));
+        let auth_manager =
+            AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
         let provider = provider_for(server.uri());
         let manager =
             ModelsManager::with_provider(codex_home.path().to_path_buf(), auth_manager, provider);
@@ -706,14 +701,14 @@ mod tests {
             .refresh_available_models(&config, RefreshStrategy::OnlineIfUncached)
             .await
             .expect("first refresh succeeds");
-        assert_models_contain(&manager.get_remote_models(&config).await, &remote_models);
+        assert_models_contain(&manager.get_remote_models().await, &remote_models);
 
         // Second call should read from cache and avoid the network.
         manager
             .refresh_available_models(&config, RefreshStrategy::OnlineIfUncached)
             .await
             .expect("cached refresh succeeds");
-        assert_models_contain(&manager.get_remote_models(&config).await, &remote_models);
+        assert_models_contain(&manager.get_remote_models().await, &remote_models);
         assert_eq!(
             models_mock.requests().len(),
             1,
@@ -734,17 +729,13 @@ mod tests {
         .await;
 
         let codex_home = tempdir().expect("temp dir");
-        let mut config = ConfigBuilder::default()
+        let config = ConfigBuilder::default()
             .codex_home(codex_home.path().to_path_buf())
             .build()
             .await
             .expect("load default test config");
-        config.features.enable(Feature::RemoteModels);
-        let auth_manager = Arc::new(AuthManager::new(
-            codex_home.path().to_path_buf(),
-            false,
-            AuthCredentialsStoreMode::File,
-        ));
+        let auth_manager =
+            AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
         let provider = provider_for(server.uri());
         let manager =
             ModelsManager::with_provider(codex_home.path().to_path_buf(), auth_manager, provider);
@@ -777,7 +768,7 @@ mod tests {
             .refresh_available_models(&config, RefreshStrategy::OnlineIfUncached)
             .await
             .expect("second refresh succeeds");
-        assert_models_contain(&manager.get_remote_models(&config).await, &updated_models);
+        assert_models_contain(&manager.get_remote_models().await, &updated_models);
         assert_eq!(
             initial_mock.requests().len(),
             1,
@@ -799,7 +790,6 @@ mod tests {
         let manager =
             ModelsManager::with_provider(codex_home.path().to_path_buf(), auth_manager, provider);
         let mut config = test_config();
-        config.features.enable(Feature::RemoteModels);
         config.model_overlay = Some(ModelOverlay {
             cross_model: ModelInfoPatch {
                 effective_context_window_percent: Some(98),
@@ -850,17 +840,13 @@ mod tests {
         .await;
 
         let codex_home = tempdir().expect("temp dir");
-        let mut config = ConfigBuilder::default()
+        let config = ConfigBuilder::default()
             .codex_home(codex_home.path().to_path_buf())
             .build()
             .await
             .expect("load default test config");
-        config.features.enable(Feature::RemoteModels);
-        let auth_manager = Arc::new(AuthManager::new(
-            codex_home.path().to_path_buf(),
-            false,
-            AuthCredentialsStoreMode::File,
-        ));
+        let auth_manager =
+            AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
         let provider = provider_for(server.uri());
         let manager =
             ModelsManager::with_provider(codex_home.path().to_path_buf(), auth_manager, provider);
@@ -893,7 +879,7 @@ mod tests {
             .refresh_available_models(&config, RefreshStrategy::OnlineIfUncached)
             .await
             .expect("second refresh succeeds");
-        assert_models_contain(&manager.get_remote_models(&config).await, &updated_models);
+        assert_models_contain(&manager.get_remote_models().await, &updated_models);
         assert_eq!(
             initial_mock.requests().len(),
             1,
@@ -919,12 +905,11 @@ mod tests {
         .await;
 
         let codex_home = tempdir().expect("temp dir");
-        let mut config = ConfigBuilder::default()
+        let config = ConfigBuilder::default()
             .codex_home(codex_home.path().to_path_buf())
             .build()
             .await
             .expect("load default test config");
-        config.features.enable(Feature::RemoteModels);
         let auth_manager =
             AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
         let provider = provider_for(server.uri());
@@ -1075,6 +1060,27 @@ mod tests {
     }
 
     #[test]
+    fn legacy_patch_override_only_supplies_a_missing_model_format() {
+        use codex_protocol::openai_models::ApplyPatchToolType::Freeform;
+        use codex_protocol::openai_models::ApplyPatchToolType::Function;
+        let mut config = test_config();
+        for (legacy, declared, expected) in [
+            (false, None, None),
+            (true, None, Some(Freeform)),
+            (true, Some(Function), Some(Function)),
+            (false, Some(Freeform), Some(Freeform)),
+        ] {
+            config.include_apply_patch_tool = legacy;
+            let mut model = model_info::model_info_from_slug("custom-model");
+            model.apply_patch_tool_type = declared;
+            assert_eq!(
+                model_info::with_config_overrides(model, &config).apply_patch_tool_type,
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn config_context_window_override_wins_over_overlay() {
         let mut config = test_config();
         config.model_context_window = Some(256_000);
@@ -1165,7 +1171,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn overlay_custom_model_can_be_listed_when_remote_models_disabled() {
+    async fn overlay_custom_model_can_be_listed_for_another_provider() {
         let codex_home = tempdir().expect("temp dir");
         let auth_manager =
             AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
@@ -1173,7 +1179,7 @@ mod tests {
         let manager =
             ModelsManager::with_provider(codex_home.path().to_path_buf(), auth_manager, provider);
         let mut config = test_config();
-        config.features.disable(Feature::RemoteModels);
+        config.model_provider_id = "private".into();
         config.model_overlay = Some(ModelOverlay {
             models: vec![ModelOverlayEntry {
                 slug: "private-model".to_string(),
@@ -1217,7 +1223,6 @@ mod tests {
             .build()
             .await
             .expect("load default test config");
-        config.features.enable(Feature::RemoteModels);
         config.model_overlay = Some(ModelOverlay {
             models: vec![ModelOverlayEntry {
                 slug: "private-model".to_string(),

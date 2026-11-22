@@ -11,7 +11,7 @@ Read this when changing composer submission, pending input, user-message acknowl
 |Ordinary queue|TUI retains editable/reorderable entries for later turns, including action kind, attachments, mentions, and supported per-message settings.|
 |Rejected steer|TUI retains it for recovery; rejected steers are merged into one next-turn submission before ordinary queue entries.|
 
-`features.steer` controls whether Enter steers running work or queues it, and defaults to enabled. Explicit queue actions retain their intent. Input is queued while a plan item is streaming, only user-shell commands are running, or a submitted turn has not started yet. Queue draining is also blocked by queue editing, modal/popup state, and lifecycle auto-send suppression.
+Enter steers a running regular turn; Tab explicitly queues a draft for a later turn. Neither requires a feature switch. Input is queued while a plan item is streaming, only user-shell commands are running, or a submitted turn has not started yet. Queue draining is also blocked by queue editing, modal/popup state, and lifecycle auto-send suppression.
 
 ## Core contract
 

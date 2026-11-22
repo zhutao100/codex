@@ -2,7 +2,6 @@
 
 use std::collections::HashMap;
 
-use codex_core::features::Feature;
 use codex_core::protocol::AskForApproval;
 use codex_core::protocol::EventMsg;
 use codex_core::protocol::Op;
@@ -85,12 +84,7 @@ async fn request_user_input_round_trip_for_mode(mode: ModeKind) -> anyhow::Resul
         cwd,
         session_configured,
         ..
-    } = builder
-        .with_config(|config| {
-            config.features.enable(Feature::CollaborationModes);
-        })
-        .build(&server)
-        .await?;
+    } = builder.with_config(|_config| {}).build(&server).await?;
 
     let call_id = "user-input-call";
     let request_args = json!({
@@ -205,12 +199,7 @@ where
         cwd,
         session_configured,
         ..
-    } = builder
-        .with_config(|config| {
-            config.features.enable(Feature::CollaborationModes);
-        })
-        .build(&server)
-        .await?;
+    } = builder.with_config(|_config| {}).build(&server).await?;
 
     let mode_slug = mode_name.to_lowercase().replace(' ', "-");
     let call_id = format!("user-input-{mode_slug}-call");

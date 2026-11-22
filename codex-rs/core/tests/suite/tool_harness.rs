@@ -3,7 +3,6 @@
 use std::fs;
 
 use assert_matches::assert_matches;
-use codex_core::features::Feature;
 use codex_core::protocol::AskForApproval;
 use codex_core::protocol::EventMsg;
 use codex_core::protocol::Op;
@@ -284,9 +283,7 @@ async fn apply_patch_tool_executes_and_emits_patch_events() -> anyhow::Result<()
 
     let server = start_mock_server().await;
 
-    let mut builder = test_codex().with_config(|config| {
-        config.features.enable(Feature::ApplyPatchFreeform);
-    });
+    let mut builder = test_codex().with_config(|_config| {});
     let TestCodex {
         codex,
         cwd,
@@ -389,9 +386,7 @@ async fn apply_patch_reports_parse_diagnostics() -> anyhow::Result<()> {
 
     let server = start_mock_server().await;
 
-    let mut builder = test_codex().with_config(|config| {
-        config.features.enable(Feature::ApplyPatchFreeform);
-    });
+    let mut builder = test_codex().with_config(|_config| {});
     let TestCodex {
         codex,
         cwd,

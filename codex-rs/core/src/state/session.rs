@@ -42,7 +42,6 @@ pub(crate) struct SessionState {
     pub(crate) latest_rate_limits: Option<RateLimitSnapshot>,
     /// Whether the stored usage baseline already includes earlier reasoning.
     pub(crate) server_reasoning_included: bool,
-    pub(crate) dependency_env: HashMap<String, String>,
     pub(crate) mcp_dependency_prompted: HashSet<String>,
     /// Whether the session's initial context has been seeded into history.
     ///
@@ -70,7 +69,6 @@ impl SessionState {
             history,
             latest_rate_limits: None,
             server_reasoning_included: false,
-            dependency_env: HashMap::new(),
             mcp_dependency_prompted: HashSet::new(),
             initial_context_seeded: false,
             previous_turn_settings: None,
@@ -153,16 +151,6 @@ impl SessionState {
 
     pub(crate) fn mcp_dependency_prompted(&self) -> HashSet<String> {
         self.mcp_dependency_prompted.clone()
-    }
-
-    pub(crate) fn set_dependency_env(&mut self, values: HashMap<String, String>) {
-        for (key, value) in values {
-            self.dependency_env.insert(key, value);
-        }
-    }
-
-    pub(crate) fn dependency_env(&self) -> HashMap<String, String> {
-        self.dependency_env.clone()
     }
 
     pub(crate) fn auto_rename_attempted(&self) -> bool {

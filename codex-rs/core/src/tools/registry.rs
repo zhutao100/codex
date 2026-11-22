@@ -8,7 +8,6 @@ use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
 use codex_protocol::models::ResponseInputItem;
-use codex_utils_readiness::Readiness;
 use futures::future::BoxFuture;
 use tracing::warn;
 
@@ -29,17 +28,6 @@ pub trait ToolHandler: Send + Sync {
         )
     }
 
-    /// Returns `true` if the [ToolInvocation] *might* mutate the environment of the
-    /// user (through file system, OS operations, ...).
-    /// This function must remains defensive and return `true` if a doubt exist on the
-    /// exact effect of a ToolInvocation.
-    fn is_mutating(
-        &self,
-        _invocation: &ToolInvocation,
-    ) -> impl std::future::Future<Output = bool> + Send {
-        async { false }
-    }
-
     /// Perform the actual [ToolInvocation] and returns a [ToolOutput] containing
     /// the final output to return to the model.
     fn handle(
@@ -50,8 +38,6 @@ pub trait ToolHandler: Send + Sync {
 
 trait AnyToolHandler: Send + Sync {
     fn matches_kind(&self, payload: &ToolPayload) -> bool;
-
-    fn is_mutating<'a>(&'a self, invocation: &'a ToolInvocation) -> BoxFuture<'a, bool>;
 
     fn handle_any<'a>(
         &'a self,
@@ -65,10 +51,6 @@ where
 {
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
         ToolHandler::matches_kind(self, payload)
-    }
-
-    fn is_mutating<'a>(&'a self, invocation: &'a ToolInvocation) -> BoxFuture<'a, bool> {
-        Box::pin(ToolHandler::is_mutating(self, invocation))
     }
 
     fn handle_any<'a>(
@@ -90,6 +72,11 @@ impl ToolRegistry {
 
     fn handler(&self, name: &str) -> Option<Arc<dyn AnyToolHandler>> {
         self.handlers.get(name).map(Arc::clone)
+    }
+
+    #[cfg(test)]
+    pub(super) fn has_handler(&self, name: &str) -> bool {
+        self.handlers.contains_key(name)
     }
 
     // TODO(jif) for dynamic tools.
@@ -169,11 +156,6 @@ impl ToolRegistry {
                     let output_cell = &output_cell;
                     let invocation = invocation;
                     async move {
-                        if handler.is_mutating(&invocation).await {
-                            tracing::trace!("waiting for tool gate");
-                            invocation.turn.tool_call_gate.wait_ready().await;
-                            tracing::trace!("tool gate released");
-                        }
                         let explorer = invocation
                             .turn
                             .config

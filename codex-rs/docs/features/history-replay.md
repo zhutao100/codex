@@ -20,7 +20,7 @@ Do not substitute one representation for another. `record_conversation_items` ad
 - Contextual user/developer messages, including preserved work notes, are excluded by the shared `is_user_turn_boundary` predicate. Use that predicate for rollback, continuation, and replay instead of checking only `role == "user"`.
 - Ordinary sampling appends completed response/tool items and accepted steering. Each request is rebuilt from current history, then projected; it is not reconstructed from TUI display text.
 - Prompt projection supplies missing tool outputs as `aborted`, removes orphan outputs, replaces unsupported images with placeholders, and excludes ghost snapshots. These changes normally affect a clone, not stored history.
-- Local compaction intentionally summarizes detailed assistant/reasoning/tool history. Remote compaction installs a returned replacement. Both preserve required work notes and snapshots and persist exact `replacement_history` for new compactions.
+- Local compaction intentionally summarizes detailed assistant/reasoning/tool history. Remote compaction installs a returned replacement. Both preserve required work notes and persist exact `replacement_history` for new compactions. Older rollouts can contain host-only ghost snapshots; new turns do not create them.
 - Compaction can clear the reference-context baseline while retaining previous-turn settings. Re-inject canonical context at the documented replacement boundary, without rewriting older context messages merely to reflect new settings.
 
 ## Replay metadata and compaction epochs

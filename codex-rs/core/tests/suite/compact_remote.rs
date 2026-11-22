@@ -4,7 +4,6 @@ use std::fs;
 
 use anyhow::Result;
 use codex_core::CodexAuth;
-use codex_core::features::Feature;
 use codex_core::protocol::EventMsg;
 use codex_core::protocol::ItemCompletedEvent;
 use codex_core::protocol::ItemStartedEvent;
@@ -48,8 +47,7 @@ async fn remote_compact_replaces_history_for_followups() -> Result<()> {
         test_codex()
             .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
             .with_config(|config| {
-                config.features.enable(Feature::RemoteCompaction);
-                config.features.disable(Feature::RemoteCompactionV2);
+                config.compaction_mode = codex_core::config::types::CompactionMode::Unary;
             }),
     )
     .await?;
@@ -177,8 +175,7 @@ async fn remote_compact_runs_automatically() -> Result<()> {
         test_codex()
             .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
             .with_config(|config| {
-                config.features.enable(Feature::RemoteCompaction);
-                config.features.disable(Feature::RemoteCompactionV2);
+                config.compaction_mode = codex_core::config::types::CompactionMode::Unary;
             }),
     )
     .await?;
@@ -281,8 +278,7 @@ async fn remote_compact_trims_function_call_history_to_fit_context_window() -> R
         test_codex()
             .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
             .with_config(|config| {
-                config.features.enable(Feature::RemoteCompaction);
-                config.features.disable(Feature::RemoteCompactionV2);
+                config.compaction_mode = codex_core::config::types::CompactionMode::Unary;
                 config.model_context_window = Some(2_000);
                 // Exercise manual output trimming, not automatic compaction
                 // of the fixture's intentionally unreported history.
@@ -417,8 +413,7 @@ async fn remote_compact_trim_estimate_uses_session_base_instructions() -> Result
         test_codex()
             .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
             .with_config(|config| {
-                config.features.enable(Feature::RemoteCompaction);
-                config.features.disable(Feature::RemoteCompactionV2);
+                config.compaction_mode = codex_core::config::types::CompactionMode::Unary;
                 config.model_context_window = Some(200_000);
             }),
     )
@@ -516,8 +511,7 @@ async fn remote_compact_trim_estimate_uses_session_base_instructions() -> Result
             .with_config({
                 let override_base_instructions = override_base_instructions.clone();
                 move |config| {
-                    config.features.enable(Feature::RemoteCompaction);
-                    config.features.disable(Feature::RemoteCompactionV2);
+                    config.compaction_mode = codex_core::config::types::CompactionMode::Unary;
                     config.model_context_window = Some(override_context_window);
                     config.base_instructions = Some(override_base_instructions);
                 }
@@ -619,8 +613,7 @@ async fn remote_manual_compact_emits_context_compaction_items() -> Result<()> {
         test_codex()
             .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
             .with_config(|config| {
-                config.features.enable(Feature::RemoteCompaction);
-                config.features.disable(Feature::RemoteCompactionV2);
+                config.compaction_mode = codex_core::config::types::CompactionMode::Unary;
             }),
     )
     .await?;
@@ -718,8 +711,7 @@ async fn remote_compact_persists_replacement_history_in_rollout() -> Result<()> 
         test_codex()
             .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
             .with_config(|config| {
-                config.features.enable(Feature::RemoteCompaction);
-                config.features.disable(Feature::RemoteCompactionV2);
+                config.compaction_mode = codex_core::config::types::CompactionMode::Unary;
             }),
     )
     .await?;

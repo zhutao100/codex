@@ -1,5 +1,4 @@
 use crate::config::Config;
-use crate::features::Feature;
 use crate::rollout::list::Cursor;
 use crate::rollout::list::ThreadSortKey;
 use crate::rollout::metadata;
@@ -26,15 +25,12 @@ use uuid::Uuid;
 /// Core-facing handle to the optional SQLite-backed state runtime.
 pub type StateDbHandle = Arc<codex_state::StateRuntime>;
 
-/// Initialize the state runtime when the `sqlite` feature flag is enabled. To only be used
-/// inside `core`. The initialization should not be done anywhere else.
-pub(crate) async fn init_if_enabled(
+/// Initialize the metadata index for a persistent recorder. JSONL remains authoritative
+/// if the database cannot open or its backfill has not completed.
+pub(crate) async fn init_for_rollout(
     config: &Config,
     otel: Option<&OtelManager>,
 ) -> Option<StateDbHandle> {
-    if !config.features.enabled(Feature::Sqlite) {
-        return None;
-    }
     let runtime = match codex_state::StateRuntime::init(
         config.codex_home.clone(),
         config.model_provider_id.clone(),
@@ -70,28 +66,24 @@ pub(crate) async fn init_if_enabled(
     require_backfill_complete(runtime, config.codex_home.as_path()).await
 }
 
-/// Get the DB if the feature is enabled and the DB exists.
+/// Open an existing complete index without creating one for ephemeral sessions.
 pub async fn get_state_db(config: &Config, otel: Option<&OtelManager>) -> Option<StateDbHandle> {
-    let state_path = codex_state::state_db_path(config.codex_home.as_path());
-    if !config.features.enabled(Feature::Sqlite)
-        || !tokio::fs::try_exists(&state_path).await.unwrap_or(false)
-    {
+    if config.ephemeral {
         return None;
     }
-    let runtime = codex_state::StateRuntime::init(
-        config.codex_home.clone(),
-        config.model_provider_id.clone(),
-        otel.cloned(),
-    )
-    .await
-    .ok()?;
-    require_backfill_complete(runtime, config.codex_home.as_path()).await
+    open_existing(&config.codex_home, &config.model_provider_id, otel).await
 }
 
-/// Open the state runtime when the SQLite file exists, without feature gating.
-///
-/// This is used for parity checks during the SQLite migration phase.
+/// Open the index only if the file and a complete backfill already exist.
 pub async fn open_if_present(codex_home: &Path, default_provider: &str) -> Option<StateDbHandle> {
+    open_existing(codex_home, default_provider, None).await
+}
+
+async fn open_existing(
+    codex_home: &Path,
+    default_provider: &str,
+    otel: Option<&OtelManager>,
+) -> Option<StateDbHandle> {
     let db_path = codex_state::state_db_path(codex_home);
     if !tokio::fs::try_exists(&db_path).await.unwrap_or(false) {
         return None;
@@ -99,7 +91,7 @@ pub async fn open_if_present(codex_home: &Path, default_provider: &str) -> Optio
     let runtime = codex_state::StateRuntime::init(
         codex_home.to_path_buf(),
         default_provider.to_string(),
-        None,
+        otel.cloned(),
     )
     .await
     .ok()?;
@@ -148,60 +140,6 @@ fn cursor_to_anchor(cursor: Option<&Cursor>) -> Option<codex_state::Anchor> {
     }
     .with_nanosecond(0)?;
     Some(codex_state::Anchor { ts, id })
-}
-
-/// List thread ids from SQLite for parity checks without rollout scanning.
-#[allow(clippy::too_many_arguments)]
-pub async fn list_thread_ids_db(
-    context: Option<&codex_state::StateRuntime>,
-    codex_home: &Path,
-    page_size: usize,
-    cursor: Option<&Cursor>,
-    sort_key: ThreadSortKey,
-    allowed_sources: &[SessionSource],
-    model_providers: Option<&[String]>,
-    archived_only: bool,
-    stage: &str,
-) -> Option<Vec<ThreadId>> {
-    let ctx = context?;
-    if ctx.codex_home() != codex_home {
-        warn!(
-            "state db codex_home mismatch: expected {}, got {}",
-            ctx.codex_home().display(),
-            codex_home.display()
-        );
-    }
-
-    let anchor = cursor_to_anchor(cursor);
-    let allowed_sources: Vec<String> = allowed_sources
-        .iter()
-        .map(|value| match serde_json::to_value(value) {
-            Ok(Value::String(s)) => s,
-            Ok(other) => other.to_string(),
-            Err(_) => String::new(),
-        })
-        .collect();
-    let model_providers = model_providers.map(<[String]>::to_vec);
-    match ctx
-        .list_thread_ids(
-            page_size,
-            anchor.as_ref(),
-            match sort_key {
-                ThreadSortKey::CreatedAt => codex_state::SortKey::CreatedAt,
-                ThreadSortKey::UpdatedAt => codex_state::SortKey::UpdatedAt,
-            },
-            allowed_sources.as_slice(),
-            model_providers.as_deref(),
-            archived_only,
-        )
-        .await
-    {
-        Ok(ids) => Some(ids),
-        Err(err) => {
-            warn!("state db list_thread_ids failed during {stage}: {err}");
-            None
-        }
-    }
 }
 
 /// List thread metadata from SQLite without rollout directory traversal.

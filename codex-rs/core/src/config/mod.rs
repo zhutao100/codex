@@ -99,8 +99,6 @@ pub use constraint::ConstraintResult;
 pub use service::ConfigService;
 pub use service::ConfigServiceError;
 
-pub use codex_git::GhostSnapshotConfig;
-
 /// Maximum number of bytes of the documentation that will be embedded. Larger
 /// files are *silently truncated* to this size so we do not take up too much of
 /// the context window.
@@ -381,6 +379,9 @@ pub struct Config {
 
     /// Optional verbosity control for GPT-5 models (Responses API `text.verbosity`).
     pub model_verbosity: Option<Verbosity>,
+    pub responses_transport: types::ResponsesTransport,
+    pub compaction_mode: types::CompactionMode,
+    pub windows_sandbox_level: WindowsSandboxLevel,
 
     /// Base URL for requests to ChatGPT (as opposed to the OpenAI API).
     pub chatgpt_base_url: String,
@@ -401,9 +402,6 @@ pub struct Config {
 
     /// If set to `true`, used only the experimental unified exec tool.
     pub use_experimental_unified_exec_tool: bool,
-
-    /// Settings for ghost snapshots (used for undo).
-    pub ghost_snapshot: GhostSnapshotConfig,
 
     /// Centralized feature flags; source of truth for feature gating.
     pub features: Features,
@@ -604,14 +602,29 @@ impl Config {
     }
 
     pub fn apply_review_model_overrides(&mut self) -> Result<(), CodexErr> {
+        let parent_model = self.model.clone();
+        let parent_provider = self.model_provider_id.clone();
         if let Some(review_model) = self.review_model.clone() {
             self.model = Some(review_model);
         }
         if let Some(provider_id) = self.review_model_provider.clone() {
             self.apply_model_provider_id(&provider_id)?;
-            self.features.disable(Feature::RemoteModels);
         }
+        self.resolve_child_model_limits(parent_model.as_deref(), &parent_provider);
         Ok(())
+    }
+
+    /// Parent context overrides describe a particular model at a particular provider.
+    /// Leave limits unset for a different child so its own catalog entry supplies them.
+    pub(crate) fn resolve_child_model_limits(
+        &mut self,
+        parent_model: Option<&str>,
+        parent_provider: &str,
+    ) {
+        if self.model.as_deref() != parent_model || self.model_provider_id != parent_provider {
+            self.model_context_window = None;
+            self.model_auto_compact_token_limit = None;
+        }
     }
 
     /// This is the preferred way to create an instance of [Config].
@@ -1135,6 +1148,9 @@ pub struct ConfigToml {
     pub model_reasoning_summary: Option<ReasoningSummary>,
     /// Optional verbosity control for GPT-5 models (Responses API `text.verbosity`).
     pub model_verbosity: Option<Verbosity>,
+    pub responses_transport: Option<types::ResponsesTransport>,
+    pub compaction_mode: Option<types::CompactionMode>,
+    pub windows: Option<types::WindowsConfig>,
 
     /// Override to force-enable reasoning summaries for the configured model.
     pub model_supports_reasoning_summaries: Option<bool>,
@@ -1167,10 +1183,6 @@ pub struct ConfigToml {
 
     /// Suppress warnings about unstable (under development) features.
     pub suppress_unstable_features_warning: Option<bool>,
-
-    /// Settings for ghost snapshots (used for undo).
-    #[serde(default)]
-    pub ghost_snapshot: Option<GhostSnapshotToml>,
 
     /// Markers used to detect the project root when searching parent
     /// directories for `.codex` folders. Defaults to [".git"] when unset.
@@ -1211,7 +1223,6 @@ pub struct ConfigToml {
     pub experimental_instructions_file: Option<AbsolutePathBuf>,
     pub experimental_compact_prompt_file: Option<AbsolutePathBuf>,
     pub experimental_use_unified_exec_tool: Option<bool>,
-    pub experimental_use_freeform_apply_patch: Option<bool>,
     /// Preferred OSS provider for local models, e.g. "lmstudio" or "ollama".
     pub oss_provider: Option<String>,
 }
@@ -1271,6 +1282,8 @@ pub struct ToolsToml {
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct AgentsToml {
+    /// Enable subagent tools. Role, depth, and managed restrictions still apply.
+    pub enabled: Option<bool>,
     /// Maximum number of agent threads that can be open concurrently.
     /// When unset, no limit is enforced.
     #[schemars(range(min = 1))]
@@ -1284,20 +1297,6 @@ impl From<ToolsToml> for Tools {
             view_image: tools_toml.view_image,
         }
     }
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
-#[schemars(deny_unknown_fields)]
-pub struct GhostSnapshotToml {
-    /// Exclude untracked files larger than this many bytes from ghost snapshots.
-    #[serde(alias = "ignore_untracked_files_over_bytes")]
-    pub ignore_large_untracked_files: Option<i64>,
-    /// Ignore untracked directories that contain this many files or more.
-    /// (Still emits a warning unless warnings are disabled.)
-    #[serde(alias = "large_untracked_dir_warning_threshold")]
-    pub ignore_large_untracked_dirs: Option<i64>,
-    /// Disable all ghost snapshot warning events.
-    pub disable_warnings: Option<bool>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1579,11 +1578,42 @@ impl Config {
         };
 
         let feature_overrides = FeatureOverrides {
-            include_apply_patch_tool: include_apply_patch_tool_override,
             web_search_request: override_tools_web_search_request,
         };
 
         let features = Features::from_config(&cfg, &config_profile, feature_overrides);
+        let legacy = |key: &str| {
+            [&config_profile.features, &cfg.features]
+                .into_iter()
+                .flatten()
+                .find_map(|features| features.entries.get(key).copied())
+        };
+        let responses_transport = config_profile
+            .responses_transport
+            .or(cfg.responses_transport)
+            .unwrap_or_else(|| {
+                match (
+                    legacy("responses_websockets"),
+                    legacy("responses_websockets_v2"),
+                ) {
+                    (None, None) | (Some(true), _) | (_, Some(true)) => {
+                        types::ResponsesTransport::Auto
+                    }
+                    _ => types::ResponsesTransport::Http,
+                }
+            });
+        let compaction_mode = config_profile
+            .compaction_mode
+            .or(cfg.compaction_mode)
+            .unwrap_or_else(|| {
+                if legacy("remote_compaction") == Some(false) {
+                    types::CompactionMode::Local
+                } else if legacy("remote_compaction_v2") == Some(false) {
+                    types::CompactionMode::Unary
+                } else {
+                    types::CompactionMode::Auto
+                }
+            });
         let resolved_cwd = {
             use std::env;
 
@@ -1613,7 +1643,11 @@ impl Config {
             || config_profile.sandbox_mode.is_some()
             || cfg.sandbox_mode.is_some();
 
-        let windows_sandbox_level = WindowsSandboxLevel::from_features(&features);
+        let windows_sandbox_level = config_profile
+            .windows
+            .and_then(|windows| windows.sandbox)
+            .or_else(|| cfg.windows.and_then(|windows| windows.sandbox))
+            .unwrap_or_else(|| WindowsSandboxLevel::from_features(&features));
         let SandboxPolicyResolution {
             policy: mut sandbox_policy,
             forced_auto_mode_downgraded_on_windows,
@@ -1705,32 +1739,6 @@ impl Config {
             ));
         }
 
-        let ghost_snapshot = {
-            let mut config = GhostSnapshotConfig::default();
-            if let Some(ghost_snapshot) = cfg.ghost_snapshot.as_ref()
-                && let Some(ignore_over_bytes) = ghost_snapshot.ignore_large_untracked_files
-            {
-                config.ignore_large_untracked_files = if ignore_over_bytes > 0 {
-                    Some(ignore_over_bytes)
-                } else {
-                    None
-                };
-            }
-            if let Some(ghost_snapshot) = cfg.ghost_snapshot.as_ref()
-                && let Some(threshold) = ghost_snapshot.ignore_large_untracked_dirs
-            {
-                config.ignore_large_untracked_dirs =
-                    if threshold > 0 { Some(threshold) } else { None };
-            }
-            if let Some(ghost_snapshot) = cfg.ghost_snapshot.as_ref()
-                && let Some(disable_warnings) = ghost_snapshot.disable_warnings
-            {
-                config.disable_warnings = disable_warnings;
-            }
-            config
-        };
-
-        let include_apply_patch_tool_flag = features.enabled(Feature::ApplyPatchFreeform);
         let use_experimental_unified_exec_tool = features.enabled(Feature::UnifiedExec);
 
         let forced_chatgpt_workspace_id =
@@ -1769,12 +1777,7 @@ impl Config {
         let developer_instructions = developer_instructions.or(cfg.developer_instructions);
         let personality = personality
             .or(config_profile.personality)
-            .or(cfg.personality)
-            .or_else(|| {
-                features
-                    .enabled(Feature::Personality)
-                    .then_some(Personality::Pragmatic)
-            });
+            .or(cfg.personality);
 
         let experimental_compact_prompt_path = config_profile
             .experimental_compact_prompt_file
@@ -1869,6 +1872,7 @@ impl Config {
             did_user_set_custom_approval_policy_or_sandbox_mode,
             forced_auto_mode_downgraded_on_windows,
             shell_environment_policy,
+            windows_sandbox_level,
             notify: cfg.notify,
             user_instructions,
             host_agents_filename,
@@ -1927,16 +1931,17 @@ impl Config {
                 .unwrap_or_default(),
             model_supports_reasoning_summaries: cfg.model_supports_reasoning_summaries,
             model_verbosity: config_profile.model_verbosity.or(cfg.model_verbosity),
+            responses_transport,
+            compaction_mode,
             chatgpt_base_url: config_profile
                 .chatgpt_base_url
                 .or(cfg.chatgpt_base_url)
                 .unwrap_or("https://chatgpt.com/backend-api/".to_string()),
             forced_chatgpt_workspace_id,
             forced_login_method,
-            include_apply_patch_tool: include_apply_patch_tool_flag,
+            include_apply_patch_tool: include_apply_patch_tool_override.unwrap_or(false),
             web_search_mode,
             use_experimental_unified_exec_tool,
-            ghost_snapshot,
             features,
             suppress_unstable_features_warning: cfg
                 .suppress_unstable_features_warning
@@ -2146,21 +2151,10 @@ impl Config {
         }
     }
 
-    pub fn set_windows_sandbox_enabled(&mut self, value: bool) {
-        if value {
-            self.features.enable(Feature::WindowsSandbox);
+    pub fn set_windows_sandbox_level(&mut self, level: WindowsSandboxLevel) {
+        self.windows_sandbox_level = level;
+        if level != WindowsSandboxLevel::Disabled {
             self.forced_auto_mode_downgraded_on_windows = false;
-        } else {
-            self.features.disable(Feature::WindowsSandbox);
-        }
-    }
-
-    pub fn set_windows_elevated_sandbox_enabled(&mut self, value: bool) {
-        if value {
-            self.features.enable(Feature::WindowsSandboxElevated);
-            self.forced_auto_mode_downgraded_on_windows = false;
-        } else {
-            self.features.disable(Feature::WindowsSandboxElevated);
         }
     }
 }
@@ -3114,24 +3108,51 @@ profile = "project"
     }
 
     #[test]
-    fn feature_table_overrides_legacy_flags() -> std::io::Result<()> {
-        let codex_home = TempDir::new()?;
-        let mut entries = BTreeMap::new();
-        entries.insert("apply_patch_freeform".to_string(), false);
-        let cfg = ConfigToml {
-            features: Some(crate::features::FeaturesToml { entries }),
-            ..Default::default()
+    fn canonical_controls_override_legacy_routes_without_losing_an_explicit_opt_out()
+    -> std::io::Result<()> {
+        use types::CompactionMode;
+        use types::ResponsesTransport;
+        let home = TempDir::new()?;
+        let load = |toml: &str| {
+            Config::load_from_base_config_with_overrides(
+                toml::from_str(toml).map_err(std::io::Error::other)?,
+                ConfigOverrides::default(),
+                home.path().to_owned(),
+            )
         };
-
-        let config = Config::load_from_base_config_with_overrides(
-            cfg,
-            ConfigOverrides::default(),
-            codex_home.path().to_path_buf(),
-        )?;
-
-        assert!(!config.features.enabled(Feature::ApplyPatchFreeform));
-        assert!(!config.include_apply_patch_tool);
-
+        let legacy = "[features]\nremote_compaction = false\nremote_compaction_v2 = false\nresponses_websockets = false\ncollab = true\nelevated_windows_sandbox = true\n";
+        let config = load(legacy)?;
+        assert_eq!(
+            (
+                config.compaction_mode,
+                config.responses_transport,
+                config.features.enabled(Feature::Collab),
+                config.windows_sandbox_level
+            ),
+            (
+                CompactionMode::Local,
+                ResponsesTransport::Http,
+                true,
+                WindowsSandboxLevel::Elevated
+            )
+        );
+        let config = load(&format!(
+            "compaction_mode = 'unary'\nresponses_transport = 'auto'\n[windows]\nsandbox = 'restricted-token'\n[agents]\nenabled = false\n{legacy}"
+        ))?;
+        assert_eq!(
+            (
+                config.compaction_mode,
+                config.responses_transport,
+                config.features.enabled(Feature::Collab),
+                config.windows_sandbox_level
+            ),
+            (
+                CompactionMode::Unary,
+                ResponsesTransport::Auto,
+                false,
+                WindowsSandboxLevel::RestrictedToken
+            )
+        );
         Ok(())
     }
 
@@ -3140,7 +3161,6 @@ profile = "project"
         let codex_home = TempDir::new()?;
         let cfg = ConfigToml {
             experimental_use_unified_exec_tool: Some(true),
-            experimental_use_freeform_apply_patch: Some(true),
             ..Default::default()
         };
 
@@ -3150,38 +3170,9 @@ profile = "project"
             codex_home.path().to_path_buf(),
         )?;
 
-        assert!(config.features.enabled(Feature::ApplyPatchFreeform));
         assert!(config.features.enabled(Feature::UnifiedExec));
 
-        assert!(config.include_apply_patch_tool);
-
         assert!(config.use_experimental_unified_exec_tool);
-
-        Ok(())
-    }
-
-    #[test]
-    fn responses_websockets_feature_does_not_change_wire_api() -> std::io::Result<()> {
-        for feature_key in ["responses_websockets", "responses_websockets_v2"] {
-            let codex_home = TempDir::new()?;
-            let mut entries = BTreeMap::new();
-            entries.insert(feature_key.to_string(), true);
-            let cfg = ConfigToml {
-                features: Some(crate::features::FeaturesToml { entries }),
-                ..Default::default()
-            };
-
-            let config = Config::load_from_base_config_with_overrides(
-                cfg,
-                ConfigOverrides::default(),
-                codex_home.path().to_path_buf(),
-            )?;
-
-            assert_eq!(
-                config.model_provider.wire_api,
-                crate::model_provider_info::WireApi::Responses
-            );
-        }
 
         Ok(())
     }
@@ -4808,7 +4799,10 @@ model_verbosity = "high"
                 model_reasoning_summary: ReasoningSummary::Detailed,
                 model_supports_reasoning_summaries: None,
                 model_verbosity: None,
-                personality: Some(Personality::Pragmatic),
+                responses_transport: Default::default(),
+                compaction_mode: Default::default(),
+                windows_sandbox_level: WindowsSandboxLevel::Disabled,
+                personality: None,
                 chatgpt_base_url: "https://chatgpt.com/backend-api/".to_string(),
                 base_instructions: None,
                 review_prompt: None,
@@ -4820,7 +4814,6 @@ model_verbosity = "high"
                 include_apply_patch_tool: false,
                 web_search_mode: None,
                 use_experimental_unified_exec_tool: !cfg!(windows),
-                ghost_snapshot: GhostSnapshotConfig::default(),
                 features: Features::with_defaults(),
                 suppress_unstable_features_warning: false,
                 active_profile: Some("o3".to_string()),
@@ -4914,7 +4907,10 @@ model_verbosity = "high"
             model_reasoning_summary: ReasoningSummary::default(),
             model_supports_reasoning_summaries: None,
             model_verbosity: None,
-            personality: Some(Personality::Pragmatic),
+            responses_transport: Default::default(),
+            compaction_mode: Default::default(),
+            windows_sandbox_level: WindowsSandboxLevel::Disabled,
+            personality: None,
             chatgpt_base_url: "https://chatgpt.com/backend-api/".to_string(),
             base_instructions: None,
             review_prompt: None,
@@ -4926,7 +4922,6 @@ model_verbosity = "high"
             include_apply_patch_tool: false,
             web_search_mode: None,
             use_experimental_unified_exec_tool: !cfg!(windows),
-            ghost_snapshot: GhostSnapshotConfig::default(),
             features: Features::with_defaults(),
             suppress_unstable_features_warning: false,
             active_profile: Some("gpt3".to_string()),
@@ -5035,7 +5030,10 @@ model_verbosity = "high"
             model_reasoning_summary: ReasoningSummary::default(),
             model_supports_reasoning_summaries: None,
             model_verbosity: None,
-            personality: Some(Personality::Pragmatic),
+            responses_transport: Default::default(),
+            compaction_mode: Default::default(),
+            windows_sandbox_level: WindowsSandboxLevel::Disabled,
+            personality: None,
             chatgpt_base_url: "https://chatgpt.com/backend-api/".to_string(),
             base_instructions: None,
             review_prompt: None,
@@ -5047,7 +5045,6 @@ model_verbosity = "high"
             include_apply_patch_tool: false,
             web_search_mode: None,
             use_experimental_unified_exec_tool: !cfg!(windows),
-            ghost_snapshot: GhostSnapshotConfig::default(),
             features: Features::with_defaults(),
             suppress_unstable_features_warning: false,
             active_profile: Some("zdr".to_string()),
@@ -5142,7 +5139,10 @@ model_verbosity = "high"
             model_reasoning_summary: ReasoningSummary::Detailed,
             model_supports_reasoning_summaries: None,
             model_verbosity: Some(Verbosity::High),
-            personality: Some(Personality::Pragmatic),
+            responses_transport: Default::default(),
+            compaction_mode: Default::default(),
+            windows_sandbox_level: WindowsSandboxLevel::Disabled,
+            personality: None,
             chatgpt_base_url: "https://chatgpt.com/backend-api/".to_string(),
             base_instructions: None,
             review_prompt: None,
@@ -5154,7 +5154,6 @@ model_verbosity = "high"
             include_apply_patch_tool: false,
             web_search_mode: None,
             use_experimental_unified_exec_tool: !cfg!(windows),
-            ghost_snapshot: GhostSnapshotConfig::default(),
             features: Features::with_defaults(),
             suppress_unstable_features_warning: false,
             active_profile: Some("gpt5".to_string()),

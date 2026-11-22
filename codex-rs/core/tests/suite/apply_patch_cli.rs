@@ -10,7 +10,6 @@ use std::fs;
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::Ordering;
 
-use codex_core::features::Feature;
 use codex_core::protocol::AskForApproval;
 use codex_core::protocol::EventMsg;
 use codex_core::protocol::Op;
@@ -669,12 +668,7 @@ async fn apply_patch_cli_verification_failure_has_no_side_effects(
 ) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
-    let harness = apply_patch_harness_with(|builder| {
-        builder.with_config(|config| {
-            config.features.enable(Feature::ApplyPatchFreeform);
-        })
-    })
-    .await?;
+    let harness = apply_patch_harness_with(|builder| builder.with_config(|_config| {})).await?;
 
     // Compose a patch that would create a file, then fail verification on an update.
     let call_id = "apply-partial-no-side-effects";

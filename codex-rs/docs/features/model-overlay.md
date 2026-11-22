@@ -38,12 +38,12 @@ Changing `base_instructions` metadata alone can have no visible effect when the 
 |---|---|
 |Replace fallback/base model text|`base_instructions` or `base_instructions_file`; clear model messages if the template must stop applying.|
 |Replace the instruction template|`instructions_template` / `_file`, or the nested `model_messages.instructions_template` / `_file`; the two forms cannot both be supplied.|
-|Change one personality|`model_messages.instructions_variables.personality_default`, `personality_friendly`, or `personality_pragmatic`, each with an optional `_file` alternative.|
+|Fill a legacy `{{ personality }}` placeholder|The template uses `model_messages.instructions_variables.personality_default` unless `personality = "none"`. Friendly/pragmatic variable fields remain readable as old catalog data, not selectable styles.|
 |Replace effective model text for every personality|`final_instruction_override` or `final_instruction_override_file`, at cross-model or per-model scope.|
 
 Session initialization resolves base instructions in this order: explicit `Config.base_instructions`, matching per-model or cross-model final override, persisted session base instructions, then rendered model template/base text. The TOML-facing explicit override is `model_instructions_file`; `Config.base_instructions` is also set programmatically by task delegates.
 
-An explicit review prompt therefore takes precedence over an overlay final override. Model switches append the resolved model instruction update; a final override suppresses personality-specific update messages. Keep these paths consistent with initial session resolution and compaction.
+An explicit review prompt therefore takes precedence over an overlay final override. Model switches append the resolved model instruction update; a legacy style change alone does not append instructions. Keep these paths consistent with initial session resolution and compaction.
 
 ## Matching and routing decisions
 

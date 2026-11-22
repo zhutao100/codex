@@ -533,15 +533,6 @@ async fn run_turn_inner(
         });
         let explicit_app_paths = collect_explicit_app_paths(&input);
 
-        let config = turn_context.config.clone();
-        if config
-            .features
-            .enabled(Feature::SkillEnvVarDependencyPrompt)
-        {
-            let env_var_dependencies = collect_env_var_dependencies(&mentioned_skills);
-            resolve_skill_dependencies_for_turn(&sess, &turn_context, &env_var_dependencies).await;
-        }
-
         maybe_prompt_and_install_mcp_dependencies(
             sess.as_ref(),
             turn_context.as_ref(),
@@ -598,8 +589,6 @@ async fn run_turn_inner(
         (explicit_app_paths, skill_name_counts_lower)
     };
 
-    sess.maybe_start_ghost_snapshot(Arc::clone(&turn_context), cancellation_token.child_token())
-        .await;
     sess.record_completion_review_advisory(&turn_context).await;
     let mut last_agent_message: Option<String> = None;
     let mut can_drain_pending_input = input.is_empty() && !recovered_notes;
@@ -1198,7 +1187,7 @@ async fn run_auto_compact(
     if cancellation_token.is_cancelled() {
         return Err(CodexErr::TurnAborted);
     }
-    let implementation = compaction_implementation(sess, &turn_context.provider);
+    let implementation = compaction_implementation(turn_context);
     turn_context.otel_manager.counter(
         "codex.task.compact",
         1,

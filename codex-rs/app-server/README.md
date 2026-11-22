@@ -163,7 +163,7 @@ Start a fresh thread when you need a new Codex conversation.
 { "method": "thread/started", "params": { "thread": { … } } }
 ```
 
-Valid `personality` values are `"friendly"`, `"pragmatic"`, and `"none"`. When `"none"` is selected, the personality placeholder is replaced with an empty string.
+`personality: "none"` omits the catalog template's personality section or legacy placeholder. `"friendly"` and `"pragmatic"` remain accepted for existing clients; both use the catalog default and neither injects a style-change message. Explicit and resumed base instructions retain precedence over catalog templates.
 Valid `serviceTier` values are `"flex"` and `"fast"`. Omit the field to let the API use its default service tier; explicit `"fast"` is sent as OpenAI Responses `"priority"`.
 
 To continue a stored session, call `thread/resume` with the `thread.id` you previously recorded. The response shape matches `thread/start`, and no additional notifications are emitted. You can also pass the same configuration overrides supported by `thread/start`, such as `personality`:

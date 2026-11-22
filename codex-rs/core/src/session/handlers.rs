@@ -154,7 +154,15 @@ pub(super) async fn submission_loop(
                     .await;
             }
             Op::Undo => {
-                undo(&sess, sub.id.clone()).await;
+                sess.send_event_raw(Event {
+                    id: sub.id.clone(),
+                    msg: EventMsg::Error(ErrorEvent {
+                        message: "Undo is no longer supported.".into(),
+                        codex_error_info: Some(CodexErrorInfo::BadRequest),
+                        client_user_message_id: None,
+                    }),
+                })
+                .await;
             }
             Op::Compact => {
                 compact(&sess, sub.id.clone()).await;
@@ -207,7 +215,6 @@ use crate::state::PendingContinuationTarget;
 use crate::tasks::CompactTask;
 use crate::tasks::ContinueTask;
 use crate::tasks::RegularTask;
-use crate::tasks::UndoTask;
 use crate::tasks::UserShellCommandMode;
 use crate::tasks::UserShellCommandTask;
 use crate::tasks::execute_user_shell_command;
@@ -226,7 +233,6 @@ use codex_protocol::protocol::RemoteSkillSummary;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::ReviewRequest;
 use codex_protocol::protocol::SkillsListEntry;
-use codex_protocol::protocol::ThreadNameUpdatedEvent;
 use codex_protocol::protocol::ThreadRolledBackEvent;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::WarningEvent;
@@ -900,12 +906,6 @@ pub async fn download_remote_skill(
     }
 }
 
-pub async fn undo(sess: &Arc<Session>, sub_id: String) {
-    let turn_context = sess.new_default_turn_with_sub_id(sub_id).await;
-    sess.spawn_task(turn_context, Vec::new(), UndoTask::new())
-        .await;
-}
-
 pub async fn compact(sess: &Arc<Session>, sub_id: String) {
     let turn_context = sess.new_default_turn_with_sub_id(sub_id).await;
 
@@ -1002,7 +1002,10 @@ pub async fn set_thread_name(sess: &Arc<Session>, sub_id: String, name: String) 
         return;
     };
 
-    if let Err(e) = sess.set_thread_name(name.clone()).await {
+    if let Err(e) = sess
+        .publish_thread_name(&sub_id, name, ThreadNameSource::Explicit)
+        .await
+    {
         let event = Event {
             id: sub_id,
             msg: EventMsg::Error(ErrorEvent {
@@ -1012,17 +1015,7 @@ pub async fn set_thread_name(sess: &Arc<Session>, sub_id: String, name: String) 
             }),
         };
         sess.send_event_raw(event).await;
-        return;
     }
-
-    sess.send_event_raw(Event {
-        id: sub_id,
-        msg: EventMsg::ThreadNameUpdated(ThreadNameUpdatedEvent {
-            thread_id: sess.conversation_id,
-            thread_name: Some(name),
-        }),
-    })
-    .await;
 }
 
 pub async fn auto_rename_thread(sess: &Arc<Session>, sub_id: String) {
@@ -1061,7 +1054,10 @@ pub async fn auto_rename_thread(sess: &Arc<Session>, sub_id: String) {
         return;
     };
 
-    if let Err(err) = sess.set_thread_name(thread_name.clone()).await {
+    if let Err(err) = sess
+        .publish_thread_name(&sub_id, thread_name, ThreadNameSource::Explicit)
+        .await
+    {
         sess.send_event_raw(Event {
             id: sub_id,
             msg: EventMsg::Error(ErrorEvent {
@@ -1071,20 +1067,11 @@ pub async fn auto_rename_thread(sess: &Arc<Session>, sub_id: String) {
             }),
         })
         .await;
-        return;
     }
-
-    sess.send_event_raw(Event {
-        id: turn_context.sub_id.clone(),
-        msg: EventMsg::ThreadNameUpdated(ThreadNameUpdatedEvent {
-            thread_id: sess.conversation_id,
-            thread_name: Some(thread_name),
-        }),
-    })
-    .await;
 }
 
 pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
+    sess.automatic_title_cancel.cancel();
     sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
     sess.services
         .unified_exec_manager

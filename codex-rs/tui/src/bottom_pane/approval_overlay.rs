@@ -17,8 +17,6 @@ use crate::render::highlight::highlight_bash_to_lines;
 use crate::render::renderable::ColumnRenderable;
 use crate::render::renderable::Renderable;
 use codex_core::config::types::DiffView;
-use codex_core::features::Feature;
-use codex_core::features::Features;
 use codex_core::protocol::ElicitationAction;
 use codex_core::protocol::ExecPolicyAmendment;
 use codex_core::protocol::FileChange;
@@ -70,11 +68,10 @@ pub(crate) struct ApprovalOverlay {
     options: Vec<ApprovalOption>,
     current_complete: bool,
     done: bool,
-    features: Features,
 }
 
 impl ApprovalOverlay {
-    pub fn new(request: ApprovalRequest, app_event_tx: AppEventSender, features: Features) -> Self {
+    pub fn new(request: ApprovalRequest, app_event_tx: AppEventSender) -> Self {
         let mut view = Self {
             current_request: None,
             current_variant: None,
@@ -84,7 +81,6 @@ impl ApprovalOverlay {
             options: Vec::new(),
             current_complete: false,
             done: false,
-            features,
         };
         view.set_current(request);
         view
@@ -99,7 +95,7 @@ impl ApprovalOverlay {
         let ApprovalRequestState { variant, header } = ApprovalRequestState::from(request);
         self.current_variant = Some(variant.clone());
         self.current_complete = false;
-        let (options, params) = Self::build_options(variant, header, &self.features);
+        let (options, params) = Self::build_options(variant, header);
         self.options = options;
         self.list = ListSelectionView::new(params, self.app_event_tx.clone());
     }
@@ -107,14 +103,13 @@ impl ApprovalOverlay {
     fn build_options(
         variant: ApprovalVariant,
         header: Box<dyn Renderable>,
-        features: &Features,
     ) -> (Vec<ApprovalOption>, SelectionViewParams) {
         let (options, title) = match &variant {
             ApprovalVariant::Exec {
                 proposed_execpolicy_amendment,
                 ..
             } => (
-                exec_options(proposed_execpolicy_amendment.clone(), features),
+                exec_options(proposed_execpolicy_amendment.clone()),
                 "Would you like to run the following command?".to_string(),
             ),
             ApprovalVariant::ApplyPatch { .. } => (
@@ -450,10 +445,7 @@ impl ApprovalOption {
     }
 }
 
-fn exec_options(
-    proposed_execpolicy_amendment: Option<ExecPolicyAmendment>,
-    features: &Features,
-) -> Vec<ApprovalOption> {
+fn exec_options(proposed_execpolicy_amendment: Option<ExecPolicyAmendment>) -> Vec<ApprovalOption> {
     vec![ApprovalOption {
         label: "Yes, proceed".to_string(),
         decision: ApprovalDecision::Review(ReviewDecision::Approved),
@@ -461,29 +453,23 @@ fn exec_options(
         additional_shortcuts: vec![key_hint::plain(KeyCode::Char('y'))],
     }]
     .into_iter()
-    .chain(
-        proposed_execpolicy_amendment
-            .filter(|_| features.enabled(Feature::ExecPolicy))
-            .and_then(|prefix| {
-                let rendered_prefix = strip_bash_lc_and_escape(prefix.command());
-                if rendered_prefix.contains('\n') || rendered_prefix.contains('\r') {
-                    return None;
-                }
+    .chain(proposed_execpolicy_amendment.and_then(|prefix| {
+        let rendered_prefix = strip_bash_lc_and_escape(prefix.command());
+        if rendered_prefix.contains('\n') || rendered_prefix.contains('\r') {
+            return None;
+        }
 
-                Some(ApprovalOption {
-                    label: format!(
-                        "Yes, and don't ask again for commands that start with `{rendered_prefix}`"
-                    ),
-                    decision: ApprovalDecision::Review(
-                        ReviewDecision::ApprovedExecpolicyAmendment {
-                            proposed_execpolicy_amendment: prefix,
-                        },
-                    ),
-                    display_shortcut: None,
-                    additional_shortcuts: vec![key_hint::plain(KeyCode::Char('p'))],
-                })
+        Some(ApprovalOption {
+            label: format!(
+                "Yes, and don't ask again for commands that start with `{rendered_prefix}`"
+            ),
+            decision: ApprovalDecision::Review(ReviewDecision::ApprovedExecpolicyAmendment {
+                proposed_execpolicy_amendment: prefix,
             }),
-    )
+            display_shortcut: None,
+            additional_shortcuts: vec![key_hint::plain(KeyCode::Char('p'))],
+        })
+    }))
     .chain([ApprovalOption {
         label: "No, and tell Codex what to do differently".to_string(),
         decision: ApprovalDecision::Review(ReviewDecision::Abort),
@@ -559,7 +545,7 @@ mod tests {
     fn ctrl_c_aborts_and_clears_queue() {
         let (tx, _rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx);
-        let mut view = ApprovalOverlay::new(make_exec_request(), tx, Features::with_defaults());
+        let mut view = ApprovalOverlay::new(make_exec_request(), tx);
         view.enqueue_request(make_exec_request());
         assert_eq!(CancellationEvent::Handled, view.on_ctrl_c());
         assert!(view.queue.is_empty());
@@ -570,7 +556,7 @@ mod tests {
     fn shortcut_triggers_selection() {
         let (tx, mut rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx);
-        let mut view = ApprovalOverlay::new(make_exec_request(), tx, Features::with_defaults());
+        let mut view = ApprovalOverlay::new(make_exec_request(), tx);
         assert!(!view.is_complete());
         view.handle_key_event(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
         // We expect at least one CodexOp message in the queue.
@@ -598,7 +584,6 @@ mod tests {
                 ])),
             },
             tx,
-            Features::with_defaults(),
         );
         view.handle_key_event(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
         let mut saw_op = false;
@@ -623,32 +608,6 @@ mod tests {
     }
 
     #[test]
-    fn exec_prefix_option_hidden_when_execpolicy_disabled() {
-        let (tx, mut rx) = unbounded_channel::<AppEvent>();
-        let tx = AppEventSender::new(tx);
-        let mut view = ApprovalOverlay::new(
-            ApprovalRequest::Exec {
-                id: "test".to_string(),
-                command: vec!["echo".to_string()],
-                reason: None,
-                proposed_execpolicy_amendment: Some(ExecPolicyAmendment::new(vec![
-                    "echo".to_string(),
-                ])),
-            },
-            tx,
-            {
-                let mut features = Features::with_defaults();
-                features.disable(Feature::ExecPolicy);
-                features
-            },
-        );
-        assert_eq!(view.options.len(), 2);
-        view.handle_key_event(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
-        assert!(!view.is_complete());
-        assert!(rx.try_recv().is_err());
-    }
-
-    #[test]
     fn header_includes_command_snippet() {
         let (tx, _rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx);
@@ -660,7 +619,7 @@ mod tests {
             proposed_execpolicy_amendment: None,
         };
 
-        let view = ApprovalOverlay::new(exec_request, tx, Features::with_defaults());
+        let view = ApprovalOverlay::new(exec_request, tx);
         let mut buf = Buffer::empty(Rect::new(0, 0, 80, view.desired_height(80)));
         view.render(Rect::new(0, 0, 80, view.desired_height(80)), &mut buf);
 
@@ -710,7 +669,7 @@ mod tests {
     fn enter_sets_last_selected_index_without_dismissing() {
         let (tx_raw, mut rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx_raw);
-        let mut view = ApprovalOverlay::new(make_exec_request(), tx, Features::with_defaults());
+        let mut view = ApprovalOverlay::new(make_exec_request(), tx);
         view.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
         assert!(

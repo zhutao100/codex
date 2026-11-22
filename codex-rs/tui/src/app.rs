@@ -49,7 +49,6 @@ use codex_core::config::ConfigOverrides;
 use codex_core::config::edit::ConfigEdit;
 use codex_core::config::edit::ConfigEditsBuilder;
 use codex_core::config_loader::ConfigLayerStackOrdering;
-use codex_core::features::Feature;
 use codex_core::models_manager::manager::RefreshStrategy;
 use codex_core::models_manager::model_presets::HIDE_GPT_5_1_CODEX_MAX_MIGRATION_PROMPT_CONFIG;
 use codex_core::models_manager::model_presets::HIDE_GPT5_1_MIGRATION_PROMPT_CONFIG;
@@ -69,7 +68,6 @@ use codex_core::windows_sandbox::WindowsSandboxLevelExt;
 use codex_otel::OtelManager;
 use codex_otel::TelemetryAuthMode;
 use codex_protocol::ThreadId;
-use codex_protocol::config_types::Personality;
 #[cfg(target_os = "windows")]
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::items::TurnItem;
@@ -2090,9 +2088,6 @@ impl App {
                 self.chat_widget.set_collaboration_mask(mask);
                 self.refresh_status_line();
             }
-            AppEvent::UpdatePersonality(personality) => {
-                self.on_update_personality(personality);
-            }
             AppEvent::OpenReasoningPopup { model } => {
                 self.chat_widget.open_reasoning_popup(model);
             }
@@ -2283,32 +2278,17 @@ impl App {
                         );
                     }
                     let profile = self.active_profile.as_deref();
-                    let feature_key = Feature::WindowsSandbox.key();
-                    let elevated_key = Feature::WindowsSandboxElevated.key();
-                    let elevated_enabled = matches!(mode, WindowsSandboxEnableMode::Elevated);
-                    let mut builder =
-                        ConfigEditsBuilder::new(&self.config.codex_home).with_profile(profile);
-                    if elevated_enabled {
-                        builder = builder.set_feature_enabled(elevated_key, true);
-                    } else {
-                        builder = builder
-                            .set_feature_enabled(feature_key, true)
-                            .set_feature_enabled(elevated_key, false);
-                    }
+                    let level = match mode {
+                        WindowsSandboxEnableMode::Elevated => WindowsSandboxLevel::Elevated,
+                        WindowsSandboxEnableMode::Legacy => WindowsSandboxLevel::RestrictedToken,
+                    };
+                    let builder = ConfigEditsBuilder::new(&self.config.codex_home)
+                        .with_profile(profile)
+                        .with_edits([ConfigEdit::SetWindowsSandbox(level)]);
                     match builder.apply().await {
                         Ok(()) => {
-                            if elevated_enabled {
-                                self.config.set_windows_elevated_sandbox_enabled(true);
-                                self.chat_widget
-                                    .set_feature_enabled(Feature::WindowsSandboxElevated, true);
-                            } else {
-                                self.config.set_windows_sandbox_enabled(true);
-                                self.config.set_windows_elevated_sandbox_enabled(false);
-                                self.chat_widget
-                                    .set_feature_enabled(Feature::WindowsSandbox, true);
-                                self.chat_widget
-                                    .set_feature_enabled(Feature::WindowsSandboxElevated, false);
-                            }
+                            self.config.set_windows_sandbox_level(level);
+                            self.chat_widget.set_windows_sandbox_level(level);
                             self.chat_widget.clear_forced_auto_mode_downgrade();
                             let windows_sandbox_level =
                                 WindowsSandboxLevel::from_config(&self.config);
@@ -2422,41 +2402,6 @@ impl App {
                     }
                 }
             }
-            AppEvent::PersistPersonalitySelection { personality } => {
-                let profile = self.active_profile.as_deref();
-                match ConfigEditsBuilder::new(&self.config.codex_home)
-                    .with_profile(profile)
-                    .set_personality(Some(personality))
-                    .apply()
-                    .await
-                {
-                    Ok(()) => {
-                        let label = Self::personality_label(personality);
-                        let mut message = format!("Personality set to {label}");
-                        if let Some(profile) = profile {
-                            message.push_str(" for ");
-                            message.push_str(profile);
-                            message.push_str(" profile");
-                        }
-                        self.chat_widget.add_info_message(message, None);
-                    }
-                    Err(err) => {
-                        tracing::error!(
-                            error = %err,
-                            "failed to persist personality selection"
-                        );
-                        if let Some(profile) = profile {
-                            self.chat_widget.add_error_message(format!(
-                                "Failed to save personality for profile `{profile}`: {err}"
-                            ));
-                        } else {
-                            self.chat_widget.add_error_message(format!(
-                                "Failed to save default personality: {err}"
-                            ));
-                        }
-                    }
-                }
-            }
             AppEvent::UpdateAskForApprovalPolicy(policy) => {
                 self.runtime_approval_policy_override = Some(policy);
                 if let Err(err) = self.config.approval_policy.set(policy) {
@@ -2533,12 +2478,6 @@ impl App {
                 if updates.is_empty() {
                     return Ok(AppRunControl::Continue);
                 }
-                let windows_sandbox_changed = updates.iter().any(|(feature, _)| {
-                    matches!(
-                        feature,
-                        Feature::WindowsSandbox | Feature::WindowsSandboxElevated
-                    )
-                });
                 let mut builder = ConfigEditsBuilder::new(&self.config.codex_home)
                     .with_profile(self.active_profile.as_deref());
                 for (feature, enabled) in &updates {
@@ -2562,25 +2501,6 @@ impl App {
                                 segments: vec!["features".to_string(), feature_key.to_string()],
                             }]);
                         }
-                    }
-                }
-                if windows_sandbox_changed {
-                    #[cfg(target_os = "windows")]
-                    {
-                        let windows_sandbox_level = WindowsSandboxLevel::from_config(&self.config);
-                        self.app_event_tx
-                            .send(AppEvent::CodexOp(Op::OverrideTurnContext {
-                                cwd: None,
-                                approval_policy: None,
-                                sandbox_policy: None,
-                                windows_sandbox_level: Some(windows_sandbox_level),
-                                model: None,
-                                effort: None,
-                                summary: None,
-                                collaboration_mode: None,
-                                personality: None,
-                                service_tier: None,
-                            }));
                     }
                 }
                 if let Err(err) = builder.apply().await {
@@ -2958,19 +2878,6 @@ impl App {
         // Instead, explicitly pass the stored collaboration mode's effort into new sessions.
         self.config.model_reasoning_effort = effort;
         self.chat_widget.set_reasoning_effort(effort);
-    }
-
-    fn on_update_personality(&mut self, personality: Personality) {
-        self.config.personality = Some(personality);
-        self.chat_widget.set_personality(personality);
-    }
-
-    fn personality_label(personality: Personality) -> &'static str {
-        match personality {
-            Personality::None => "None",
-            Personality::Friendly => "Friendly",
-            Personality::Pragmatic => "Pragmatic",
-        }
     }
 
     async fn launch_external_editor(&mut self, tui: &mut tui::Tui) {

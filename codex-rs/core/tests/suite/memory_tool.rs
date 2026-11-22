@@ -17,7 +17,6 @@ async fn get_memory_tool_returns_persisted_thread_memory() -> Result<()> {
 
     let server = start_mock_server().await;
     let mut builder = test_codex().with_config(|config| {
-        config.features.enable(Feature::Sqlite);
         config.features.enable(Feature::MemoryTool);
     });
     let test = builder.build(&server).await?;

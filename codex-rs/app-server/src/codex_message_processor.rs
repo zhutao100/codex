@@ -1704,12 +1704,7 @@ impl CodexMessageProcessor {
         // Persist windows sandbox feature.
         // TODO: persist default config in general.
         let mut request_overrides = request_overrides.unwrap_or_default();
-        if cfg!(windows) && self.config.features.enabled(Feature::WindowsSandbox) {
-            request_overrides.insert(
-                "features.experimental_windows_sandbox".to_string(),
-                serde_json::json!(true),
-            );
-        }
+        inherit_windows_sandbox(&mut request_overrides, self.config.windows_sandbox_level);
 
         let cloud_requirements = self.current_cloud_requirements();
         let config = match derive_config_from_params(
@@ -2831,12 +2826,7 @@ impl CodexMessageProcessor {
 
         // Persist windows sandbox feature.
         let mut cli_overrides = cli_overrides.unwrap_or_default();
-        if cfg!(windows) && self.config.features.enabled(Feature::WindowsSandbox) {
-            cli_overrides.insert(
-                "features.experimental_windows_sandbox".to_string(),
-                serde_json::json!(true),
-            );
-        }
+        inherit_windows_sandbox(&mut cli_overrides, self.config.windows_sandbox_level);
         let request_overrides = if cli_overrides.is_empty() {
             None
         } else {
@@ -3216,8 +3206,7 @@ impl CodexMessageProcessor {
         params: ModelListParams,
     ) {
         let ModelListParams { limit, cursor } = params;
-        let mut config = (*config).clone();
-        config.features.enable(Feature::RemoteModels);
+        let config = (*config).clone();
         let models = supported_models(thread_manager, &config).await;
         let total = models.len();
 
@@ -3735,12 +3724,7 @@ impl CodexMessageProcessor {
 
                 // Persist windows sandbox feature.
                 let mut request_overrides = request_overrides.unwrap_or_default();
-                if cfg!(windows) && self.config.features.enabled(Feature::WindowsSandbox) {
-                    request_overrides.insert(
-                        "features.experimental_windows_sandbox".to_string(),
-                        serde_json::json!(true),
-                    );
-                }
+                inherit_windows_sandbox(&mut request_overrides, self.config.windows_sandbox_level);
 
                 let typesafe_overrides = ConfigOverrides {
                     model,
@@ -3914,12 +3898,7 @@ impl CodexMessageProcessor {
 
                 // Persist windows sandbox feature.
                 let mut cli_overrides = cli_overrides.unwrap_or_default();
-                if cfg!(windows) && self.config.features.enabled(Feature::WindowsSandbox) {
-                    cli_overrides.insert(
-                        "features.experimental_windows_sandbox".to_string(),
-                        serde_json::json!(true),
-                    );
-                }
+                inherit_windows_sandbox(&mut cli_overrides, self.config.windows_sandbox_level);
                 let request_overrides = if cli_overrides.is_empty() {
                     None
                 } else {
@@ -5464,6 +5443,18 @@ async fn sync_default_client_residency_requirement(
 ///   `typesafe_overrides` is a `ConfigOverrides` derived from the respective request object.
 ///   Because the overrides are defined explicitly in the `*Params`, this takes priority over
 ///   the more general "bag of config options" provided by `cli_overrides` and `request_overrides`.
+fn inherit_windows_sandbox(
+    overrides: &mut HashMap<String, serde_json::Value>,
+    level: WindowsSandboxLevel,
+) {
+    if cfg!(windows) && level != WindowsSandboxLevel::Disabled && !overrides.contains_key("windows")
+    {
+        overrides
+            .entry("windows.sandbox".to_owned())
+            .or_insert_with(|| serde_json::json!(level));
+    }
+}
+
 async fn derive_config_from_params(
     cli_overrides: &[(String, TomlValue)],
     request_overrides: Option<HashMap<String, serde_json::Value>>,

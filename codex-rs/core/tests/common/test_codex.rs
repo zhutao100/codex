@@ -10,7 +10,6 @@ use codex_core::ModelProviderInfo;
 use codex_core::ThreadManager;
 use codex_core::built_in_model_providers;
 use codex_core::config::Config;
-use codex_core::features::Feature;
 use codex_core::protocol::AskForApproval;
 use codex_core::protocol::EventMsg;
 use codex_core::protocol::Op;
@@ -126,7 +125,7 @@ impl TestCodexBuilder {
         let base_url_clone = base_url.clone();
         self.config_mutators.push(Box::new(move |config| {
             config.model_provider.base_url = Some(base_url_clone);
-            config.features.enable(Feature::ResponsesWebsockets);
+            config.responses_transport = codex_core::config::types::ResponsesTransport::Auto;
         }));
         self.build_with_home_and_base_url(base_url, home, None)
             .await
@@ -224,9 +223,7 @@ impl TestCodexBuilder {
         }
 
         if config.include_apply_patch_tool {
-            config.features.enable(Feature::ApplyPatchFreeform);
         } else {
-            config.features.disable(Feature::ApplyPatchFreeform);
         }
 
         Ok((config, cwd))

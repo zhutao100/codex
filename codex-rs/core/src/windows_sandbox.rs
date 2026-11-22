@@ -19,7 +19,7 @@ pub trait WindowsSandboxLevelExt {
 
 impl WindowsSandboxLevelExt for WindowsSandboxLevel {
     fn from_config(config: &Config) -> WindowsSandboxLevel {
-        Self::from_features(&config.features)
+        config.windows_sandbox_level
     }
 
     fn from_features(features: &Features) -> WindowsSandboxLevel {

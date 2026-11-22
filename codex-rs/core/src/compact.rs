@@ -1,14 +1,12 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use crate::ModelProviderInfo;
 use crate::Prompt;
 use crate::client::ModelClientSession;
 use crate::client_common::ResponseEvent;
 use crate::context_manager::ContextManager;
 use crate::error::CodexErr;
 use crate::error::Result as CodexResult;
-use crate::features::Feature;
 use crate::preserved_work_notes::PRESERVED_WORK_NOTES_MESSAGE_PREFIX;
 use crate::protocol::CompactedItem;
 use crate::protocol::EventMsg;
@@ -84,16 +82,12 @@ impl CompactionImplementation {
     }
 }
 
-pub(crate) fn compaction_implementation(
-    session: &Session,
-    provider: &ModelProviderInfo,
-) -> CompactionImplementation {
-    if !provider.is_openai() || !session.enabled(Feature::RemoteCompaction) {
-        CompactionImplementation::Local
-    } else if session.enabled(Feature::RemoteCompactionV2) {
-        CompactionImplementation::RemoteV2
-    } else {
-        CompactionImplementation::Remote
+pub(crate) fn compaction_implementation(context: &TurnContext) -> CompactionImplementation {
+    use crate::config::types::CompactionMode;
+    match (context.provider.is_openai(), context.config.compaction_mode) {
+        (false, _) | (true, CompactionMode::Local) => CompactionImplementation::Local,
+        (true, CompactionMode::Unary) => CompactionImplementation::Remote,
+        (true, CompactionMode::Auto) => CompactionImplementation::RemoteV2,
     }
 }
 

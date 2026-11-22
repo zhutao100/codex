@@ -12,6 +12,8 @@ pub(crate) enum UnifiedExecError {
     RegisteredJob,
     #[error("failed to write to stdin")]
     WriteToStdin,
+    #[error("the current policy does not authorize input to this retained terminal")]
+    StdinNotAuthorized,
     #[error(
         "stdin is closed for this session; rerun exec_command with tty=true to keep stdin open"
     )]

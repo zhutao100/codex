@@ -27,7 +27,7 @@ impl SessionTask for CompactTask {
         cancellation_token: CancellationToken,
     ) -> Option<String> {
         let session = session.clone_session();
-        let implementation = compaction_implementation(&session, &ctx.provider);
+        let implementation = compaction_implementation(&ctx);
         session.services.otel_manager.counter(
             "codex.task.compact",
             1,

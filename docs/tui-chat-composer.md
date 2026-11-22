@@ -94,11 +94,11 @@ popup so gating stays in sync.
 
 ## Submission flow (Enter/Tab)
 
-There are multiple submission paths, but they share the same core rules:
+Enter submits when idle and steers a running regular turn. With work active, Tab explicitly queues the draft instead. A queued slash command keeps its original text, arguments and attachments until drain, when it is parsed against the then-current command context.
 
 ### Normal submit/queue path
 
-`handle_submission` calls `prepare_submission_text` for both submit and queue. That method:
+For ordinary text, `handle_submission` uses `prepare_submission_text`. When a custom prompt is expanded for execution, preparation:
 
 1. Expands any pending paste placeholders so element ranges align with the final text.
 2. Trims whitespace and rebases element ranges to the trimmed buffer.

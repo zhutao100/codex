@@ -158,9 +158,6 @@ impl ChatWidget {
     }
 
     pub(super) fn maybe_prompt_plan_implementation(&mut self) {
-        if !self.collaboration_modes_enabled() {
-            return;
-        }
         if self.has_queued_follow_up_messages() {
             return;
         }

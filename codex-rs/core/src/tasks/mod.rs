@@ -1,10 +1,8 @@
 mod compact;
 mod continue_task;
-mod ghost_snapshot;
 pub(crate) mod post_turn_completion_review;
 mod regular;
 mod review;
-mod undo;
 mod user_shell;
 
 use std::sync::Arc;
@@ -29,7 +27,6 @@ use crate::protocol::ErrorEvent;
 use crate::protocol::Event;
 use crate::protocol::EventMsg;
 use crate::protocol::SessionSource;
-use crate::protocol::ThreadNameUpdatedEvent;
 use crate::protocol::TurnAbortReason;
 use crate::protocol::TurnAbortedEvent;
 use crate::protocol::TurnCompleteEvent;
@@ -37,6 +34,7 @@ use crate::protocol::TurnContinuationSource;
 use crate::protocol::TurnPauseReason;
 use crate::protocol::TurnPausedEvent;
 use crate::protocol::WarningEvent;
+use crate::session::ThreadNameSource;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::session_prefix::TURN_ABORTED_OPEN_TAG;
@@ -55,14 +53,12 @@ use codex_protocol::user_input::UserInput;
 
 pub(crate) use compact::CompactTask;
 pub(crate) use continue_task::ContinueTask;
-pub(crate) use ghost_snapshot::GhostSnapshotTask;
 pub(crate) use post_turn_completion_review::PostTurnCompletionReviewTask;
 pub(crate) use regular::RegularTask;
 pub(crate) use review::ReviewDelegateConfigParams;
 pub(crate) use review::ReviewDelegateInstructionProfile;
 pub(crate) use review::ReviewTask;
 pub(crate) use review::configure_review_delegate_config;
-pub(crate) use undo::UndoTask;
 pub(crate) use user_shell::UserShellCommandMode;
 pub(crate) use user_shell::UserShellCommandTask;
 pub(crate) use user_shell::execute_user_shell_command;
@@ -530,9 +526,11 @@ impl Session {
         let session = Arc::clone(self);
         let turn_context = Arc::clone(&turn_context);
         tokio::spawn(async move {
-            let thread_name_result =
-                crate::thread_name::generate_thread_name(session.as_ref(), turn_context.as_ref())
-                    .await;
+            let thread_name_result = tokio::select! {
+                biased;
+                _ = session.automatic_title_cancel.cancelled() => return,
+                result = crate::thread_name::generate_thread_name(session.as_ref(), turn_context.as_ref()) => result,
+            };
             let thread_name = match thread_name_result {
                 Ok(thread_name) => thread_name,
                 Err(err) => {
@@ -564,7 +562,14 @@ impl Session {
                 return;
             };
 
-            if let Err(err) = session.set_thread_name(thread_name.clone()).await {
+            if let Err(err) = session
+                .publish_thread_name(
+                    &turn_context.sub_id,
+                    thread_name,
+                    ThreadNameSource::Automatic,
+                )
+                .await
+            {
                 session
                     .send_event(
                         turn_context.as_ref(),
@@ -575,18 +580,7 @@ impl Session {
                         }),
                     )
                     .await;
-                return;
             }
-
-            session
-                .send_event(
-                    turn_context.as_ref(),
-                    EventMsg::ThreadNameUpdated(ThreadNameUpdatedEvent {
-                        thread_id: session.conversation_id,
-                        thread_name: Some(thread_name),
-                    }),
-                )
-                .await;
         });
     }
 

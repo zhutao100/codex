@@ -143,7 +143,6 @@ Rules:
             config.features.disable(Feature::Collab);
             config.features.disable(Feature::Apps);
             config.features.disable(Feature::SkillMcpDependencyInstall);
-            config.features.disable(Feature::GhostCommit);
             config
                 .features
                 .disable(Feature::AutoPostTurnCompletionReview);

@@ -68,7 +68,7 @@ async fn stream_disconnect_rejects_undispatched_call_before_retry() -> Result<()
     let test = test_codex()
         .with_config(|config| {
             config.features.enable(Feature::UnifiedExec);
-            config.features.disable(Feature::ResponsesWebsockets);
+            config.responses_transport = codex_core::config::types::ResponsesTransport::Http;
             config.features.disable(Feature::EnableRequestCompression);
             config.features.disable(Feature::RecoverableExecOutput);
             config.features.disable(Feature::ExecJobCompletion);
@@ -124,7 +124,7 @@ async fn recover_command_output_from_replayed_receipt() -> Result<()> {
     let enable_capture = |config: &mut codex_core::config::Config| {
         config.features.enable(Feature::UnifiedExec);
         config.features.enable(Feature::RecoverableExecOutput);
-        config.features.disable(Feature::RemoteCompaction);
+        config.compaction_mode = codex_core::config::types::CompactionMode::Local;
     };
     let test = test_codex()
         .with_config(enable_capture)

@@ -409,36 +409,6 @@ FROM threads
         Ok(max_id.unwrap_or(0))
     }
 
-    /// List thread ids using the underlying database (no rollout scanning).
-    pub async fn list_thread_ids(
-        &self,
-        limit: usize,
-        anchor: Option<&crate::Anchor>,
-        sort_key: crate::SortKey,
-        allowed_sources: &[String],
-        model_providers: Option<&[String]>,
-        archived_only: bool,
-    ) -> anyhow::Result<Vec<ThreadId>> {
-        let mut builder = QueryBuilder::<Sqlite>::new("SELECT id FROM threads");
-        push_thread_filters(
-            &mut builder,
-            archived_only,
-            allowed_sources,
-            model_providers,
-            anchor,
-            sort_key,
-        );
-        push_thread_order_and_limit(&mut builder, sort_key, limit);
-
-        let rows = builder.build().fetch_all(self.pool.as_ref()).await?;
-        rows.into_iter()
-            .map(|row| {
-                let id: String = row.try_get("id")?;
-                Ok(ThreadId::try_from(id)?)
-            })
-            .collect()
-    }
-
     /// Insert or replace thread metadata directly.
     pub async fn upsert_thread(&self, metadata: &crate::ThreadMetadata) -> anyhow::Result<()> {
         sqlx::query(

@@ -53,12 +53,13 @@ pub(crate) fn build_command_spec(
 pub(crate) fn maybe_wrap_shell_lc_with_snapshot(
     command: &[String],
     session_shell: &Shell,
+    policy: &crate::config::types::ShellEnvironmentPolicy,
 ) -> Vec<String> {
     let Some(snapshot) = session_shell.shell_snapshot() else {
         return command.to_vec();
     };
 
-    if !snapshot.path.exists() {
+    if &snapshot.policy != policy || !snapshot.path.exists() {
         return command.to_vec();
     }
 
@@ -71,8 +72,14 @@ pub(crate) fn maybe_wrap_shell_lc_with_snapshot(
         return command.to_vec();
     }
 
-    let snapshot_path = snapshot.path.to_string_lossy();
-    let rewritten_script = format!(". \"{snapshot_path}\" && {}", command[2]);
+    if std::path::Path::new(&command[0]) != session_shell.shell_path {
+        return command.to_vec();
+    }
+    let path = snapshot.path.to_string_lossy();
+    let Ok(snapshot_path) = shlex::try_quote(&path) else {
+        return command.to_vec();
+    };
+    let rewritten_script = format!(". {snapshot_path} && {}", command[2]);
 
     let mut rewritten = command.to_vec();
     rewritten[1] = "-c".to_string();

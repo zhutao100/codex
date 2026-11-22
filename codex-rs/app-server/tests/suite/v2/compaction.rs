@@ -29,7 +29,6 @@ use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::UserInput as V2UserInput;
 use codex_core::auth::AuthCredentialsStoreMode;
-use codex_core::features::Feature;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use core_test_support::responses;
@@ -147,18 +146,18 @@ async fn auto_compaction_remote_emits_started_and_completed_items() -> Result<()
     .await;
 
     let codex_home = TempDir::new()?;
-    let mut features = BTreeMap::default();
-    features.insert(Feature::RemoteCompaction, true);
-    features.insert(Feature::RemoteCompactionV2, false);
     write_mock_responses_config_toml(
         codex_home.path(),
         &server.uri(),
-        &features,
+        &BTreeMap::default(),
         AUTO_COMPACT_LIMIT,
         Some(true),
         "openai",
         COMPACT_PROMPT,
     )?;
+    let config_path = codex_home.path().join("config.toml");
+    let toml = std::fs::read_to_string(&config_path)?;
+    std::fs::write(config_path, format!("compaction_mode = \"unary\"\n{toml}"))?;
     write_chatgpt_auth(
         codex_home.path(),
         ChatGptAuthFixture::new("access-chatgpt").plan_type("pro"),

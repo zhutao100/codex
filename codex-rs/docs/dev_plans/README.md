@@ -4,7 +4,7 @@ This index contains unfinished work only. A plan records current status, accepte
 
 |Plan|Status|Next decision|
 |---|---|---|
-|[Feature alignment](feature_alignment/README.md)|Source/history comparison complete; implementation proposed.|Retire obsolete controls in scoped changes; preserve custom contracts and select core alignment work.|
+|[Native feature alignment](feature_alignment/README.md)|Cross-platform controls migrated; conditional defaults retained.|Qualify the packaged Linux sandbox, Windows ConPTY and shell snapshot support on their native targets before changing defaults.|
 |[Context harness](context_harness/README.md)|Experimental evidence and waiting contracts implemented.|Run controlled model comparisons before changing defaults; validate additional platform boundaries before extending support.|
 |[Build optimization](cargo_build_optimization/README.md)|Partially implemented; profiles, async adapters and hidden sidecars already exist.|Measure the remaining CLI dependency cost before selecting another split.|
 

@@ -334,6 +334,7 @@ pub struct SandboxState {
 /// A thin wrapper around a set of running [`RmcpClient`] instances.
 #[derive(Default)]
 pub(crate) struct McpConnectionManager {
+    pub(crate) configured_servers: HashMap<String, McpServerConfig>,
     clients: HashMap<String, AsyncManagedClient>,
     elicitation_requests: ElicitationRequestManager,
 }
@@ -358,6 +359,7 @@ impl McpConnectionManager {
         let mut clients = HashMap::new();
         let mut join_set = JoinSet::new();
         let elicitation_requests = ElicitationRequestManager::default();
+        self.configured_servers.clone_from(mcp_servers);
         let mcp_servers = mcp_servers.clone();
         for (server_name, cfg) in mcp_servers.into_iter().filter(|(_, cfg)| cfg.enabled) {
             let cancel_token = cancel_token.child_token();

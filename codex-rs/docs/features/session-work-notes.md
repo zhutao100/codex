@@ -21,7 +21,7 @@ Capture makes at most two attempts. A final JSON output schema skips a new free-
 - The scanner accepts trailing reasoning, whitespace-only assistant output text, and exact rejection outputs for calls made during capture. It rejects unrelated work or mismatched tool activity instead of deleting an uncertain suffix.
 - A later real user boundary bounds the capture segment. Acknowledged input beyond it must survive cleanup, finalization, and replay.
 - Notes recovery runs before ordinary sampling and new input installation. The recorded source model/provider/instructions belong to capture; the destination context belongs to the replacement and resumed work. A pending model downshift cannot be inferred from token usage alone.
-- Notes and ghost snapshots remain exact across local, unary remote, and streaming remote compaction. Do not truncate mandatory retained items to make a replacement fit; use the streaming compaction budget/failure contract.
+- Notes remain exact across local, unary remote, and streaming remote compaction. Legacy worktree snapshots are not model input. Do not truncate mandatory retained items to make a replacement fit; use the streaming compaction budget/failure contract.
 - Local summarization output stays private until that attempt succeeds. A failed summary must not become a completed notes capture in live history or replay.
 
 ## Implementation and checks

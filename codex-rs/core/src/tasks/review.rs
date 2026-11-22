@@ -118,9 +118,10 @@ pub(crate) fn configure_review_delegate_config(
         .map(str::to_string);
     if let Some(provider_id) = provider_id {
         apply_delegate_model_provider(&mut sub_agent_config, &provider_id)?;
-        sub_agent_config.features.disable(Feature::RemoteModels);
     }
 
+    sub_agent_config
+        .resolve_child_model_limits(Some(parent_model_slug), &parent_config.model_provider_id);
     Ok(sub_agent_config)
 }
 
@@ -690,5 +691,28 @@ mod tests {
             post_delegate.user_instructions.as_deref(),
             Some("custom post")
         );
+    }
+
+    #[test]
+    fn only_the_same_model_at_the_same_provider_inherits_context_limits() {
+        for (model, provider, expected) in [
+            ("parent", "provider", (Some(32000), Some(16000))),
+            ("other", "provider", (None, None)),
+            ("parent", "other", (None, None)),
+        ] {
+            let mut child = crate::config::test_config();
+            child.model = Some(model.into());
+            child.model_provider_id = provider.into();
+            child.model_context_window = Some(32000);
+            child.model_auto_compact_token_limit = Some(16000);
+            child.resolve_child_model_limits(Some("parent"), "provider");
+            assert_eq!(
+                (
+                    child.model_context_window,
+                    child.model_auto_compact_token_limit
+                ),
+                expected
+            );
+        }
     }
 }

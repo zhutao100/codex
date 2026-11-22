@@ -140,12 +140,43 @@ impl Default for UnifiedExecProcessManager {
 
 struct ProcessEntry {
     process: Arc<UnifiedExecProcess>,
+    stdin_authority: StdinAuthority,
+    launch_cwd: PathBuf,
     call_id: String,
     process_id: String,
     command: Vec<String>,
     tty: bool,
     background_job: Option<Arc<jobs::BackgroundJob>>,
     last_used: tokio::time::Instant,
+}
+
+#[derive(Clone, PartialEq)]
+struct StdinAuthority {
+    policy: crate::protocol::SandboxPolicy,
+    policy_cwd: PathBuf,
+    approval: crate::protocol::AskForApproval,
+    windows_level: codex_protocol::config_types::WindowsSandboxLevel,
+}
+
+impl StdinAuthority {
+    fn from_turn(turn: &TurnContext) -> Self {
+        Self {
+            policy: turn.sandbox_policy.clone(),
+            policy_cwd: turn.cwd.clone(),
+            approval: turn.approval_policy,
+            windows_level: turn.windows_sandbox_level,
+        }
+    }
+
+    fn covers_write(&self, sandbox: crate::exec::SandboxType, turn: &TurnContext) -> bool {
+        use crate::protocol::SandboxPolicy;
+        if matches!(turn.sandbox_policy, SandboxPolicy::DangerFullAccess) {
+            return true;
+        }
+        *self == Self::from_turn(turn)
+            && (sandbox != crate::exec::SandboxType::None
+                || matches!(self.policy, SandboxPolicy::ExternalSandbox { .. }))
+    }
 }
 
 pub(crate) fn clamp_yield_time(yield_time_ms: u64) -> u64 {
@@ -194,6 +225,20 @@ mod tests {
         (Arc::new(session), Arc::new(turn))
     }
 
+    #[tokio::test]
+    async fn retained_terminal_compares_actual_sandbox_and_policy_root() {
+        use crate::exec::SandboxType;
+        let (_, mut turn) = make_session_and_context().await;
+        turn.sandbox_policy = SandboxPolicy::new_workspace_write_policy();
+        let launch = super::StdinAuthority::from_turn(&turn);
+        assert!(launch.covers_write(SandboxType::MacosSeatbelt, &turn));
+        assert!(!launch.covers_write(SandboxType::None, &turn));
+        turn.cwd = turn.cwd.join("different-policy-root");
+        assert!(!launch.covers_write(SandboxType::MacosSeatbelt, &turn));
+        turn.sandbox_policy = SandboxPolicy::DangerFullAccess;
+        assert!(launch.covers_write(SandboxType::None, &turn));
+    }
+
     async fn exec_command(
         session: &Arc<Session>,
         turn: &Arc<TurnContext>,
@@ -231,6 +276,7 @@ mod tests {
 
     async fn write_stdin(
         session: &Arc<Session>,
+        turn: &Arc<TurnContext>,
         process_id: &str,
         input: &str,
         yield_time_ms: u64,
@@ -238,12 +284,15 @@ mod tests {
         session
             .services
             .unified_exec_manager
-            .write_stdin(WriteStdinRequest {
-                process_id,
-                input,
-                yield_time_ms,
-                max_output_tokens: None,
-            })
+            .write_stdin(
+                WriteStdinRequest {
+                    process_id,
+                    input,
+                    yield_time_ms,
+                    max_output_tokens: None,
+                },
+                &super::UnifiedExecContext::new(session.clone(), turn.clone(), "write".into()),
+            )
             .await
     }
 
@@ -281,6 +330,38 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restricted_turn_can_poll_but_not_feed_a_retained_terminal() -> anyhow::Result<()> {
+        skip_if_sandbox!(Ok(()));
+        let (session, launch) = test_session_and_turn().await;
+        let result = exec_command(
+            &session,
+            &launch,
+            "read -r line && printf 'received:%s\\n' \"$line\"",
+            50,
+        )
+        .await?;
+        let id = result.process_id.expect("waiting on terminal input");
+        let (_, mut restricted) = make_session_and_context().await;
+        restricted.approval_policy = AskForApproval::Never;
+        restricted.sandbox_policy = SandboxPolicy::new_read_only_policy();
+        let restricted = Arc::new(restricted);
+        assert!(matches!(
+            write_stdin(&session, &restricted, &id, "denied\n", 50).await,
+            Err(UnifiedExecError::StdinNotAuthorized)
+        ));
+        assert_eq!(
+            write_stdin(&session, &restricted, &id, "", 50)
+                .await?
+                .process_id,
+            Some(id.clone())
+        );
+        let final_result = write_stdin(&session, &launch, &id, "allowed\n", 1000).await?;
+        assert!(final_result.output.contains("received:allowed"));
+        assert!(!final_result.output.contains("denied"));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unified_exec_persists_across_requests() -> anyhow::Result<()> {
         skip_if_sandbox!(Ok(()));
 
@@ -295,6 +376,7 @@ mod tests {
 
         write_stdin(
             &session,
+            &turn,
             process_id,
             "export CODEX_INTERACTIVE_SHELL_VAR=codex\n",
             2_500,
@@ -303,6 +385,7 @@ mod tests {
 
         let out_2 = write_stdin(
             &session,
+            &turn,
             process_id,
             "echo $CODEX_INTERACTIVE_SHELL_VAR\n",
             2_500,
@@ -331,6 +414,7 @@ mod tests {
 
         write_stdin(
             &session,
+            &turn,
             session_a.as_str(),
             "export CODEX_INTERACTIVE_SHELL_VAR=codex\n",
             2_500,
@@ -351,6 +435,7 @@ mod tests {
 
         let out_3 = write_stdin(
             &session,
+            &turn,
             shell_a
                 .process_id
                 .as_ref()
@@ -385,6 +470,7 @@ mod tests {
 
         write_stdin(
             &session,
+            &turn,
             process_id,
             format!("export CODEX_INTERACTIVE_SHELL_VAR={TEST_VAR_VALUE}\n").as_str(),
             2_500,
@@ -393,6 +479,7 @@ mod tests {
 
         let out_2 = write_stdin(
             &session,
+            &turn,
             process_id,
             "sleep 5 && echo $CODEX_INTERACTIVE_SHELL_VAR\n",
             10,
@@ -405,7 +492,7 @@ mod tests {
 
         tokio::time::sleep(Duration::from_secs(7)).await;
 
-        let out_3 = write_stdin(&session, process_id, "", 100).await?;
+        let out_3 = write_stdin(&session, &turn, process_id, "", 100).await?;
 
         assert!(
             out_3.output.contains(TEST_VAR_VALUE),
@@ -467,11 +554,11 @@ mod tests {
             .expect("expected process id")
             .as_str();
 
-        write_stdin(&session, process_id, "exit\n", 2_500).await?;
+        write_stdin(&session, &turn, process_id, "exit\n", 2_500).await?;
 
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        let err = write_stdin(&session, process_id, "", 100)
+        let err = write_stdin(&session, &turn, process_id, "", 100)
             .await
             .expect_err("expected unknown process error");
 

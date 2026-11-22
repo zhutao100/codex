@@ -85,8 +85,13 @@ impl Session {
     ) {
         let auth = self.services.auth_manager.auth().await;
         let config = self.get_config().await;
+        let mut constrained = config.mcp_servers.clone();
+        if let Err(err) = constrained.set(mcp_servers) {
+            warn!("failed to validate refreshed MCP servers: {err}");
+            return;
+        }
         let mcp_servers = with_codex_apps_mcp(
-            mcp_servers,
+            constrained.get().clone(),
             self.features.enabled(Feature::Apps),
             auth.as_ref(),
             config.as_ref(),
@@ -149,14 +154,52 @@ impl Session {
             .await;
     }
 
-    pub(crate) async fn refresh_mcp_servers_now(
+    pub(crate) async fn refresh_mcp_servers_after_install(
         &self,
         turn_context: &TurnContext,
-        mcp_servers: HashMap<String, McpServerConfig>,
+        added: Vec<(String, McpServerConfig)>,
         store_mode: OAuthCredentialsStoreMode,
     ) {
-        self.refresh_mcp_servers_inner(turn_context, mcp_servers, store_mode)
+        let running = self
+            .services
+            .mcp_connection_manager
+            .read()
+            .await
+            .configured_servers
+            .clone();
+        let mut pending = self.pending_mcp_server_refresh_config.lock().await;
+        let mut servers: HashMap<String, McpServerConfig> = pending
+            .as_ref()
+            .and_then(|next| serde_json::from_value(next.mcp_servers.clone()).ok())
+            .unwrap_or(running);
+        for (name, server) in added {
+            servers.entry(name).or_insert(server);
+        }
+        // The next turn must not replay an older map over this installation.
+        if let Some(next) = pending.as_mut()
+            && let Ok(merged) = serde_json::to_value(&servers)
+        {
+            next.mcp_servers = merged;
+        }
+        drop(pending);
+        self.refresh_mcp_servers_inner(turn_context, servers, store_mode)
             .await;
+    }
+
+    pub(crate) async fn configured_mcp_servers(&self) -> HashMap<String, McpServerConfig> {
+        let pending = self.pending_mcp_server_refresh_config.lock().await;
+        if let Some(refresh) = pending.as_ref()
+            && let Ok(servers) = serde_json::from_value(refresh.mcp_servers.clone())
+        {
+            return servers;
+        }
+        drop(pending);
+        self.services
+            .mcp_connection_manager
+            .read()
+            .await
+            .configured_servers
+            .clone()
     }
 
     pub(super) async fn mcp_startup_cancellation_token(&self) -> CancellationToken {

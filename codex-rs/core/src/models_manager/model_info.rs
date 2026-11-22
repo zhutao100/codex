@@ -10,7 +10,6 @@ use codex_protocol::openai_models::TruncationPolicyConfig;
 use codex_protocol::openai_models::default_input_modalities;
 
 use crate::config::Config;
-use crate::features::Feature;
 use crate::truncate::approx_bytes_for_tokens;
 
 pub const BASE_INSTRUCTIONS: &str = include_str!("../../prompt.md");
@@ -48,10 +47,12 @@ pub(crate) fn with_config_overrides(mut model: ModelInfo, config: &Config) -> Mo
         };
     }
 
+    // The published v1 request can supply a fallback; it never replaces a model-selected format.
+    if config.include_apply_patch_tool && model.apply_patch_tool_type.is_none() {
+        model.apply_patch_tool_type = Some(ApplyPatchToolType::Freeform);
+    }
     if let Some(base_instructions) = &config.base_instructions {
         model.base_instructions = base_instructions.clone();
-        model.model_messages = None;
-    } else if !config.features.enabled(Feature::Personality) {
         model.model_messages = None;
     }
 

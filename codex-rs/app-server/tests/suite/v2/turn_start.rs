@@ -2,7 +2,6 @@ use anyhow::Result;
 use app_test_support::McpProcess;
 use app_test_support::create_apply_patch_sse_response;
 use app_test_support::create_exec_command_sse_response;
-use app_test_support::create_fake_rollout;
 use app_test_support::create_final_assistant_message_sse_response;
 use app_test_support::create_mock_responses_server_sequence;
 use app_test_support::create_mock_responses_server_sequence_unchecked;
@@ -35,10 +34,8 @@ use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::TurnStartedNotification;
 use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::UserInput as V2UserInput;
-use codex_core::config::ConfigToml;
 use codex_core::features::FEATURES;
 use codex_core::features::Feature;
-use codex_core::personality_migration::PERSONALITY_MIGRATION_FILENAME;
 use codex_core::protocol_config_types::ReasoningSummary;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
@@ -55,7 +52,6 @@ use tokio::time::timeout;
 
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const TEST_ORIGINATOR: &str = "codex_vscode";
-const LOCAL_PRAGMATIC_TEMPLATE: &str = "You are a deeply pragmatic, effective software engineer.";
 
 #[tokio::test]
 async fn turn_start_sends_originator_header() -> Result<()> {
@@ -63,12 +59,7 @@ async fn turn_start_sends_originator_header() -> Result<()> {
     let server = create_mock_responses_server_sequence_unchecked(responses).await;
 
     let codex_home = TempDir::new()?;
-    create_config_toml(
-        codex_home.path(),
-        &server.uri(),
-        "never",
-        &BTreeMap::from([(Feature::Personality, true)]),
-    )?;
+    create_config_toml(codex_home.path(), &server.uri(), "never", &BTreeMap::new())?;
 
     let mut mcp = McpProcess::new(codex_home.path()).await?;
     timeout(
@@ -138,12 +129,7 @@ async fn turn_start_emits_user_message_item_with_text_elements() -> Result<()> {
     let server = create_mock_responses_server_sequence_unchecked(responses).await;
 
     let codex_home = TempDir::new()?;
-    create_config_toml(
-        codex_home.path(),
-        &server.uri(),
-        "never",
-        &BTreeMap::from([(Feature::Personality, true)]),
-    )?;
+    create_config_toml(codex_home.path(), &server.uri(), "never", &BTreeMap::new())?;
 
     let mut mcp = McpProcess::new(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
@@ -230,12 +216,7 @@ async fn turn_start_emits_notifications_and_accepts_model_override() -> Result<(
     let server = create_mock_responses_server_sequence_unchecked(responses).await;
 
     let codex_home = TempDir::new()?;
-    create_config_toml(
-        codex_home.path(),
-        &server.uri(),
-        "never",
-        &BTreeMap::from([(Feature::Personality, true)]),
-    )?;
+    create_config_toml(codex_home.path(), &server.uri(), "never", &BTreeMap::new())?;
 
     let mut mcp = McpProcess::new(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
@@ -425,12 +406,7 @@ async fn turn_start_accepts_personality_override_v2() -> Result<()> {
     let response_mock = responses::mount_sse_once(&server, body).await;
 
     let codex_home = TempDir::new()?;
-    create_config_toml(
-        codex_home.path(),
-        &server.uri(),
-        "never",
-        &BTreeMap::from([(Feature::Personality, true)]),
-    )?;
+    create_config_toml(codex_home.path(), &server.uri(), "never", &BTreeMap::new())?;
 
     let mut mcp = McpProcess::new(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
@@ -481,8 +457,8 @@ async fn turn_start_accepts_personality_override_v2() -> Result<()> {
     assert!(
         developer_texts
             .iter()
-            .any(|text| text.contains("<personality_spec>")),
-        "expected personality update message in developer input, got {developer_texts:?}"
+            .all(|text| !text.contains("<personality_spec>")),
+        "unexpected personality update message in developer input, got {developer_texts:?}"
     );
 
     Ok(())
@@ -636,12 +612,7 @@ async fn turn_start_change_personality_mid_thread_v2() -> Result<()> {
     let response_mock = responses::mount_sse_sequence(&server, vec![sse1, sse2]).await;
 
     let codex_home = TempDir::new()?;
-    create_config_toml(
-        codex_home.path(),
-        &server.uri(),
-        "never",
-        &BTreeMap::from([(Feature::Personality, true)]),
-    )?;
+    create_config_toml(codex_home.path(), &server.uri(), "never", &BTreeMap::new())?;
 
     let mut mcp = McpProcess::new(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
@@ -738,98 +709,8 @@ async fn turn_start_change_personality_mid_thread_v2() -> Result<()> {
     assert!(
         second_developer_texts
             .iter()
-            .any(|text| text.contains("<personality_spec>")),
-        "expected personality update message in second request, got {second_developer_texts:?}"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn turn_start_uses_migrated_pragmatic_personality_without_override_v2() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let server = responses::start_mock_server().await;
-    let body = responses::sse(vec![
-        responses::ev_response_created("resp-1"),
-        responses::ev_assistant_message("msg-1", "Done"),
-        responses::ev_completed("resp-1"),
-    ]);
-    let response_mock = responses::mount_sse_once(&server, body).await;
-
-    let codex_home = TempDir::new()?;
-    create_config_toml(
-        codex_home.path(),
-        &server.uri(),
-        "never",
-        &BTreeMap::from([(Feature::Personality, true)]),
-    )?;
-    create_fake_rollout(
-        codex_home.path(),
-        "2025-01-01T00-00-00",
-        "2025-01-01T00:00:00Z",
-        "history user message",
-        Some("mock_provider"),
-        None,
-    )?;
-
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
-
-    let persisted_toml: ConfigToml = toml::from_str(&std::fs::read_to_string(
-        codex_home.path().join("config.toml"),
-    )?)?;
-    assert_eq!(persisted_toml.personality, Some(Personality::Pragmatic));
-    assert!(
-        codex_home
-            .path()
-            .join(PERSONALITY_MIGRATION_FILENAME)
-            .exists(),
-        "expected personality migration marker to be written on startup"
-    );
-
-    let thread_req = mcp
-        .send_thread_start_request(ThreadStartParams {
-            model: Some("gpt-5.2-codex".to_string()),
-            ..Default::default()
-        })
-        .await?;
-    let thread_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(thread_req)),
-    )
-    .await??;
-    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(thread_resp)?;
-
-    let turn_req = mcp
-        .send_turn_start_request(TurnStartParams {
-            thread_id: thread.id,
-            input: vec![V2UserInput::Text {
-                text: "Hello".to_string(),
-                text_elements: Vec::new(),
-            }],
-            personality: None,
-            ..Default::default()
-        })
-        .await?;
-    let turn_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(turn_req)),
-    )
-    .await??;
-    let _turn: TurnStartResponse = to_response::<TurnStartResponse>(turn_resp)?;
-
-    timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_notification_message("turn/completed"),
-    )
-    .await??;
-
-    let request = response_mock.single_request();
-    let instructions_text = request.instructions_text();
-    assert!(
-        instructions_text.contains(LOCAL_PRAGMATIC_TEMPLATE),
-        "expected startup-migrated pragmatic personality in model instructions, got: {instructions_text:?}"
+            .all(|text| !text.contains("<personality_spec>")),
+        "unexpected personality update message in second request, got {second_developer_texts:?}"
     );
 
     Ok(())
@@ -2015,16 +1896,12 @@ fn create_config_toml_with_sandbox(
     feature_flags: &BTreeMap<Feature, bool>,
     sandbox_mode: &str,
 ) -> std::io::Result<()> {
-    let mut features = BTreeMap::from([(Feature::RemoteModels, false)]);
-    for (feature, enabled) in feature_flags {
-        features.insert(*feature, *enabled);
-    }
-    let feature_entries = features
-        .into_iter()
+    let feature_entries = feature_flags
+        .iter()
         .map(|(feature, enabled)| {
             let key = FEATURES
                 .iter()
-                .find(|spec| spec.id == feature)
+                .find(|spec| spec.id == *feature)
                 .map(|spec| spec.key)
                 .unwrap_or_else(|| panic!("missing feature key for {feature:?}"));
             format!("{key} = {enabled}")

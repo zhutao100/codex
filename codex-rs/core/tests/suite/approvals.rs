@@ -1069,7 +1069,7 @@ fn scenarios() -> Vec<ScenarioSpec> {
                 content: "function-patch-danger",
             },
             sandbox_permissions: SandboxPermissions::UseDefault,
-            features: vec![Feature::ApplyPatchFreeform],
+            features: vec![],
             model_override: Some("gpt-5.1-codex"),
             outcome: Outcome::Auto,
             expectation: Expectation::PatchApplied {

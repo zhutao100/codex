@@ -30,7 +30,6 @@ use crate::render::renderable::RenderableItem;
 use crate::tui::FrameRequester;
 use bottom_pane_view::BottomPaneView;
 use codex_core::config::types::ProgressLegendMode;
-use codex_core::features::Features;
 use codex_core::skills::model::SkillMetadata;
 use codex_file_search::FileMatch;
 use codex_protocol::openai_models::ReasoningEffort;
@@ -260,15 +259,6 @@ impl BottomPane {
         let _ = self.take_mention_paths();
     }
 
-    pub fn set_steer_enabled(&mut self, enabled: bool) {
-        self.composer.set_steer_enabled(enabled);
-    }
-
-    pub fn set_collaboration_modes_enabled(&mut self, enabled: bool) {
-        self.composer.set_collaboration_modes_enabled(enabled);
-        self.request_redraw();
-    }
-
     pub fn set_connectors_enabled(&mut self, enabled: bool) {
         self.composer.set_connectors_enabled(enabled);
     }
@@ -284,11 +274,6 @@ impl BottomPane {
         indicator: Option<CollaborationModeIndicator>,
     ) {
         self.composer.set_collaboration_mode_indicator(indicator);
-        self.request_redraw();
-    }
-
-    pub fn set_personality_command_enabled(&mut self, enabled: bool) {
-        self.composer.set_personality_command_enabled(enabled);
         self.request_redraw();
     }
 
@@ -854,7 +839,7 @@ impl BottomPane {
     }
 
     /// Called when the agent requests user approval.
-    pub fn push_approval_request(&mut self, request: ApprovalRequest, features: &Features) {
+    pub fn push_approval_request(&mut self, request: ApprovalRequest) {
         let request = if let Some(view) = self.view_stack.last_mut() {
             match view.try_consume_approval_request(request) {
                 Some(request) => request,
@@ -868,7 +853,7 @@ impl BottomPane {
         };
 
         // Otherwise create a new approval modal overlay.
-        let modal = ApprovalOverlay::new(request, self.app_event_tx.clone(), features.clone());
+        let modal = ApprovalOverlay::new(request, self.app_event_tx.clone());
         self.pause_status_timer_for_modal();
         self.push_view(Box::new(modal));
     }
@@ -1099,7 +1084,6 @@ mod tests {
     fn ctrl_c_on_modal_consumes_without_showing_quit_hint() {
         let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx_raw);
-        let features = Features::with_defaults();
         let mut pane = BottomPane::new(BottomPaneParams {
             app_event_tx: tx,
             frame_requester: FrameRequester::test_dummy(),
@@ -1112,7 +1096,7 @@ mod tests {
             progress_trace_styles: ProgressTraceStyles::default(),
             skills: Some(Vec::new()),
         });
-        pane.push_approval_request(exec_request(), &features);
+        pane.push_approval_request(exec_request());
         assert_eq!(CancellationEvent::Handled, pane.on_ctrl_c());
         assert!(!pane.quit_shortcut_hint_visible());
         assert_eq!(CancellationEvent::NotHandled, pane.on_ctrl_c());
@@ -1124,7 +1108,6 @@ mod tests {
     fn overlay_not_shown_above_approval_modal() {
         let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx_raw);
-        let features = Features::with_defaults();
         let mut pane = BottomPane::new(BottomPaneParams {
             app_event_tx: tx,
             frame_requester: FrameRequester::test_dummy(),
@@ -1139,7 +1122,7 @@ mod tests {
         });
 
         // Create an approval modal (active view).
-        pane.push_approval_request(exec_request(), &features);
+        pane.push_approval_request(exec_request());
 
         // Render and verify the top row does not include an overlay.
         let area = Rect::new(0, 0, 60, 6);
@@ -1160,7 +1143,6 @@ mod tests {
     fn composer_shown_after_denied_while_task_running() {
         let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx_raw);
-        let features = Features::with_defaults();
         let mut pane = BottomPane::new(BottomPaneParams {
             app_event_tx: tx,
             frame_requester: FrameRequester::test_dummy(),
@@ -1178,7 +1160,7 @@ mod tests {
         pane.set_task_running(true);
 
         // Push an approval modal (e.g., command approval) which should hide the status view.
-        pane.push_approval_request(exec_request(), &features);
+        pane.push_approval_request(exec_request());
 
         // Simulate pressing 'n' (No) on the modal.
         use crossterm::event::KeyCode;

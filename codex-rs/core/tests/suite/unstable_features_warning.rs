@@ -21,13 +21,13 @@ use toml::toml;
 async fn emits_warning_when_unstable_features_enabled_via_config() {
     let home = TempDir::new().expect("tempdir");
     let mut config = load_default_config_for_test(&home).await;
-    config.features.enable(Feature::ChildAgentsMd);
+    config.features.enable(Feature::OutputTokenReplay);
     let user_config_path =
         AbsolutePathBuf::from_absolute_path(config.codex_home.join(CONFIG_TOML_FILE))
             .expect("absolute user config path");
     config.config_layer_stack = config.config_layer_stack.with_user_config(
         &user_config_path,
-        toml! { features = { child_agents_md = true } }.into(),
+        toml! { features = { output_token_replay = true } }.into(),
     );
 
     let thread_manager = ThreadManager::with_models_provider(
@@ -48,7 +48,7 @@ async fn emits_warning_when_unstable_features_enabled_via_config() {
     let EventMsg::Warning(WarningEvent { message }) = warning else {
         panic!("expected warning event");
     };
-    assert!(message.contains("child_agents_md"));
+    assert!(message.contains("output_token_replay"));
     assert!(message.contains("Under-development features enabled"));
     assert!(message.contains("suppress_unstable_features_warning = true"));
 }
@@ -57,14 +57,14 @@ async fn emits_warning_when_unstable_features_enabled_via_config() {
 async fn suppresses_warning_when_configured() {
     let home = TempDir::new().expect("tempdir");
     let mut config = load_default_config_for_test(&home).await;
-    config.features.enable(Feature::ChildAgentsMd);
+    config.features.enable(Feature::OutputTokenReplay);
     config.suppress_unstable_features_warning = true;
     let user_config_path =
         AbsolutePathBuf::from_absolute_path(config.codex_home.join(CONFIG_TOML_FILE))
             .expect("absolute user config path");
     config.config_layer_stack = config.config_layer_stack.with_user_config(
         &user_config_path,
-        toml! { features = { child_agents_md = true } }.into(),
+        toml! { features = { output_token_replay = true } }.into(),
     );
 
     let thread_manager = ThreadManager::with_models_provider(
