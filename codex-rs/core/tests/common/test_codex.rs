@@ -222,10 +222,6 @@ impl TestCodexBuilder {
             mutator(&mut config);
         }
 
-        if config.include_apply_patch_tool {
-        } else {
-        }
-
         Ok((config, cwd))
     }
 }
