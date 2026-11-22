@@ -10,8 +10,6 @@ use crate::sse::responses::ResponsesStreamEvent;
 use crate::sse::responses::process_responses_event;
 use crate::telemetry::WebsocketTelemetry;
 use codex_client::TransportError;
-use futures::SinkExt;
-use futures::StreamExt;
 use http::HeaderMap;
 use http::HeaderName;
 use http::HeaderValue;
@@ -22,13 +20,9 @@ use serde_json::map::Map as JsonMap;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
-use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
-use tokio::sync::oneshot;
 use tokio::time::Instant;
-use tokio_tungstenite::MaybeTlsStream;
-use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::connect_async_tls_with_config;
 use tokio_tungstenite::tungstenite::Error as WsError;
 use tokio_tungstenite::tungstenite::Message;
@@ -42,111 +36,9 @@ use tungstenite::extensions::compression::deflate::DeflateConfig;
 use tungstenite::protocol::WebSocketConfig;
 use url::Url;
 
-struct WsStream {
-    tx_command: mpsc::Sender<WsCommand>,
-    rx_message: mpsc::UnboundedReceiver<Result<Message, WsError>>,
-    pump_task: tokio::task::JoinHandle<()>,
-}
-
-enum WsCommand {
-    Send {
-        message: Message,
-        tx_result: oneshot::Sender<Result<(), WsError>>,
-    },
-}
-
-impl WsStream {
-    fn new(inner: WebSocketStream<MaybeTlsStream<TcpStream>>) -> Self {
-        let (tx_command, mut rx_command) = mpsc::channel::<WsCommand>(32);
-        let (tx_message, rx_message) = mpsc::unbounded_channel::<Result<Message, WsError>>();
-
-        let pump_task = tokio::spawn(async move {
-            let mut inner = inner;
-            loop {
-                tokio::select! {
-                    command = rx_command.recv() => {
-                        let Some(command) = command else {
-                            break;
-                        };
-                        match command {
-                            WsCommand::Send { message, tx_result } => {
-                                let result = inner.send(message).await;
-                                let should_break = result.is_err();
-                                let _ = tx_result.send(result);
-                                if should_break {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    message = inner.next() => {
-                        let Some(message) = message else {
-                            break;
-                        };
-                        match message {
-                            Ok(Message::Ping(payload)) => {
-                                if let Err(err) = inner.send(Message::Pong(payload)).await {
-                                    let _ = tx_message.send(Err(err));
-                                    break;
-                                }
-                            }
-                            Ok(Message::Pong(_)) => {}
-                            Ok(message) => {
-                                let is_close = matches!(message, Message::Close(_));
-                                if tx_message.send(Ok(message)).is_err() {
-                                    break;
-                                }
-                                if is_close {
-                                    break;
-                                }
-                            }
-                            Err(err) => {
-                                let _ = tx_message.send(Err(err));
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        });
-
-        Self {
-            tx_command,
-            rx_message,
-            pump_task,
-        }
-    }
-
-    async fn request(
-        &self,
-        make_command: impl FnOnce(oneshot::Sender<Result<(), WsError>>) -> WsCommand,
-    ) -> Result<(), WsError> {
-        let (tx_result, rx_result) = oneshot::channel();
-        if self.tx_command.send(make_command(tx_result)).await.is_err() {
-            return Err(WsError::ConnectionClosed);
-        }
-        rx_result.await.unwrap_or(Err(WsError::ConnectionClosed))
-    }
-
-    async fn send(&self, message: Message) -> Result<(), WsError> {
-        self.request(|tx_result| WsCommand::Send { message, tx_result })
-            .await
-    }
-
-    async fn next(&mut self) -> Option<Result<Message, WsError>> {
-        self.rx_message.recv().await
-    }
-
-    fn is_closed(&self) -> bool {
-        self.pump_task.is_finished() || self.tx_command.is_closed()
-    }
-}
-
-impl Drop for WsStream {
-    fn drop(&mut self) {
-        self.pump_task.abort();
-    }
-}
+mod pump;
+use pump::WsSendOutcome;
+use pump::WsStream;
 
 const X_CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
 const X_MODELS_ETAG_HEADER: &str = "x-models-etag";
@@ -510,7 +402,21 @@ async fn run_websocket_response_stream(
     turn_state: Option<&OnceLock<String>>,
 ) -> Result<(), ApiError> {
     let mut last_server_model: Option<String> = None;
-    send_websocket_request(ws_stream, request_text, idle_timeout, telemetry.as_ref()).await?;
+    trace!("websocket request: {request_text}");
+    let start = Instant::now();
+    let outcome = ws_stream.send(request_text, idle_timeout).await;
+    if let Some(telemetry) = &telemetry {
+        let error = match &outcome {
+            WsSendOutcome::Flushed => None,
+            WsSendOutcome::NotStarted(error) | WsSendOutcome::Interrupted(error) => Some(error),
+        };
+        telemetry.on_ws_request(start.elapsed(), error);
+    }
+    let send_error = match outcome {
+        WsSendOutcome::Flushed => None,
+        WsSendOutcome::NotStarted(error) => return Err(error),
+        WsSendOutcome::Interrupted(error) => Some(error),
+    };
 
     loop {
         let poll_start = Instant::now();
@@ -526,6 +432,9 @@ async fn run_websocket_response_stream(
                 return Err(ApiError::Stream(err.to_string()));
             }
             Ok(None) => {
+                if let Some(error) = send_error {
+                    return Err(error);
+                }
                 return Err(ApiError::Stream(
                     "stream closed before response.completed".into(),
                 ));
@@ -599,48 +508,16 @@ async fn run_websocket_response_stream(
             Message::Binary(_) => {
                 return Err(ApiError::Stream("unexpected binary websocket event".into()));
             }
-            Message::Ping(payload) => {
-                if ws_stream.send(Message::Pong(payload)).await.is_err() {
-                    return Err(ApiError::Stream("websocket ping failed".into()));
-                }
-            }
-            Message::Pong(_) => {}
+            Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {}
             Message::Close(_) => {
                 return Err(ApiError::Stream(
                     "websocket closed by server before response.completed".into(),
                 ));
             }
-            _ => {}
         }
     }
 
     Ok(())
-}
-
-async fn send_websocket_request(
-    ws_stream: &WsStream,
-    request_text: String,
-    idle_timeout: Duration,
-    telemetry: Option<&Arc<dyn WebsocketTelemetry>>,
-) -> Result<(), ApiError> {
-    trace!("websocket request: {request_text}");
-
-    let request_start = Instant::now();
-    let result = tokio::time::timeout(
-        idle_timeout,
-        ws_stream.send(Message::Text(request_text.into())),
-    )
-    .await
-    .map_err(|_| ApiError::Stream("idle timeout sending websocket request".into()))
-    .and_then(|result| {
-        result.map_err(|err| ApiError::Stream(format!("failed to send websocket request: {err}")))
-    });
-
-    if let Some(t) = telemetry.as_ref() {
-        t.on_ws_request(request_start.elapsed(), result.as_ref().err());
-    }
-
-    result
 }
 
 fn serialize_websocket_request(request: &ResponsesWsRequest) -> Result<String, ApiError> {
