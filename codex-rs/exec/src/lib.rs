@@ -354,7 +354,7 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         thread,
         session_configured,
     } = if let Some(ExecCommand::Resume(args)) = command.as_ref() {
-        let resume_path = resolve_resume_path(&config, args).await?;
+        let resume_path = resolve_resume_path(&config, &default_model, args).await?;
 
         if let Some(path) = resume_path {
             thread_manager
@@ -593,10 +593,13 @@ fn spawn_thread_listener(
 
 async fn resolve_resume_path(
     config: &Config,
+    selected_model: &str,
     args: &crate::cli::ResumeArgs,
 ) -> anyhow::Result<Option<PathBuf>> {
     if args.last {
-        let default_provider_filter = vec![config.model_provider_id.clone()];
+        let provider_filter = [config
+            .model_provider_id_for_model(selected_model)
+            .to_owned()];
         let filter_cwd = if args.all {
             None
         } else {
@@ -608,7 +611,7 @@ async fn resolve_resume_path(
             None,
             codex_core::ThreadSortKey::UpdatedAt,
             &[],
-            Some(default_provider_filter.as_slice()),
+            Some(&provider_filter),
             &config.model_provider_id,
             filter_cwd,
         )

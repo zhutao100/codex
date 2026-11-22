@@ -116,6 +116,65 @@ fn exec_repo_root() -> anyhow::Result<std::path::PathBuf> {
     Ok(codex_utils_cargo_bin::repo_root()?)
 }
 
+#[tokio::test]
+async fn exec_resume_last_finds_the_selected_models_provider_with_either_reader()
+-> anyhow::Result<()> {
+    let test = test_codex_exec();
+    let fixture = exec_fixture()?;
+    std::fs::write(
+        test.home_path().join("config.toml"),
+        r#"
+model = "fixture-bound"
+[model_providers.bound]
+name = "Bound"
+wire_api = "responses"
+base_url = "http://unused.local/v1"
+[[model_overlay.models]]
+slug = "fixture-bound"
+model_provider = "bound"
+"#,
+    )?;
+    let run = |args: &[&str]| {
+        test.cmd()
+            .env("CODEX_RS_SSE_FIXTURE", &fixture)
+            .arg("--skip-git-repo-check")
+            .args(args)
+            .assert()
+            .success();
+    };
+    let sessions = test.home_path().join("sessions");
+    run(&["first bound thread"]);
+    let path = find_session_file_containing_marker(&sessions, "first bound thread")
+        .context("bound rollout")?;
+    let first = std::fs::read_to_string(&path)?;
+    assert_eq!(
+        serde_json::from_str::<Value>(first.lines().next().unwrap())?["payload"]["model_provider"],
+        "bound"
+    );
+    // A newer default-provider thread must not replace the bound thread in the picker.
+    run(&["--model", "unbound-fixture", "default provider thread"]);
+    for (marker, index_available) in [
+        ("indexed continuation", true),
+        ("filesystem continuation", false),
+    ] {
+        if !index_available {
+            std::fs::create_dir(test.home_path().join("state_index_misses"))?;
+        }
+        assert_eq!(
+            codex_core::state_db::open_if_present(test.home_path(), "openai")
+                .await
+                .is_some(),
+            index_available
+        );
+        run(&["resume", "--last", marker]);
+        assert_eq!(
+            find_session_file_containing_marker(&sessions, marker),
+            Some(path.clone())
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn exec_resume_last_appends_to_existing_file() -> anyhow::Result<()> {
     let test = test_codex_exec();

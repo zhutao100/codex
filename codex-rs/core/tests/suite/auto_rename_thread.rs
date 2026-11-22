@@ -1,11 +1,14 @@
 use anyhow::Result;
 use base64::Engine as _;
+use codex_core::AuthManager;
 use codex_core::CodexAuth;
+use codex_core::ThreadManager;
 use codex_core::auth::AuthCredentialsStoreMode;
 use codex_core::features::Feature;
 use codex_core::models_manager::client_version_to_whole;
 use codex_core::protocol::EventMsg;
 use codex_core::protocol::Op;
+use codex_core::protocol::SessionSource;
 use codex_protocol::openai_models::ConfigShellToolType;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelVisibility;
@@ -13,6 +16,7 @@ use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::openai_models::ReasoningEffortPreset;
 use codex_protocol::openai_models::TruncationPolicyConfig;
 use codex_protocol::openai_models::default_input_modalities;
+use codex_protocol::user_input::UserInput;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_response_created;
@@ -36,10 +40,6 @@ const PREVIOUS_LUNA_MODEL: &str = "gpt-5.6-luna";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn manual_title_wins_while_automatic_generation_is_blocked() -> Result<()> {
-    use codex_core::AuthManager;
-    use codex_core::ThreadManager;
-    use codex_core::protocol::SessionSource;
-    use codex_protocol::user_input::UserInput;
     use core_test_support::streaming_sse::StreamingSseChunk;
     use core_test_support::streaming_sse::start_streaming_sse_server;
 
@@ -238,6 +238,80 @@ fn write_thread_name_models_cache_with_hidden_luna(codex_home: &TempDir) -> Resu
             ModelVisibility::Hide,
         )],
     )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn automatic_title_uses_the_lightweight_models_bound_provider() -> Result<()> {
+    use codex_core::models_manager::overlay::ModelInfoPatch;
+    use codex_core::models_manager::overlay::ModelOverlay;
+    use codex_core::models_manager::overlay::ModelOverlayEntry;
+
+    skip_if_no_network_unless_localhost!(Ok(()));
+    let parent = start_mock_server().await;
+    let titles = start_mock_server().await;
+    let reply = |id, text| {
+        sse(vec![
+            ev_response_created(id),
+            ev_assistant_message(id, text),
+            ev_completed(id),
+        ])
+    };
+    let parent_requests =
+        core_test_support::responses::mount_sse_once(&parent, reply("turn", "done")).await;
+    let title_requests =
+        core_test_support::responses::mount_sse_once(&titles, reply("title", "Separate provider"))
+            .await;
+    let home = TempDir::new()?;
+    let mut config = core_test_support::load_default_config_for_test(&home).await;
+    config.model = Some("gpt-6.1-sol".into());
+    config.model_provider.base_url = Some(format!("{}/v1", parent.uri()));
+    config.model_provider.supports_websockets = false;
+    let mut title_provider = config.model_provider.clone();
+    title_provider.name = "Title fixture".into();
+    title_provider.base_url = Some(format!("{}/v1", titles.uri()));
+    config
+        .model_providers
+        .insert("titles".into(), title_provider);
+    config.model_overlay = Some(ModelOverlay {
+        models: vec![ModelOverlayEntry {
+            slug: "gpt-6-luna".into(),
+            model_provider: Some("titles".into()),
+            patch: ModelInfoPatch {
+                visibility: Some(ModelVisibility::List),
+                supported_in_api: Some(true),
+                ..Default::default()
+            },
+            final_instruction_override: None,
+        }],
+        ..Default::default()
+    });
+    config.features.enable(Feature::AutoRenameThread);
+    let auth = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("fixture"));
+    let manager = ThreadManager::new(config.codex_home.clone(), auth, SessionSource::Cli);
+    let started = manager.start_thread(config).await?;
+    started
+        .thread
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "name this".into(),
+                text_elements: vec![],
+            }],
+            final_output_json_schema: None,
+        })
+        .await?;
+    wait_for_event(&started.thread, |event| {
+        matches!(event, EventMsg::ThreadNameUpdated(updated) if updated.thread_name.as_deref() == Some("Separate provider"))
+    })
+    .await;
+    assert_eq!(
+        parent_requests.single_request().body_json()["model"],
+        "gpt-6.1-sol"
+    );
+    assert_eq!(
+        title_requests.single_request().body_json()["model"],
+        "gpt-6-luna"
+    );
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

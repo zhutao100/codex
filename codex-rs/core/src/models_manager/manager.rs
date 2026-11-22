@@ -187,10 +187,7 @@ impl ModelsManager {
     }
 
     fn uses_openai_catalog(model: &str, config: &Config) -> bool {
-        config
-            .overlay_model_provider_id_for_model(model)
-            .unwrap_or(&config.model_provider_id)
-            == "openai"
+        config.model_provider_id_for_model(model) == "openai"
     }
 
     pub(crate) async fn refresh_for_selected_model(&self, model: &str, config: &Config) {

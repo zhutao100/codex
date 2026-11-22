@@ -120,12 +120,14 @@ pub async fn run_resume_picker(
     tui: &mut Tui,
     codex_home: &Path,
     default_provider: &str,
+    selected_provider: &str,
     show_all: bool,
 ) -> Result<SessionSelection> {
     run_session_picker(
         tui,
         codex_home,
         default_provider,
+        selected_provider,
         show_all,
         SessionPickerAction::Resume,
     )
@@ -136,12 +138,14 @@ pub async fn run_fork_picker(
     tui: &mut Tui,
     codex_home: &Path,
     default_provider: &str,
+    selected_provider: &str,
     show_all: bool,
 ) -> Result<SessionSelection> {
     run_session_picker(
         tui,
         codex_home,
         default_provider,
+        selected_provider,
         show_all,
         SessionPickerAction::Fork,
     )
@@ -152,6 +156,7 @@ async fn run_session_picker(
     tui: &mut Tui,
     codex_home: &Path,
     default_provider: &str,
+    selected_provider: &str,
     show_all: bool,
     action: SessionPickerAction,
 ) -> Result<SessionSelection> {
@@ -166,17 +171,18 @@ async fn run_session_picker(
     };
 
     let loader_tx = bg_tx.clone();
+    let selected_provider = selected_provider.to_owned();
     let page_loader: PageLoader = Arc::new(move |request: PageLoadRequest| {
         let tx = loader_tx.clone();
+        let selected_provider = selected_provider.clone();
         tokio::spawn(async move {
-            let provider_filter = vec![request.default_provider.clone()];
             let page = RolloutRecorder::list_threads(
                 &request.codex_home,
                 PAGE_SIZE,
                 request.cursor.as_ref(),
                 request.sort_key,
                 INTERACTIVE_SESSION_SOURCES,
-                Some(provider_filter.as_slice()),
+                Some(std::slice::from_ref(&selected_provider)),
                 request.default_provider.as_str(),
             )
             .await;

@@ -583,6 +583,12 @@ impl Config {
             .and_then(|overlay| overlay.model_provider_for_slug(model))
     }
 
+    /// Provider whose threads and catalog belong to the selected model.
+    pub fn model_provider_id_for_model(&self, model: &str) -> &str {
+        self.overlay_model_provider_id_for_model(model)
+            .unwrap_or(&self.model_provider_id)
+    }
+
     pub(crate) fn resolve_model_provider_for_model(
         &self,
         model: &str,

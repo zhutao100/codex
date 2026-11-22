@@ -14,6 +14,7 @@ use codex_core::AuthManager;
 use codex_core::CodexAuth;
 use codex_core::INTERACTIVE_SESSION_SOURCES;
 use codex_core::RolloutRecorder;
+use codex_core::ThreadManager;
 use codex_core::ThreadSortKey;
 use codex_core::auth::AuthMode;
 use codex_core::auth::enforce_login_restrictions;
@@ -29,8 +30,10 @@ use codex_core::config_loader::format_config_error_with_source;
 use codex_core::default_client::set_default_client_residency_requirement;
 use codex_core::find_thread_path_by_id_str;
 use codex_core::find_thread_path_by_name_str;
+use codex_core::models_manager::manager::RefreshStrategy;
 use codex_core::path_utils;
 use codex_core::protocol::AskForApproval;
+use codex_core::protocol::SessionSource;
 use codex_core::read_session_meta_line;
 use codex_core::terminal::Multiplexer;
 use codex_core::windows_sandbox::WindowsSandboxLevelExt;
@@ -45,6 +48,7 @@ use cwd_prompt::CwdPromptAction;
 use cwd_prompt::CwdSelection;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tracing::error;
 use tracing_appender::non_blocking;
 use tracing_subscriber::EnvFilter;
@@ -526,6 +530,21 @@ async fn run_ratatui_app(
         })
     };
 
+    let thread_manager = Arc::new(ThreadManager::new(
+        config.codex_home.clone(),
+        auth_manager.clone(),
+        SessionSource::Cli,
+    ));
+    let history_provider = async || {
+        if config.model_overlay.is_none() {
+            return config.model_provider_id.as_str();
+        }
+        let model = thread_manager
+            .get_models_manager()
+            .get_default_model(&config.model, &config, RefreshStrategy::Offline)
+            .await;
+        config.model_provider_id_for_model(&model)
+    };
     let use_fork = cli.fork_picker || cli.fork_last || cli.fork_session_id.is_some();
     let session_selection = if use_fork {
         if let Some(id_str) = cli.fork_session_id.as_deref() {
@@ -543,7 +562,7 @@ async fn run_ratatui_app(
                 None => return missing_session_exit(id_str, "fork"),
             }
         } else if cli.fork_last {
-            let provider_filter = vec![config.model_provider_id.clone()];
+            let provider_filter = [history_provider().await.to_owned()];
             match RolloutRecorder::list_threads(
                 &config.codex_home,
                 1,
@@ -567,6 +586,7 @@ async fn run_ratatui_app(
                 &mut tui,
                 &config.codex_home,
                 &config.model_provider_id,
+                history_provider().await,
                 cli.fork_show_all,
             )
             .await?
@@ -602,7 +622,7 @@ async fn run_ratatui_app(
             None => return missing_session_exit(id_str, "resume"),
         }
     } else if cli.resume_last {
-        let provider_filter = vec![config.model_provider_id.clone()];
+        let provider_filter = [history_provider().await.to_owned()];
         let filter_cwd = if cli.resume_show_all {
             None
         } else {
@@ -628,6 +648,7 @@ async fn run_ratatui_app(
             &mut tui,
             &config.codex_home,
             &config.model_provider_id,
+            history_provider().await,
             cli.resume_show_all,
         )
         .await?
@@ -694,6 +715,7 @@ async fn run_ratatui_app(
         &mut tui,
         codex_linux_sandbox_exe,
         auth_manager,
+        thread_manager,
         config,
         cli_kv_overrides.clone(),
         overrides.clone(),

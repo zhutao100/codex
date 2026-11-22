@@ -176,10 +176,13 @@ async fn stream_thread_name(
         .otel_manager
         .clone()
         .with_model(model_info.slug.as_str(), model_info.slug.as_str());
+    let (_, provider) = turn_context
+        .config
+        .resolve_model_provider_for_model(&model_info.slug)?;
     let mut client_session = session
         .services
         .model_client
-        .new_session_with_provider(turn_context.provider.clone());
+        .new_session_with_provider(provider);
     let mut stream = client_session
         .stream(
             &prompt,

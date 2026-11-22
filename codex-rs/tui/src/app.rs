@@ -1178,6 +1178,7 @@ impl App {
         tui: &mut tui::Tui,
         codex_linux_sandbox_exe: Option<PathBuf>,
         auth_manager: Arc<AuthManager>,
+        thread_manager: Arc<ThreadManager>,
         mut config: Config,
         cli_kv_overrides: Vec<(String, TomlValue)>,
         harness_overrides: ConfigOverrides,
@@ -1197,11 +1198,6 @@ impl App {
 
         let harness_overrides =
             normalize_harness_overrides_for_cwd(harness_overrides, &config.cwd)?;
-        let thread_manager = Arc::new(ThreadManager::new(
-            config.codex_home.clone(),
-            auth_manager.clone(),
-            SessionSource::Cli,
-        ));
         let models_manager = thread_manager.get_models_manager();
         let models_refresh_worker =
             refresh_worker::spawn(&models_manager, Arc::new(config.clone()));
@@ -1639,6 +1635,8 @@ impl App {
                     tui,
                     &self.config.codex_home,
                     &self.config.model_provider_id,
+                    self.config
+                        .model_provider_id_for_model(self.chat_widget.current_model()),
                     false,
                 )
                 .await?

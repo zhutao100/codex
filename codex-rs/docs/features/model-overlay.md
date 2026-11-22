@@ -49,6 +49,7 @@ An explicit review prompt therefore takes precedence over an overlay final overr
 
 - Metadata uses the longest matching slug prefix, with one narrowly constrained namespace fallback; the requested slug remains the wire model identifier. Final instruction lookup follows the selected candidate so a shorter overlay prefix does not override a more specific model.
 - Provider binding uses the exact configured model slug. Metadata alias/prefix matching does not imply provider alias routing.
+- An automatic title uses the provider resolved for its selected naming model, not necessarily the provider that answered the parent turn. Resume and fork selection also use the selected model's provider, while explicit thread IDs remain unfiltered.
 - Normal configuration is overlay-aware: the session provider is a fallback for models without a binding. A derived config explicitly pinned by `apply_model_provider_id` keeps its selected provider even if the model has an overlay binding. [Review provider selection](review-provider.md) uses this distinction.
 - Validate provider ids at configuration load. Keep credentials and endpoints in provider configuration, separate from model metadata.
 
