@@ -1,15 +1,25 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use anyhow::Result;
+use codex_core::CodexThread;
 use codex_core::features::Feature;
+use codex_core::protocol::EventMsg;
+use codex_core::protocol::Op;
+use core_test_support::responses;
 use core_test_support::responses::mount_function_call_agent_response;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network_unless_localhost;
 use core_test_support::test_codex::test_codex;
+use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
-use tokio::time::Duration;
+
+async fn stop_writer(thread: &CodexThread) -> Result<()> {
+    thread.submit(Op::Shutdown).await?;
+    wait_for_event(thread, |event| matches!(event, EventMsg::ShutdownComplete)).await;
+    Ok(())
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_memory_tool_returns_persisted_thread_memory() -> Result<()> {
@@ -25,16 +35,17 @@ async fn get_memory_tool_returns_persisted_thread_memory() -> Result<()> {
     let thread_id = test.session_configured.session_id;
     let thread_id_string = thread_id.to_string();
 
-    let mut thread_exists = false;
-    // Wait for DB creation.
-    for _ in 0..100 {
-        if db.get_thread(thread_id).await?.is_some() {
-            thread_exists = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    assert!(thread_exists, "thread should exist in state db");
+    responses::mount_sse_once(
+        &server,
+        responses::sse(vec![
+            responses::ev_response_created("initial"),
+            responses::ev_assistant_message("message", "saved"),
+            responses::ev_completed("initial"),
+        ]),
+    )
+    .await;
+    test.submit_turn("create the original thread").await?;
+    stop_writer(&test.codex).await?;
 
     let trace_summary = "trace summary from sqlite";
     let memory_summary = "memory summary from sqlite";
@@ -52,7 +63,7 @@ async fn get_memory_tool_returns_persisted_thread_memory() -> Result<()> {
             uuid::Uuid::new_v4()
         ));
     std::fs::File::create(&orphan)?;
-    db.invalidate_backfill(1).await?;
+    std::fs::write(test.codex_home_path().join("state_index_misses"), [1])?;
     let test = test_codex()
         .with_home(home)
         .with_config(|config| {
@@ -111,11 +122,8 @@ async fn get_memory_tool_returns_persisted_thread_memory() -> Result<()> {
         })
     );
 
+    stop_writer(&test.codex).await?;
     std::fs::remove_file(orphan)?;
-    let _next = test_codex()
-        .with_home(test.home.clone())
-        .build(&server)
-        .await?;
     assert!(
         codex_core::state_db::open_if_present(
             test.codex_home_path(),

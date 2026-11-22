@@ -1,3 +1,4 @@
+use codex_core::CodexThread;
 use codex_core::compact::SUMMARIZATION_PROMPT;
 use codex_core::protocol::EventMsg;
 use codex_core::protocol::Op;
@@ -13,6 +14,7 @@ use core_test_support::responses::ev_output_text_delta;
 use core_test_support::responses::ev_reasoning_item;
 use core_test_support::responses::ev_reasoning_item_added;
 use core_test_support::responses::ev_response_created;
+use core_test_support::skip_if_no_network_unless_localhost;
 use core_test_support::streaming_sse::StreamingSseChunk;
 use core_test_support::streaming_sse::start_streaming_sse_server;
 use core_test_support::test_codex::test_codex;
@@ -70,8 +72,19 @@ fn find_item_position(items: &[Value], label: &str, predicate: impl Fn(&Value) -
         .unwrap_or_else(|| panic!("expected {label} in request suffix: {items:#?}"))
 }
 
+async fn wait_for_queued_input(codex: &CodexThread) {
+    // submit() enqueues an operation. A later read-only FIFO request proves its handler
+    // finished before the fixture releases the active model stream.
+    codex.submit(Op::ListCustomPrompts).await.unwrap();
+    wait_for_event(codex, |event| {
+        matches!(event, EventMsg::ListCustomPromptsResponse(_))
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn injected_user_input_triggers_follow_up_request_with_deltas() {
+    skip_if_no_network_unless_localhost!();
     let (gate_completed_tx, gate_completed_rx) = oneshot::channel();
 
     let first_chunks = vec![
@@ -149,6 +162,7 @@ async fn injected_user_input_triggers_follow_up_request_with_deltas() {
         .await
         .unwrap();
 
+    wait_for_queued_input(&codex).await;
     let _ = gate_completed_tx.send(());
 
     let _ = wait_for_event(&codex, |event| {
@@ -177,6 +191,7 @@ async fn injected_user_input_triggers_follow_up_request_with_deltas() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn explicit_prompt_samples_before_pending_input() {
+    skip_if_no_network_unless_localhost!();
     let (first_completed_tx, first_completed_rx) = oneshot::channel();
 
     let first_chunks = vec![
@@ -233,6 +248,7 @@ async fn explicit_prompt_samples_before_pending_input() {
         .await
         .unwrap();
 
+    wait_for_queued_input(&codex).await;
     let _ = first_completed_tx.send(());
     wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
 
@@ -262,6 +278,7 @@ async fn explicit_prompt_samples_before_pending_input() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn steered_user_input_preserves_previous_request_prefix_after_reasoning_item() {
+    skip_if_no_network_unless_localhost!();
     let (gate_reasoning_done_tx, gate_reasoning_done_rx) = oneshot::channel();
     let call_id = "call-preserved-prefix";
 
@@ -333,6 +350,7 @@ async fn steered_user_input_preserves_previous_request_prefix_after_reasoning_it
         .await
         .unwrap();
 
+    wait_for_queued_input(&codex).await;
     let _ = gate_reasoning_done_tx.send(());
     wait_for_event(&codex, |event| {
         matches!(event, EventMsg::AgentMessage(message) if message.message == "first answer")
@@ -408,6 +426,7 @@ async fn remote_v2_mid_turn_compaction_defers_pending_input_until_model_follow_u
 }
 
 async fn assert_pending_input_after_compaction(remote_v2: bool) -> anyhow::Result<()> {
+    skip_if_no_network_unless_localhost!(Ok(()));
     let (work_notes_completed_tx, work_notes_completed_rx) = oneshot::channel();
     let pending_text = "queued during work-notes capture";
     let call_id = "call-pending-compact";
@@ -538,6 +557,7 @@ async fn assert_pending_input_after_compaction(remote_v2: bool) -> anyhow::Resul
         })
         .await?;
 
+    wait_for_queued_input(&codex).await;
     let _ = work_notes_completed_tx.send(());
     wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
 
