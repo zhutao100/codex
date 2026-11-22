@@ -55,8 +55,7 @@ use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_state::ThreadMetadataBuilder;
 
-/// Records all [`ResponseItem`]s for a session and flushes them to disk at
-/// explicit durability boundaries.
+/// Writes ordered batches to JSONL before indexing them; explicit checkpoints acknowledge prior writes.
 ///
 /// Rollouts are recorded as JSONL and can be inspected with tools such as:
 ///
@@ -179,7 +178,7 @@ impl RolloutRecorder {
         default_provider: &str,
         archived: bool,
     ) -> std::io::Result<ThreadsPage> {
-        let state_db_ctx = state_db::open_if_present(codex_home, default_provider).await;
+        let state_db_ctx = state_db::history_index(codex_home, default_provider, archived).await;
         if let Some(db_page) = state_db::list_threads_db(
             state_db_ctx.as_deref(),
             codex_home,
@@ -194,9 +193,6 @@ impl RolloutRecorder {
         {
             return Ok(db_page.into());
         }
-        tracing::error!("Falling back on rollout system");
-        state_db::record_discrepancy("list_threads_with_db_fallback", "falling_back");
-
         if archived {
             let root = codex_home.join(ARCHIVED_SESSIONS_SUBDIR);
             return get_threads_in_root(
@@ -238,7 +234,7 @@ impl RolloutRecorder {
         default_provider: &str,
         filter_cwd: Option<&Path>,
     ) -> std::io::Result<Option<PathBuf>> {
-        let state_db_ctx = state_db::open_if_present(codex_home, default_provider).await;
+        let state_db_ctx = state_db::history_index(codex_home, default_provider, false).await;
         if state_db_ctx.is_some() {
             let mut db_cursor = cursor.cloned();
             loop {
@@ -697,7 +693,7 @@ fn create_log_file(config: &Config, conversation_id: ThreadId) -> std::io::Resul
 async fn rollout_writer(
     file: tokio::fs::File,
     mut rx: mpsc::Receiver<RolloutCmd>,
-    mut meta: Option<SessionMeta>,
+    meta: Option<SessionMeta>,
     cwd: std::path::PathBuf,
     rollout_path: PathBuf,
     state_db_ctx: Option<StateDbHandle>,
@@ -710,13 +706,12 @@ async fn rollout_writer(
         last_flushed_completion_review_state: None,
         pending_completion_review_state: None,
     };
-    let mut pending_index_time = None;
     if let Some(builder) = state_builder.as_mut() {
         builder.rollout_path = rollout_path.clone();
     }
 
     // If we have a meta, collect git info asynchronously and write meta first
-    if let Some(session_meta) = meta.take() {
+    let mut initial = if let Some(session_meta) = meta {
         let git_info = collect_git_info(&cwd).await;
         let session_meta_line = SessionMetaLine {
             meta: session_meta,
@@ -725,39 +720,32 @@ async fn rollout_writer(
         state_builder =
             metadata::builder_from_session_meta(&session_meta_line, rollout_path.as_path());
 
-        // Write the SessionMeta as the first item in the file, wrapped in a rollout line
-        let rollout_item = RolloutItem::SessionMeta(session_meta_line);
-        writer.write_rollout_item(&rollout_item).await?;
-        let indexed = state_db::apply_rollout_items(
-            state_db_ctx.as_deref(),
-            rollout_path.as_path(),
-            default_provider.as_str(),
-            state_builder.as_ref(),
-            std::slice::from_ref(&rollout_item),
-            "rollout_writer",
-        )
-        .await;
-        if indexed {
-            pending_index_time = state_builder.as_ref().map(|builder| builder.id);
-        }
-        if !indexed && let Some(home) = &codex_home {
-            writer.flush().await?;
-            state_db::note_missed_append(home, &rollout_path).await?;
-        }
-    }
+        Some(RolloutCmd::AddItems(vec![RolloutItem::SessionMeta(
+            session_meta_line,
+        )]))
+    } else {
+        None
+    };
 
-    // Process rollout commands
-    while let Some(cmd) = rx.recv().await {
+    let mut write_error = None;
+    loop {
+        let cmd = match initial.take() {
+            Some(cmd) => cmd,
+            None => match rx.recv().await {
+                Some(cmd) => cmd,
+                None => break,
+            },
+        };
         match cmd {
             RolloutCmd::AddItems(items) => {
-                if items.is_empty() {
+                if items.is_empty() || write_error.is_some() {
                     continue;
                 }
-                for item in &items {
-                    writer.write_rollout_item(item).await?;
-                }
-                if let Some(builder) = state_builder.as_mut() {
-                    builder.rollout_path = rollout_path.clone();
+                if let Err(error) = writer.write_batch(&items).await {
+                    // AddItems is queued, not acknowledged. Deliver the original OS error
+                    // to the next explicit checkpoint instead of dropping its channel.
+                    write_error = Some(error);
+                    continue;
                 }
                 let indexed = state_db::apply_rollout_items(
                     state_db_ctx.as_deref(),
@@ -768,24 +756,18 @@ async fn rollout_writer(
                     "rollout_writer",
                 )
                 .await;
-                if indexed {
-                    pending_index_time = state_builder.as_ref().map(|builder| builder.id);
-                }
-                if !indexed && let Some(home) = &codex_home {
-                    writer.flush().await?;
-                    state_db::note_missed_append(home, &rollout_path).await?;
+                if !indexed
+                    && let Some(home) = &codex_home
+                    && let Err(err) = state_db::note_missed_append(home, &rollout_path).await
+                {
+                    warn!(
+                        "could not journal a missed index update for {}: {err}",
+                        rollout_path.display()
+                    );
                 }
             }
             RolloutCmd::Flush { ack } | RolloutCmd::Shutdown { ack } => {
-                if let Err(error) = writer
-                    .flush_checkpoint(
-                        state_db_ctx.as_deref(),
-                        pending_index_time.take(),
-                        &rollout_path,
-                        codex_home.as_deref(),
-                    )
-                    .await
-                {
+                if let Some(error) = write_error.take() {
                     let writer_error = IoError::new(error.kind(), error.to_string());
                     let _ = ack.send(Err(error));
                     return Err(writer_error);
@@ -795,16 +777,7 @@ async fn rollout_writer(
         }
     }
 
-    writer
-        .flush_checkpoint(
-            state_db_ctx.as_deref(),
-            pending_index_time,
-            &rollout_path,
-            codex_home.as_deref(),
-        )
-        .await?;
-
-    Ok(())
+    write_error.map_or(Ok(()), Err)
 }
 
 struct JsonlWriter {
@@ -821,25 +794,10 @@ struct RolloutLineRef<'a> {
 }
 
 impl JsonlWriter {
-    async fn flush_checkpoint(
-        &mut self,
-        db: Option<&codex_state::StateRuntime>,
-        pending: Option<ThreadId>,
-        path: &Path,
-        home: Option<&Path>,
-    ) -> std::io::Result<()> {
-        self.flush().await?;
-        if let (Some(db), Some(id), Some(home)) = (db, pending, home) {
-            // The open file, not a possibly unlinked/replaced path, owns this flush's mtime.
-            let modified = self.file.get_ref().metadata().await?.modified()?;
-            if db.sync_rollout_mtime(id, path, modified).await.is_err() {
-                state_db::note_missed_append(home, path).await?;
-            }
+    async fn write_batch(&mut self, items: &[RolloutItem]) -> std::io::Result<()> {
+        for item in items {
+            self.write_rollout_item(item).await?;
         }
-        Ok(())
-    }
-
-    async fn flush(&mut self) -> std::io::Result<()> {
         self.file.flush().await?;
         if let Some(state) = self.pending_completion_review_state.take() {
             self.last_flushed_completion_review_state = Some(state);

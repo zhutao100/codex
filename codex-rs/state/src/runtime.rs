@@ -318,6 +318,20 @@ WHERE thread_id = ?
             .map(PathBuf::from))
     }
 
+    /// Files with a recorded user message and their modification times at the history cursor's precision.
+    pub async fn indexed_history_files(
+        &self,
+        archived: bool,
+    ) -> anyhow::Result<std::collections::HashMap<PathBuf, i64>> {
+        let rows = sqlx::query_as::<_, (String, i64)>(
+            "SELECT rollout_path, updated_at FROM threads WHERE archived = ? AND first_user_message IS NOT NULL AND first_user_message <> ''",
+        ).bind(archived).fetch_all(self.pool.as_ref()).await?;
+        Ok(rows
+            .into_iter()
+            .map(|(path, time)| (PathBuf::from(path), time))
+            .collect())
+    }
+
     /// List threads using the underlying database.
     pub async fn list_threads(
         &self,
@@ -724,24 +738,6 @@ ON CONFLICT(thread_id, position) DO NOTHING
             }
             return Err(err);
         }
-        Ok(())
-    }
-
-    /// Match the index timestamp to JSONL after a successful recorder flush.
-    pub async fn sync_rollout_mtime(
-        &self,
-        id: ThreadId,
-        path: &Path,
-        modified: std::time::SystemTime,
-    ) -> anyhow::Result<()> {
-        let updated = chrono::DateTime::<Utc>::from(modified).timestamp();
-        sqlx::query("UPDATE threads SET updated_at = ? WHERE id = ? AND rollout_path = ? AND updated_at <> ?")
-                .bind(updated)
-                .bind(id.to_string())
-                .bind(path.to_string_lossy())
-                .bind(updated)
-                .execute(self.pool.as_ref())
-                .await?;
         Ok(())
     }
 

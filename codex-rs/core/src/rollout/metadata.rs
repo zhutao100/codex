@@ -398,7 +398,7 @@ async fn backfill_rollout(
     Ok(())
 }
 
-async fn collect_rollout_paths(root: &Path) -> std::io::Result<Vec<PathBuf>> {
+pub(crate) async fn collect_rollout_paths(root: &Path) -> std::io::Result<Vec<PathBuf>> {
     let mut stack = vec![root.to_path_buf()];
     let mut paths = Vec::new();
     while let Some(dir) = stack.pop() {
@@ -596,15 +596,244 @@ mod tests {
     }
 
     fn picker_message() -> RolloutItem {
+        user_message("visible in the picker")
+    }
+
+    fn user_message(text: &str) -> RolloutItem {
         RolloutItem::EventMsg(codex_protocol::protocol::EventMsg::UserMessage(
             codex_protocol::protocol::UserMessageEvent {
-                message: "visible in the picker".into(),
+                message: text.into(),
                 client_user_message_id: None,
                 images: None,
                 local_images: vec![],
                 text_elements: vec![],
             },
         ))
+    }
+
+    #[tokio::test]
+    async fn older_writer_without_an_index_journal_is_visible_to_list_and_resume()
+    -> anyhow::Result<()> {
+        use crate::ThreadSortKey::UpdatedAt;
+        let home = tempdir()?;
+        let mut config = crate::config::test_config();
+        config.codex_home = home.path().into();
+        let old = write_rollout_in_sessions(
+            home.path(),
+            "2026-01-27T12-00-00",
+            "2026-01-27T12:00:00Z",
+            Uuid::new_v4(),
+        );
+        append_picker_message(&old)?;
+        let earlier = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_760_000_000);
+        File::open(&old)?.set_modified(earlier)?;
+        let db = crate::state_db::init_for_rollout(&config, None)
+            .await
+            .unwrap();
+        assert!(
+            crate::state_db::history_index(home.path(), &config.model_provider_id, false)
+                .await
+                .is_some()
+        );
+        let newer = write_rollout_in_sessions(
+            home.path(),
+            "2026-01-27T13-00-00",
+            "2026-01-27T13:00:00Z",
+            Uuid::new_v4(),
+        );
+        append_picker_message(&newer)?;
+        File::open(&newer)?.set_modified(earlier + std::time::Duration::from_secs(60))?;
+        assert!(!home.path().join("state_index_misses").exists());
+        assert_eq!(
+            db.get_backfill_state().await?.status,
+            BackfillStatus::Complete
+        );
+        let first = RolloutRecorder::list_threads(
+            home.path(),
+            1,
+            None,
+            UpdatedAt,
+            &[],
+            None,
+            &config.model_provider_id,
+        )
+        .await?;
+        assert_eq!(
+            first
+                .items
+                .iter()
+                .map(|item| &item.path)
+                .collect::<Vec<_>>(),
+            [&newer]
+        );
+        let second = RolloutRecorder::list_threads(
+            home.path(),
+            1,
+            Some(&first.next_cursor.unwrap()),
+            UpdatedAt,
+            &[],
+            None,
+            &config.model_provider_id,
+        )
+        .await?;
+        assert_eq!(
+            second
+                .items
+                .iter()
+                .map(|item| &item.path)
+                .collect::<Vec<_>>(),
+            [&old]
+        );
+        assert_eq!(
+            RolloutRecorder::find_latest_thread_path(
+                home.path(),
+                1,
+                None,
+                UpdatedAt,
+                &[],
+                None,
+                &config.model_provider_id,
+                Some(home.path())
+            )
+            .await?,
+            Some(newer)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn same_second_external_first_message_makes_a_header_only_thread_visible()
+    -> anyhow::Result<()> {
+        let home = tempdir()?;
+        let mut config = crate::config::test_config();
+        config.codex_home = home.path().into();
+        let path = write_rollout_in_sessions(
+            home.path(),
+            "2026-01-27T12-00-00",
+            "2026-01-27T12:00:00Z",
+            Uuid::new_v4(),
+        );
+        let timestamp = File::open(&path)?.metadata()?.modified()?;
+        crate::state_db::init_for_rollout(&config, None)
+            .await
+            .unwrap();
+        let index =
+            || crate::state_db::history_index(home.path(), &config.model_provider_id, false);
+        assert!(
+            index().await.is_some(),
+            "an empty rollout is not a missing history entry"
+        );
+        append_picker_message(&path)?;
+        File::open(&path)?.set_modified(timestamp)?;
+        assert!(
+            index().await.is_none(),
+            "a new user event needs authoritative discovery"
+        );
+        let latest = RolloutRecorder::find_latest_thread_path(
+            home.path(),
+            1,
+            None,
+            crate::ThreadSortKey::UpdatedAt,
+            &[],
+            None,
+            &config.model_provider_id,
+            Some(home.path()),
+        )
+        .await?;
+        assert_eq!(latest, Some(path));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn indexed_message_survives_an_abrupt_writer_exit() -> anyhow::Result<()> {
+        const CHILD_HOME: &str = "CODEX_TEST_ABRUPT_RECORDER_CHILD_HOME";
+        if let Some(path) = std::env::var_os(CHILD_HOME) {
+            let mut config = crate::config::test_config();
+            config.codex_home = path.into();
+            config.cwd = config.codex_home.clone();
+            let db = crate::state_db::init_for_rollout(&config, None)
+                .await
+                .unwrap();
+            let id = ThreadId::new();
+            let params = crate::RolloutRecorderParams::new(
+                id,
+                None,
+                SessionSource::Cli,
+                config.model_provider_id.clone(),
+                Default::default(),
+                vec![],
+            );
+            let recorder = RolloutRecorder::new(&config, params, Some(db.clone()), None).await?;
+            recorder.record_items(&[picker_message()]).await?;
+            while db
+                .get_thread(id)
+                .await?
+                .is_none_or(|row| row.first_user_message.is_none())
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            // No flush, shutdown, or destructors after the row is observable by another reader.
+            std::process::exit(0);
+        }
+        let home = tempdir()?;
+        let child = tokio::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "rollout::metadata::tests::indexed_message_survives_an_abrupt_writer_exit",
+            ])
+            .env(CHILD_HOME, home.path())
+            .kill_on_drop(true)
+            .output();
+        let output = tokio::time::timeout(std::time::Duration::from_secs(15), child).await??;
+        anyhow::ensure!(
+            output.status.success(),
+            "recorder child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let paths = collect_rollout_paths(&home.path().join("sessions")).await?;
+        assert_eq!(paths.len(), 1);
+        let (items, _, errors) = RolloutRecorder::load_rollout_items(&paths[0]).await?;
+        assert_eq!(errors, 0);
+        assert_eq!(
+            serde_json::to_value(items.last())?,
+            serde_json::to_value(picker_message())?
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unavailable_index_and_journal_do_not_interrupt_jsonl_recording() -> anyhow::Result<()>
+    {
+        let home = tempdir()?;
+        let mut config = crate::config::test_config();
+        config.codex_home = home.path().into();
+        config.cwd = home.path().into();
+        std::fs::create_dir(codex_state::state_db_path(home.path()))?;
+        std::fs::create_dir(home.path().join("state_index_misses"))?;
+        let db = crate::state_db::init_for_rollout(&config, None).await;
+        assert!(db.is_none());
+        let params = crate::RolloutRecorderParams::new(
+            ThreadId::new(),
+            None,
+            SessionSource::Cli,
+            config.model_provider_id.clone(),
+            Default::default(),
+            vec![],
+        );
+        let recorder = RolloutRecorder::new(&config, params, db, None).await?;
+        for text in ["first batch", "next batch"] {
+            recorder.record_items(&[user_message(text)]).await?;
+            recorder.flush().await?;
+        }
+        recorder.shutdown().await?;
+        let (items, _, errors) =
+            RolloutRecorder::load_rollout_items(recorder.rollout_path()).await?;
+        assert_eq!(errors, 0);
+        assert_eq!(
+            serde_json::to_value(&items[1..])?,
+            serde_json::to_value([user_message("first batch"), user_message("next batch")])?
+        );
+        Ok(())
     }
 
     fn append_picker_message(path: &Path) -> anyhow::Result<()> {

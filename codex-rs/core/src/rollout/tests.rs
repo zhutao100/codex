@@ -88,6 +88,9 @@ async fn insert_state_db_thread(
         builder.archived_at = Some(created_at);
     }
     let mut metadata = builder.build(TEST_PROVIDER);
+    if let Ok(modified) = fs::metadata(rollout_path).and_then(|file| file.modified()) {
+        metadata.updated_at = modified.into();
+    }
     metadata.first_user_message = Some("Hello from user".to_string());
     runtime
         .upsert_thread(&metadata)
@@ -505,17 +508,16 @@ async fn clean_for_continue_removes_abort_custom_and_dangling_records() -> Resul
 async fn list_threads_prefers_state_db_when_available() {
     let temp = TempDir::new().unwrap();
     let home = temp.path();
-    let fs_uuid = Uuid::from_u128(101);
+    let db_uuid = Uuid::from_u128(102);
     write_session_file(
         home,
-        "2025-01-03T13-00-00",
-        fs_uuid,
+        "2025-01-03T12-00-00",
+        db_uuid,
         1,
         Some(SessionSource::Cli),
     )
     .unwrap();
 
-    let db_uuid = Uuid::from_u128(102);
     let db_thread_id = ThreadId::from_string(&db_uuid.to_string()).expect("valid thread id");
     let db_rollout_path = home.join(format!(
         "sessions/2025/01/03/rollout-2025-01-03T12-00-00-{db_uuid}.jsonl"
@@ -550,14 +552,24 @@ async fn list_archived_threads_prefers_state_db_when_available() {
     let home = temp.path();
     let archived_root = home.join("archived_sessions");
     fs::create_dir_all(&archived_root).unwrap();
-    let fs_uuid = Uuid::from_u128(201);
-    let fs_path = archived_root.join(format!("rollout-2025-01-03T13-00-00-{fs_uuid}.jsonl"));
-    fs::write(&fs_path, "{\"type\":\"session_meta\",\"payload\":{}}\n").unwrap();
-
     let db_uuid = Uuid::from_u128(202);
     let db_thread_id = ThreadId::from_string(&db_uuid.to_string()).expect("valid thread id");
     let db_rollout_path =
         archived_root.join(format!("rollout-2025-01-03T12-00-00-{db_uuid}.jsonl"));
+    write_session_file(
+        home,
+        "2025-01-03T12-00-00",
+        db_uuid,
+        1,
+        Some(SessionSource::Cli),
+    )
+    .unwrap();
+    fs::rename(
+        home.join("sessions/2025/01/03")
+            .join(db_rollout_path.file_name().unwrap()),
+        &db_rollout_path,
+    )
+    .unwrap();
     insert_state_db_thread(home, db_thread_id, db_rollout_path.as_path(), true).await;
 
     let page = RolloutRecorder::list_archived_threads(
@@ -590,6 +602,14 @@ async fn list_threads_db_excludes_archived_entries() {
         ThreadId::from_string(&active_uuid.to_string()).expect("valid active thread id");
     let active_rollout_path =
         sessions_root.join(format!("rollout-2025-01-03T12-00-00-{active_uuid}.jsonl"));
+    write_session_file(
+        home,
+        "2025-01-03T12-00-00",
+        active_uuid,
+        1,
+        Some(SessionSource::Cli),
+    )
+    .unwrap();
     insert_state_db_thread(home, active_thread_id, active_rollout_path.as_path(), false).await;
 
     let archived_uuid = Uuid::from_u128(212);

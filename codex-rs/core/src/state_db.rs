@@ -67,6 +67,59 @@ pub async fn open_if_present(codex_home: &Path, default_provider: &str) -> Optio
     open_existing(codex_home, default_provider, None).await
 }
 
+/// Other builds may change JSONL without writing our journal. Certify membership and
+/// ordering before a SQL-only page can hide a file. Do not delete unrelated thread memories.
+pub(crate) async fn history_index(
+    home: &Path,
+    provider: &str,
+    archived: bool,
+) -> Option<StateDbHandle> {
+    let runtime = open_if_present(home, provider).await?;
+    let mut indexed = runtime.indexed_history_files(archived).await.ok()?;
+    let root = home.join(if archived {
+        crate::rollout::ARCHIVED_SESSIONS_SUBDIR
+    } else {
+        crate::rollout::SESSIONS_SUBDIR
+    });
+    let paths = match metadata::collect_rollout_paths(&root).await {
+        Ok(paths) => paths,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(_) => return None,
+    };
+    let unchecked =
+        tokio::task::spawn_blocking(move || -> std::io::Result<Option<Vec<PathBuf>>> {
+            let mut unchecked = Vec::new();
+            for path in paths {
+                let Some(updated) = indexed.remove(&path) else {
+                    if path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .and_then(crate::rollout::list::parse_timestamp_uuid_from_filename)
+                        .is_some()
+                    {
+                        unchecked.push(path);
+                    }
+                    continue;
+                };
+                if DateTime::<Utc>::from(path.metadata()?.modified()?).timestamp() != updated {
+                    return Ok(None);
+                }
+            }
+            Ok(indexed.is_empty().then_some(unchecked))
+        })
+        .await
+        .ok()?
+        .ok()??;
+    // A newly started thread has a header but no user event. It must neither
+    // invalidate every SQL page nor mask a first message appended in the same second.
+    for path in unchecked {
+        if crate::rollout::list::is_visible_rollout(&path).await.ok()? {
+            return None;
+        }
+    }
+    Some(runtime)
+}
+
 async fn open_existing(
     codex_home: &Path,
     default_provider: &str,
@@ -142,7 +195,8 @@ pub(crate) async fn missed_deletions(
 
 async fn missed_generation(home: &Path) -> std::io::Result<i64> {
     match tokio::fs::metadata(home.join(MISSED_INDEX_WRITES)).await {
-        Ok(meta) => i64::try_from(meta.len()).map_err(std::io::Error::other),
+        Ok(meta) if meta.is_file() => i64::try_from(meta.len()).map_err(std::io::Error::other),
+        Ok(_) => Err(std::io::Error::other("index journal is not a regular file")),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
         Err(error) => Err(error),
     }

@@ -988,6 +988,11 @@ impl<'a> ProviderMatcher<'a> {
     }
 }
 
+pub(crate) async fn is_visible_rollout(path: &Path) -> io::Result<bool> {
+    let summary = read_head_summary(path, HEAD_RECORD_LIMIT).await?;
+    Ok(summary.saw_session_meta && summary.saw_user_event)
+}
+
 async fn read_head_summary(path: &Path, head_limit: usize) -> io::Result<HeadTailSummary> {
     use tokio::io::AsyncBufReadExt;
 
