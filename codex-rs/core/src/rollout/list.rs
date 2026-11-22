@@ -1075,6 +1075,10 @@ async fn read_head_summary(path: &Path, head_limit: usize) -> io::Result<HeadTai
 /// Read up to `HEAD_RECORD_LIMIT` records from the start of the rollout file at `path`.
 /// This should be enough to produce a summary including the session meta line.
 pub async fn read_head_for_summary(path: &Path) -> io::Result<Vec<serde_json::Value>> {
+    read_head_records(path, HEAD_RECORD_LIMIT).await
+}
+
+async fn read_head_records(path: &Path, limit: usize) -> io::Result<Vec<serde_json::Value>> {
     use tokio::io::AsyncBufReadExt;
 
     let file = tokio::fs::File::open(path).await?;
@@ -1082,7 +1086,7 @@ pub async fn read_head_for_summary(path: &Path) -> io::Result<Vec<serde_json::Va
     let mut lines = reader.lines();
     let mut head = Vec::new();
 
-    while head.len() < HEAD_RECORD_LIMIT {
+    while head.len() < limit {
         let Some(line) = lines.next_line().await? else {
             break;
         };
@@ -1124,7 +1128,7 @@ fn strip_user_message_prefix(text: &str) -> &str {
 /// Read the SessionMetaLine from the head of a rollout file for reuse by
 /// callers that need the session metadata (e.g. to derive a cwd for config).
 pub async fn read_session_meta_line(path: &Path) -> io::Result<SessionMetaLine> {
-    let head = read_head_for_summary(path).await?;
+    let head = read_head_records(path, 1).await?;
     let Some(first) = head.first() else {
         return Err(io::Error::other(format!(
             "rollout at {} is empty",

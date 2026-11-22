@@ -256,7 +256,7 @@ impl RolloutRecorder {
                 else {
                     break;
                 };
-                if let Some(path) = select_resume_path_from_db_page(&db_page, filter_cwd) {
+                if let Some(path) = select_resume_path_from_db_page(&db_page, filter_cwd).await {
                     return Ok(Some(path));
                 }
                 db_cursor = db_page.next_anchor.map(Into::into);
@@ -939,20 +939,25 @@ fn select_resume_path(page: &ThreadsPage, filter_cwd: Option<&Path>) -> Option<P
     }
 }
 
-fn select_resume_path_from_db_page(
+async fn select_resume_path_from_db_page(
     page: &codex_state::ThreadsPage,
     filter_cwd: Option<&Path>,
 ) -> Option<PathBuf> {
-    match filter_cwd {
-        Some(cwd) => page.items.iter().find_map(|item| {
-            if cwd_matches(item.cwd.as_path(), cwd) {
-                Some(item.rollout_path.clone())
-            } else {
-                None
-            }
-        }),
-        None => page.items.first().map(|item| item.rollout_path.clone()),
+    for item in &page.items {
+        let path = &item.rollout_path;
+        let matches = match filter_cwd {
+            // SQLite tracks the latest turn's cwd (also used by memories).
+            // Resume groups a thread by its original recorded workspace.
+            Some(cwd) => super::list::read_session_meta_line(path)
+                .await
+                .is_ok_and(|meta| cwd_matches(&meta.meta.cwd, cwd)),
+            None => tokio::fs::try_exists(path).await.unwrap_or(false),
+        };
+        if matches {
+            return Some(path.clone());
+        }
     }
+    None
 }
 
 fn cwd_matches(session_cwd: &Path, cwd: &Path) -> bool {
