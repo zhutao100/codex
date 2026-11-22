@@ -69,7 +69,7 @@ async fn insert_state_db_thread(
             .await
             .expect("state db should initialize");
     runtime
-        .mark_backfill_complete(None)
+        .mark_backfill_complete(0, None)
         .await
         .expect("backfill should be complete");
     let created_at = chrono::Utc
@@ -697,7 +697,7 @@ async fn find_thread_path_repairs_missing_db_row_after_filesystem_fallback() {
             .await
             .expect("state db should initialize");
     _runtime
-        .mark_backfill_complete(None)
+        .mark_backfill_complete(0, None)
         .await
         .expect("backfill should be complete");
 
@@ -853,7 +853,7 @@ fn write_session_file_with_delayed_user_event(
         let payload = serde_json::json!({
             "id": id,
             "timestamp": ts_str,
-            "cwd": ".",
+            "cwd": if i == 0 { "fork-workspace" } else { "parent-workspace" },
             "originator": "test_originator",
             "cli_version": "test_version",
             "source": "vscode",
@@ -1319,6 +1319,10 @@ async fn test_list_threads_uses_first_session_meta_thread_id() {
 
     assert_eq!(page.items.len(), 1);
     assert_eq!(page.items[0].thread_id, Some(thread_id_from_uuid(uuid)));
+    assert_eq!(
+        page.items[0].cwd.as_deref(),
+        Some(Path::new("fork-workspace"))
+    );
 }
 
 #[tokio::test]

@@ -50,20 +50,7 @@ pub(crate) async fn init_for_rollout(
             return None;
         }
     };
-    let backfill_state = match runtime.get_backfill_state().await {
-        Ok(state) => state,
-        Err(err) => {
-            warn!(
-                "failed to read backfill state at {}: {err}",
-                config.codex_home.display()
-            );
-            return None;
-        }
-    };
-    if backfill_state.status != codex_state::BackfillStatus::Complete {
-        metadata::backfill_sessions(runtime.as_ref(), config, otel).await;
-    }
-    require_backfill_complete(runtime, config.codex_home.as_path()).await
+    verified_index(runtime, &config.model_provider_id, otel, true).await
 }
 
 /// Open an existing complete index without creating one for ephemeral sessions.
@@ -95,31 +82,52 @@ async fn open_existing(
     )
     .await
     .ok()?;
-    require_backfill_complete(runtime, codex_home).await
+    verified_index(runtime, default_provider, otel, false).await
 }
 
-async fn require_backfill_complete(
-    runtime: StateDbHandle,
-    codex_home: &Path,
-) -> Option<StateDbHandle> {
-    match runtime.get_backfill_state().await {
-        Ok(state) if state.status == codex_state::BackfillStatus::Complete => Some(runtime),
-        Ok(state) => {
-            warn!(
-                "state db backfill not complete at {} (status: {})",
-                codex_home.display(),
-                state.status.as_str()
-            );
-            None
-        }
-        Err(err) => {
-            warn!(
-                "failed to read backfill state at {}: {err}",
-                codex_home.display()
-            );
-            None
-        }
+const MISSED_INDEX_WRITES: &str = "state_index_misses";
+
+/// Appending one byte is atomic across recorders and works even when SQLite is locked.
+/// Never truncate this file: its length is a persistent generation, not a backlog to delete.
+pub(crate) async fn note_missed_write(home: &Path) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut file = tokio::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(home.join(MISSED_INDEX_WRITES))
+        .await?;
+    file.write_all(&[1]).await?;
+    file.flush().await
+}
+
+async fn missed_generation(home: &Path) -> std::io::Result<i64> {
+    match tokio::fs::metadata(home.join(MISSED_INDEX_WRITES)).await {
+        Ok(meta) => i64::try_from(meta.len()).map_err(std::io::Error::other),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(error),
     }
+}
+
+async fn verified_index(
+    runtime: StateDbHandle,
+    provider: &str,
+    otel: Option<&OtelManager>,
+    initialize: bool,
+) -> Option<StateDbHandle> {
+    let generation = missed_generation(runtime.codex_home()).await.ok()?;
+    let state = runtime.get_backfill_state().await.ok()?;
+    if state.generation < generation {
+        runtime.invalidate_backfill(generation).await.ok()?;
+    } else if state.status == codex_state::BackfillStatus::Complete {
+        return Some(runtime);
+    } else if !initialize && generation == 0 {
+        return None;
+    }
+    metadata::backfill_sessions(&runtime, provider, otel).await;
+    let completed = runtime.get_backfill_state().await.ok()?;
+    let latest = missed_generation(runtime.codex_home()).await.ok()?;
+    (completed.status == codex_state::BackfillStatus::Complete && completed.generation >= latest)
+        .then_some(runtime)
 }
 
 fn cursor_to_anchor(cursor: Option<&Cursor>) -> Option<codex_state::Anchor> {
@@ -432,9 +440,9 @@ pub async fn apply_rollout_items(
     builder: Option<&ThreadMetadataBuilder>,
     items: &[RolloutItem],
     stage: &str,
-) {
+) -> bool {
     let Some(ctx) = context else {
-        return;
+        return false;
     };
     let mut builder = match builder {
         Some(builder) => builder.clone(),
@@ -446,7 +454,7 @@ pub async fn apply_rollout_items(
                     rollout_path.display()
                 );
                 record_discrepancy(stage, "missing_builder");
-                return;
+                return false;
             }
         },
     };
@@ -456,7 +464,9 @@ pub async fn apply_rollout_items(
             "state db apply_rollout_items failed during {stage} for {}: {err}",
             rollout_path.display()
         );
+        return false;
     }
+    true
 }
 
 /// Record a state discrepancy metric with a stage and reason tag.

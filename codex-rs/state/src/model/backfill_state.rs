@@ -7,6 +7,8 @@ use sqlx::sqlite::SqliteRow;
 /// Persisted lifecycle state for rollout metadata backfill.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackfillState {
+    /// Generation of JSONL-only writes covered by this scan's watermark.
+    pub generation: i64,
     /// Current lifecycle status.
     pub status: BackfillStatus,
     /// Last processed rollout watermark.
@@ -18,6 +20,7 @@ pub struct BackfillState {
 impl Default for BackfillState {
     fn default() -> Self {
         Self {
+            generation: 0,
             status: BackfillStatus::Pending,
             last_watermark: None,
             last_success_at: None,
@@ -33,6 +36,7 @@ impl BackfillState {
             .map(epoch_seconds_to_datetime)
             .transpose()?;
         Ok(Self {
+            generation: row.try_get("generation")?,
             status: BackfillStatus::parse(status.as_str())?,
             last_watermark: row.try_get("last_watermark")?,
             last_success_at,

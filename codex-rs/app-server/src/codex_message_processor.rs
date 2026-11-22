@@ -5489,7 +5489,7 @@ async fn read_history_cwd_from_state_db(
     if let Some(state_db_ctx) =
         open_if_present(&config.codex_home, config.model_provider_id.as_str()).await
         && let Some(thread_id) = thread_id
-        && let Ok(Some(metadata)) = state_db_ctx.get_thread(thread_id).await
+        && let Ok(Some(metadata)) = state_db_ctx.get_thread_for_history(thread_id).await
     {
         return Some(metadata.cwd);
     }
@@ -5518,7 +5518,7 @@ async fn read_summary_from_state_db_context_by_thread_id(
 ) -> Option<ConversationSummary> {
     let state_db_ctx = state_db_ctx?;
 
-    let metadata = match state_db_ctx.get_thread(thread_id).await {
+    let metadata = match state_db_ctx.get_thread_for_history(thread_id).await {
         Ok(Some(metadata)) => metadata,
         Ok(None) | Err(_) => return None,
     };

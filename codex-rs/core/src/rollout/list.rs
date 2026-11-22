@@ -1015,6 +1015,10 @@ async fn read_head_summary(path: &Path, head_limit: usize) -> io::Result<HeadTai
 
         match rollout_line.item {
             RolloutItem::SessionMeta(session_meta_line) => {
+                if summary.saw_session_meta {
+                    // Fork history may carry a parent header after the fork's own header.
+                    continue;
+                }
                 summary.source = Some(session_meta_line.meta.source.clone());
                 summary.model_provider = session_meta_line.meta.model_provider.clone();
                 if summary.thread_id.is_none() {

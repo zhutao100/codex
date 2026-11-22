@@ -96,7 +96,7 @@ impl StateRuntime {
         self.ensure_backfill_state_row().await?;
         let row = sqlx::query(
             r#"
-SELECT status, last_watermark, last_success_at
+SELECT generation, status, last_watermark, last_success_at
 FROM backfill_state
 WHERE id = 1
             "#,
@@ -106,43 +106,70 @@ WHERE id = 1
         crate::BackfillState::try_from_row(&row)
     }
 
+    /// Restart the scan only when a recorder reports a newer generation of missed writes.
+    pub async fn invalidate_backfill(&self, generation: i64) -> anyhow::Result<()> {
+        sqlx::query(
+            r#"
+UPDATE backfill_state
+SET generation = ?, status = 'pending', last_watermark = NULL, last_success_at = NULL, updated_at = ?
+WHERE id = 1 AND generation < ?
+            "#,
+        )
+        .bind(generation)
+        .bind(Utc::now().timestamp())
+        .bind(generation)
+        .execute(self.pool.as_ref())
+        .await?;
+        Ok(())
+    }
+
     /// Mark rollout metadata backfill as running.
-    pub async fn mark_backfill_running(&self) -> anyhow::Result<()> {
+    pub async fn mark_backfill_running(&self, generation: i64) -> anyhow::Result<()> {
         self.ensure_backfill_state_row().await?;
         sqlx::query(
             r#"
 UPDATE backfill_state
 SET status = ?, updated_at = ?
-WHERE id = 1
+WHERE id = 1 AND generation = ? AND status <> 'complete'
             "#,
         )
         .bind(crate::BackfillStatus::Running.as_str())
         .bind(Utc::now().timestamp())
+        .bind(generation)
         .execute(self.pool.as_ref())
         .await?;
         Ok(())
     }
 
     /// Persist rollout metadata backfill progress.
-    pub async fn checkpoint_backfill(&self, watermark: &str) -> anyhow::Result<()> {
+    pub async fn checkpoint_backfill(
+        &self,
+        generation: i64,
+        watermark: &str,
+    ) -> anyhow::Result<()> {
         self.ensure_backfill_state_row().await?;
         sqlx::query(
             r#"
 UPDATE backfill_state
 SET status = ?, last_watermark = ?, updated_at = ?
-WHERE id = 1
+WHERE id = 1 AND generation = ? AND status <> 'complete'
             "#,
         )
         .bind(crate::BackfillStatus::Running.as_str())
         .bind(watermark)
         .bind(Utc::now().timestamp())
+        .bind(generation)
         .execute(self.pool.as_ref())
         .await?;
         Ok(())
     }
 
     /// Mark rollout metadata backfill as complete.
-    pub async fn mark_backfill_complete(&self, last_watermark: Option<&str>) -> anyhow::Result<()> {
+    pub async fn mark_backfill_complete(
+        &self,
+        generation: i64,
+        last_watermark: Option<&str>,
+    ) -> anyhow::Result<()> {
         self.ensure_backfill_state_row().await?;
         let now = Utc::now().timestamp();
         sqlx::query(
@@ -153,13 +180,14 @@ SET
     last_watermark = COALESCE(?, last_watermark),
     last_success_at = ?,
     updated_at = ?
-WHERE id = 1
+WHERE id = 1 AND generation = ?
             "#,
         )
         .bind(crate::BackfillStatus::Complete.as_str())
         .bind(last_watermark)
         .bind(now)
         .bind(now)
+        .bind(generation)
         .execute(self.pool.as_ref())
         .await?;
         Ok(())
@@ -167,6 +195,22 @@ WHERE id = 1
 
     /// Load thread metadata by id using the underlying database.
     pub async fn get_thread(&self, id: ThreadId) -> anyhow::Result<Option<crate::ThreadMetadata>> {
+        self.get_thread_with_workspace(id, false).await
+    }
+
+    /// Client history and fork configuration use the recorded workspace, not the last turn's cwd.
+    pub async fn get_thread_for_history(
+        &self,
+        id: ThreadId,
+    ) -> anyhow::Result<Option<crate::ThreadMetadata>> {
+        self.get_thread_with_workspace(id, true).await
+    }
+
+    async fn get_thread_with_workspace(
+        &self,
+        id: ThreadId,
+        original: bool,
+    ) -> anyhow::Result<Option<crate::ThreadMetadata>> {
         let row = sqlx::query(
             r#"
 SELECT
@@ -176,7 +220,7 @@ SELECT
     updated_at,
     source,
     model_provider,
-    cwd,
+    CASE WHEN ? THEN COALESCE(rollout_cwd, cwd) ELSE cwd END AS cwd,
     cli_version,
     title,
     sandbox_policy,
@@ -191,6 +235,7 @@ FROM threads
 WHERE id = ?
             "#,
         )
+        .bind(original)
         .bind(id.to_string())
         .fetch_optional(self.pool.as_ref())
         .await?;
@@ -420,7 +465,28 @@ FROM threads
         metadata: &crate::ThreadMetadata,
         rollout_cwd: Option<&Path>,
     ) -> anyhow::Result<()> {
-        sqlx::query(
+        self.write_thread(metadata, rollout_cwd, None).await?;
+        Ok(())
+    }
+
+    /// A scan that lost its generation must not replace a newer scan's rows.
+    pub async fn upsert_backfilled_thread(
+        &self,
+        metadata: &crate::ThreadMetadata,
+        rollout_cwd: &Path,
+        generation: i64,
+    ) -> anyhow::Result<bool> {
+        self.write_thread(metadata, Some(rollout_cwd), Some(generation))
+            .await
+    }
+
+    async fn write_thread(
+        &self,
+        metadata: &crate::ThreadMetadata,
+        rollout_cwd: Option<&Path>,
+        scan_generation: Option<i64>,
+    ) -> anyhow::Result<bool> {
+        let row = sqlx::query(
             r#"
 INSERT INTO threads (
     id,
@@ -442,7 +508,8 @@ INSERT INTO threads (
     git_branch,
     git_origin_url,
     rollout_cwd
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+WHERE ? IS NULL OR EXISTS (SELECT 1 FROM backfill_state WHERE id = 1 AND generation = ? AND status = 'running')
 ON CONFLICT(id) DO UPDATE SET
     rollout_path = excluded.rollout_path,
     created_at = excluded.created_at,
@@ -487,9 +554,11 @@ ON CONFLICT(id) DO UPDATE SET
                 .filter(|cwd| !cwd.as_os_str().is_empty())
                 .map(|cwd| cwd.to_string_lossy().into_owned()),
         )
+        .bind(scan_generation)
+        .bind(scan_generation)
         .execute(self.pool.as_ref())
         .await?;
-        Ok(())
+        Ok(row.rows_affected() != 0)
     }
 
     /// Insert or update memory summaries for a thread.
@@ -1081,11 +1150,11 @@ mod tests {
         assert_eq!(initial.last_success_at, None);
 
         runtime
-            .mark_backfill_running()
+            .mark_backfill_running(0)
             .await
             .expect("mark backfill running");
         runtime
-            .checkpoint_backfill("sessions/2026/01/27/rollout-a.jsonl")
+            .checkpoint_backfill(0, "sessions/2026/01/27/rollout-a.jsonl")
             .await
             .expect("checkpoint backfill");
 
@@ -1101,7 +1170,7 @@ mod tests {
         assert_eq!(running.last_success_at, None);
 
         runtime
-            .mark_backfill_complete(Some("sessions/2026/01/28/rollout-b.jsonl"))
+            .mark_backfill_complete(0, Some("sessions/2026/01/28/rollout-b.jsonl"))
             .await
             .expect("mark backfill complete");
         let completed = runtime
@@ -1114,6 +1183,21 @@ mod tests {
             Some("sessions/2026/01/28/rollout-b.jsonl".to_string())
         );
         assert!(completed.last_success_at.is_some());
+
+        runtime.invalidate_backfill(2).await.unwrap();
+        let pending = runtime.get_backfill_state().await.unwrap();
+        assert_eq!(
+            (pending.generation, pending.status, &pending.last_watermark),
+            (2, crate::BackfillStatus::Pending, &None)
+        );
+        runtime.invalidate_backfill(1).await.unwrap();
+        runtime.mark_backfill_running(1).await.unwrap();
+        runtime.checkpoint_backfill(1, "obsolete").await.unwrap();
+        runtime
+            .mark_backfill_complete(1, Some("obsolete"))
+            .await
+            .unwrap();
+        assert_eq!(runtime.get_backfill_state().await.unwrap(), pending);
 
         let _ = tokio::fs::remove_dir_all(codex_home).await;
     }

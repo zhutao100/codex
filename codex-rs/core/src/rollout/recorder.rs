@@ -374,6 +374,7 @@ impl RolloutRecorder {
             state_db_ctx.clone(),
             state_builder,
             default_provider_id,
+            Some(config.codex_home.clone()),
         ));
 
         Ok(Self {
@@ -409,6 +410,7 @@ impl RolloutRecorder {
             None,
             None,
             "test-provider".into(),
+            None,
         ));
         Self {
             tx,
@@ -701,6 +703,7 @@ async fn rollout_writer(
     state_db_ctx: Option<StateDbHandle>,
     mut state_builder: Option<ThreadMetadataBuilder>,
     default_provider: String,
+    codex_home: Option<PathBuf>,
 ) -> std::io::Result<()> {
     let mut writer = JsonlWriter {
         file: BufWriter::new(file),
@@ -718,23 +721,25 @@ async fn rollout_writer(
             meta: session_meta,
             git: git_info,
         };
-        if state_db_ctx.is_some() {
-            state_builder =
-                metadata::builder_from_session_meta(&session_meta_line, rollout_path.as_path());
-        }
+        state_builder =
+            metadata::builder_from_session_meta(&session_meta_line, rollout_path.as_path());
 
         // Write the SessionMeta as the first item in the file, wrapped in a rollout line
         let rollout_item = RolloutItem::SessionMeta(session_meta_line);
         writer.write_rollout_item(&rollout_item).await?;
-        state_db::reconcile_rollout(
+        let indexed = state_db::apply_rollout_items(
             state_db_ctx.as_deref(),
             rollout_path.as_path(),
             default_provider.as_str(),
             state_builder.as_ref(),
             std::slice::from_ref(&rollout_item),
-            None,
+            "rollout_writer",
         )
         .await;
+        if !indexed && let Some(home) = &codex_home {
+            writer.flush().await?;
+            state_db::note_missed_write(home).await?;
+        }
     }
 
     // Process rollout commands
@@ -750,7 +755,7 @@ async fn rollout_writer(
                 if let Some(builder) = state_builder.as_mut() {
                     builder.rollout_path = rollout_path.clone();
                 }
-                state_db::apply_rollout_items(
+                let indexed = state_db::apply_rollout_items(
                     state_db_ctx.as_deref(),
                     rollout_path.as_path(),
                     default_provider.as_str(),
@@ -759,6 +764,10 @@ async fn rollout_writer(
                     "rollout_writer",
                 )
                 .await;
+                if !indexed && let Some(home) = &codex_home {
+                    writer.flush().await?;
+                    state_db::note_missed_write(home).await?;
+                }
             }
             RolloutCmd::Flush { ack } | RolloutCmd::Shutdown { ack } => {
                 if let Err(error) = writer.flush().await {

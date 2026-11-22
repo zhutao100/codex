@@ -1,4 +1,3 @@
-use crate::config::Config;
 use crate::rollout;
 use crate::rollout::list::parse_timestamp_uuid_from_filename;
 use crate::rollout::recorder::RolloutRecorder;
@@ -13,7 +12,6 @@ use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
-use codex_state::BackfillState;
 use codex_state::BackfillStats;
 use codex_state::BackfillStatus;
 use codex_state::DB_ERROR_METRIC;
@@ -138,30 +136,33 @@ pub(crate) async fn extract_metadata_from_rollout(
 
 pub(crate) async fn backfill_sessions(
     runtime: &codex_state::StateRuntime,
-    config: &Config,
+    default_provider: &str,
     otel: Option<&OtelManager>,
 ) {
     let timer = otel.and_then(|otel| otel.start_timer(DB_METRIC_BACKFILL_DURATION_MS, &[]).ok());
-    let mut backfill_state = match runtime.get_backfill_state().await {
+    let backfill_state = match runtime.get_backfill_state().await {
         Ok(state) => state,
         Err(err) => {
             warn!(
                 "failed to read backfill state at {}: {err}",
-                config.codex_home.display()
+                runtime.codex_home().display()
             );
             if let Some(otel) = otel {
                 otel.counter(DB_ERROR_METRIC, 1, &[("stage", "backfill_state_read")]);
             }
-            BackfillState::default()
+            return;
         }
     };
     if backfill_state.status == BackfillStatus::Complete {
         return;
     }
-    if let Err(err) = runtime.mark_backfill_running().await {
+    if let Err(err) = runtime
+        .mark_backfill_running(backfill_state.generation)
+        .await
+    {
         warn!(
             "failed to mark backfill running at {}: {err}",
-            config.codex_home.display()
+            runtime.codex_home().display()
         );
         if let Some(otel) = otel {
             otel.counter(
@@ -170,12 +171,11 @@ pub(crate) async fn backfill_sessions(
                 &[("stage", "backfill_state_mark_running")],
             );
         }
-    } else {
-        backfill_state.status = BackfillStatus::Running;
+        return;
     }
 
-    let sessions_root = config.codex_home.join(rollout::SESSIONS_SUBDIR);
-    let archived_root = config.codex_home.join(rollout::ARCHIVED_SESSIONS_SUBDIR);
+    let sessions_root = runtime.codex_home().join(rollout::SESSIONS_SUBDIR);
+    let archived_root = runtime.codex_home().join(rollout::ARCHIVED_SESSIONS_SUBDIR);
     let mut rollout_paths: Vec<BackfillRolloutPath> = Vec::new();
     for (root, archived) in [(sessions_root, false), (archived_root, true)] {
         match tokio::fs::try_exists(&root).await {
@@ -192,7 +192,7 @@ pub(crate) async fn backfill_sessions(
         match collect_rollout_paths(&root).await {
             Ok(paths) => {
                 rollout_paths.extend(paths.into_iter().map(|path| BackfillRolloutPath {
-                    watermark: backfill_watermark_for_path(config.codex_home.as_path(), &path),
+                    watermark: backfill_watermark_for_path(runtime.codex_home(), &path),
                     path,
                     archived,
                 }));
@@ -220,7 +220,15 @@ pub(crate) async fn backfill_sessions(
     'backfill: for batch in rollout_paths.chunks(BACKFILL_BATCH_SIZE) {
         for rollout in batch {
             stats.scanned = stats.scanned.saturating_add(1);
-            if let Err(err) = backfill_rollout(runtime, config, rollout, otel).await {
+            if let Err(err) = backfill_rollout(
+                runtime,
+                default_provider,
+                rollout,
+                backfill_state.generation,
+                otel,
+            )
+            .await
+            {
                 // Only successful batches are checkpointed; retry this batch after recovery.
                 warn!("failed to index rollout {}: {err}", rollout.path.display());
                 if let Some(otel) = otel {
@@ -234,12 +242,12 @@ pub(crate) async fn backfill_sessions(
 
         if let Some(last_entry) = batch.last() {
             if let Err(err) = runtime
-                .checkpoint_backfill(last_entry.watermark.as_str())
+                .checkpoint_backfill(backfill_state.generation, last_entry.watermark.as_str())
                 .await
             {
                 warn!(
                     "failed to checkpoint backfill at {}: {err}",
-                    config.codex_home.display()
+                    runtime.codex_home().display()
                 );
                 if let Some(otel) = otel {
                     otel.counter(
@@ -257,13 +265,13 @@ pub(crate) async fn backfill_sessions(
     }
     if stats.failed == 0
         && let Err(err) = runtime
-            .mark_backfill_complete(last_watermark.as_deref())
+            .mark_backfill_complete(backfill_state.generation, last_watermark.as_deref())
             .await
     {
         stats.failed = stats.failed.saturating_add(1);
         warn!(
             "failed to mark backfill complete at {}: {err}",
-            config.codex_home.display()
+            runtime.codex_home().display()
         );
         if let Some(otel) = otel {
             otel.counter(
@@ -336,24 +344,26 @@ fn parse_timestamp_to_utc(ts: &str) -> Option<DateTime<Utc>> {
 
 async fn backfill_rollout(
     runtime: &codex_state::StateRuntime,
-    config: &Config,
+    default_provider: &str,
     rollout: &BackfillRolloutPath,
+    generation: i64,
     otel: Option<&OtelManager>,
 ) -> anyhow::Result<()> {
-    let outcome =
-        extract_metadata_from_rollout(&rollout.path, &config.model_provider_id, otel).await?;
+    let outcome = extract_metadata_from_rollout(&rollout.path, default_provider, otel).await?;
     let mut metadata = outcome.metadata;
     if rollout.archived && metadata.archived_at.is_none() {
         metadata.archived_at = file_modified_time_utc(&rollout.path)
             .await
             .or(Some(metadata.updated_at));
     }
-    runtime
-        .upsert_rollout_thread(&metadata, Some(&outcome.rollout_cwd))
-        .await?;
-    runtime
-        .persist_dynamic_tools(metadata.id, outcome.dynamic_tools.as_deref())
-        .await?;
+    if runtime
+        .upsert_backfilled_thread(&metadata, &outcome.rollout_cwd, generation)
+        .await?
+    {
+        runtime
+            .persist_dynamic_tools(metadata.id, outcome.dynamic_tools.as_deref())
+            .await?;
+    }
     Ok(())
 }
 
@@ -494,23 +504,7 @@ mod tests {
             "2026-01-27T12:34:56Z",
             id,
         );
-        let message = RolloutLine {
-            timestamp: "2026-01-27T12:35:00Z".into(),
-            item: RolloutItem::EventMsg(codex_protocol::protocol::EventMsg::UserMessage(
-                codex_protocol::protocol::UserMessageEvent {
-                    message: "visible in the picker".into(),
-                    client_user_message_id: None,
-                    images: None,
-                    local_images: vec![],
-                    text_elements: vec![],
-                },
-            )),
-        };
-        writeln!(
-            File::options().append(true).open(&path)?,
-            "{}",
-            serde_json::to_string(&message)?
-        )?;
+        append_picker_message(&path)?;
         let contents = std::fs::read(&path)?;
         std::fs::write(&path, [])?;
         let mut config = crate::config::test_config();
@@ -521,7 +515,7 @@ mod tests {
             None,
         )
         .await?;
-        backfill_sessions(&runtime, &config, None).await;
+        backfill_sessions(&runtime, &config.model_provider_id, None).await;
         let state = runtime.get_backfill_state().await?;
         assert_ne!(state.status, BackfillStatus::Complete);
         assert!(state.last_watermark.is_none());
@@ -548,18 +542,127 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![Some(id)]
         );
-        backfill_sessions(&runtime, &config, None).await;
+        backfill_sessions(&runtime, &config.model_provider_id, None).await;
         assert_eq!(
             runtime.get_backfill_state().await?.status,
             BackfillStatus::Complete
         );
         let mut changed = runtime.get_thread(id).await?.expect("recovered thread");
+        let original = changed.clone();
         changed.cwd = dir.path().join("later-workspace");
         runtime.upsert_thread(&changed).await?;
+        assert!(
+            !runtime
+                .upsert_backfilled_thread(&original, dir.path(), 0)
+                .await?
+        );
         assert_eq!(runtime.get_thread(id).await?, Some(changed));
+        assert_eq!(runtime.get_thread_for_history(id).await?, Some(original));
         let indexed = list().await?;
         assert_eq!(indexed.items[0].cwd, from_jsonl.items[0].cwd);
         assert_eq!(indexed.items[0].cwd.as_deref(), Some(dir.path()));
+        Ok(())
+    }
+
+    fn picker_message() -> RolloutItem {
+        RolloutItem::EventMsg(codex_protocol::protocol::EventMsg::UserMessage(
+            codex_protocol::protocol::UserMessageEvent {
+                message: "visible in the picker".into(),
+                client_user_message_id: None,
+                images: None,
+                local_images: vec![],
+                text_elements: vec![],
+            },
+        ))
+    }
+
+    fn append_picker_message(path: &Path) -> anyhow::Result<()> {
+        let message = RolloutLine {
+            timestamp: "2026-01-27T12:35:00Z".into(),
+            item: picker_message(),
+        };
+        writeln!(
+            File::options().append(true).open(path)?,
+            "{}",
+            serde_json::to_string(&message)?
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn completed_index_recovers_jsonl_only_recording_before_resume_last() -> anyhow::Result<()>
+    {
+        let home = tempdir()?;
+        let mut config = crate::config::test_config();
+        config.codex_home = home.path().into();
+        config.cwd = home.path().into();
+        let provider = &config.model_provider_id;
+        let old_id = Uuid::new_v4();
+        let old = write_rollout_in_sessions(
+            home.path(),
+            "2026-01-27T12-34-56",
+            "2026-01-27T12:34:56Z",
+            old_id,
+        );
+        append_picker_message(&old)?;
+        let db = crate::state_db::init_for_rollout(&config, None)
+            .await
+            .expect("complete index");
+        let last = || {
+            RolloutRecorder::find_latest_thread_path(
+                home.path(),
+                10,
+                None,
+                crate::ThreadSortKey::CreatedAt,
+                &[],
+                None,
+                provider,
+                Some(&config.cwd),
+            )
+        };
+        assert_eq!(last().await?, Some(old));
+        let id = ThreadId::new();
+        let recorder = RolloutRecorder::new(
+            &config,
+            crate::RolloutRecorderParams::new(
+                id,
+                None,
+                SessionSource::Cli,
+                provider.clone(),
+                Default::default(),
+                vec![],
+            ),
+            None,
+            None,
+        )
+        .await?;
+        recorder.record_items(&[picker_message()]).await?;
+        recorder.shutdown().await?;
+        assert!(db.get_thread(id).await?.is_none());
+        let stale = db.get_backfill_state().await?;
+        assert_eq!(
+            (stale.status, stale.generation),
+            (BackfillStatus::Complete, 0)
+        );
+        assert_eq!(last().await?.as_deref(), Some(recorder.rollout_path()));
+        let page = RolloutRecorder::list_threads(
+            home.path(),
+            10,
+            None,
+            crate::ThreadSortKey::CreatedAt,
+            &[],
+            None,
+            provider,
+        )
+        .await?;
+        assert_eq!(
+            page.items.iter().map(|it| it.thread_id).collect::<Vec<_>>(),
+            vec![Some(id), Some(ThreadId::from_string(&old_id.to_string())?)]
+        );
+        assert!(db.get_thread(id).await?.is_some());
+        let recovered = db.get_backfill_state().await?;
+        assert_eq!(recovered.status, BackfillStatus::Complete);
+        assert!(recovered.generation > stale.generation);
         Ok(())
     }
 
@@ -588,16 +691,19 @@ mod tests {
                 .expect("initialize runtime");
         let first_watermark =
             backfill_watermark_for_path(codex_home.as_path(), first_path.as_path());
-        runtime.mark_backfill_running().await.expect("mark running");
         runtime
-            .checkpoint_backfill(first_watermark.as_str())
+            .mark_backfill_running(0)
+            .await
+            .expect("mark running");
+        runtime
+            .checkpoint_backfill(0, first_watermark.as_str())
             .await
             .expect("checkpoint first watermark");
 
         let mut config = crate::config::test_config();
         config.codex_home = codex_home.clone();
         config.model_provider_id = "test-provider".to_string();
-        backfill_sessions(runtime.as_ref(), &config, None).await;
+        backfill_sessions(runtime.as_ref(), &config.model_provider_id, None).await;
 
         let first_id = ThreadId::from_string(&first_uuid.to_string()).expect("first thread id");
         let second_id = ThreadId::from_string(&second_uuid.to_string()).expect("second thread id");
