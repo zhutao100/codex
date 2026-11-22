@@ -239,9 +239,6 @@ use codex_protocol::protocol::WarningEvent;
 use codex_protocol::request_user_input::RequestUserInputResponse;
 
 use crate::context_manager::is_user_turn_boundary;
-use codex_protocol::config_types::CollaborationMode;
-use codex_protocol::config_types::ModeKind;
-use codex_protocol::config_types::Settings;
 use codex_protocol::dynamic_tools::DynamicToolResponse;
 use codex_protocol::mcp::RequestId as ProtocolRequestId;
 use codex_protocol::user_input::UserInput;
@@ -487,16 +484,14 @@ pub async fn user_input_or_turn(sess: &Arc<Session>, sub_id: String, op: Op) {
             personality,
             service_tier,
         } => {
-            let collaboration_mode = collaboration_mode.or_else(|| {
-                Some(CollaborationMode {
-                    mode: ModeKind::Default,
-                    settings: Settings {
-                        model: model.clone(),
-                        reasoning_effort: effort,
-                        developer_instructions: None,
-                    },
-                })
-            });
+            let collaboration_mode = match collaboration_mode {
+                Some(mode) => mode,
+                None => {
+                    sess.collaboration_mode()
+                        .await
+                        .with_updates(Some(model), Some(effort), None)
+                }
+            };
             (
                 items,
                 SessionSettingsUpdate {
@@ -504,7 +499,7 @@ pub async fn user_input_or_turn(sess: &Arc<Session>, sub_id: String, op: Op) {
                     approval_policy: Some(approval_policy),
                     sandbox_policy: Some(sandbox_policy),
                     windows_sandbox_level: None,
-                    collaboration_mode,
+                    collaboration_mode: Some(collaboration_mode),
                     reasoning_summary: Some(summary),
                     final_output_json_schema: Some(final_output_json_schema),
                     personality,

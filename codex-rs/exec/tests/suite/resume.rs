@@ -437,6 +437,28 @@ fn exec_resume_preserves_cli_configuration_overrides() -> anyhow::Result<()> {
     let path = find_session_file_containing_marker(&sessions_dir, &marker)
         .expect("no session file found after first run");
 
+    // A different frontend can save Plan mode before the user switches to `exec resume`.
+    let mut lines = std::fs::read_to_string(&path)?
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    let saved = lines
+        .iter_mut()
+        .rev()
+        .find(|line| line["type"] == "turn_context")
+        .context("original turn context")?;
+    saved["payload"]["collaboration_mode"] = serde_json::json!({
+        "mode": "plan",
+        "settings": {"model": "gpt-5.1", "reasoning_effort": null, "developer_instructions": "Keep the saved Plan instructions."}
+    });
+    let mut persisted = lines
+        .iter()
+        .map(serde_json::to_string)
+        .collect::<Result<Vec<_>, _>>()?
+        .join("\n");
+    persisted.push('\n');
+    std::fs::write(&path, &persisted)?;
+
     let marker2 = format!("resume-config-2-{}", Uuid::new_v4());
     let prompt2 = format!("echo {marker2}");
 
@@ -483,6 +505,24 @@ fn exec_resume_preserves_cli_configuration_overrides() -> anyhow::Result<()> {
     let content = std::fs::read_to_string(&resumed_path)?;
     assert!(content.contains(&marker));
     assert!(content.contains(&marker2));
+    let appended = content
+        .strip_prefix(&persisted)
+        .context("resume appended to the saved rollout")?;
+    let new_turn = appended
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .rev()
+        .find(|line| line["type"] == "turn_context")
+        .context("resumed turn context")?;
+    let mode = &new_turn["payload"]["collaboration_mode"];
+    assert_eq!(mode["mode"], "plan");
+    assert_eq!(mode["settings"]["model"], "gpt-5.1-high");
+    assert_eq!(
+        mode["settings"]["developer_instructions"],
+        "Keep the saved Plan instructions."
+    );
     Ok(())
 }
 
