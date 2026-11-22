@@ -1959,22 +1959,6 @@ impl Session {
         )
     }
 
-    pub(crate) async fn update_token_usage_info(
-        &self,
-        turn_context: &TurnContext,
-        token_usage: Option<&TokenUsage>,
-        server_reasoning_included: bool,
-    ) {
-        self.update_token_usage_info_with_request_context(
-            turn_context,
-            token_usage,
-            0,
-            server_reasoning_included,
-            0,
-        )
-        .await;
-    }
-
     pub(crate) async fn update_token_usage_info_with_request_context(
         &self,
         turn_context: &TurnContext,

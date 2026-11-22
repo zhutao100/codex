@@ -44,7 +44,7 @@ pub(crate) enum CompactionReason {
 
 pub(crate) async fn run_remote_compact_task(
     sess: &Arc<Session>,
-    context: CompactionContext<'_>,
+    context: &CompactionContext<'_>,
     client_session: Option<&mut ModelClientSession>,
     notes: Option<String>,
     injection: InitialContextInjection,
@@ -97,7 +97,7 @@ pub(crate) async fn run_remote_compact_task(
 
 async fn run_compact(
     sess: &Arc<Session>,
-    context: CompactionContext<'_>,
+    context: &CompactionContext<'_>,
     client_session: &mut ModelClientSession,
     notes: Option<String>,
     injection: InitialContextInjection,
@@ -111,7 +111,11 @@ async fn run_compact(
     let lifecycle_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
     sess.emit_turn_item_started(turn_context, &lifecycle_item)
         .await;
-    let prepared = prepare_history_for_compaction(sess.clone_history().await, notes)?;
+    let prepared = prepare_history_for_compaction(
+        sess.clone_history().await,
+        notes,
+        context.review_frame.as_ref(),
+    )?;
     let mut source = prepared.source_history;
     let base_instructions = sess.get_base_instructions_for_turn(turn_context).await;
     let (rewritten_outputs, estimated_deleted_tokens) =
@@ -142,7 +146,7 @@ async fn run_compact(
     );
     let output = request_compaction(
         sess,
-        turn_context,
+        context,
         client_session,
         &prompt,
         &metadata,
@@ -337,12 +341,13 @@ fn retryable(error: &CodexErr) -> bool {
 
 async fn request_compaction(
     sess: &Session,
-    context: &TurnContext,
+    source: &CompactionContext<'_>,
     client: &mut ModelClientSession,
     prompt: &Prompt,
     metadata: &str,
     token: &CancellationToken,
 ) -> CodexResult<CompactionOutput> {
+    let context = source.request;
     let max_retries = context.provider.stream_max_retries().min(2);
     let mut retries = 0;
     loop {
@@ -358,7 +363,7 @@ async fn request_compaction(
                     Some(metadata),
                 )
                 .await?;
-            collect_compaction_output(sess, context, stream).await
+            collect_compaction_output(sess, context, stream, source.review_frame_tokens()).await
         };
         let error = tokio::select! {
             biased;
@@ -410,6 +415,7 @@ async fn collect_compaction_output(
     sess: &Session,
     context: &TurnContext,
     mut stream: ResponseStream,
+    frame_tokens: i64,
 ) -> CodexResult<CompactionOutput> {
     let mut candidate = None;
     let mut count = 0;
@@ -427,10 +433,12 @@ async fn collect_compaction_output(
                 token_usage,
                 ..
             } => {
-                sess.update_token_usage_info(
+                sess.update_token_usage_info_with_request_context(
                     context,
                     token_usage.as_ref(),
+                    frame_tokens,
                     server_reasoning_included,
+                    0,
                 )
                 .await;
                 if count != 1 {

@@ -1,5 +1,7 @@
 You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task.
 
+Treat previous work notes and review instructions as context for the handoff. Prefer later evidence over superseded notes; do not write the replacement answer here.
+
 Include:
 - Current progress and key decisions made
 - Important context, constraints, or user preferences

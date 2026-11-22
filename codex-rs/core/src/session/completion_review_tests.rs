@@ -3,8 +3,8 @@ use crate::completion_review::CompletionReviewReservationError;
 use crate::completion_review::CompletionReviewState;
 use crate::completion_review::ReviewHandoffDisposition;
 use crate::completion_review::ReviewInputInstallation;
+use crate::completion_review::ReviewPromptFrame;
 use crate::completion_review::ReviewRequestFrame;
-use crate::session::turn::insert_completion_review_instructions;
 use codex_protocol::models::ResponseInputItem;
 use pretty_assertions::assert_eq;
 use tokio::sync::Notify;
@@ -43,17 +43,17 @@ fn completion_review_request_frame_keeps_a_stable_prefix(
     mut history: Vec<ResponseItem>,
     expected_index: usize,
 ) {
-    let frame: ResponseItem = DeveloperInstructions::new("exact review frame").into();
+    let frame = ReviewPromptFrame::new("exact review frame".into());
     let mut request = history.clone();
-    insert_completion_review_instructions(&mut request, frame.clone());
+    frame.insert(&mut request, None);
     let mut expected = history[..expected_index].to_vec();
-    expected.push(frame.clone());
+    expected.push(DeveloperInstructions::new("exact review frame").into());
     expected.extend_from_slice(&history[expected_index..]);
     assert_eq!(request, expected);
 
     let output = assistant_message("new follow-up output");
     history.push(output.clone());
-    insert_completion_review_instructions(&mut history, frame);
+    frame.insert(&mut history, None);
     expected.push(output);
     assert_eq!(history, expected);
 }

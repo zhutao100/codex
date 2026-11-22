@@ -35,7 +35,7 @@ Do not duplicate this ledger when integrating another usage representation. Pres
 
 ## Recovering from overflow
 
-The ordinary auto-compaction threshold is not the review payload limit. Before every main follow-up request (including the first handoff, a tool round or `/continue`), try the full frame, then omit the optional reference. If the mandatory frame fits alone but not with history, run normal inline compaction even below the ordinary threshold. Rebuild history, advisory and frame against the installed baseline before sending. Notes capture and compaction are not replacement answers and do not receive the request-only frame.
+The ordinary auto-compaction threshold is not the review payload limit. Before every main follow-up request (including the first handoff, a tool round or `/continue`), try the full frame, then omit the optional reference. If the mandatory frame fits alone but not with history, run normal inline compaction even below the ordinary threshold. Notes capture and compaction reuse the [source frame](request_prefix.md) under their own budgets; they do not produce a replacement answer or recursively apply the follow-up guard. After installation, rebuild the ordinary frame against the new baseline.
 
 Within one run, the review guard does not compact again without an intervening successful ordinary sample. If the rebuilt request still exceeds the limit, stop before sending it; the user can compact further or select a larger main model, then `/continue`. If the mandatory frame alone is too large, skip the review-triggered compaction and ask for a larger window. Neither path truncates the scope or candidate.
 

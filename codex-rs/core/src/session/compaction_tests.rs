@@ -70,7 +70,7 @@ async fn compaction_notes_preserve_multipart_text_and_source_model_after_replay(
         Some(expected)
     );
     let prepared =
-        compact::prepare_history_for_compaction(session.clone_history().await, None).unwrap();
+        compact::prepare_history_for_compaction(session.clone_history().await, None, None).unwrap();
     assert_eq!(prepared.source_history.raw_items(), &[user_message("task")]);
     assert_eq!(prepared.preserved_work_notes, Some(notes.into()));
 }
@@ -155,7 +155,7 @@ fn compaction_notes_accept_only_matching_rejected_capture_outputs() {
             items.extend(tail);
             let mut history = ContextManager::new();
             history.replace(items.clone());
-            let prepared = compact::prepare_history_for_compaction(history, None).unwrap();
+            let prepared = compact::prepare_history_for_compaction(history, None, None).unwrap();
             assert_eq!(prepared.source_history.raw_items(), &[user_message("task")]);
             assert_eq!(prepared.preserved_work_notes, Some(notes.into()));
             // The same rejection without its matching capture call is
@@ -474,7 +474,7 @@ async fn completed_work_notes_with_response_tail_remain_pending_work_after_resta
     );
     let mut source = ContextManager::new();
     source.replace(history.clone());
-    let prepared = compact::prepare_history_for_compaction(source, None).unwrap();
+    let prepared = compact::prepare_history_for_compaction(source, None, None).unwrap();
     assert_eq!(prepared.source_history.raw_items(), &history[..1]);
     assert_eq!(prepared.preserved_work_notes, Some(notes.into()));
     let mut abandoned = history.clone();
@@ -482,10 +482,16 @@ async fn completed_work_notes_with_response_tail_remain_pending_work_after_resta
     abandoned.push(later.clone());
     let mut source = ContextManager::new();
     source.replace(abandoned.clone());
-    let prepared = compact::prepare_history_for_compaction(source.clone(), None).unwrap();
+    let frame = crate::completion_review::ReviewPromptFrame::new("work frame".into());
+    let prepared =
+        compact::prepare_history_for_compaction(source.clone(), None, Some(&frame)).unwrap();
     assert_eq!(
         prepared.source_history.raw_items(),
-        &[history[0].clone(), later]
+        &[
+            history[0].clone(),
+            DeveloperInstructions::new("work frame").into(),
+            later
+        ]
     );
     assert_eq!(prepared.preserved_work_notes, Some(notes.into()));
     assert_eq!(source.raw_items(), abandoned);
@@ -527,7 +533,7 @@ async fn completed_work_notes_with_response_tail_remain_pending_work_after_resta
         let mut items = history.clone();
         items.push(later_work);
         ambiguous.replace(items.clone());
-        assert!(compact::prepare_history_for_compaction(ambiguous.clone(), None).is_err());
+        assert!(compact::prepare_history_for_compaction(ambiguous.clone(), None, None).is_err());
         assert_eq!(ambiguous.raw_items(), items);
     }
 }
@@ -557,7 +563,7 @@ async fn interrupted_notes_replay_and_preparation_preserve_the_known_abort_marke
         assert_eq!(reconstructed.history, history);
         let mut source = ContextManager::new();
         source.replace(history);
-        let prepared = compact::prepare_history_for_compaction(source, None).unwrap();
+        let prepared = compact::prepare_history_for_compaction(source, None, None).unwrap();
         assert_eq!(
             prepared.source_history.raw_items(),
             &[user_message("original task"), marker.clone()]

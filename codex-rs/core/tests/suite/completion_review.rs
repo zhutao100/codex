@@ -1,5 +1,6 @@
 use super::*;
 use anyhow::Context;
+use codex_core::config::types::CompactionMode;
 use codex_core::features::Feature;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
@@ -142,8 +143,10 @@ fn assert_review_compaction_cycle(requests: &[ResponsesRequest]) {
         compact.input().last(),
         Some(&serde_json::json!({"type":"compaction_trigger"}))
     );
-    assert_eq!(followup_frame(notes), None);
-    assert_eq!(followup_frame(compact), None);
+    let capture = notes.input();
+    let trigger = compact.input();
+    assert!(followup_frame(notes).is_some());
+    assert_eq!(&capture[..capture.len() - 1], &trigger[..trigger.len() - 1]);
     assert!(
         replacement
             .input()
@@ -985,32 +988,48 @@ async fn review_followup_uses_reported_usage_instead_of_full_history_byte_estima
     Ok(())
 }
 
+#[test_case::test_case(true; "omitted reference")]
+#[test_case::test_case(false; "full reference across restart")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn review_followup_omits_optional_reference_before_compacting() -> anyhow::Result<()> {
+async fn compaction_replays_the_sampled_optional_reference_choice(
+    omitted: bool,
+) -> anyhow::Result<()> {
     skip_if_no_network_unless_localhost!(Ok(()));
     let server = MockServer::start().await;
     let initial = "Superseded reference.\n".repeat(400);
     let candidate = "Complete current candidate.";
-    let requests = mount_sse_sequence(
-        &server,
-        vec![
-            answer(&initial),
-            verdict("Revise the initial answer.", true),
-            sse(vec![
-                ev_assistant_message("candidate", candidate),
-                ev_completed_with_tokens("candidate", 14_600),
-            ]),
-            verdict("Verify the replacement.", true),
-            answer("Verified the replacement."),
-        ],
-    )
-    .await;
-    let codex = new_conversation_for_server(
-        &server,
-        Arc::new(TempDir::new()?),
-        configure_recovery_models,
-    )
-    .await;
+    let mut replies = vec![
+        answer(&initial),
+        verdict("Revise the initial answer.", true),
+        sse(vec![
+            ev_assistant_message("candidate", candidate),
+            ev_completed_with_tokens("candidate", if omitted { 14_600 } else { 4_000 }),
+        ]),
+        verdict("Verify the replacement.", true),
+        sse(vec![
+            ev_function_call(
+                "plan",
+                "update_plan",
+                r#"{"plan":[{"step":"Verify","status":"completed"}]}"#,
+            ),
+            ev_completed_with_tokens("near-limit", 20_500),
+        ]),
+        sse(vec![
+            ev_assistant_message("notes", REVIEW_WORK_NOTES),
+            ev_completed_with_tokens("notes", 21_000),
+        ]),
+    ];
+    if !omitted {
+        // No completed compaction item. Resume after the failed installation, not from a live frame.
+        replies.push(sse(vec![ev_completed_with_tokens(
+            "invalid-compact",
+            20_500,
+        )]));
+    }
+    replies.extend([compacted_answer(), answer("Verified the replacement.")]);
+    let requests = mount_sse_sequence(&server, replies).await;
+    let home = Arc::new(TempDir::new()?);
+    let codex = new_conversation_for_server(&server, home.clone(), configure_recovery_models).await;
     submit_request(&codex, "Keep the exact user request.").await;
     for expected_answer in [&initial, candidate] {
         wait_for_event(&codex, |event| {
@@ -1020,6 +1039,22 @@ async fn review_followup_omits_optional_reference_before_compacting() -> anyhow:
         .await;
         codex.submit(Op::ReviewCompletedTurn).await?;
     }
+    let codex = if omitted {
+        codex
+    } else {
+        wait_for_event(&codex, |event| {
+            matches!(event, EventMsg::Error(error)
+            if error.message.contains("expected exactly one compaction output"))
+        })
+        .await;
+        let path = codex.rollout_path().context("rollout before restart")?;
+        codex.submit(Op::Shutdown).await?;
+        wait_for_event(&codex, |event| matches!(event, EventMsg::ShutdownComplete)).await;
+        let resumed =
+            resume_conversation_for_server(&server, home, path, configure_recovery_models).await;
+        resumed.submit(Op::Continue).await?;
+        resumed
+    };
     wait_for_event(&codex, |event| match event {
         EventMsg::Error(event) => panic!("optional omission failed: {}", event.message),
         EventMsg::TurnComplete(turn) => {
@@ -1029,12 +1064,20 @@ async fn review_followup_omits_optional_reference_before_compacting() -> anyhow:
     })
     .await;
     let captured = requests.requests();
-    assert_eq!(captured.len(), 5);
+    assert_eq!(captured.len(), if omitted { 8 } else { 9 });
     let frame = followup_frame(&captured[4]).context("missing replacement frame")?;
-    assert!(frame.contains("omitted_for_budget"));
-    assert!(!frame.contains(&initial));
+    assert_eq!(frame.contains("omitted_for_budget"), omitted);
+    assert_eq!(frame.contains(&initial), !omitted);
     assert!(frame.contains(candidate));
     assert!(frame.contains("Keep the exact user request."));
+    let hot = captured[4].input();
+    for request in &captured[5..captured.len() - 1] {
+        assert!(request.input().starts_with(&hot));
+        assert_eq!(followup_frame(request).as_ref(), Some(&frame));
+    }
+    if !omitted {
+        assert_eq!(captured[6].input(), captured[7].input());
+    }
     server.verify().await;
     Ok(())
 }
@@ -1091,6 +1134,11 @@ async fn review_followup_compacts_before_sending_over_budget_prompt(
     let first = 2 + usize::from(after_tool);
     assert_review_compaction_cycle(&captured[first..]);
     if after_tool {
+        assert!(
+            captured[first]
+                .input()
+                .starts_with(&captured[first - 1].input())
+        );
         assert!(
             captured[first]
                 .input()
@@ -1471,30 +1519,39 @@ async fn review_followup_budget_recovery_preserves_scope(
     Ok(())
 }
 
-#[test_case::test_case(false; "pause")]
-#[test_case::test_case(true; "interrupt")]
+#[test_case::test_case(false, CompactionMode::Auto; "pause")]
+#[test_case::test_case(true, CompactionMode::Auto; "interrupt")]
+#[test_case::test_case(false, CompactionMode::Local; "local summary")]
+#[test_case::test_case(false, CompactionMode::Unary; "unary echoes frame")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stopped_review_followup_survives_standalone_compaction_and_restart(
     interrupt: bool,
+    mode: CompactionMode,
 ) -> anyhow::Result<()> {
     skip_if_no_network_unless_localhost!(Ok(()));
     for restart in [false, true] {
         let server = MockServer::start().await;
-        let requests = mount_response_sequence(
-            &server,
-            vec![
-                sse_response(answer("Original complete answer.")),
-                sse_response(verdict("Verify and replace the complete answer.", true)),
-                sse_response(answer("Cancelled output must not be installed."))
-                    .set_delay(std::time::Duration::from_secs(5)),
-                sse_response(compacted_answer()),
-                sse_response(answer("Complete replacement after compaction.")),
-            ],
-        )
-        .await;
+        let mut replies = vec![
+            sse_response(answer("Original complete answer.")),
+            sse_response(verdict("Verify and replace the complete answer.", true)),
+            sse_response(answer("Cancelled output must not be installed."))
+                .set_delay(std::time::Duration::from_secs(5)),
+        ];
+        match mode {
+            CompactionMode::Auto => replies.push(sse_response(compacted_answer())),
+            CompactionMode::Local => replies.push(sse_response(answer("Work summary."))),
+            CompactionMode::Unary => {}
+        }
+        replies.push(sse_response(answer(
+            "Complete replacement after compaction.",
+        )));
+        let requests = mount_response_sequence(&server, replies).await;
         let home = Arc::new(TempDir::new()?);
-        let codex =
-            new_conversation_for_server(&server, home.clone(), configure_recovery_models).await;
+        let configure = move |config: &mut Config| {
+            configure_recovery_models(config);
+            config.compaction_mode = mode;
+        };
+        let codex = new_conversation_for_server(&server, home.clone(), configure).await;
         submit_request(&codex, "Complete the original user scope.").await;
         wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
         codex.submit(Op::ReviewCompletedTurn).await?;
@@ -1511,6 +1568,16 @@ async fn stopped_review_followup_survives_standalone_compaction_and_restart(
         } else {
             matches!(stopped, EventMsg::TurnPaused(_))
         });
+        let frame = followup_frame(&requests.requests()[2]).context("sampled review frame")?;
+        let unary = if mode == CompactionMode::Unary {
+            let output = serde_json::json!({"output": [
+                {"type":"message","role":"developer","id":"server-echo","status":"completed","content":[{"type":"input_text","text":frame}]},
+                {"type":"compaction","encrypted_content":"summary"}
+            ]});
+            Some(core_test_support::responses::mount_compact_json_once(&server, output).await)
+        } else {
+            None
+        };
         codex.submit(Op::Compact).await?;
         wait_for_event(&codex, |event| match event {
             EventMsg::Error(event) => panic!("compaction failed: {}", event.message),
@@ -1522,13 +1589,7 @@ async fn stopped_review_followup_survives_standalone_compaction_and_restart(
         let active = if restart {
             codex.submit(Op::Shutdown).await?;
             wait_for_event(&codex, |event| matches!(event, EventMsg::ShutdownComplete)).await;
-            resume_conversation_for_server(
-                &server,
-                home.clone(),
-                path.clone(),
-                configure_recovery_models,
-            )
-            .await
+            resume_conversation_for_server(&server, home.clone(), path.clone(), configure).await
         } else {
             codex
         };
@@ -1559,8 +1620,18 @@ async fn stopped_review_followup_survives_standalone_compaction_and_restart(
         })
         .await;
         let captured = requests.requests();
-        assert_eq!(captured.len(), 5);
-        let input = serde_json::to_string(&captured[4].input())?;
+        assert_eq!(captured.len(), if unary.is_some() { 4 } else { 5 });
+        let compact = unary.map_or_else(|| captured[3].clone(), |mock| mock.single_request());
+        assert_eq!(followup_frame(&compact), Some(frame.clone()));
+        let installed = read_rollout_lines(&path)
+            .into_iter()
+            .find_map(|line| match line.item {
+                RolloutItem::Compacted(item) => item.replacement_history,
+                _ => None,
+            })
+            .context("durable replacement")?;
+        assert!(!serde_json::to_string(&installed)?.contains("<completed_turn_review_context>"));
+        let input = serde_json::to_string(&captured.last().context("continued work")?.input())?;
         for text in [
             "Complete the original user scope.",
             "Original complete answer.",

@@ -292,7 +292,7 @@ async fn mid_turn_notes_are_carried_exactly_and_transient_suffix_is_excluded() -
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn repeated_auto_compaction_fits_from_work_usage_and_preserves_the_eligible_prefix()
+async fn repeated_auto_compaction_preserves_the_full_work_prefix_and_installs_only_latest_notes()
 -> Result<()> {
     skip_if_no_network_unless_localhost!(Ok(()));
     let server = responses::start_mock_server().await;
@@ -309,7 +309,9 @@ async fn repeated_auto_compaction_fits_from_work_usage_and_preserves_the_eligibl
     std::fs::write(&path, "observed evidence\n".repeat(120))?;
     let arguments = json!({"file_path":path}).to_string();
     let mut streams = Vec::new();
-    for epoch in 1..=2 {
+    let mut starts = Vec::new();
+    for epoch in 1..=5 {
+        starts.push(streams.len());
         let mut reasoning = responses::ev_reasoning_item("reasoning", &[], &[]);
         // The opaque wire representation is large; the completed work request reports that it fits.
         reasoning["item"]["encrypted_content"] = json!("A".repeat(240_000));
@@ -321,7 +323,11 @@ async fn repeated_auto_compaction_fits_from_work_usage_and_preserves_the_eligibl
             ]),
             responses::sse(vec![
                 responses::ev_function_call("last", "read_file", &arguments),
-                responses::ev_completed_with_tokens("near-limit", 28_000),
+                // Even cycles hit the review payload guard below the ordinary threshold.
+                responses::ev_completed_with_tokens(
+                    "near-limit",
+                    if epoch % 2 == 0 { 24_000 } else { 28_000 },
+                ),
             ]),
             responses::sse(vec![
                 responses::ev_assistant_message("notes", &format!("{NOTES} {epoch}")),
@@ -329,18 +335,52 @@ async fn repeated_auto_compaction_fits_from_work_usage_and_preserves_the_eligibl
             ]),
             compact_response(&format!("summary-{epoch}")),
         ]);
+        if epoch == 1 {
+            streams.extend([
+                responses::sse(vec![
+                    responses::ev_assistant_message("candidate", "Initial complete answer."),
+                    responses::ev_completed("candidate"),
+                ]),
+                responses::sse(vec![
+                    responses::ev_assistant_message(
+                        "review",
+                        r#"{"evaluation":"Verify the remaining work.","fix_actions_advised":true}"#,
+                    ),
+                    responses::ev_completed("review"),
+                ]),
+            ]);
+        }
     }
-    streams.push(responses::sse(vec![responses::ev_completed("done")]));
+    streams.push(responses::sse(vec![
+        responses::ev_assistant_message("done", "Finished all work."),
+        responses::ev_completed("done"),
+    ]));
     let mock = responses::mount_sse_sequence(&server, streams).await;
     test.codex
         .submit(user_input("continue the same work"))
         .await?;
     complete(&test.codex).await;
+    test.codex.submit(Op::ReviewCompletedTurn).await?;
+    wait_for_event(&test.codex, |event| match event {
+        EventMsg::Error(error) => panic!("unexpected error: {}", error.message),
+        EventMsg::TurnComplete(turn) => {
+            turn.last_agent_message.as_deref() == Some("Finished all work.")
+        }
+        _ => false,
+    })
+    .await;
+    test.codex.submit(Op::Shutdown).await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::ShutdownComplete)
+    })
+    .await;
+    let installed = replacement_history(test.session_configured.rollout_path.as_ref().unwrap());
     let requests = mock.requests();
-    assert_eq!(requests.len(), 9);
+    assert_eq!(requests.len(), 23);
+    assert_eq!(installed.len(), starts.len());
     let mut previous_wrapper = None;
-    for (epoch, cycle) in requests.windows(5).step_by(4).enumerate() {
-        let [_, work, notes, compact, followup] = cycle else {
+    for (epoch, start) in starts.into_iter().enumerate() {
+        let [work, notes, compact, followup] = &requests[start + 1..start + 5] else {
             unreachable!()
         };
         let hot = work.input();
@@ -356,6 +396,30 @@ async fn repeated_auto_compaction_fits_from_work_usage_and_preserves_the_eligibl
             source.starts_with(&hot),
             "capture rewrote the sampled prefix"
         );
+        let ordinary = work.body_json();
+        for request in [notes, compact] {
+            let body = request.body_json();
+            for key in [
+                "model",
+                "instructions",
+                "tools",
+                "parallel_tool_calls",
+                "reasoning",
+                "prompt_cache_key",
+            ] {
+                assert_eq!(body[key], ordinary[key], "changed request field {key}");
+            }
+        }
+        let is_review_frame = |item: &Value| {
+            item["role"] == "developer"
+                && item["content"][0]["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("<completed_turn_review_context>"))
+        };
+        assert_eq!(
+            hot.iter().filter(|item| is_review_frame(item)).count(),
+            usize::from(epoch > 0)
+        );
         for (request, call) in [(work, "early"), (notes, "last")] {
             let (text, _) = request
                 .function_call_output_content_and_success(call)
@@ -367,24 +431,38 @@ async fn repeated_auto_compaction_fits_from_work_usage_and_preserves_the_eligibl
         let (trigger, compact_source) = compact_input.split_last().unwrap();
         assert_eq!(trigger, &json!({"type":"compaction_trigger"}));
         assert!(
-            compact_source.iter().eq(source
-                .iter()
-                .filter(|item| Some(*item) != previous_wrapper.as_ref())),
-            "compaction may remove the old notes, not rewrite the work"
+            compact_source == source,
+            "notes and compact diverged before their last item in cycle {}",
+            epoch + 1
         );
-        let mut replacement = followup.input();
+        let replacement = followup.input();
         if let Some(previous) = &previous_wrapper {
             assert!(hot.contains(previous));
             assert!(!replacement.contains(previous));
         }
-        let wrapper = replacement.pop().unwrap();
+        let persisted = serde_json::to_value(&installed[epoch])?;
+        let persisted = persisted.as_array().unwrap();
+        assert!(!persisted.iter().any(is_review_frame));
+        let wrappers = persisted
+            .iter()
+            .filter(|item| {
+                item["role"] == "user"
+                    && item["content"][0]["text"]
+                        .as_str()
+                        .is_some_and(|text| text.starts_with("Immediately before compaction,"))
+            })
+            .collect::<Vec<_>>();
+        let [wrapper] = wrappers.as_slice() else {
+            panic!("expected one installed notes wrapper")
+        };
+        assert!(replacement.contains(wrapper));
         assert!(
             wrapper["content"][0]["text"]
                 .as_str()
                 .unwrap()
                 .ends_with(&format!("{NOTES} {}", epoch + 1))
         );
-        previous_wrapper = Some(wrapper);
+        previous_wrapper = Some((*wrapper).clone());
     }
     Ok(())
 }
@@ -478,7 +556,7 @@ async fn websocket_notes_compact_followup_reuses_socket_with_fresh_history() -> 
     let server = responses::start_websocket_server(vec![vec![
         vec![
             responses::ev_shell_command_call("work", "printf work"),
-            responses::ev_completed_with_tokens("work", 1_000_000),
+            responses::ev_completed_with_tokens("work", 28_000),
         ],
         vec![
             responses::ev_assistant_message("notes", NOTES),
@@ -491,12 +569,28 @@ async fn websocket_notes_compact_followup_reuses_socket_with_fresh_history() -> 
         ],
     ]])
     .await;
-    let test = test_codex().build_with_websocket_server(&server).await?;
+    let test = test_codex()
+        .with_config(|config| {
+            config.model_context_window = Some(32_000);
+            config.model_auto_compact_token_limit = Some(27_000);
+        })
+        .build_with_websocket_server(&server)
+        .await?;
     test.codex.submit(user_input("do work")).await?;
     complete(&test.codex).await;
     assert_eq!(server.handshakes().len(), 1);
     let requests = server.single_connection();
     assert_eq!(requests.len(), 4);
+    let notes = requests[1].body_json();
+    assert_eq!(notes["previous_response_id"], "work");
+    assert_eq!(notes["input"].as_array().unwrap().len(), 2);
+    assert_eq!(notes["input"][0]["call_id"], "work");
+    assert!(
+        notes["input"][1]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("<AUTO_COMPACT_WORK_NOTES_REQUEST>")
+    );
     let compact = requests[2].body_json();
     assert_compact_request(&compact);
     assert!(compact.get("previous_response_id").is_none());

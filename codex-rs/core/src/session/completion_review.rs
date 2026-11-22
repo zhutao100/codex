@@ -5,6 +5,7 @@ use crate::completion_review::InternalReviewOperation;
 use crate::completion_review::ReviewHandoff;
 use crate::completion_review::ReviewHandoffDisposition;
 use crate::completion_review::ReviewInputInstallation;
+use crate::completion_review::ReviewPromptFrame;
 use crate::completion_review::ReviewTicket;
 
 impl Session {
@@ -668,6 +669,34 @@ impl Session {
         include_reference: bool,
     ) -> Result<Option<String>, CodexErr> {
         let state = self.state.lock().await;
+        Self::render_review_instructions(&state, include_reference)
+    }
+
+    /// Across a new task or restart, recover the reference choice from the existing usage credit
+    /// when it identifies the full frame. Never add an unverified optional reference to the source.
+    pub(crate) async fn compaction_review_frame(&self) -> CodexResult<Option<ReviewPromptFrame>> {
+        let state = self.state.lock().await;
+        let Some(mandatory) = Self::render_review_instructions(&state, false)? else {
+            return Ok(None);
+        };
+        let mandatory = ReviewPromptFrame::new(mandatory);
+        let credit = state.history.request_context_tokens();
+        if credit > 0
+            && credit != mandatory.tokens
+            && let Some(full) = Self::render_review_instructions(&state, true)?
+        {
+            let full = ReviewPromptFrame::new(full);
+            if full.tokens == credit {
+                return Ok(Some(full));
+            }
+        }
+        Ok(Some(mandatory))
+    }
+
+    fn render_review_instructions(
+        state: &SessionState,
+        include_reference: bool,
+    ) -> CodexResult<Option<String>> {
         let review = &state.completion_review;
         if !review.replacement_answer_required {
             return Ok(None);

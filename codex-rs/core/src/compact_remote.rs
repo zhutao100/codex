@@ -5,6 +5,7 @@ use crate::compact::CompactionContext;
 use crate::compact::InitialContextInjection;
 use crate::compact::PreparedCompactionInput;
 use crate::compact::insert_initial_context_before_last_real_user_message;
+use crate::compact::is_preserved_work_notes_item;
 use crate::compact::prepare_history_for_compaction;
 use crate::compact::preserved_work_notes_message;
 use crate::context_manager::ContextManager;
@@ -25,7 +26,7 @@ use tracing::info;
 
 pub(crate) async fn run_inline_remote_auto_compact_task(
     sess: Arc<Session>,
-    context: CompactionContext<'_>,
+    context: &CompactionContext<'_>,
     preserved_work_notes: Option<String>,
     initial_context_injection: InitialContextInjection,
 ) -> CodexResult<bool> {
@@ -41,26 +42,21 @@ pub(crate) async fn run_inline_remote_auto_compact_task(
 
 pub(crate) async fn run_remote_compact_task(
     sess: Arc<Session>,
-    turn_context: Arc<TurnContext>,
+    context: &CompactionContext<'_>,
 ) -> CodexResult<()> {
+    let turn_context = context.request;
     let start_event = EventMsg::TurnStarted(TurnStartedEvent {
         model_context_window: turn_context.model_context_window(),
         collaboration_mode_kind: turn_context.collaboration_mode.mode,
     });
-    sess.send_event(&turn_context, start_event).await;
+    sess.send_event(turn_context, start_event).await;
 
-    run_remote_compact_task_inner(
-        &sess,
-        CompactionContext::new(&turn_context),
-        None,
-        InitialContextInjection::DoNotInject,
-    )
-    .await
+    run_remote_compact_task_inner(&sess, context, None, InitialContextInjection::DoNotInject).await
 }
 
 async fn run_remote_compact_task_inner(
     sess: &Arc<Session>,
-    context: CompactionContext<'_>,
+    context: &CompactionContext<'_>,
     preserved_work_notes: Option<String>,
     initial_context_injection: InitialContextInjection,
 ) -> CodexResult<()> {
@@ -83,7 +79,7 @@ async fn run_remote_compact_task_inner(
 
 async fn run_remote_compact_task_inner_impl(
     sess: &Arc<Session>,
-    context: CompactionContext<'_>,
+    context: &CompactionContext<'_>,
     preserved_work_notes: Option<String>,
     initial_context_injection: InitialContextInjection,
 ) -> CodexResult<()> {
@@ -95,7 +91,11 @@ async fn run_remote_compact_task_inner_impl(
     let PreparedCompactionInput {
         mut source_history,
         preserved_work_notes,
-    } = prepare_history_for_compaction(sess.clone_history().await, preserved_work_notes)?;
+    } = prepare_history_for_compaction(
+        sess.clone_history().await,
+        preserved_work_notes,
+        context.review_frame.as_ref(),
+    )?;
     let (rewritten_outputs, estimated_deleted_tokens) =
         trim_function_call_history_to_fit_context_window(
             &mut source_history,
@@ -141,6 +141,14 @@ async fn run_remote_compact_task_inner_impl(
         )
         .await?;
 
+    // Unlike V2, the unary endpoint supplies the replacement list and can echo its input.
+    new_history.retain(|item| {
+        !is_preserved_work_notes_item(item)
+            && !context
+                .review_frame
+                .as_ref()
+                .is_some_and(|frame| frame.matches_message(item))
+    });
     let reference_context_item = match initial_context_injection {
         InitialContextInjection::DoNotInject => None,
         InitialContextInjection::BeforeLastUserMessage => {

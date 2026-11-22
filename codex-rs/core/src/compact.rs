@@ -4,6 +4,7 @@ use std::sync::Arc;
 use crate::Prompt;
 use crate::client::ModelClientSession;
 use crate::client_common::ResponseEvent;
+use crate::completion_review::ReviewPromptFrame;
 use crate::context_manager::ContextManager;
 use crate::error::CodexErr;
 use crate::error::Result as CodexResult;
@@ -50,12 +51,13 @@ pub(crate) enum InitialContextInjection {
     BeforeLastUserMessage,
 }
 
-#[derive(Clone, Copy)]
 pub(crate) struct CompactionContext<'a> {
     pub(crate) request: &'a Arc<TurnContext>,
     pub(crate) replacement: &'a Arc<TurnContext>,
     /// Difference between ledger and byte estimates of the same pre-capture transcript.
     pub(crate) source_token_adjustment: i64,
+    /// Freeze the work frame across capture, retries and the subsequent compact request.
+    pub(crate) review_frame: Option<ReviewPromptFrame>,
 }
 
 impl<'a> CompactionContext<'a> {
@@ -64,7 +66,12 @@ impl<'a> CompactionContext<'a> {
             request: context,
             replacement: context,
             source_token_adjustment: 0,
+            review_frame: None,
         }
+    }
+
+    pub(crate) fn review_frame_tokens(&self) -> i64 {
+        self.review_frame.as_ref().map_or(0, |frame| frame.tokens)
     }
 }
 
@@ -96,7 +103,7 @@ pub(crate) fn compaction_implementation(context: &TurnContext) -> CompactionImpl
 
 pub(crate) async fn run_inline_auto_compact_task(
     sess: Arc<Session>,
-    context: CompactionContext<'_>,
+    context: &CompactionContext<'_>,
     preserved_work_notes: Option<String>,
     initial_context_injection: InitialContextInjection,
 ) -> CodexResult<bool> {
@@ -120,17 +127,18 @@ pub(crate) async fn run_inline_auto_compact_task(
 
 pub(crate) async fn run_compact_task(
     sess: Arc<Session>,
-    turn_context: Arc<TurnContext>,
+    context: &CompactionContext<'_>,
     input: Vec<UserInput>,
 ) -> CodexResult<()> {
+    let turn_context = context.request;
     let start_event = EventMsg::TurnStarted(TurnStartedEvent {
         model_context_window: turn_context.model_context_window(),
         collaboration_mode_kind: turn_context.collaboration_mode.mode,
     });
-    sess.send_event(&turn_context, start_event).await;
+    sess.send_event(turn_context, start_event).await;
     run_compact_task_inner(
         sess.clone(),
-        CompactionContext::new(&turn_context),
+        context,
         input,
         None,
         InitialContextInjection::DoNotInject,
@@ -140,7 +148,7 @@ pub(crate) async fn run_compact_task(
 
 async fn run_compact_task_inner(
     sess: Arc<Session>,
-    context: CompactionContext<'_>,
+    context: &CompactionContext<'_>,
     input: Vec<UserInput>,
     preserved_work_notes: Option<String>,
     initial_context_injection: InitialContextInjection,
@@ -154,7 +162,11 @@ async fn run_compact_task_inner(
     let PreparedCompactionInput {
         source_history,
         preserved_work_notes,
-    } = prepare_history_for_compaction(sess.clone_history().await, preserved_work_notes)?;
+    } = prepare_history_for_compaction(
+        sess.clone_history().await,
+        preserved_work_notes,
+        context.review_frame.as_ref(),
+    )?;
     let mut history = source_history;
     history.record_items(
         &[initial_input_for_turn.into()],
@@ -182,6 +194,11 @@ async fn run_compact_task_inner(
             .clone()
             .for_prompt_with_modalities(&turn_context.model_info.input_modalities);
         let turn_input_len = turn_input.len();
+        let frame_tokens = context
+            .review_frame
+            .as_ref()
+            .filter(|frame| turn_input.iter().any(|item| frame.matches_message(item)))
+            .map_or(0, |frame| frame.tokens);
         let prompt = Prompt {
             input: turn_input,
             base_instructions: sess.get_base_instructions_for_turn(turn_context).await,
@@ -194,6 +211,7 @@ async fn run_compact_task_inner(
             &mut client_session,
             turn_metadata_header.as_deref(),
             &prompt,
+            frame_tokens,
         )
         .await;
 
@@ -489,6 +507,7 @@ fn build_compacted_history_with_limit(
 pub(crate) fn prepare_history_for_compaction(
     mut history: ContextManager,
     preserved_work_notes: Option<String>,
+    review_frame: Option<&ReviewPromptFrame>,
 ) -> CodexResult<PreparedCompactionInput> {
     let mut items = history.raw_items().to_vec();
 
@@ -506,14 +525,17 @@ pub(crate) fn prepare_history_for_compaction(
         items.splice(pending.request_index..pending.capture_end, controls);
     }
 
-    let extracted_work_notes = extract_existing_preserved_work_notes(&items);
-    items.retain(|item| !is_preserved_work_notes_item(item));
-    history.replace(items);
-
+    if let Some(frame) = review_frame {
+        frame.insert(
+            &mut items,
+            pending_notes.as_ref().map(|pending| pending.request_index),
+        );
+    }
     let preserved_work_notes = preserved_work_notes
         .and_then(|notes| (!notes.trim().is_empty()).then_some(notes))
         .or_else(|| pending_notes.and_then(|pending| pending.notes))
-        .or(extracted_work_notes);
+        .or_else(|| extract_existing_preserved_work_notes(&items));
+    history.replace(items);
 
     Ok(PreparedCompactionInput {
         source_history: history,
@@ -651,7 +673,7 @@ pub(crate) fn is_work_notes_request_item(item: &ResponseItem) -> bool {
         .starts_with(AUTO_COMPACT_WORK_NOTES_REQUEST_TAG)
 }
 
-fn is_preserved_work_notes_item(item: &ResponseItem) -> bool {
+pub(crate) fn is_preserved_work_notes_item(item: &ResponseItem) -> bool {
     let ResponseItem::Message { role, content, .. } = item else {
         return false;
     };
@@ -687,6 +709,7 @@ async fn drain_to_completed(
     client_session: &mut ModelClientSession,
     turn_metadata_header: Option<&str>,
     prompt: &Prompt,
+    frame_tokens: i64,
 ) -> CodexResult<Vec<ResponseItem>> {
     let mut stream = client_session
         .stream(
@@ -722,10 +745,12 @@ async fn drain_to_completed(
                 sess.update_rate_limits(turn_context, snapshot).await;
             }
             Ok(ResponseEvent::Completed { token_usage, .. }) => {
-                sess.update_token_usage_info(
+                sess.update_token_usage_info_with_request_context(
                     turn_context,
                     token_usage.as_ref(),
+                    frame_tokens,
                     server_reasoning_included,
+                    0,
                 )
                 .await;
                 return Ok(output);
@@ -1091,13 +1116,14 @@ mod tests {
             },
         ]);
 
-        let prepared = prepare_history_for_compaction(history, None).unwrap();
+        let work = history.raw_items()[..2].to_vec();
+        let prepared = prepare_history_for_compaction(history, None, None).unwrap();
 
         assert_eq!(
             prepared.preserved_work_notes,
             Some("previous notes".to_string())
         );
-        assert_eq!(prepared.source_history.raw_items().len(), 1);
+        assert_eq!(prepared.source_history.raw_items(), work);
         assert_eq!(
             collect_user_messages(prepared.source_history.raw_items()),
             vec!["keep".to_string()]

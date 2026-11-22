@@ -4,7 +4,7 @@
 
 [The implementation](../../../core/src/compact_remote_v2.rs) uses the ordinary Responses client rather than changing the URL of the unary compact API. The two protocols have different request, response and retention contracts. Reuse an active client for mid-turn compaction; standalone requests create a session for the resolved source provider.
 
-Project history first, then append exactly one request-only `CompactionTrigger`. Reuse ordinary sampling tools when compatible with the source model; otherwise derive them through the normal tool router. Set `output_schema` to `None` for the compact request and restore normal sampling afterward. Request-local turn metadata adds compaction reason/phase/implementation without mutating cached sampling metadata.
+Project the ordinary work prefix, including its request-only review frame and previous notes wrapper in place, then append exactly one `CompactionTrigger` instead of the capture suffix. Reuse ordinary sampling tools when compatible with the source model; otherwise derive them through the normal tool router. Set `output_schema` to `None` for the compact request and restore normal sampling afterward. Request-local turn metadata adds compaction reason/phase/implementation without mutating cached sampling metadata.
 
 The collector counts completed compaction items, not all output items. It accounts completed usage even if cardinality is invalid, but installs only one completed encrypted summary after `Completed`. EOF, cancellation or stream failure discards the candidate. Unrelated assistant, tool and reasoning items are ignored.
 

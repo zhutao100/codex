@@ -1,13 +1,50 @@
-//! Host-owned completion snapshots. These are rollout metadata, never model history.
+//! Host-owned completion snapshots and their request-only prompt frame, never transcript items.
 
 use std::path::PathBuf;
 
+use crate::context_manager::estimate_item_token_count;
+use codex_protocol::models::DeveloperInstructions;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::user_input::UserInput;
 use serde::Deserialize;
 use serde::Serialize;
 use uuid::Uuid;
+
+/// The exact request-only frame selected for ordinary work, including its optional-reference choice.
+pub(crate) struct ReviewPromptFrame {
+    item: ResponseItem,
+    pub(crate) tokens: i64,
+}
+
+impl ReviewPromptFrame {
+    pub(crate) fn new(instructions: String) -> Self {
+        let item = DeveloperInstructions::new(instructions).into();
+        Self {
+            tokens: estimate_item_token_count(&item),
+            item,
+        }
+    }
+
+    pub(crate) fn insert(&self, input: &mut Vec<ResponseItem>, capture_start: Option<usize>) {
+        // A capture marker, its retries and any later acknowledged input are not anchors for
+        // the work frame. Ordinary sampling and compact requests otherwise use the same boundary.
+        let work = &input[..capture_start.unwrap_or(input.len())];
+        let index = work.iter().rposition(|item| {
+            matches!(item, ResponseItem::Message { role, .. }
+                if matches!(role.as_str(), "system" | "developer" | "user"))
+                || matches!(item, ResponseItem::Compaction { .. })
+        });
+        input.insert(index.map_or(0, |i| i + 1), self.item.clone());
+    }
+
+    pub(crate) fn matches_message(&self, item: &ResponseItem) -> bool {
+        // A unary compact response may echo the message with a server-assigned id/status.
+        matches!((&self.item, item),
+            (ResponseItem::Message { content: expected, .. }, ResponseItem::Message { role, content, .. })
+                if role == "developer" && content == expected)
+    }
+}
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum CompletionReviewReservationError {

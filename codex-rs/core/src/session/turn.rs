@@ -5,6 +5,7 @@ use crate::compact::WORK_NOTES_SOURCE_MODEL_PREFIX;
 use crate::compact::WORK_NOTES_TOOL_REJECT_REASON;
 use crate::compact::pending_work_notes;
 use crate::compact_remote_v2::CompactionReason;
+use crate::completion_review::ReviewPromptFrame;
 use crate::context_manager::estimate_item_token_count;
 use crate::session_prefix::is_turn_aborted_marker;
 use crate::truncate::approx_token_count;
@@ -41,6 +42,7 @@ Token limit is approaching and follow-up work is still needed.\n\
 Respond with exactly one assistant message and do not call tools.\n\
 Put the notes in your final answer, not in commentary.\n\
 Produce structured SESSION WORK NOTES for the next model after compaction.\n\
+This is a checkpoint, not a replacement answer. Treat earlier notes as historical; prefer later evidence.\n\
 \n\
 Required sections:\n\
 - Objective\n\
@@ -79,10 +81,14 @@ async fn captured_pre_compact_work_notes(
 
 async fn sampling_input_for_pre_compact_work_notes(
     sess: &Session,
-    context: CompactionContext<'_>,
+    context: &CompactionContext<'_>,
 ) -> Vec<ResponseItem> {
     let turn_context = context.request;
     let mut input = sess.prompt_history(turn_context).await;
+    if let Some(frame) = &context.review_frame {
+        let capture_start = input.iter().rposition(compact::is_work_notes_request_item);
+        frame.insert(&mut input, capture_start);
+    }
     let base_instructions = sess.get_base_instructions_for_turn(turn_context).await;
     if let Some(stats) = trim_pre_compact_work_notes_input_to_headroom(
         &mut input,
@@ -245,23 +251,6 @@ fn fit_work_notes_output(item: &ResponseItem, excess: i64) -> Option<(ResponseIt
             .saturating_sub(usize::try_from(excess.saturating_sub(savings)).unwrap_or(usize::MAX))
             .max(1);
     }
-}
-
-pub(super) fn insert_completion_review_instructions(
-    input: &mut Vec<ResponseItem>,
-    instructions: ResponseItem,
-) {
-    // Keep request-only context before the work it governs, not at the moving
-    // transcript tail. Tool rounds must extend the preceding request verbatim.
-    let index = input
-        .iter()
-        .rposition(|item| {
-            matches!(item, ResponseItem::Message { role, .. }
-                if matches!(role.as_str(), "system" | "developer" | "user"))
-                || matches!(item, ResponseItem::Compaction { .. })
-        })
-        .map_or(0, |index| index + 1);
-    input.insert(index, instructions);
 }
 
 /// Takes a user message as input and runs a loop where, at each sampling request, the model
@@ -611,7 +600,7 @@ async fn run_turn_inner(
                 compaction_source_token_adjustment(&sess, &turn_context, None).await;
             compaction = match begin_follow_up_compaction(
                 &sess,
-                compact_context,
+                &compact_context,
                 &mut client_session,
                 &cancellation_token,
             )
@@ -640,6 +629,7 @@ async fn run_turn_inner(
             Vec::new()
         };
         if !pending_input.is_empty() {
+            compact_context.review_frame = None;
             for pending_input_item in pending_input {
                 if !sess
                     .install_pending_completion_review_input(
@@ -656,7 +646,7 @@ async fn run_turn_inner(
 
         // Construct the input that we will send to the model.
         let mut sampling_request_input = if capturing_notes {
-            sampling_input_for_pre_compact_work_notes(&sess, compact_context).await
+            sampling_input_for_pre_compact_work_notes(&sess, &compact_context).await
         } else {
             sess.prompt_history(turn_context.as_ref()).await
         };
@@ -691,13 +681,23 @@ async fn run_turn_inner(
         } else {
             None
         };
-        let mut request_context_tokens = 0;
+        let mut request_context_tokens = if capturing_notes {
+            compact_context.review_frame_tokens()
+        } else {
+            0
+        };
         if let Some(instructions) = review_instructions {
             let base = sess.get_base_instructions_for_turn(&turn_context).await;
             // Reuse compaction's usage baseline plus unreported local items.
             // Re-estimating the entire transcript from bytes can drift far
             // above reported usage, especially with long reasoning histories.
-            let usage = sess.state.lock().await.history_tokens_from_usage();
+            let (usage, baseline_frame_tokens) = {
+                let state = sess.state.lock().await;
+                (
+                    state.history_tokens_from_usage(),
+                    state.history.request_context_tokens(),
+                )
+            };
             let history_tokens = usage.unwrap_or_else(|| {
                 estimate_work_notes_prompt_tokens(&sampling_request_input, &base)
             });
@@ -707,9 +707,8 @@ async fn run_turn_inner(
                 .model_context_window()
                 .unwrap_or_default()
                 .saturating_sub(8_192);
-            let mut review_item: ResponseItem = DeveloperInstructions::new(instructions).into();
-            let mut frame_tokens = estimate_item_token_count(&review_item);
-            if estimate_prompt_tokens(frame_tokens) > target {
+            let mut frame = ReviewPromptFrame::new(instructions);
+            if estimate_prompt_tokens(frame.tokens) > target {
                 let instructions = match sess.completion_review_main_instructions(false).await {
                     Ok(Some(instructions)) => instructions,
                     Ok(None) => return None,
@@ -719,13 +718,22 @@ async fn run_turn_inner(
                         return None;
                     }
                 };
-                review_item = DeveloperInstructions::new(instructions).into();
-                frame_tokens = estimate_item_token_count(&review_item);
+                let mandatory = ReviewPromptFrame::new(instructions);
+                let frame_tokens = mandatory.tokens;
                 let prompt_tokens = estimate_prompt_tokens(frame_tokens);
                 if prompt_tokens > target {
                     if frame_tokens <= target && matches!(compaction, FollowUpCompaction::Idle) {
                         // The exact frame fits alone. The projected request can run out
                         // of headroom before ordinary history reaches auto_compact_limit.
+                        // Prefer the frame actually sampled, not a smaller variant considered
+                        // for an ordinary request we are not sending.
+                        compact_context.review_frame.get_or_insert(
+                            if baseline_frame_tokens == frame.tokens {
+                                frame
+                            } else {
+                                mandatory
+                            },
+                        );
                         info!(turn_id = %turn_context.sub_id, prompt_tokens, frame_tokens, target, auto_compact_limit, "compacting history to fit review follow-up");
                         compaction = FollowUpCompaction::Pending;
                         can_drain_pending_input = false;
@@ -741,9 +749,13 @@ async fn run_turn_inner(
                     ).to_error_event(None))).await;
                     return None;
                 }
+                frame = mandatory;
             }
-            request_context_tokens = frame_tokens;
-            insert_completion_review_instructions(&mut sampling_request_input, review_item);
+            request_context_tokens = frame.tokens;
+            frame.insert(&mut sampling_request_input, None);
+            compact_context.review_frame = Some(frame);
+        } else if !capturing_notes {
+            compact_context.review_frame = None;
         }
 
         let sampling_request_input_messages = sampling_request_input
@@ -877,7 +889,7 @@ async fn run_turn_inner(
                     }
                     if let Err(e) = run_auto_compact(
                         &sess,
-                        compact_context,
+                        &compact_context,
                         notes,
                         InitialContextInjection::BeforeLastUserMessage,
                         Some(&mut client_session),
@@ -931,7 +943,7 @@ async fn run_turn_inner(
                 info!("Work-notes capture failed; compacting without notes: {e:#}");
                 match run_auto_compact(
                     &sess,
-                    compact_context,
+                    &compact_context,
                     None,
                     InitialContextInjection::BeforeLastUserMessage,
                     Some(&mut client_session),
@@ -992,7 +1004,7 @@ async fn run_turn_inner(
 
 async fn begin_follow_up_compaction(
     sess: &Arc<Session>,
-    context: CompactionContext<'_>,
+    context: &CompactionContext<'_>,
     client_session: &mut ModelClientSession,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<FollowUpCompaction> {
@@ -1147,7 +1159,7 @@ fn should_compact_with_previous_model(
 
 async fn run_auto_compact(
     sess: &Arc<Session>,
-    context: CompactionContext<'_>,
+    context: &CompactionContext<'_>,
     preserved_work_notes: Option<String>,
     initial_context_injection: InitialContextInjection,
     mut client_session: Option<&mut ModelClientSession>,
@@ -1224,6 +1236,14 @@ async fn run_pre_turn_compact(
         (pending, has_following_input)
     };
     let mut attempts = pending.as_ref().map_or(0, |pending| pending.attempts);
+    context.review_frame = match sess.compaction_review_frame().await {
+        Ok(frame) => frame,
+        Err(error) => {
+            sess.send_event(turn_context, EventMsg::Error(error.to_error_event(None)))
+                .await;
+            return Err(error);
+        }
+    };
     context.source_token_adjustment = compaction_source_token_adjustment(
         sess,
         turn_context,
@@ -1248,7 +1268,7 @@ async fn run_pre_turn_compact(
         let turn_state = sess.turn_state_for_sub_id(&turn_context.sub_id).await;
         let skill_name_counts_lower = HashMap::new();
         while attempts < WORK_NOTES_CAPTURE_MAX_ATTEMPTS {
-            let input = sampling_input_for_pre_compact_work_notes(sess, context).await;
+            let input = sampling_input_for_pre_compact_work_notes(sess, &context).await;
             let output = run_sampling_request(
                 Arc::clone(sess),
                 Arc::clone(turn_context),
@@ -1257,7 +1277,7 @@ async fn run_pre_turn_compact(
                 &mut client_session,
                 metadata.as_deref(),
                 input,
-                0,
+                context.review_frame_tokens(),
                 SamplingRequestToolSelection {
                     explicit_app_paths: &[],
                     skill_name_counts_lower: &skill_name_counts_lower,
@@ -1286,7 +1306,7 @@ async fn run_pre_turn_compact(
     }
     run_auto_compact(
         sess,
-        context,
+        &context,
         notes,
         injection,
         Some(&mut client_session),

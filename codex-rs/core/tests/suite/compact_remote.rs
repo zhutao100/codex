@@ -259,6 +259,48 @@ async fn remote_compact_runs_automatically() -> Result<()> {
     assert!(follow_up_body.contains("REMOTE_COMPACTED_SUMMARY"));
     assert!(follow_up_body.contains("ENCRYPTED_COMPACTION_SUMMARY"));
 
+    // The unary endpoint can echo a real wrapper. Keep it in the request but install the
+    // recovered notes only once, even when a manual compact does not capture new notes.
+    let wrapper = follow_up_request
+        .input()
+        .into_iter()
+        .find(|item| {
+            item["role"] == "user"
+                && item["content"][0]["text"]
+                    .as_str()
+                    .is_some_and(|text| text.starts_with("Immediately before compaction,"))
+        })
+        .expect("first installed notes");
+    let echoed = responses::mount_compact_json_once(
+        harness.server(),
+        serde_json::json!({
+            "output": [wrapper, {"type":"compaction","encrypted_content":"second-summary"}]
+        }),
+    )
+    .await;
+    codex.submit(Op::Compact).await?;
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    assert!(echoed.single_request().input().contains(&wrapper));
+    let next = mount_sse_once(harness.server(), sse(vec![responses::ev_completed("next")])).await;
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "next task".into(),
+                text_elements: vec![],
+            }],
+            final_output_json_schema: None,
+        })
+        .await?;
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    assert_eq!(
+        next.single_request()
+            .input()
+            .iter()
+            .filter(|item| **item == wrapper)
+            .count(),
+        1
+    );
+
     Ok(())
 }
 

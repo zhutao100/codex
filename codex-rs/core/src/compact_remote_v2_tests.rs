@@ -69,6 +69,7 @@ async fn collector_accepts_only_completed_compaction_and_never_records_extra_out
             Ok(ResponseEvent::OutputItemDone(compaction("summary"))),
             completed(),
         ]),
+        17,
     )
     .await
     .unwrap();
@@ -80,6 +81,7 @@ async fn collector_accepts_only_completed_compaction_and_never_records_extra_out
         }
     );
     assert_eq!(session.clone_history().await.raw_items(), &[]);
+    assert_eq!(session.clone_history().await.request_context_tokens(), 17);
     assert_eq!(
         session
             .clone_history()
@@ -101,7 +103,7 @@ async fn collector_rejects_invalid_completed_cardinality_but_accounts_for_usage(
             .collect();
         events.push(completed());
         assert!(matches!(
-            collect_compaction_output(&session, &context, stream(events)).await,
+            collect_compaction_output(&session, &context, stream(events), 0).await,
             Err(CodexErr::Fatal(_))
         ));
         assert_eq!(session.clone_history().await.raw_items(), &[]);
@@ -127,7 +129,7 @@ async fn collector_discards_partial_summary_on_eof_or_failure() {
             events.push(Err(error));
         }
         assert!(matches!(
-            collect_compaction_output(&session, &context, stream(events)).await,
+            collect_compaction_output(&session, &context, stream(events), 0).await,
             Err(CodexErr::Stream(..))
         ));
         assert_eq!(session.clone_history().await.raw_items(), &[]);
@@ -139,6 +141,7 @@ async fn collector_discards_partial_summary_on_eof_or_failure() {
             Ok(ResponseEvent::OutputItemDone(compaction("fresh"))),
             completed(),
         ]),
+        0,
     )
     .await
     .unwrap();
@@ -494,7 +497,7 @@ fn work_notes_preparation_keeps_snapshots_that_arrive_during_capture() {
     .into();
     let mut history = ContextManager::new();
     history.replace(vec![request, snapshot.clone()]);
-    let prepared = prepare_history_for_compaction(history, Some("notes".into())).unwrap();
+    let prepared = prepare_history_for_compaction(history, Some("notes".into()), None).unwrap();
     assert_eq!(prepared.source_history.raw_items(), &[snapshot]);
     assert_eq!(prepared.source_history.for_prompt(), vec![]);
     assert_eq!(prepared.preserved_work_notes, Some("notes".into()));
