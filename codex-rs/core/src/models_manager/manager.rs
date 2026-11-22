@@ -329,7 +329,7 @@ impl ModelsManager {
         config: &Config,
         refresh_strategy: RefreshStrategy,
     ) -> CoreResult<()> {
-        if config.model_provider_id != "openai" {
+        if !Self::picker_uses_openai(config) {
             return Ok(());
         }
         self.refresh_openai_catalog(refresh_strategy).await
@@ -480,10 +480,8 @@ impl ModelsManager {
     }
 
     async fn get_remote_models_for_picker(&self, config: &Config) -> Vec<ModelInfo> {
-        if config.model_provider_id == "openai" {
+        if Self::picker_uses_openai(config) {
             self.remote_models.read().await.clone()
-        } else if config.model_overlay.is_some() {
-            Self::load_remote_models_from_file().unwrap_or_default()
         } else {
             Vec::new()
         }
@@ -493,25 +491,48 @@ impl ModelsManager {
         &self,
         config: &Config,
     ) -> Result<Vec<ModelInfo>, TryLockError> {
-        if config.model_provider_id == "openai" {
+        if Self::picker_uses_openai(config) {
             Ok(self.remote_models.try_read()?.clone())
-        } else if config.model_overlay.is_some() {
-            Ok(Self::load_remote_models_from_file().unwrap_or_default())
         } else {
             Ok(Vec::new())
         }
     }
 
+    fn picker_uses_openai(config: &Config) -> bool {
+        config.model_provider_id == "openai"
+            || config.model_overlay.as_ref().is_some_and(|overlay| {
+                overlay
+                    .models
+                    .iter()
+                    .any(|entry| Self::uses_openai_catalog(&entry.slug, config))
+            })
+    }
+
     fn overlaid_candidates_for_picker(
-        remote_models: Vec<ModelInfo>,
+        mut remote_models: Vec<ModelInfo>,
         config: &Config,
     ) -> Vec<ModelInfo> {
-        match config.model_overlay.as_ref() {
-            Some(overlay) if config.model_provider_id == "openai" => {
-                overlay.apply_to_candidates(&remote_models)
-            }
-            Some(overlay) => overlay.apply_mentioned_to_candidates(&remote_models),
-            None => remote_models,
+        let Some(overlay) = &config.model_overlay else {
+            return remote_models;
+        };
+        if config.model_provider_id != "openai"
+            || overlay
+                .models
+                .iter()
+                .any(|entry| !Self::uses_openai_catalog(&entry.slug, config))
+        {
+            remote_models.retain(|model| Self::uses_openai_catalog(&model.slug, config));
+            remote_models.extend(
+                Self::load_remote_models_from_file()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|model| !Self::uses_openai_catalog(&model.slug, config)),
+            );
+        }
+        if config.model_provider_id == "openai" {
+            overlay.apply_to_candidates(&remote_models)
+        } else {
+            overlay.apply_mentioned_to_candidates(&remote_models)
         }
     }
 
@@ -1199,6 +1220,74 @@ mod tests {
         );
 
         assert_eq!(instructions, "final instructions");
+    }
+
+    #[tokio::test]
+    async fn picker_and_turn_use_the_catalog_bound_to_each_slug() -> anyhow::Result<()> {
+        use codex_protocol::openai_models::InputModality;
+        use codex_protocol::openai_models::ModelVisibility;
+
+        core_test_support::skip_if_no_network_unless_localhost!(Ok(()));
+        let bundled = ModelsManager::load_remote_models_from_file()?
+            .into_iter()
+            .find(|model| {
+                model.visibility == ModelVisibility::List
+                    && model.input_modalities.contains(&InputModality::Image)
+            })
+            .expect("visible bundled model with image input");
+        let mut hosted = bundled.clone();
+        hosted.input_modalities = vec![InputModality::Text];
+        hosted.visibility = ModelVisibility::Hide;
+        let server = MockServer::start().await;
+        let mock = mount_models_once(
+            &server,
+            ModelsResponse {
+                models: vec![hosted.clone()],
+            },
+        )
+        .await;
+        let home = tempdir()?;
+        let auth =
+            AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+        let manager =
+            ModelsManager::with_provider(home.path().into(), auth, provider_for(server.uri()));
+        let mut config = test_config();
+        for (default, binding, source) in
+            [("other", "openai", &hosted), ("openai", "other", &bundled)]
+        {
+            config.model_provider_id = default.into();
+            config.model_overlay = Some(ModelOverlay {
+                models: vec![ModelOverlayEntry {
+                    slug: bundled.slug.clone(),
+                    model_provider: Some(binding.into()),
+                    patch: Default::default(),
+                    final_instruction_override: None,
+                }],
+                ..Default::default()
+            });
+            let presets = manager
+                .list_models(&config, RefreshStrategy::OnlineIfUncached)
+                .await;
+            assert_eq!(manager.try_list_models(&config)?, presets);
+            let preset = presets
+                .into_iter()
+                .find(|preset| preset.model == bundled.slug)
+                .expect("listed slug");
+            let info = manager.get_model_info(&bundled.slug, &config).await;
+            assert_eq!(
+                (&info.input_modalities, info.visibility),
+                (&source.input_modalities, source.visibility)
+            );
+            assert_eq!(
+                (preset.input_modalities, preset.show_in_picker),
+                (
+                    info.input_modalities,
+                    info.visibility == ModelVisibility::List
+                )
+            );
+        }
+        assert_eq!(mock.requests().len(), 1);
+        Ok(())
     }
 
     #[tokio::test]

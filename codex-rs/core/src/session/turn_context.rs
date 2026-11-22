@@ -132,6 +132,7 @@ impl Session {
         per_turn_config.model_provider = session_configuration.provider.clone();
         per_turn_config.approval_policy = session_configuration.approval_policy.clone();
         per_turn_config.sandbox_policy = session_configuration.sandbox_policy.clone();
+        per_turn_config.set_windows_sandbox_level(session_configuration.windows_sandbox_level);
         per_turn_config.model_reasoning_effort =
             session_configuration.collaboration_mode.reasoning_effort();
         per_turn_config.model_reasoning_summary = session_configuration.model_reasoning_summary;

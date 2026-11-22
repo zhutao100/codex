@@ -2302,6 +2302,51 @@ fn mark_state_initial_context_seeded(state: &mut SessionState) {
 }
 
 #[tokio::test]
+async fn override_turn_context_updates_windows_level_in_delegated_config() {
+    let (session, initial, _events) = make_session_and_context_with_rx().await;
+    assert_eq!(
+        initial.config.windows_sandbox_level,
+        WindowsSandboxLevel::Disabled
+    );
+    for level in [
+        WindowsSandboxLevel::RestrictedToken,
+        WindowsSandboxLevel::Elevated,
+    ] {
+        handlers::override_turn_context(
+            &session,
+            "update".into(),
+            SessionSettingsUpdate {
+                windows_sandbox_level: Some(level),
+                ..Default::default()
+            },
+            false,
+        )
+        .await;
+        let turn = session.new_default_turn().await;
+        let delegate = crate::tasks::configure_review_delegate_config(
+            &turn.config,
+            &turn.model_info.slug,
+            crate::tasks::ReviewDelegateConfigParams {
+                base_instructions: "review",
+                sandbox_policy: SandboxPolicy::new_read_only_policy(),
+                disable_collab: true,
+                instruction_profile:
+                    crate::tasks::ReviewDelegateInstructionProfile::PostTurnCompletionReview,
+            },
+        )
+        .expect("review delegate config");
+        assert_eq!(
+            (
+                turn.windows_sandbox_level,
+                turn.config.windows_sandbox_level,
+                delegate.windows_sandbox_level,
+            ),
+            (level, level, level)
+        );
+    }
+}
+
+#[tokio::test]
 async fn refresh_mcp_servers_is_deferred_until_next_turn() {
     let (session, turn_context) = make_session_and_context().await;
     let old_token = session.mcp_startup_cancellation_token().await;

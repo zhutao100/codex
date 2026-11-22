@@ -37,7 +37,7 @@ use core_test_support::responses::mount_models_once_with_delay;
 use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
-use core_test_support::skip_if_no_network;
+use core_test_support::skip_if_no_network_unless_localhost;
 use core_test_support::skip_if_sandbox;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
@@ -57,7 +57,7 @@ const REMOTE_MODEL_SLUG: &str = "codex-test";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_models_remote_model_uses_unified_exec() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    skip_if_no_network_unless_localhost!(Ok(()));
     skip_if_sandbox!(Ok(()));
 
     let server = MockServer::builder()
@@ -203,7 +203,7 @@ async fn remote_models_remote_model_uses_unified_exec() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_models_truncation_policy_without_override_preserves_remote() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    skip_if_no_network_unless_localhost!(Ok(()));
     skip_if_sandbox!(Ok(()));
 
     let server = MockServer::builder()
@@ -247,7 +247,7 @@ async fn remote_models_truncation_policy_without_override_preserves_remote() -> 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_models_truncation_policy_with_tool_output_override() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    skip_if_no_network_unless_localhost!(Ok(()));
     skip_if_sandbox!(Ok(()));
 
     let server = MockServer::builder()
@@ -292,7 +292,7 @@ async fn remote_models_truncation_policy_with_tool_output_override() -> Result<(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_models_apply_remote_base_instructions() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    skip_if_no_network_unless_localhost!(Ok(()));
     skip_if_sandbox!(Ok(()));
 
     let server = MockServer::builder()
@@ -411,7 +411,7 @@ async fn remote_models_apply_remote_base_instructions() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_models_preserve_builtin_presets() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    skip_if_no_network_unless_localhost!(Ok(()));
     skip_if_sandbox!(Ok(()));
 
     let server = MockServer::start().await;
@@ -475,7 +475,7 @@ async fn remote_models_preserve_builtin_presets() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_models_merge_adds_new_high_priority_first() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    skip_if_no_network_unless_localhost!(Ok(()));
     skip_if_sandbox!(Ok(()));
 
     let server = MockServer::start().await;
@@ -520,7 +520,7 @@ async fn remote_models_merge_adds_new_high_priority_first() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_models_merge_replaces_overlapping_model() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    skip_if_no_network_unless_localhost!(Ok(()));
     skip_if_sandbox!(Ok(()));
 
     let server = MockServer::start().await;
@@ -575,7 +575,7 @@ async fn remote_models_merge_replaces_overlapping_model() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_models_merge_preserves_bundled_models_on_empty_response() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    skip_if_no_network_unless_localhost!(Ok(()));
     skip_if_sandbox!(Ok(()));
 
     let server = MockServer::start().await;
@@ -614,7 +614,7 @@ async fn remote_models_merge_preserves_bundled_models_on_empty_response() -> Res
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_models_request_times_out_after_5s() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    skip_if_no_network_unless_localhost!(Ok(()));
     skip_if_sandbox!(Ok(()));
 
     let server = MockServer::start().await;
@@ -682,7 +682,7 @@ async fn remote_models_request_times_out_after_5s() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_models_hide_picker_only_models() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    skip_if_no_network_unless_localhost!(Ok(()));
     skip_if_sandbox!(Ok(()));
 
     let server = MockServer::start().await;

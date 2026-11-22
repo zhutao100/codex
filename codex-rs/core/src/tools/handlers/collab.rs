@@ -1189,6 +1189,9 @@ mod tests {
         turn.codex_linux_sandbox_exe = Some(PathBuf::from("/bin/echo"));
         turn.approval_policy = AskForApproval::Never;
         turn.sandbox_policy = SandboxPolicy::DangerFullAccess;
+        turn.windows_sandbox_level =
+            codex_protocol::config_types::WindowsSandboxLevel::RestrictedToken;
+        Arc::make_mut(&mut turn.config).set_windows_sandbox_level(turn.windows_sandbox_level);
 
         let config = build_agent_spawn_config(&base_instructions, &turn, 0).expect("spawn config");
         let mut expected = (*turn.config).clone();

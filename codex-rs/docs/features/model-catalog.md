@@ -4,7 +4,7 @@
 
 [The bundled catalog](../../core/models.json) supplies fallback model metadata, including instructions, reasoning levels, tools, visibility and context limits. Offline presets are derived from this catalog and sorted by priority; the first picker-visible model is the default. Keep one catalog rather than handwritten parallel preset/default lists.
 
-An overlay-selected provider owns discovery from the first turn. Only a turn served by OpenAI can refresh its catalog on a response ETag. Models bound to another provider use bundled/overlay metadata without reading OpenAI's disk or in-memory overrides, even when OpenAI is the configured default.
+An overlay-selected provider owns discovery from the first turn. Only a turn served by OpenAI can refresh its catalog on a response ETag. The picker and runtime resolve each model slug against the same provider: a model bound to another provider uses bundled/overlay visibility and input modalities even when OpenAI has a cached entry for the same slug. Conversely, a model explicitly bound to OpenAI can use its catalog when the configured default is another provider.
 
 - Thread naming selects the dedicated model in [thread naming](../../core/src/thread_name.rs), with low reasoning effort and title-only instructions. If that model is unavailable or hidden, it falls back through configured/default model selection and then the current model.
 - [Explorer selection](../../core/src/agent/role.rs) and [rate-limit switching](../../tui/src/chatwidget/rate_limits.rs) have their own selectors. Keep them compatible with the catalog when updating models; do not assume they share naming's fallback logic.
