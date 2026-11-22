@@ -25,12 +25,13 @@ impl ToolHandler for McpHandler {
             ..
         } = invocation;
 
-        let payload = match payload {
+        let (server, tool, hosted_binding, arguments) = match payload {
             ToolPayload::Mcp {
                 server,
                 tool,
+                hosted_binding,
                 raw_arguments,
-            } => (server, tool, raw_arguments),
+            } => (server, tool, hosted_binding, raw_arguments),
             _ => {
                 return Err(FunctionCallError::RespondToModel(
                     "mcp handler received unsupported payload".to_string(),
@@ -38,16 +39,14 @@ impl ToolHandler for McpHandler {
             }
         };
 
-        let (server, tool, raw_arguments) = payload;
-        let arguments_str = raw_arguments;
-
         let response = handle_mcp_tool_call(
             Arc::clone(&session),
             turn.as_ref(),
             call_id.clone(),
             server,
             tool,
-            arguments_str,
+            hosted_binding,
+            arguments,
         )
         .await;
 

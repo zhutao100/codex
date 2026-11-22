@@ -3181,13 +3181,9 @@ async fn fatal_tool_error_stops_turn_and_reports_error() {
     };
     let router = ToolRouter::from_config(
         &turn_context.tools_config,
-        Some(
-            tools
-                .into_iter()
-                .map(|(name, tool)| (name, tool.tool))
-                .collect(),
-        ),
+        Some(tools),
         turn_context.dynamic_tools.as_slice(),
+        None,
     );
     let item = ResponseItem::CustomToolCall {
         encrypted_content: None,
@@ -3198,8 +3194,8 @@ async fn fatal_tool_error_stops_turn_and_reports_error() {
         input: "{}".to_string(),
     };
 
-    let call = ToolRouter::build_tool_call(session.as_ref(), item.clone())
-        .await
+    let call = router
+        .build_tool_call(item.clone())
         .expect("build tool call")
         .expect("tool call present");
     let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));

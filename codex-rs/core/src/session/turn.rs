@@ -1724,7 +1724,7 @@ async fn sampling_tool_router(
         .list_all_tools()
         .or_cancel(cancellation_token)
         .await?;
-    drop(mcp_connection_manager);
+    let hosted_binding = mcp_connection_manager.hosted_binding();
     let connectors_for_tools = if turn_context.config.features.enabled(Feature::Apps) {
         let connectors = connectors::accessible_connectors_from_mcp_tools(&mcp_tools);
         Some(filter_connectors_for_input(
@@ -1741,13 +1741,9 @@ async fn sampling_tool_router(
     }
     Ok(Arc::new(ToolRouter::from_config(
         &turn_context.tools_config,
-        has_mcp_servers.then(|| {
-            mcp_tools
-                .into_iter()
-                .map(|(name, tool)| (name, tool.tool))
-                .collect()
-        }),
+        has_mcp_servers.then_some(mcp_tools),
         turn_context.dynamic_tools.as_slice(),
+        hosted_binding,
     )))
 }
 
@@ -2460,6 +2456,7 @@ async fn try_run_sampling_request(
                 let mut ctx = HandleOutputCtx {
                     sess: sess.clone(),
                     turn_context: turn_context.clone(),
+                    router: &router,
                     plan_mode,
                 };
 

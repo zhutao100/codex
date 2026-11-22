@@ -40,6 +40,7 @@ pub enum ToolPayload {
     Mcp {
         server: String,
         tool: String,
+        hosted_binding: Option<uuid::Uuid>,
         raw_arguments: String,
     },
 }

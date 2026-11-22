@@ -16,7 +16,6 @@ use codex_protocol::models::LocalShellAction;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::models::ShellToolCallParams;
-use rmcp::model::Tool;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::instrument;
@@ -31,18 +30,36 @@ pub struct ToolCall {
 pub struct ToolRouter {
     registry: ToolRegistry,
     specs: Vec<ConfiguredToolSpec>,
+    mcp_targets: HashMap<String, (String, String)>,
+    hosted_binding: Option<uuid::Uuid>,
 }
 
 impl ToolRouter {
-    pub fn from_config(
+    pub(crate) fn from_config(
         config: &ToolsConfig,
-        mcp_tools: Option<HashMap<String, Tool>>,
+        mcp_tools: Option<HashMap<String, crate::mcp_connection_manager::ToolInfo>>,
         dynamic_tools: &[DynamicToolSpec],
+        hosted_binding: Option<uuid::Uuid>,
     ) -> Self {
+        let mut mcp_targets = HashMap::new();
+        let mcp_tools = mcp_tools.map(|tools| {
+            tools
+                .into_iter()
+                .map(|(name, info)| {
+                    mcp_targets.insert(name.clone(), (info.server_name, info.tool_name));
+                    (name, info.tool)
+                })
+                .collect()
+        });
         let builder = build_specs(config, mcp_tools, dynamic_tools);
         let (specs, registry) = builder.build();
 
-        Self { registry, specs }
+        Self {
+            registry,
+            specs,
+            mcp_targets,
+            hosted_binding,
+        }
     }
 
     pub fn specs(&self) -> Vec<ToolSpec> {
@@ -60,8 +77,8 @@ impl ToolRouter {
     }
 
     #[instrument(level = "trace", skip_all, err)]
-    pub async fn build_tool_call(
-        session: &Session,
+    pub fn build_tool_call(
+        &self,
         item: ResponseItem,
     ) -> Result<Option<ToolCall>, FunctionCallError> {
         match item {
@@ -71,13 +88,16 @@ impl ToolRouter {
                 call_id,
                 ..
             } => {
-                if let Some((server, tool)) = session.parse_mcp_tool_name(&name).await {
+                if let Some((server, tool)) = self.mcp_targets.get(&name) {
                     Ok(Some(ToolCall {
                         tool_name: name,
                         call_id,
                         payload: ToolPayload::Mcp {
-                            server,
-                            tool,
+                            server: server.clone(),
+                            tool: tool.clone(),
+                            hosted_binding: self
+                                .hosted_binding
+                                .filter(|_| server == crate::mcp::CODEX_APPS_MCP_SERVER_NAME),
                             raw_arguments: arguments,
                         },
                     }))

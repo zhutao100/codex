@@ -4,7 +4,9 @@ use std::time::Duration;
 
 use anyhow::Result;
 use app_test_support::ChatGptAuthFixture;
+use app_test_support::ChatGptIdTokenClaims;
 use app_test_support::McpProcess;
+use app_test_support::encode_id_token;
 use app_test_support::to_response;
 use app_test_support::write_chatgpt_auth;
 use axum::Json;
@@ -19,7 +21,12 @@ use codex_app_server_protocol::AppsListParams;
 use codex_app_server_protocol::AppsListResponse;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RequestId;
+use codex_app_server_protocol::ServerRequest;
+use codex_app_server_protocol::ThreadStartResponse;
+use codex_app_server_protocol::TurnStartParams;
+use codex_app_server_protocol::UserInput;
 use codex_core::auth::AuthCredentialsStoreMode;
+use core_test_support::responses;
 use pretty_assertions::assert_eq;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::JsonObject;
@@ -40,18 +47,7 @@ use tokio::time::timeout;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
-#[tokio::test]
-async fn loaded_thread_rebinds_app_tools_on_logout_and_login() -> Result<()> {
-    use app_test_support::ChatGptIdTokenClaims;
-    use app_test_support::encode_id_token;
-    use codex_app_server_protocol::ThreadStartResponse;
-    use codex_app_server_protocol::TurnStartParams;
-    use codex_app_server_protocol::UserInput;
-    use core_test_support::responses;
-
-    core_test_support::skip_if_no_network_unless_localhost!(Ok(()));
-    let model = responses::start_mock_server().await;
-    let (apps, task, _) = start_apps_server(vec![], vec![connector_tool("beta", "Beta")?]).await?;
+async fn start_app_thread(apps: &str, model: &str) -> Result<(TempDir, McpProcess, String)> {
     let home = TempDir::new()?;
     std::fs::write(
         home.path().join("config.toml"),
@@ -60,15 +56,15 @@ async fn loaded_thread_rebinds_app_tools_on_logout_and_login() -> Result<()> {
 chatgpt_base_url = "{apps}"
 model_provider = "fixture"
 model = "mock-model"
-approval_policy = "never"
+approval_policy = "on-request"
+sandbox_mode = "read-only"
 [features]
 connectors = true
 [model_providers.fixture]
 name = "Fixture"
-base_url = "{}/v1"
+base_url = "{model}/v1"
 wire_api = "responses"
-"#,
-            model.uri()
+"#
         ),
     )?;
     write_chatgpt_auth(
@@ -86,7 +82,19 @@ wire_api = "responses"
         mcp.read_stream_until_response_message(RequestId::Integer(start)),
     )
     .await??;
-    let thread = to_response::<ThreadStartResponse>(reply)?.thread.id;
+    Ok((
+        home,
+        mcp,
+        to_response::<ThreadStartResponse>(reply)?.thread.id,
+    ))
+}
+
+#[tokio::test]
+async fn loaded_thread_rebinds_app_tools_on_logout_and_login() -> Result<()> {
+    core_test_support::skip_if_no_network_unless_localhost!(Ok(()));
+    let model = responses::start_mock_server().await;
+    let (apps, task, _) = start_apps_server(vec![], vec![connector_tool("beta", "Beta")?]).await?;
+    let (_home, mut mcp, thread) = start_app_thread(&apps, &model.uri()).await?;
     for (step, expected) in ["beta", "", "gamma"].into_iter().enumerate() {
         let auth_request = match step {
             1 => Some(mcp.send_logout_account_request().await?),
@@ -188,6 +196,120 @@ wire_api = "responses"
         }
     }
     task.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn app_approval_cannot_follow_the_same_tool_to_another_account() -> Result<()> {
+    core_test_support::skip_if_no_network_unless_localhost!(Ok(()));
+    let model = responses::start_mock_server().await;
+    let mut tool = connector_tool("shared", "Shared")?;
+    tool.annotations = Some(ToolAnnotations::new().read_only(false).destructive(true));
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (apps, task, _) =
+        start_apps_server_with_accounts(vec![], vec![tool.clone()], vec![tool], calls.clone())
+            .await?;
+    let (_home, mut mcp, thread) = start_app_thread(&apps, &model.uri()).await?;
+    for (step, call_id) in ["pending-a", "fresh-b", "remembered-b", "fresh-a"]
+        .into_iter()
+        .enumerate()
+    {
+        if step == 3 {
+            switch_app_account(&mut mcp, "account-123", "chatgpt-token").await?;
+        }
+        let model_requests = responses::mount_sse_sequence(
+            &model,
+            vec![
+                responses::sse(vec![
+                    responses::ev_function_call(call_id, "mcp__codex_apps__connector_shared", "{}"),
+                    responses::ev_completed("action"),
+                ]),
+                responses::sse(vec![
+                    responses::ev_assistant_message("answer", "done"),
+                    responses::ev_completed("done"),
+                ]),
+            ],
+        )
+        .await;
+        let turn = mcp
+            .send_turn_start_request(TurnStartParams {
+                thread_id: thread.clone(),
+                input: vec![
+                    UserInput::Text {
+                        text: "Use the selected app".into(),
+                        text_elements: vec![],
+                    },
+                    UserInput::Mention {
+                        name: "Shared".into(),
+                        path: "app://shared".into(),
+                    },
+                ],
+                ..Default::default()
+            })
+            .await?;
+        timeout(
+            DEFAULT_TIMEOUT,
+            mcp.read_stream_until_response_message(RequestId::Integer(turn)),
+        )
+        .await??;
+        if step != 2 {
+            let request =
+                timeout(DEFAULT_TIMEOUT, mcp.read_stream_until_request_message()).await??;
+            let ServerRequest::ToolRequestUserInput { request_id, params } = request else {
+                anyhow::bail!("expected app approval, got {request:?}")
+            };
+            assert_eq!(params.item_id, call_id);
+            if step == 0 {
+                switch_app_account(&mut mcp, "account-456", "second-token").await?;
+            }
+            mcp.send_response(request_id, json!({"answers": {(&params.questions[0].id): {"answers": ["Approve this Session"]}}})).await?;
+        }
+        timeout(
+            DEFAULT_TIMEOUT,
+            mcp.read_stream_until_notification_message("turn/completed"),
+        )
+        .await??;
+        let requests = model_requests.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[0].body_json()["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["name"] == "mcp__codex_apps__connector_shared")
+        );
+        if step == 0 {
+            assert!(
+                requests[1]
+                    .function_call_output_text(call_id)
+                    .unwrap()
+                    .contains("app connection changed")
+            );
+            assert!(calls.lock().unwrap().is_empty());
+        }
+    }
+    assert_eq!(
+        *calls.lock().unwrap(),
+        ["account-456", "account-456", "account-123"]
+    );
+    task.abort();
+    Ok(())
+}
+
+async fn switch_app_account(mcp: &mut McpProcess, account: &str, access: &str) -> Result<()> {
+    let token = encode_id_token(
+        &ChatGptIdTokenClaims::new()
+            .chatgpt_account_id(account)
+            .plan_type("pro"),
+    )?;
+    let id = mcp
+        .send_chatgpt_auth_tokens_login_request(token, access.into())
+        .await?;
+    timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(id)),
+    )
+    .await??;
     Ok(())
 }
 
@@ -479,6 +601,7 @@ struct AppsServerState {
 struct AppListMcpServer {
     tools: Arc<Vec<Tool>>,
     second_account_tools: Arc<Vec<Tool>>,
+    calls: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl ServerHandler for AppListMcpServer {
@@ -513,11 +636,48 @@ impl ServerHandler for AppListMcpServer {
             })
         }
     }
+
+    async fn call_tool(
+        &self,
+        _: rmcp::model::CallToolRequestParam,
+        context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        let account = context
+            .extensions
+            .get::<axum::http::request::Parts>()
+            .and_then(|parts| parts.headers.get("chatgpt-account-id"))
+            .and_then(|account| account.to_str().ok())
+            .ok_or_else(|| {
+                rmcp::ErrorData::invalid_request("missing account on tool request", None)
+            })?;
+        self.calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(account.to_owned());
+        Ok(rmcp::model::CallToolResult::success(vec![
+            rmcp::model::Content::text("executed"),
+        ]))
+    }
 }
 
 async fn start_apps_server(
     connectors: Vec<AppInfo>,
     tools: Vec<Tool>,
+) -> Result<(String, JoinHandle<()>, Arc<std::sync::atomic::AtomicUsize>)> {
+    start_apps_server_with_accounts(
+        connectors,
+        tools,
+        vec![connector_tool("gamma", "Gamma")?],
+        Default::default(),
+    )
+    .await
+}
+
+async fn start_apps_server_with_accounts(
+    connectors: Vec<AppInfo>,
+    tools: Vec<Tool>,
+    second_account_tools: Vec<Tool>,
+    calls: Arc<std::sync::Mutex<Vec<String>>>,
 ) -> Result<(String, JoinHandle<()>, Arc<std::sync::atomic::AtomicUsize>)> {
     let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let state = AppsServerState {
@@ -529,7 +689,8 @@ async fn start_apps_server(
     let state = Arc::new(state);
     let mcp_server = AppListMcpServer {
         tools: Arc::new(tools),
-        second_account_tools: Arc::new(vec![connector_tool("gamma", "Gamma")?]),
+        second_account_tools: Arc::new(second_account_tools),
+        calls,
     };
 
     let listener = TcpListener::bind("127.0.0.1:0").await?;

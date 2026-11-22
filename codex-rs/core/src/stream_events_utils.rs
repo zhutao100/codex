@@ -25,22 +25,23 @@ pub(crate) struct OutputItemResult {
     pub tool_call: Option<ToolCall>,
 }
 
-pub(crate) struct HandleOutputCtx {
+pub(crate) struct HandleOutputCtx<'a> {
     pub sess: Arc<Session>,
     pub turn_context: Arc<TurnContext>,
     pub plan_mode: bool,
+    pub router: &'a ToolRouter,
 }
 
 #[instrument(level = "trace", skip_all)]
 pub(crate) async fn handle_output_item_done(
-    ctx: &mut HandleOutputCtx,
+    ctx: &mut HandleOutputCtx<'_>,
     item: ResponseItem,
     previously_active_item: Option<TurnItem>,
 ) -> Result<OutputItemResult> {
     let mut output = OutputItemResult::default();
     let plan_mode = ctx.plan_mode;
 
-    match ToolRouter::build_tool_call(ctx.sess.as_ref(), item.clone()).await {
+    match ctx.router.build_tool_call(item.clone()) {
         // Record the call now. The request owner decides whether to dispatch it
         // after the response completes or reject it after a failed stream.
         Ok(Some(call)) => {

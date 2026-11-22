@@ -144,25 +144,6 @@ impl Session {
             .await
     }
 
-    pub async fn call_tool(
-        &self,
-        server: &str,
-        tool: &str,
-        arguments: Option<serde_json::Value>,
-    ) -> anyhow::Result<CallToolResult> {
-        self.current_mcp_manager()
-            .await
-            .call_tool(server, tool, arguments)
-            .await
-    }
-
-    pub(crate) async fn parse_mcp_tool_name(&self, tool_name: &str) -> Option<(String, String)> {
-        self.current_mcp_manager()
-            .await
-            .parse_tool_name(tool_name)
-            .await
-    }
-
     async fn refresh_mcp_servers_inner(
         &self,
         turn_context: &TurnContext,

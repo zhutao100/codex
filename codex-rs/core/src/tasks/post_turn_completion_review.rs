@@ -218,7 +218,7 @@ async fn start_post_turn_completion_review_conversation(
             features: &sub_agent_config.features,
             web_search_mode: Some(codex_protocol::config_types::WebSearchMode::Disabled),
         });
-    let tools = crate::tools::ToolRouter::from_config(&tools_config, None, &[]).specs();
+    let tools = crate::tools::ToolRouter::from_config(&tools_config, None, &[], None).specs();
     let tool_tokens = approx_token_count(
         &serde_json::to_string(&tools).map_err(|error| CodexErr::Fatal(error.to_string()))?,
     );

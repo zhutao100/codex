@@ -4,6 +4,7 @@ use std::time::Instant;
 use tracing::error;
 
 use crate::mcp::CODEX_APPS_MCP_SERVER_NAME;
+use crate::mcp_connection_manager::McpConnectionManager;
 use crate::protocol::EventMsg;
 use crate::protocol::McpInvocation;
 use crate::protocol::McpToolCallBeginEvent;
@@ -35,6 +36,7 @@ pub(crate) async fn handle_mcp_tool_call(
     call_id: String,
     server: String,
     tool_name: String,
+    hosted_binding: Option<uuid::Uuid>,
     arguments: String,
 ) -> ResponseInputItem {
     // Parse the `arguments` as JSON. An empty string is OK, but invalid JSON
@@ -63,70 +65,50 @@ pub(crate) async fn handle_mcp_tool_call(
         arguments: arguments_value.clone(),
     };
 
-    if let Some(decision) =
-        maybe_request_mcp_tool_approval(sess.as_ref(), turn_context, &call_id, &server, &tool_name)
-            .await
-    {
-        let result = match decision {
-            McpToolApprovalDecision::Accept | McpToolApprovalDecision::AcceptAndRemember => {
-                let tool_call_begin_event = EventMsg::McpToolCallBegin(McpToolCallBeginEvent {
-                    call_id: call_id.clone(),
-                    invocation: invocation.clone(),
-                });
-                notify_mcp_tool_call_event(sess.as_ref(), turn_context, tool_call_begin_event)
-                    .await;
-
-                let start = Instant::now();
-                let result: Result<CallToolResult, String> = sess
-                    .call_tool(&server, &tool_name, arguments_value.clone())
-                    .await
-                    .map_err(|e| format!("tool call error: {e:?}"));
-                if let Err(e) = &result {
-                    tracing::warn!("MCP tool call error: {e:?}");
-                }
-                let tool_call_end_event = EventMsg::McpToolCallEnd(McpToolCallEndEvent {
-                    call_id: call_id.clone(),
-                    invocation,
-                    duration: start.elapsed(),
-                    result: result.clone(),
-                });
-                notify_mcp_tool_call_event(
-                    sess.as_ref(),
-                    turn_context,
-                    tool_call_end_event.clone(),
-                )
-                .await;
-                result
+    let manager = sess.current_mcp_manager().await;
+    let binding_matches = |manager: &McpConnectionManager| {
+        server != CODEX_APPS_MCP_SERVER_NAME
+            || (hosted_binding.is_some() && manager.hosted_binding() == hosted_binding)
+    };
+    let changed = "app connection changed; request fresh tool approval";
+    let skip = if !binding_matches(&manager) {
+        Some(changed)
+    } else {
+        let decision = maybe_request_mcp_tool_approval(
+            &sess,
+            turn_context,
+            &call_id,
+            &manager,
+            &server,
+            &tool_name,
+        )
+        .await;
+        match decision {
+            Some(McpToolApprovalDecision::Decline) => Some("user rejected MCP tool call"),
+            Some(McpToolApprovalDecision::Cancel) => Some("user cancelled MCP tool call"),
+            _ if server == CODEX_APPS_MCP_SERVER_NAME
+                && !binding_matches(sess.current_mcp_manager().await.as_ref()) =>
+            {
+                Some(changed)
             }
-            McpToolApprovalDecision::Decline => {
-                let message = "user rejected MCP tool call".to_string();
-                notify_mcp_tool_call_skip(
-                    sess.as_ref(),
-                    turn_context,
-                    &call_id,
-                    invocation,
-                    message,
-                )
-                .await
+            None
+            | Some(McpToolApprovalDecision::Accept | McpToolApprovalDecision::AcceptAndRemember) => {
+                None
             }
-            McpToolApprovalDecision::Cancel => {
-                let message = "user cancelled MCP tool call".to_string();
-                notify_mcp_tool_call_skip(
-                    sess.as_ref(),
-                    turn_context,
-                    &call_id,
-                    invocation,
-                    message,
-                )
-                .await
-            }
-        };
-
-        let status = if result.is_ok() { "ok" } else { "error" };
+        }
+    };
+    if let Some(message) = skip {
+        let result = notify_mcp_tool_call_skip(
+            &sess,
+            turn_context,
+            &call_id,
+            invocation,
+            message.to_string(),
+        )
+        .await;
         turn_context
             .otel_manager
-            .counter("codex.mcp.call", 1, &[("status", status)]);
-
+            .counter("codex.mcp.call", 1, &[("status", "error")]);
         return ResponseInputItem::McpToolCallOutput { call_id, result };
     }
 
@@ -138,8 +120,8 @@ pub(crate) async fn handle_mcp_tool_call(
 
     let start = Instant::now();
     // Perform the tool call.
-    let result: Result<CallToolResult, String> = sess
-        .call_tool(&server, &tool_name, arguments_value.clone())
+    let result: Result<CallToolResult, String> = manager
+        .call_tool(&server, &tool_name, arguments_value)
         .await
         .map_err(|e| format!("tool call error: {e:?}"));
     if let Err(e) = &result {
@@ -212,6 +194,7 @@ const MCP_TOOL_APPROVAL_CANCEL: &str = "Cancel";
 
 #[derive(Debug, Serialize)]
 struct McpToolApprovalKey {
+    connection: uuid::Uuid,
     server: String,
     connector_id: String,
     tool_name: String,
@@ -221,6 +204,7 @@ async fn maybe_request_mcp_tool_approval(
     sess: &Session,
     turn_context: &TurnContext,
     call_id: &str,
+    manager: &McpConnectionManager,
     server: &str,
     tool_name: &str,
 ) -> Option<McpToolApprovalDecision> {
@@ -231,7 +215,8 @@ async fn maybe_request_mcp_tool_approval(
         return None;
     }
 
-    let metadata = lookup_mcp_tool_metadata(sess, server, tool_name).await?;
+    let connection = manager.hosted_binding()?;
+    let metadata = lookup_mcp_tool_metadata(manager, server, tool_name).await?;
     if !requires_mcp_tool_approval(&metadata.annotations) {
         return None;
     }
@@ -239,6 +224,7 @@ async fn maybe_request_mcp_tool_approval(
         .connector_id
         .as_deref()
         .map(|connector_id| McpToolApprovalKey {
+            connection,
             server: server.to_string(),
             connector_id: connector_id.to_string(),
             tool_name: tool_name.to_string(),
@@ -267,6 +253,7 @@ async fn maybe_request_mcp_tool_approval(
     let decision = parse_mcp_tool_approval_response(response, &question_id);
     if matches!(decision, McpToolApprovalDecision::AcceptAndRemember)
         && let Some(key) = approval_key
+        && sess.current_mcp_manager().await.hosted_binding() == Some(connection)
     {
         remember_mcp_tool_approval(sess, key).await;
     }
@@ -282,11 +269,11 @@ fn is_full_access_mode(turn_context: &TurnContext) -> bool {
 }
 
 async fn lookup_mcp_tool_metadata(
-    sess: &Session,
+    manager: &McpConnectionManager,
     server: &str,
     tool_name: &str,
 ) -> Option<McpToolApprovalMetadata> {
-    let tools = sess.current_mcp_manager().await.list_all_tools().await;
+    let tools = manager.list_all_tools().await;
 
     tools.into_values().find_map(|tool_info| {
         if tool_info.server_name == server && tool_info.tool_name == tool_name {

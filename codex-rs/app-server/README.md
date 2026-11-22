@@ -698,7 +698,7 @@ To enable or disable a skill by path:
 
 ## Apps
 
-Use `app/list` to fetch available apps (connectors). Each entry includes metadata like the app `id`, display `name`, `installUrl`, and whether it is currently accessible. Hosted directory requests and tools use the current account. After logout or an account switch, an already-loaded thread also drops its old hosted tool connection before advertising or dispatching app tools.
+Use `app/list` to fetch available apps (connectors). Each entry includes metadata like the app `id`, display `name`, `installUrl`, and whether it is currently accessible. Hosted directory requests and tools use the current account. An app tool call and any session approval belong to the connection that advertised the tool. If that connection changes while approval is pending, the call returns an error without executing. A replacement account must approve its own tool, even if both accounts use the same tool name.
 
 ```json
 { "method": "app/list", "id": 50, "params": {

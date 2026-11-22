@@ -259,6 +259,7 @@ impl ManagedClient {
 
 #[derive(Clone)]
 struct AsyncManagedClient {
+    id: uuid::Uuid,
     client: Shared<BoxFuture<'static, Result<ManagedClient, StartupOutcomeError>>>,
     startup: CancellationToken,
     retired: CancellationToken,
@@ -300,6 +301,7 @@ impl AsyncManagedClient {
         };
         Self {
             client: fut.boxed().shared(),
+            id: uuid::Uuid::new_v4(),
             startup,
             retired: CancellationToken::new(),
         }
@@ -340,6 +342,11 @@ pub(crate) struct McpConnectionManager {
 }
 
 impl McpConnectionManager {
+    pub(crate) fn hosted_binding(&self) -> Option<uuid::Uuid> {
+        self.clients
+            .get(CODEX_APPS_MCP_SERVER_NAME)
+            .map(|client| client.id)
+    }
     pub(crate) fn retire_hosted_apps(&self) {
         if let Some(previous) = self.clients.get(CODEX_APPS_MCP_SERVER_NAME) {
             previous.startup.cancel();
@@ -808,13 +815,6 @@ impl McpConnectionManager {
             .read_resource(params, timeout)
             .await
             .with_context(|| format!("resources/read failed for `{server}` ({uri})"))
-    }
-
-    pub async fn parse_tool_name(&self, tool_name: &str) -> Option<(String, String)> {
-        self.list_all_tools()
-            .await
-            .get(tool_name)
-            .map(|tool| (tool.server_name.clone(), tool.tool_name.clone()))
     }
 
     pub async fn notify_sandbox_state_change(&self, sandbox_state: &SandboxState) -> Result<()> {
