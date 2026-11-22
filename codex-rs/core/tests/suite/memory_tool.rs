@@ -4,7 +4,7 @@ use anyhow::Result;
 use codex_core::features::Feature;
 use core_test_support::responses::mount_function_call_agent_response;
 use core_test_support::responses::start_mock_server;
-use core_test_support::skip_if_no_network;
+use core_test_support::skip_if_no_network_unless_localhost;
 use core_test_support::test_codex::test_codex;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
@@ -13,7 +13,7 @@ use tokio::time::Duration;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_memory_tool_returns_persisted_thread_memory() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    skip_if_no_network_unless_localhost!(Ok(()));
 
     let server = start_mock_server().await;
     let mut builder = test_codex().with_config(|config| {

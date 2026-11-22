@@ -51,14 +51,14 @@ pub struct StateRuntime {
 impl StateRuntime {
     /// Initialize the state runtime using the provided Codex home and default provider.
     ///
-    /// This opens (and migrates) the SQLite database at `codex_home/state.sqlite`.
+    /// Open and migrate only this build's versioned database. Other databases may
+    /// contain memories or logs that cannot be reconstructed from JSONL.
     pub async fn init(
         codex_home: PathBuf,
         default_provider: String,
         otel: Option<OtelManager>,
     ) -> anyhow::Result<Arc<Self>> {
         tokio::fs::create_dir_all(&codex_home).await?;
-        remove_legacy_state_files(&codex_home).await;
         let state_path = state_db_path(codex_home.as_path());
         let existed = tokio::fs::try_exists(&state_path).await.unwrap_or(false);
         let pool = match open_sqlite(&state_path).await {
@@ -918,54 +918,6 @@ pub fn state_db_path(codex_home: &Path) -> PathBuf {
     codex_home.join(state_db_filename())
 }
 
-async fn remove_legacy_state_files(codex_home: &Path) {
-    let mut entries = match tokio::fs::read_dir(codex_home).await {
-        Ok(entries) => entries,
-        Err(err) => {
-            warn!(
-                "failed to read codex_home for state db cleanup {}: {err}",
-                codex_home.display()
-            );
-            return;
-        }
-    };
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        if !entry
-            .file_type()
-            .await
-            .map(|file_type| file_type.is_file())
-            .unwrap_or(false)
-        {
-            continue;
-        }
-        let file_name = entry.file_name();
-        let file_name = file_name.to_string_lossy();
-        if !should_remove_state_file(file_name.as_ref()) {
-            continue;
-        }
-
-        let legacy_path = entry.path();
-        if let Err(err) = tokio::fs::remove_file(&legacy_path).await {
-            warn!(
-                "failed to remove legacy state db file {}: {err}",
-                legacy_path.display()
-            );
-        }
-    }
-}
-
-fn should_remove_state_file(file_name: &str) -> bool {
-    let mut base_name = file_name;
-    for suffix in ["-wal", "-shm", "-journal"] {
-        if let Some(stripped) = file_name.strip_suffix(suffix) {
-            base_name = stripped;
-            break;
-        }
-    }
-    // Unknown versions may be live databases owned by another build sharing CODEX_HOME.
-    matches!(base_name, "state.sqlite" | "state_2.sqlite")
-}
-
 fn push_thread_filters<'a>(
     builder: &mut QueryBuilder<'a, Sqlite>,
     archived_only: bool,
@@ -1066,7 +1018,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn init_removes_legacy_state_db_files() {
+    async fn init_preserves_other_database_versions_and_all_sidecars() {
         let codex_home = unique_temp_dir();
         tokio::fs::create_dir_all(&codex_home)
             .await
@@ -1114,20 +1066,13 @@ mod tests {
                 b"other build"
             );
             let legacy_path = codex_home.join(format!("{unversioned_name}{suffix}"));
-            assert_eq!(
-                tokio::fs::try_exists(&legacy_path)
-                    .await
-                    .expect("check legacy path"),
-                false
-            );
+            assert_eq!(tokio::fs::read(legacy_path).await.unwrap(), b"legacy");
             let old_version_path = codex_home.join(format!(
                 "{STATE_DB_FILENAME}_{previous_version}.sqlite{suffix}"
             ));
             assert_eq!(
-                tokio::fs::try_exists(&old_version_path)
-                    .await
-                    .expect("check old version path"),
-                false
+                tokio::fs::read(old_version_path).await.unwrap(),
+                b"old_version"
             );
         }
         assert_eq!(
