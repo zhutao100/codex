@@ -702,6 +702,8 @@ To enable or disable a skill by path:
 
 Use `app/list` to fetch available apps (connectors). Each entry includes metadata like the app `id`, display `name`, `installUrl`, and whether it is currently accessible. Hosted directory requests and tools use the current account. An app tool call and any session approval belong to the connection that advertised the tool. If that connection changes while approval is pending, the call returns an error without executing. A replacement account must approve its own tool, even if both accounts use the same tool name.
 
+Treat an MCP elicitation's displayed ID as opaque. Each prompt belongs to one connection; retiring it cancels its outstanding prompts. A delayed answer cannot satisfy a new prompt even if the replacement server reuses the same wire request ID.
+
 ```json
 { "method": "app/list", "id": 50, "params": {
     "cursor": null,

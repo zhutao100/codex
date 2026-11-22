@@ -170,60 +170,61 @@ struct ConnectionTools {
     tools: Vec<ToolInfo>,
 }
 
-type ResponderMap = HashMap<(String, RequestId), oneshot::Sender<ElicitationResponse>>;
+type ResponderMap = HashMap<RequestId, oneshot::Sender<ElicitationResponse>>;
 
 #[derive(Clone, Default)]
 struct ElicitationRequestManager {
     requests: Arc<Mutex<ResponderMap>>,
+    retired: CancellationToken,
 }
 
 impl ElicitationRequestManager {
-    async fn resolve(
-        &self,
-        server_name: String,
-        id: RequestId,
-        response: ElicitationResponse,
-    ) -> Result<()> {
+    async fn resolve(&self, id: RequestId, response: ElicitationResponse) -> Result<()> {
+        anyhow::ensure!(!self.retired.is_cancelled(), "MCP connection retired");
         self.requests
             .lock()
             .await
-            .remove(&(server_name, id))
+            .remove(&id)
             .ok_or_else(|| anyhow!("elicitation request not found"))?
             .send(response)
             .map_err(|e| anyhow!("failed to send elicitation response: {e:?}"))
     }
 
     fn make_sender(&self, server_name: String, tx_event: Sender<Event>) -> SendElicitation {
-        let elicitation_requests = self.requests.clone();
-        Box::new(move |id, elicitation| {
-            let elicitation_requests = elicitation_requests.clone();
+        let prompts = self.clone();
+        Box::new(move |_wire_id, elicitation| {
+            let prompts = prompts.clone();
             let tx_event = tx_event.clone();
             let server_name = server_name.clone();
             async move {
+                // The MCP client already pairs this future with its wire request.
+                // UI answers can outlive the connection and need a host-owned ID.
+                let prompt_id = uuid::Uuid::new_v4().to_string();
+                let id = RequestId::String(prompt_id.clone().into());
                 let (tx, rx) = oneshot::channel();
-                {
-                    let mut lock = elicitation_requests.lock().await;
-                    lock.insert((server_name.clone(), id.clone()), tx);
-                }
-                let _ = tx_event
-                    .send(Event {
-                        id: "mcp_elicitation_request".to_string(),
-                        msg: EventMsg::ElicitationRequest(ElicitationRequestEvent {
-                            server_name,
-                            id: match id.clone() {
-                                rmcp::model::NumberOrString::String(value) => {
-                                    ProtocolRequestId::String(value.to_string())
-                                }
-                                rmcp::model::NumberOrString::Number(value) => {
-                                    ProtocolRequestId::Integer(value)
-                                }
-                            },
-                            message: elicitation.message,
-                        }),
-                    })
-                    .await;
-                rx.await
-                    .context("elicitation request channel closed unexpectedly")
+                prompts.requests.lock().await.insert(id.clone(), tx);
+                let deliver = async {
+                    tx_event
+                        .send(Event {
+                            id: "mcp_elicitation_request".to_string(),
+                            msg: EventMsg::ElicitationRequest(ElicitationRequestEvent {
+                                server_name,
+                                id: ProtocolRequestId::String(prompt_id),
+                                message: elicitation.message,
+                            }),
+                        })
+                        .await
+                        .context("elicitation event receiver closed")?;
+                    rx.await
+                        .context("elicitation request channel closed unexpectedly")
+                };
+                let result = tokio::select! {
+                    biased;
+                    _ = prompts.retired.cancelled() => Err(anyhow!("MCP connection retired")),
+                    result = deliver => result,
+                };
+                prompts.requests.lock().await.remove(&id);
+                result
             }
             .boxed()
         })
@@ -263,6 +264,7 @@ struct AsyncManagedClient {
     client: Shared<BoxFuture<'static, Result<ManagedClient, StartupOutcomeError>>>,
     startup: CancellationToken,
     retired: CancellationToken,
+    prompts: ElicitationRequestManager,
 }
 
 impl AsyncManagedClient {
@@ -272,10 +274,11 @@ impl AsyncManagedClient {
         store_mode: OAuthCredentialsStoreMode,
         cancel_token: CancellationToken,
         tx_event: Sender<Event>,
-        elicitation_requests: ElicitationRequestManager,
     ) -> Self {
         let tool_filter = ToolFilter::from_config(&config);
         let startup = cancel_token.clone();
+        let prompts = ElicitationRequestManager::default();
+        let elicitation_requests = prompts.clone();
         let fut = async move {
             if let Err(error) = validate_mcp_server_name(&server_name) {
                 return Err(error.into());
@@ -303,7 +306,8 @@ impl AsyncManagedClient {
             client: fut.boxed().shared(),
             id: uuid::Uuid::new_v4(),
             startup,
-            retired: CancellationToken::new(),
+            retired: prompts.retired.clone(),
+            prompts,
         }
     }
 
@@ -338,7 +342,6 @@ pub struct SandboxState {
 pub(crate) struct McpConnectionManager {
     pub(crate) configured_servers: HashMap<String, McpServerConfig>,
     clients: HashMap<String, AsyncManagedClient>,
-    elicitation_requests: ElicitationRequestManager,
 }
 
 impl McpConnectionManager {
@@ -368,11 +371,6 @@ impl McpConnectionManager {
         }
         self.retire_hosted_apps();
         self.clients.remove(name);
-        self.elicitation_requests
-            .requests
-            .lock()
-            .await
-            .retain(|(server, _), _| server != name);
         self.configured_servers.remove(name);
         if let Some(config) = server {
             self.configured_servers
@@ -387,7 +385,6 @@ impl McpConnectionManager {
                     cancel.child_token()
                 },
                 tx,
-                self.elicitation_requests.clone(),
             );
             self.clients.insert(name.to_owned(), client.clone());
             tokio::spawn(async move {
@@ -419,7 +416,6 @@ impl McpConnectionManager {
         }
         let mut clients = HashMap::new();
         let mut join_set = JoinSet::new();
-        let elicitation_requests = ElicitationRequestManager::default();
         self.configured_servers.clone_from(mcp_servers);
         let mcp_servers = mcp_servers.clone();
         for (server_name, cfg) in mcp_servers.into_iter().filter(|(_, cfg)| cfg.enabled) {
@@ -438,7 +434,6 @@ impl McpConnectionManager {
                 store_mode,
                 cancel_token.clone(),
                 tx_event.clone(),
-                elicitation_requests.clone(),
             );
             clients.insert(server_name.clone(), async_managed_client.clone());
             let tx_event = tx_event.clone();
@@ -485,7 +480,6 @@ impl McpConnectionManager {
             });
         }
         self.clients = clients;
-        self.elicitation_requests = elicitation_requests.clone();
         tokio::spawn(async move {
             let outcomes = join_set.join_all().await;
             let mut summary = McpStartupCompleteEvent::default();
@@ -525,8 +519,11 @@ impl McpConnectionManager {
         id: RequestId,
         response: ElicitationResponse,
     ) -> Result<()> {
-        self.elicitation_requests
-            .resolve(server_name, id, response)
+        self.clients
+            .get(&server_name)
+            .ok_or_else(|| anyhow!("unknown MCP server '{server_name}'"))?
+            .prompts
+            .resolve(id, response)
             .await
     }
 
@@ -1184,6 +1181,85 @@ mod tests {
     use rmcp::model::JsonObject;
     use std::collections::HashSet;
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn late_elicitation_answer_does_not_resolve_reused_wire_id() -> Result<()> {
+        let mut manager = McpConnectionManager::default();
+        let name = CODEX_APPS_MCP_SERVER_NAME;
+        let (tx, rx) = async_channel::bounded(2);
+        let config: McpServerConfig =
+            serde_json::from_value(serde_json::json!({"command":"unused"}))?;
+        let client = || {
+            AsyncManagedClient::new(
+                name.into(),
+                config.clone(),
+                OAuthCredentialsStoreMode::File,
+                CancellationToken::new(),
+                tx.clone(),
+            )
+        };
+        manager
+            .configured_servers
+            .insert(name.into(), config.clone());
+        manager.clients.insert(name.into(), client());
+        let request = || {
+            serde_json::from_value(serde_json::json!({
+                "message": "Choose", "requestedSchema": {"type":"object","properties":{}}
+            }))
+        };
+        let answer = || serde_json::from_value(serde_json::json!({"action":"accept"}));
+        let prompt = async || -> Result<RequestId> {
+            match rx.recv().await? {
+                Event {
+                    msg:
+                        EventMsg::ElicitationRequest(ElicitationRequestEvent {
+                            id: ProtocolRequestId::String(id),
+                            ..
+                        }),
+                    ..
+                } => Ok(RequestId::String(id.into())),
+                _ => anyhow::bail!("missing host prompt ID"),
+            }
+        };
+        let old = manager.clients[name]
+            .prompts
+            .make_sender(name.into(), tx.clone());
+        let first = tokio::spawn(old(RequestId::Number(1), request()?));
+        let stale = prompt().await?;
+        manager
+            .rebind_hosted_apps(
+                None,
+                OAuthCredentialsStoreMode::File,
+                CancellationToken::new(),
+                tx.clone(),
+                SandboxState {
+                    sandbox_policy: SandboxPolicy::new_read_only_policy(),
+                    sandbox_cwd: ".".into(),
+                    codex_linux_sandbox_exe: None,
+                },
+            )
+            .await;
+        assert!(first.await?.is_err());
+        assert!(old(RequestId::Number(2), request()?).await.is_err());
+        assert!(rx.is_empty());
+        manager.clients.insert(name.into(), client());
+        let new = manager.clients[name].prompts.make_sender(name.into(), tx);
+        let second = tokio::spawn(new(RequestId::Number(1), request()?));
+        let current = prompt().await?;
+        assert_ne!(stale, current);
+        assert!(
+            manager
+                .resolve_elicitation(name.into(), stale, answer()?)
+                .await
+                .is_err()
+        );
+        assert!(!second.is_finished());
+        manager
+            .resolve_elicitation(name.into(), current, answer()?)
+            .await?;
+        pretty_assertions::assert_eq!(second.await??, answer()?);
+        Ok(())
+    }
 
     fn create_test_tool(server_name: &str, tool_name: &str) -> ToolInfo {
         ToolInfo {
