@@ -148,3 +148,11 @@ pub(crate) fn is_altgr(mods: KeyModifiers) -> bool {
 pub(crate) fn is_altgr(_mods: KeyModifiers) -> bool {
     false
 }
+#[cfg(test)]
+pub(crate) fn snapshot_settings() -> insta::Settings {
+    let mut settings = insta::Settings::clone_current();
+    if !cfg!(target_os = "macos") {
+        settings.set_snapshot_suffix("non_macos");
+    }
+    settings
+}

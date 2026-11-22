@@ -1,0 +1,21 @@
+---
+source: tui/src/bottom_pane/chat_composer.rs
+expression: terminal.backend()
+---
+"                                                                                                    "
+"› Ask Codex to do anything                                                                          "
+"                                                                                                    "
+"                                                                                                    "
+"                                                                                                    "
+"                                                                                                    "
+"                                                                                                    "
+"                                                                                                    "
+"  / for commands                                     ! for shell commands                           "
+"  ⇧ + enter for newline                              ⌃ + ⇧ + ← / Ctrl+Shift+→ to change model       "
+"  ⌃ + ⇧ + ↑ / Ctrl+Shift+↓ to change thinking                                                       "
+"  tab to queue message                               @ for file paths                               "
+"  ⌃ + v to paste from clipboard                      ⌃ + r to copy last output                      "
+"  ⌃ + b to copy code block                           ⌃ + l to copy prompt                           "
+"  ⌃ + g to edit in external editor                   esc again to edit or branch previous message   "
+"  ⌃ + c to exit                                      ⇧ + tab to change mode                         "
+"                                                     ⌃ + t to view transcript                       "

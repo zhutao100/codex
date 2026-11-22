@@ -853,6 +853,7 @@ mod tests {
 
     #[test]
     fn transcript_overlay_snapshot_basic() {
+        let _settings = crate::key_hint::snapshot_settings().bind_to_scope();
         // Prepare a transcript overlay with a few lines
         let mut overlay = TranscriptOverlay::new(vec![
             Arc::new(TestCell {
@@ -873,6 +874,7 @@ mod tests {
 
     #[test]
     fn transcript_overlay_renders_live_tail() {
+        let _settings = crate::key_hint::snapshot_settings().bind_to_scope();
         let mut overlay = TranscriptOverlay::new(vec![Arc::new(TestCell {
             lines: vec![Line::from("alpha")],
         })]);
@@ -939,6 +941,7 @@ mod tests {
 
     #[test]
     fn transcript_overlay_apply_patch_scroll_vt100_clears_previous_page() {
+        let _settings = crate::key_hint::snapshot_settings().bind_to_scope();
         let cwd = PathBuf::from("/repo");
         let mut cells: Vec<Arc<dyn HistoryCell>> = Vec::new();
 
@@ -1060,6 +1063,7 @@ mod tests {
 
     #[test]
     fn static_overlay_snapshot_basic() {
+        let _settings = crate::key_hint::snapshot_settings().bind_to_scope();
         // Prepare a static overlay with a few lines and a title
         let mut overlay = StaticOverlay::with_title(
             vec!["one".into(), "two".into(), "three".into()],
@@ -1167,6 +1171,7 @@ mod tests {
 
     #[test]
     fn static_overlay_wraps_long_lines() {
+        let _settings = crate::key_hint::snapshot_settings().bind_to_scope();
         let mut overlay = StaticOverlay::with_title(
             vec!["a very long line that should wrap when rendered within a narrow pager overlay width".into()],
             "S T A T I C".to_string(),

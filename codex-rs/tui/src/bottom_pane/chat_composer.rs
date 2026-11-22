@@ -3821,6 +3821,8 @@ mod tests {
         terminal
             .draw(|f| composer.render(f.area(), f.buffer_mut()))
             .unwrap();
+        let _settings = (footer_props.mode == FooterMode::ShortcutOverlay)
+            .then(|| crate::key_hint::snapshot_settings().bind_to_scope());
         insta::assert_snapshot!(name, terminal.backend());
     }
 

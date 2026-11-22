@@ -960,6 +960,11 @@ fn test_otel_manager(config: &Config, model: &str) -> OtelManager {
 }
 
 // --- Helpers for tests that need direct construction and event draining ---
+fn use_snapshot_workspace(chat: &mut ChatWidget) {
+    chat.current_cwd = Some(PathBuf::from("/project"));
+    chat.refresh_status_line();
+}
+
 async fn make_chatwidget_manual(
     model_override: Option<&str>,
 ) -> (
@@ -2571,6 +2576,7 @@ async fn preamble_keeps_status_indicator_visible_until_exec_begin() {
 #[tokio::test]
 async fn preamble_keeps_working_status_snapshot() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    use_snapshot_workspace(&mut chat);
     chat.thread_id = Some(ThreadId::new());
 
     // Regression sequence: a preamble line is committed to history before any exec/tool event.
@@ -2609,6 +2615,7 @@ async fn unified_exec_begin_restores_status_indicator_after_preamble() {
 #[tokio::test]
 async fn unified_exec_begin_restores_working_status_snapshot() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    use_snapshot_workspace(&mut chat);
 
     chat.on_task_started(Some("turn-1".to_string()));
     chat.on_agent_message_delta("Preamble line\n".to_string());
@@ -6512,6 +6519,7 @@ async fn status_widget_and_approval_modal_snapshot() {
 #[tokio::test]
 async fn status_widget_active_snapshot() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    use_snapshot_workspace(&mut chat);
     // Activate the status indicator by simulating a task start.
     chat.handle_codex_event(Event {
         id: "task-1".into(),
@@ -7613,6 +7621,7 @@ async fn deltas_then_same_final_message_are_rendered_snapshot() {
 #[tokio::test]
 async fn chatwidget_exec_and_status_layout_vt100_snapshot() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    use_snapshot_workspace(&mut chat);
     chat.handle_codex_event(Event {
         id: "t1".into(),
         msg: EventMsg::AgentMessage(AgentMessageEvent { message: "I’m going to search the repo for where “Change Approved” is rendered to update that view.".into() }),
@@ -8111,6 +8120,7 @@ printf 'fenced within fenced\n'
 #[tokio::test]
 async fn chatwidget_tall() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    use_snapshot_workspace(&mut chat);
     chat.thread_id = Some(ThreadId::new());
     chat.handle_codex_event(Event {
         id: "t1".into(),

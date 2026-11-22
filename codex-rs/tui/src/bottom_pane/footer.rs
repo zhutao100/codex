@@ -1328,6 +1328,8 @@ mod tests {
         let height = footer_height(props).max(1);
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         draw_footer_frame(&mut terminal, height, props, collaboration_mode_indicator);
+        let _settings = (props.mode == FooterMode::ShortcutOverlay)
+            .then(|| crate::key_hint::snapshot_settings().bind_to_scope());
         assert_snapshot!(name, terminal.backend());
     }
 
