@@ -33,6 +33,7 @@ use core_test_support::responses::WebSocketTestServer;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_function_call;
+use core_test_support::responses::ev_message_item_added;
 use core_test_support::responses::ev_output_text_delta;
 use core_test_support::responses::ev_reasoning_item;
 use core_test_support::responses::ev_response_created;
@@ -846,11 +847,13 @@ async fn responses_websocket_reconnects_when_cached_connection_was_closed() {
 async fn responses_websocket_pause_continue_reconnects_after_in_flight_response() {
     skip_if_no_network_unless_localhost!();
 
+    let partial = "partial streamed text that must not continue";
     let server = start_websocket_server_with_headers(vec![
         WebSocketConnectionConfig {
             requests: vec![vec![
                 ev_response_created("resp-pause"),
-                ev_output_text_delta("partial streamed text that must not continue"),
+                ev_message_item_added("partial-message", ""),
+                ev_output_text_delta(partial),
             ]],
             response_headers: Vec::new(),
             keep_open: true,
@@ -874,7 +877,7 @@ async fn responses_websocket_pause_continue_reconnects_after_in_flight_response(
 
     submit_user_input(&test, "start pauseable websocket work").await;
 
-    wait_for_websocket_request_count(&server, 0, 1).await;
+    wait_for_event(&test.codex, |event| matches!(event, EventMsg::AgentMessageContentDelta(delta) if delta.delta == partial)).await;
     test.codex.submit(Op::Pause).await.expect("pause turn");
     wait_for_event(&test.codex, |event| {
         matches!(event, EventMsg::TurnPaused(_))
@@ -912,7 +915,7 @@ async fn responses_websocket_pause_continue_reconnects_after_in_flight_response(
     let continued_text = continued.to_string();
     assert!(continued_text.contains("start pauseable websocket work"));
     assert!(!continued_text.contains("resp-pause"));
-    assert!(!continued_text.contains("partial streamed text that must not continue"));
+    assert!(!continued_text.contains(partial));
 
     server.shutdown().await;
 }
