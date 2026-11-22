@@ -147,6 +147,15 @@ impl Session {
         per_turn_config
     }
 
+    pub(crate) async fn effective_fork_config(&self) -> Config {
+        let state = self.state.lock().await;
+        let session = &state.session_configuration;
+        let mut config = Self::build_per_turn_config(session);
+        config.cwd = session.cwd.clone();
+        config.model = Some(session.collaboration_mode.model().to_owned());
+        config
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn make_turn_context(
         auth_manager: Option<Arc<AuthManager>>,

@@ -286,7 +286,25 @@ async fn review_start_with_detached_delivery_returns_new_thread_id() -> Result<(
     let mut mcp = McpProcess::new(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
-    let thread_id = start_default_thread(&mut mcp).await?;
+    let workspace = TempDir::new()?;
+    let cwd = workspace.path().canonicalize()?;
+    let start = mcp
+        .send_thread_start_request(ThreadStartParams {
+            cwd: Some(cwd.display().to_string()),
+            config: Some(
+                [("windows".into(), json!({"sandbox": "restricted-token"}))]
+                    .into_iter()
+                    .collect(),
+            ),
+            ..Default::default()
+        })
+        .await?;
+    let response = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(start)),
+    )
+    .await??;
+    let thread_id = to_response::<ThreadStartResponse>(response)?.thread.id;
 
     let review_req = mcp
         .send_review_start_request(ReviewStartParams {
@@ -330,6 +348,7 @@ async fn review_start_with_detached_delivery_returns_new_thread_id() -> Result<(
     }
     let started = started.expect("did not observe detached review thread/started notification");
     assert_eq!(started.thread.id, review_thread_id);
+    assert_eq!(started.thread.cwd, cwd);
     assert_eq!(started.thread.model.as_deref(), Some("review-model"));
     assert_eq!(started.thread.model_provider, "review_provider");
 

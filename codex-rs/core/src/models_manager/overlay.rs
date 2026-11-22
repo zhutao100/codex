@@ -58,26 +58,6 @@ impl ModelOverlay {
         overlaid
     }
 
-    pub(crate) fn apply_mentioned_to_candidates(&self, candidates: &[ModelInfo]) -> Vec<ModelInfo> {
-        self.models
-            .iter()
-            .filter(|entry| entry.creates_model_candidate())
-            .map(|entry| {
-                let mut model = candidates
-                    .iter()
-                    .find(|candidate| candidate.slug == entry.slug)
-                    .cloned()
-                    .unwrap_or_else(|| model_info::model_info_from_slug(&entry.slug));
-                self.cross_model
-                    .apply_to(&mut model, self.final_instruction_override.is_some());
-                entry
-                    .patch
-                    .apply_to(&mut model, entry.final_instruction_override.is_some());
-                model
-            })
-            .collect()
-    }
-
     pub(crate) fn apply_to_fallback_model(&self, model: &mut ModelInfo) {
         self.cross_model
             .apply_to(model, self.final_instruction_override.is_some());

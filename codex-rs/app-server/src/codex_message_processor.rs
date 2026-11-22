@@ -4720,6 +4720,7 @@ impl CodexMessageProcessor {
         &mut self,
         request_id: &ConnectionRequestId,
         parent_thread_id: ThreadId,
+        parent_thread: &CodexThread,
         review_request: ReviewRequest,
         display_text: &str,
     ) -> std::result::Result<(), JSONRPCErrorError> {
@@ -4737,7 +4738,7 @@ impl CodexMessageProcessor {
                     data: None,
                 })?;
 
-        let mut config = self.config.as_ref().clone();
+        let mut config = parent_thread.effective_fork_config().await;
         config
             .apply_review_model_overrides()
             .map_err(|err| JSONRPCErrorError {
@@ -4868,6 +4869,7 @@ impl CodexMessageProcessor {
                     .start_detached_review(
                         &request_id,
                         parent_thread_id,
+                        &parent_thread,
                         review_request,
                         display_text.as_str(),
                     )
@@ -5887,6 +5889,76 @@ mod tests {
     use pretty_assertions::assert_eq;
     use serde_json::json;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn detached_review_rpc_inherits_parent_windows_level() -> Result<()> {
+        use core_test_support::responses;
+        core_test_support::skip_if_no_network_unless_localhost!(Ok(()));
+        let home = TempDir::new()?;
+        let server = responses::start_mock_server().await;
+        let _response =
+            responses::mount_sse_once(&server, responses::sse_completed("review")).await;
+        let mut startup = codex_core::config::ConfigBuilder::default()
+            .codex_home(home.path().into())
+            .build()
+            .await?;
+        startup.model_provider.base_url = Some(format!("{}/v1", server.uri()));
+        startup.model_providers.insert(
+            startup.model_provider_id.clone(),
+            startup.model_provider.clone(),
+        );
+        startup.set_windows_sandbox_level(WindowsSandboxLevel::Disabled);
+        let mut parent_config = startup.clone();
+        parent_config.set_windows_sandbox_level(WindowsSandboxLevel::RestrictedToken);
+        let auth =
+            AuthManager::from_auth_for_testing(codex_core::CodexAuth::from_api_key("fixture"));
+        let manager = Arc::new(ThreadManager::new(
+            home.path().into(),
+            auth.clone(),
+            SessionSource::VSCode,
+        ));
+        let parent = manager.start_thread(parent_config).await?;
+        let (tx, _rx) = tokio::sync::mpsc::channel(128);
+        let mut processor = CodexMessageProcessor::new(CodexMessageProcessorArgs {
+            auth_manager: auth,
+            thread_manager: manager.clone(),
+            outgoing: Arc::new(OutgoingMessageSender::new(tx)),
+            codex_linux_sandbox_exe: None,
+            config: Arc::new(startup),
+            cli_overrides: vec![],
+            cloud_requirements: Default::default(),
+            feedback: CodexFeedback::new(),
+        });
+        processor
+            .review_start(
+                ConnectionRequestId {
+                    connection_id: ConnectionId(1),
+                    request_id: codex_app_server_protocol::RequestId::Integer(1),
+                },
+                ReviewStartParams {
+                    thread_id: parent.thread_id.to_string(),
+                    delivery: Some(ApiReviewDelivery::Detached),
+                    target: ApiReviewTarget::Custom {
+                        instructions: "Review".into(),
+                    },
+                },
+            )
+            .await;
+        let ids: Vec<_> = manager
+            .list_thread_ids()
+            .await
+            .into_iter()
+            .filter(|id| *id != parent.thread_id)
+            .collect();
+        assert_eq!(ids.len(), 1);
+        let child = manager.get_thread(ids[0]).await?;
+        assert_eq!(
+            child.effective_fork_config().await.windows_sandbox_level,
+            WindowsSandboxLevel::RestrictedToken
+        );
+        manager.remove_and_close_all_threads().await?;
+        Ok(())
+    }
 
     #[test]
     fn validate_dynamic_tools_rejects_unsupported_input_schema() {

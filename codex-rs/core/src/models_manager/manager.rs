@@ -529,11 +529,7 @@ impl ModelsManager {
                     .filter(|model| !Self::uses_openai_catalog(&model.slug, config)),
             );
         }
-        if config.model_provider_id == "openai" {
-            overlay.apply_to_candidates(&remote_models)
-        } else {
-            overlay.apply_mentioned_to_candidates(&remote_models)
-        }
+        overlay.apply_to_candidates(&remote_models)
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -1288,6 +1284,35 @@ mod tests {
         }
         assert_eq!(mock.requests().len(), 1);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn global_overlay_applies_to_unlisted_bundled_models_in_both_pickers() {
+        use codex_protocol::openai_models::InputModality;
+        let home = tempdir().unwrap();
+        let manager = ModelsManager::new(
+            home.path().into(),
+            AuthManager::from_auth_for_testing(CodexAuth::from_api_key("test")),
+        );
+        let mut config = test_config();
+        config.model_provider_id = "other".into();
+        config.model_overlay = Some(ModelOverlay {
+            cross_model: ModelInfoPatch {
+                input_modalities: Some(vec![InputModality::Text]),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let presets = manager.list_models(&config, RefreshStrategy::Offline).await;
+        assert_eq!(manager.try_list_models(&config).unwrap(), presets);
+        assert!(!presets.is_empty());
+        for preset in presets {
+            let turn = manager.get_model_info(&preset.model, &config).await;
+            assert_eq!(
+                (preset.input_modalities, turn.input_modalities),
+                (vec![InputModality::Text], vec![InputModality::Text])
+            );
+        }
     }
 
     #[tokio::test]

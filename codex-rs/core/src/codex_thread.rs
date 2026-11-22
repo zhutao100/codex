@@ -95,6 +95,10 @@ impl CodexThread {
         self.codex.thread_config_snapshot().await
     }
 
+    pub async fn effective_fork_config(&self) -> crate::config::Config {
+        self.codex.session.effective_fork_config().await
+    }
+
     pub async fn active_turn_ids(&self) -> Vec<String> {
         let active = self.codex.session.active_turn.lock().await;
         active

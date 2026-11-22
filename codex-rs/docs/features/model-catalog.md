@@ -6,6 +6,8 @@
 
 An overlay-selected provider owns discovery from the first turn. Only a turn served by OpenAI can refresh its catalog on a response ETag. The picker and runtime resolve each model slug against the same provider: a model bound to another provider uses bundled/overlay visibility and input modalities even when OpenAI has a cached entry for the same slug. Conversely, a model explicitly bound to OpenAI can use its catalog when the configured default is another provider.
 
+A global overlay patch also applies to bundled models that have no per-model entry, including when the default provider is not OpenAI. A text-only global modality setting therefore disables image input consistently in both picker paths and in turns.
+
 - Thread naming selects the dedicated model in [thread naming](../../core/src/thread_name.rs), with low reasoning effort and title-only instructions. If that model is unavailable or hidden, it falls back through configured/default model selection and then the current model.
 - [Explorer selection](../../core/src/agent/role.rs) and [rate-limit switching](../../tui/src/chatwidget/rate_limits.rs) have their own selectors. Keep them compatible with the catalog when updating models; do not assume they share naming's fallback logic.
 - Removing a bundled entry changes discovery/pickers, not the ability to configure a custom provider's explicit model identifier. Retain valid tests of custom identifiers.

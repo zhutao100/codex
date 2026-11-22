@@ -2323,6 +2323,10 @@ async fn override_turn_context_updates_windows_level_in_delegated_config() {
         )
         .await;
         let turn = session.new_default_turn().await;
+        assert_eq!(
+            session.effective_fork_config().await.windows_sandbox_level,
+            level
+        );
         let delegate = crate::tasks::configure_review_delegate_config(
             &turn.config,
             &turn.model_info.slug,
