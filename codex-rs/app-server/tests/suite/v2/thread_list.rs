@@ -441,6 +441,37 @@ async fn thread_list_filters_by_subagent_variant() -> Result<()> {
 
     let mut mcp = init_mcp(codex_home.path()).await?;
 
+    let start = mcp.send_thread_start_request(Default::default()).await?;
+    let response = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(start)),
+    )
+    .await??;
+    let _ = to_response::<codex_app_server_protocol::ThreadStartResponse>(response)?;
+    let db = codex_core::state_db::open_if_present(codex_home.path(), "openai")
+        .await
+        .expect("complete backfill");
+    assert!(
+        db.get_thread(ThreadId::from_string(&spawn_id)?)
+            .await?
+            .is_some()
+    );
+    let read = mcp
+        .send_thread_read_request(codex_app_server_protocol::ThreadReadParams {
+            thread_id: review_id.clone(),
+            include_turns: false,
+        })
+        .await?;
+    let response = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(read)),
+    )
+    .await??;
+    let indexed = to_response::<codex_app_server_protocol::ThreadReadResponse>(response)?.thread;
+    assert_eq!(
+        indexed.source,
+        CoreSessionSource::SubAgent(SubAgentSource::Review).into()
+    );
     let review = list_threads(
         &mut mcp,
         None,

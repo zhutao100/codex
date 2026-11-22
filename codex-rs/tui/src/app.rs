@@ -37,7 +37,6 @@ use crate::sessions_picker::SessionSelection as ManagedSessionSelection;
 use crate::tui;
 use crate::tui::TuiEvent;
 use crate::update_action::UpdateAction;
-use chrono::Utc;
 use codex_app_server_protocol::ConfigLayerSource;
 use codex_backend_client::TokenUsageProfile;
 use codex_core::AuthManager;
@@ -839,15 +838,14 @@ impl App {
                 self.config.model_provider_id.as_str(),
             )
             .await;
-            if let Some(ctx) = state_db_ctx
-                && let Err(err) = ctx
-                    .mark_archived(thread_id, archived_path.as_path(), Utc::now())
-                    .await
-            {
-                tracing::warn!(
-                    "failed to mark archived session in state db for thread {thread_id}: {err}"
-                );
-            }
+            codex_core::state_db::record_rollout_move(
+                &self.config.codex_home,
+                state_db_ctx.as_deref(),
+                thread_id,
+                &archived_path,
+                true,
+            )
+            .await?;
         }
 
         Ok(())
@@ -900,11 +898,11 @@ impl App {
             )
             .await;
             codex_core::state_db::delete_thread_metadata(
+                &self.config.codex_home,
                 state_db_ctx.as_deref(),
                 thread_id,
-                "tui_delete_archived_session",
             )
-            .await;
+            .await?;
         }
 
         Ok(())

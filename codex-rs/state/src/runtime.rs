@@ -14,7 +14,6 @@ use crate::model::ThreadRow;
 use crate::model::anchor_from_item;
 use crate::model::datetime_to_epoch_seconds;
 use crate::paths::file_modified_time_utc;
-use chrono::DateTime;
 use chrono::Utc;
 use codex_otel::OtelManager;
 use codex_protocol::ThreadId;
@@ -728,51 +727,77 @@ ON CONFLICT(thread_id, position) DO NOTHING
         Ok(())
     }
 
-    /// Mark a thread as archived using the underlying database.
-    pub async fn mark_archived(
+    /// Match the index timestamp to JSONL after a successful recorder flush.
+    pub async fn sync_rollout_mtime(
         &self,
-        thread_id: ThreadId,
-        rollout_path: &Path,
-        archived_at: DateTime<Utc>,
+        id: ThreadId,
+        path: &Path,
+        modified: std::time::SystemTime,
     ) -> anyhow::Result<()> {
-        let Some(mut metadata) = self.get_thread(thread_id).await? else {
-            return Ok(());
-        };
-        metadata.archived_at = Some(archived_at);
-        metadata.rollout_path = rollout_path.to_path_buf();
-        if let Some(updated_at) = file_modified_time_utc(rollout_path).await {
-            metadata.updated_at = updated_at;
-        }
-        if metadata.id != thread_id {
-            warn!(
-                "thread id mismatch during archive: expected {thread_id}, got {}",
-                metadata.id
-            );
-        }
-        self.upsert_thread(&metadata).await
+        let updated = chrono::DateTime::<Utc>::from(modified).timestamp();
+        sqlx::query("UPDATE threads SET updated_at = ? WHERE id = ? AND rollout_path = ? AND updated_at <> ?")
+                .bind(updated)
+                .bind(id.to_string())
+                .bind(path.to_string_lossy())
+                .bind(updated)
+                .execute(self.pool.as_ref())
+                .await?;
+        Ok(())
     }
 
-    /// Mark a thread as unarchived using the underlying database.
-    pub async fn mark_unarchived(
+    /// Update only the fields changed by an archive or restore.
+    pub async fn set_rollout_location(
         &self,
         thread_id: ThreadId,
         rollout_path: &Path,
+        archived: bool,
+    ) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            r#"
+UPDATE threads SET rollout_path = ?, archived = ?, archived_at = ?, updated_at = COALESCE(?, updated_at)
+WHERE id = ? AND EXISTS (SELECT 1 FROM backfill_state WHERE id = 1 AND status = 'complete')
+            "#,
+        )
+        .bind(rollout_path.to_string_lossy())
+        .bind(archived)
+        .bind(archived.then(|| Utc::now().timestamp()))
+        .bind(file_modified_time_utc(rollout_path).await.map(datetime_to_epoch_seconds))
+        .bind(thread_id.to_string())
+        .execute(self.pool.as_ref())
+        .await?;
+        Ok(result.rows_affected() != 0)
+    }
+
+    pub async fn delete_backfilled_thread(
+        &self,
+        id: uuid::Uuid,
+        generation: i64,
     ) -> anyhow::Result<()> {
-        let Some(mut metadata) = self.get_thread(thread_id).await? else {
-            return Ok(());
-        };
-        metadata.archived_at = None;
-        metadata.rollout_path = rollout_path.to_path_buf();
-        if let Some(updated_at) = file_modified_time_utc(rollout_path).await {
-            metadata.updated_at = updated_at;
-        }
-        if metadata.id != thread_id {
-            warn!(
-                "thread id mismatch during unarchive: expected {thread_id}, got {}",
-                metadata.id
-            );
-        }
-        self.upsert_thread(&metadata).await
+        sqlx::query(
+            r#"
+DELETE FROM threads WHERE id = ?
+AND EXISTS (SELECT 1 FROM backfill_state WHERE id = 1 AND generation = ? AND status = 'running')
+            "#,
+        )
+        .bind(id.to_string())
+        .bind(generation)
+        .execute(self.pool.as_ref())
+        .await?;
+        Ok(())
+    }
+
+    /// If a scan is still running, journal the filesystem deletion instead so the scan cannot undo it.
+    pub async fn delete_thread_if_complete(&self, id: ThreadId) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            r#"
+DELETE FROM threads WHERE id = ?
+AND EXISTS (SELECT 1 FROM backfill_state WHERE id = 1 AND status = 'complete')
+            "#,
+        )
+        .bind(id.to_string())
+        .execute(self.pool.as_ref())
+        .await?;
+        Ok(result.rows_affected() != 0)
     }
 
     /// Permanently delete a thread and its dependent rows.

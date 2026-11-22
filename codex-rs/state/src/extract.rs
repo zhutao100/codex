@@ -110,6 +110,16 @@ fn user_message_preview(user: &UserMessageEvent) -> Option<String> {
     None
 }
 
+/// Scalar sources are stored without quotes; data-bearing sources retain their JSON object.
+pub fn decode_session_source(source: String) -> codex_protocol::protocol::SessionSource {
+    if source.starts_with('{') {
+        serde_json::from_str(&source).unwrap_or(codex_protocol::protocol::SessionSource::Unknown)
+    } else {
+        serde_json::from_value(serde_json::Value::String(source))
+            .unwrap_or(codex_protocol::protocol::SessionSource::Unknown)
+    }
+}
+
 pub(crate) fn enum_to_string<T: Serialize>(value: &T) -> String {
     match serde_json::to_value(value) {
         Ok(Value::String(s)) => s,

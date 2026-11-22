@@ -2170,7 +2170,7 @@ impl CodexMessageProcessor {
                     message: format!("failed to unarchive thread: {err}"),
                     data: None,
                 })?;
-            tokio::task::spawn_blocking({
+            let timestamp = tokio::task::spawn_blocking({
                 let restored_path = restored_path.clone();
                 move || -> std::io::Result<()> {
                     let times = FileTimes::new().set_modified(SystemTime::now());
@@ -2182,21 +2182,26 @@ impl CodexMessageProcessor {
                 }
             })
             .await
+            .map_err(IoError::other)
+            .and_then(std::convert::identity);
+            codex_core::state_db::record_rollout_move(
+                &self.config.codex_home,
+                state_db_ctx.as_deref(),
+                thread_id,
+                &restored_path,
+                false,
+            )
+            .await
             .map_err(|err| JSONRPCErrorError {
                 code: INTERNAL_ERROR_CODE,
-                message: format!("failed to update unarchived thread timestamp: {err}"),
+                message: format!("failed to record restored rollout: {err}"),
                 data: None,
-            })?
-            .map_err(|err| JSONRPCErrorError {
+            })?;
+            timestamp.map_err(|err| JSONRPCErrorError {
                 code: INTERNAL_ERROR_CODE,
                 message: format!("failed to update unarchived thread timestamp: {err}"),
                 data: None,
             })?;
-            if let Some(ctx) = state_db_ctx {
-                let _ = ctx
-                    .mark_unarchived(thread_id, restored_path.as_path())
-                    .await;
-            }
             let summary =
                 read_summary_from_rollout(restored_path.as_path(), fallback_provider.as_str())
                     .await
@@ -4157,11 +4162,14 @@ impl CodexMessageProcessor {
             tokio::fs::create_dir_all(&archive_folder).await?;
             let archived_path = archive_folder.join(&file_name);
             tokio::fs::rename(&canonical_rollout_path, &archived_path).await?;
-            if let Some(ctx) = state_db_ctx {
-                let _ = ctx
-                    .mark_archived(thread_id, archived_path.as_path(), Utc::now())
-                    .await;
-            }
+            codex_core::state_db::record_rollout_move(
+                &self.config.codex_home,
+                state_db_ctx.as_deref(),
+                thread_id,
+                &archived_path,
+                true,
+            )
+            .await?;
             Ok(())
         }
         .await;
@@ -5625,8 +5633,7 @@ fn summary_from_state_db_metadata(
     git_origin_url: Option<String>,
 ) -> ConversationSummary {
     let preview = first_user_message.unwrap_or_default();
-    let source = serde_json::from_value(serde_json::Value::String(source))
-        .unwrap_or(codex_protocol::protocol::SessionSource::Unknown);
+    let source = codex_core::state_db::decode_session_source(source);
     let git_info = if git_sha.is_none() && git_branch.is_none() && git_origin_url.is_none() {
         None
     } else {

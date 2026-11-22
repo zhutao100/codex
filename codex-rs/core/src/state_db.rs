@@ -15,6 +15,7 @@ use codex_state::DB_METRIC_COMPARE_ERROR;
 pub use codex_state::LogEntry;
 use codex_state::STATE_DB_VERSION;
 use codex_state::ThreadMetadataBuilder;
+pub use codex_state::decode_session_source;
 use serde_json::Value;
 use std::path::Path;
 use std::path::PathBuf;
@@ -87,17 +88,56 @@ async fn open_existing(
 
 const MISSED_INDEX_WRITES: &str = "state_index_misses";
 
-/// Appending one byte is atomic across recorders and works even when SQLite is locked.
-/// Never truncate this file: its length is a persistent generation, not a backlog to delete.
+/// Ordinary misses are one byte. Explicit deletions also record the UUID: a scan cannot
+/// infer deletion from a missing file alone. Each record is one append, even across processes.
 pub(crate) async fn note_missed_write(home: &Path) -> std::io::Result<()> {
+    append_miss(home, &[1]).await
+}
+
+/// An open descriptor can outlive its directory entry. Only a still-recoverable rollout
+/// should invalidate the index; never recreate a removed home just to write the journal.
+pub(crate) async fn note_missed_append(home: &Path, rollout: &Path) -> std::io::Result<()> {
+    if tokio::fs::try_exists(rollout).await?
+        && let Err(err) = note_missed_write(home).await
+        && (err.kind() != std::io::ErrorKind::NotFound || tokio::fs::try_exists(rollout).await?)
+    {
+        return Err(err);
+    }
+    Ok(())
+}
+
+async fn append_miss(home: &Path, record: &[u8]) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt;
     let mut file = tokio::fs::OpenOptions::new()
         .append(true)
         .create(true)
         .open(home.join(MISSED_INDEX_WRITES))
         .await?;
-    file.write_all(&[1]).await?;
+    file.write_all(record).await?;
     file.flush().await
+}
+
+pub(crate) async fn missed_deletions(
+    home: &Path,
+    generation: i64,
+) -> anyhow::Result<std::collections::HashSet<Uuid>> {
+    use tokio::io::AsyncReadExt;
+    let mut ids = std::collections::HashSet::new();
+    if generation > 0 {
+        let mut records = Vec::new();
+        tokio::fs::File::open(home.join(MISSED_INDEX_WRITES))
+            .await?
+            .take(generation.try_into()?)
+            .read_to_end(&mut records)
+            .await?;
+        for record in records
+            .split(|byte| matches!(byte, 1 | b'\n'))
+            .filter(|record| !record.is_empty())
+        {
+            ids.insert(Uuid::try_parse_ascii(record)?);
+        }
+    }
+    Ok(ids)
 }
 
 async fn missed_generation(home: &Path) -> std::io::Result<i64> {
@@ -287,18 +327,34 @@ pub async fn upsert_thread_memory(
     }
 }
 
-/// Delete a thread row and dependent metadata from SQLite.
+/// Record a completed filesystem move, including when the derived index is unavailable.
+pub async fn record_rollout_move(
+    home: &Path,
+    context: Option<&codex_state::StateRuntime>,
+    id: ThreadId,
+    path: &Path,
+    archived: bool,
+) -> std::io::Result<()> {
+    if let Some(ctx) = context
+        && matches!(ctx.set_rollout_location(id, path, archived).await, Ok(true))
+    {
+        return Ok(());
+    }
+    note_missed_write(home).await
+}
+
+/// Delete a thread row and dependent metadata, or leave a durable deletion record.
 pub async fn delete_thread_metadata(
+    home: &Path,
     context: Option<&codex_state::StateRuntime>,
     thread_id: ThreadId,
-    stage: &str,
-) {
-    let Some(ctx) = context else {
-        return;
-    };
-    if let Err(err) = ctx.delete_thread(thread_id).await {
-        warn!("state db delete_thread_metadata failed during {stage}: {err}");
+) -> std::io::Result<()> {
+    if let Some(ctx) = context
+        && matches!(ctx.delete_thread_if_complete(thread_id).await, Ok(true))
+    {
+        return Ok(());
     }
+    append_miss(home, format!("\n{thread_id}\n").as_bytes()).await
 }
 
 /// Get the last N memories corresponding to a cwd using an exact path match.

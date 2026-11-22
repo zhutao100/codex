@@ -206,6 +206,37 @@ pub(crate) async fn backfill_sessions(
             }
         }
     }
+    let mut deleted =
+        match crate::state_db::missed_deletions(runtime.codex_home(), backfill_state.generation)
+            .await
+        {
+            Ok(ids) => ids,
+            Err(err) => {
+                warn!("failed to read rollout deletion records: {err}");
+                return;
+            }
+        };
+    if !deleted.is_empty() {
+        for rollout in &rollout_paths {
+            if let Some((_, id)) = rollout
+                .path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(parse_timestamp_uuid_from_filename)
+            {
+                deleted.remove(&id);
+            }
+        }
+        for id in deleted {
+            if let Err(err) = runtime
+                .delete_backfilled_thread(id, backfill_state.generation)
+                .await
+            {
+                warn!("failed to reconcile deleted rollout {id}: {err}");
+                return;
+            }
+        }
+    }
     rollout_paths.sort_by(|a, b| a.watermark.cmp(&b.watermark));
     if let Some(last_watermark) = backfill_state.last_watermark.as_deref() {
         rollout_paths.retain(|entry| entry.watermark.as_str() > last_watermark);
@@ -663,6 +694,181 @@ mod tests {
         let recovered = db.get_backfill_state().await?;
         assert_eq!(recovered.status, BackfillStatus::Complete);
         assert!(recovered.generation > stale.generation);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn missed_moves_and_deletion_reconcile_a_complete_index() -> anyhow::Result<()> {
+        let home = tempdir()?;
+        let mut config = crate::config::test_config();
+        config.codex_home = home.path().into();
+        let id = Uuid::new_v4();
+        let path = write_rollout_in_sessions(
+            home.path(),
+            "2026-01-27T12-00-00",
+            "2026-01-27T12:00:00Z",
+            id,
+        );
+        append_picker_message(&path)?;
+        let id = ThreadId::from_string(&id.to_string())?;
+        let unrelated = Uuid::new_v4();
+        let unmounted = write_rollout_in_sessions(
+            home.path(),
+            "2026-01-27T10-00-00",
+            "2026-01-27T10:00:00Z",
+            unrelated,
+        );
+        let unrelated = ThreadId::from_string(&unrelated.to_string())?;
+        let db = crate::state_db::init_for_rollout(&config, None)
+            .await
+            .unwrap();
+        db.upsert_thread_memory(unrelated, "keep", "memory").await?;
+        let memory = db
+            .get_thread_memory(unrelated)
+            .await?
+            .expect("stored memory");
+        std::fs::remove_file(unmounted)?;
+        let archive = home.path().join(rollout::ARCHIVED_SESSIONS_SUBDIR);
+        std::fs::create_dir_all(&archive)?;
+        let moved = archive.join(path.file_name().unwrap());
+        let active = || {
+            RolloutRecorder::list_threads(
+                home.path(),
+                10,
+                None,
+                crate::ThreadSortKey::UpdatedAt,
+                &[],
+                None,
+                &config.model_provider_id,
+            )
+        };
+        let archived = || {
+            RolloutRecorder::list_archived_threads(
+                home.path(),
+                10,
+                None,
+                crate::ThreadSortKey::UpdatedAt,
+                &[],
+                None,
+                &config.model_provider_id,
+            )
+        };
+        for (from, to, is_archive) in [
+            (&path, &moved, true),
+            (&moved, &path, false),
+            (&path, &moved, true),
+        ] {
+            std::fs::rename(from, to)?;
+            crate::state_db::record_rollout_move(home.path(), None, id, to, is_archive).await?;
+            assert_eq!(
+                (active().await?.items.len(), archived().await?.items.len()),
+                if is_archive { (0, 1) } else { (1, 0) }
+            );
+            assert_eq!(db.get_thread(id).await?.unwrap().rollout_path, *to);
+        }
+        std::fs::remove_file(&moved)?;
+        crate::state_db::delete_thread_metadata(home.path(), None, id).await?;
+        assert!(db.get_thread(id).await?.is_some());
+        assert!(archived().await?.items.is_empty());
+        assert!(db.get_thread(id).await?.is_none());
+        assert_eq!(db.get_thread_memory(unrelated).await?, Some(memory));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn updated_at_resume_matches_jsonl_after_flushing_an_older_thread() -> anyhow::Result<()>
+    {
+        let home = tempdir()?;
+        let mut config = crate::config::test_config();
+        config.codex_home = home.path().into();
+        config.cwd = home.path().into();
+        let old = write_rollout_in_sessions(
+            home.path(),
+            "2026-01-27T12-00-00",
+            "2026-01-27T12:00:00Z",
+            Uuid::new_v4(),
+        );
+        let newer = write_rollout_in_sessions(
+            home.path(),
+            "2026-01-27T13-00-00",
+            "2026-01-27T13:00:00Z",
+            Uuid::new_v4(),
+        );
+        for (path, ts) in [(&old, 1_600_000_000), (&newer, 1_700_000_000)] {
+            append_picker_message(path)?;
+            File::options()
+                .write(true)
+                .open(path)?
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(ts))?;
+        }
+        let db = crate::state_db::init_for_rollout(&config, None)
+            .await
+            .unwrap();
+        let last = || {
+            RolloutRecorder::find_latest_thread_path(
+                home.path(),
+                10,
+                None,
+                crate::ThreadSortKey::UpdatedAt,
+                &[],
+                None,
+                &config.model_provider_id,
+                Some(&config.cwd),
+            )
+        };
+        assert_eq!(last().await?, Some(newer));
+        let recorder = RolloutRecorder::new(
+            &config,
+            crate::RolloutRecorderParams::resume(old.clone()),
+            Some(db),
+            builder_from_items(&[], &old),
+        )
+        .await?;
+        recorder.record_items(&[picker_message()]).await?;
+        recorder.flush().await?;
+        let jsonl = crate::rollout::list::get_threads(
+            home.path(),
+            10,
+            None,
+            crate::ThreadSortKey::UpdatedAt,
+            &[],
+            None,
+            &config.model_provider_id,
+        )
+        .await?;
+        assert_eq!(jsonl.items[0].path, old);
+        assert_eq!(last().await?, Some(old));
+        recorder.shutdown().await?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unlinked_open_rollout_does_not_recreate_its_home_or_fail_flush()
+    -> anyhow::Result<()> {
+        let root = tempdir()?;
+        let mut config = crate::config::test_config();
+        config.codex_home = root.path().join("home");
+        config.cwd = root.path().into();
+        let recorder = RolloutRecorder::new(
+            &config,
+            crate::RolloutRecorderParams::new(
+                ThreadId::new(),
+                None,
+                SessionSource::Cli,
+                config.model_provider_id.clone(),
+                Default::default(),
+                vec![],
+            ),
+            None,
+            None,
+        )
+        .await?;
+        recorder.flush().await?;
+        std::fs::remove_dir_all(&config.codex_home)?;
+        recorder.record_items(&[picker_message()]).await?;
+        recorder.shutdown().await?;
+        assert!(!config.codex_home.exists());
         Ok(())
     }
 

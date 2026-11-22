@@ -710,6 +710,7 @@ async fn rollout_writer(
         last_flushed_completion_review_state: None,
         pending_completion_review_state: None,
     };
+    let mut pending_index_time = None;
     if let Some(builder) = state_builder.as_mut() {
         builder.rollout_path = rollout_path.clone();
     }
@@ -736,9 +737,12 @@ async fn rollout_writer(
             "rollout_writer",
         )
         .await;
+        if indexed {
+            pending_index_time = state_builder.as_ref().map(|builder| builder.id);
+        }
         if !indexed && let Some(home) = &codex_home {
             writer.flush().await?;
-            state_db::note_missed_write(home).await?;
+            state_db::note_missed_append(home, &rollout_path).await?;
         }
     }
 
@@ -764,13 +768,24 @@ async fn rollout_writer(
                     "rollout_writer",
                 )
                 .await;
+                if indexed {
+                    pending_index_time = state_builder.as_ref().map(|builder| builder.id);
+                }
                 if !indexed && let Some(home) = &codex_home {
                     writer.flush().await?;
-                    state_db::note_missed_write(home).await?;
+                    state_db::note_missed_append(home, &rollout_path).await?;
                 }
             }
             RolloutCmd::Flush { ack } | RolloutCmd::Shutdown { ack } => {
-                if let Err(error) = writer.flush().await {
+                if let Err(error) = writer
+                    .flush_checkpoint(
+                        state_db_ctx.as_deref(),
+                        pending_index_time.take(),
+                        &rollout_path,
+                        codex_home.as_deref(),
+                    )
+                    .await
+                {
                     let writer_error = IoError::new(error.kind(), error.to_string());
                     let _ = ack.send(Err(error));
                     return Err(writer_error);
@@ -780,7 +795,14 @@ async fn rollout_writer(
         }
     }
 
-    writer.flush().await?;
+    writer
+        .flush_checkpoint(
+            state_db_ctx.as_deref(),
+            pending_index_time,
+            &rollout_path,
+            codex_home.as_deref(),
+        )
+        .await?;
 
     Ok(())
 }
@@ -799,6 +821,24 @@ struct RolloutLineRef<'a> {
 }
 
 impl JsonlWriter {
+    async fn flush_checkpoint(
+        &mut self,
+        db: Option<&codex_state::StateRuntime>,
+        pending: Option<ThreadId>,
+        path: &Path,
+        home: Option<&Path>,
+    ) -> std::io::Result<()> {
+        self.flush().await?;
+        if let (Some(db), Some(id), Some(home)) = (db, pending, home) {
+            // The open file, not a possibly unlinked/replaced path, owns this flush's mtime.
+            let modified = self.file.get_ref().metadata().await?.modified()?;
+            if db.sync_rollout_mtime(id, path, modified).await.is_err() {
+                state_db::note_missed_append(home, path).await?;
+            }
+        }
+        Ok(())
+    }
+
     async fn flush(&mut self) -> std::io::Result<()> {
         self.file.flush().await?;
         if let Some(state) = self.pending_completion_review_state.take() {
@@ -912,10 +952,7 @@ impl From<codex_state::ThreadsPage> for ThreadsPage {
                 git_branch: item.git_branch,
                 git_sha: item.git_sha,
                 git_origin_url: item.git_origin_url,
-                source: Some(
-                    serde_json::from_value(Value::String(item.source))
-                        .unwrap_or(SessionSource::Unknown),
-                ),
+                source: Some(state_db::decode_session_source(item.source)),
                 model_provider: Some(item.model_provider),
                 cli_version: Some(item.cli_version),
                 created_at: Some(item.created_at.to_rfc3339_opts(SecondsFormat::Secs, true)),
