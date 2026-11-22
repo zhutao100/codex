@@ -898,7 +898,6 @@ pub fn state_db_path(codex_home: &Path) -> PathBuf {
 }
 
 async fn remove_legacy_state_files(codex_home: &Path) {
-    let current_name = state_db_filename();
     let mut entries = match tokio::fs::read_dir(codex_home).await {
         Ok(entries) => entries,
         Err(err) => {
@@ -920,7 +919,7 @@ async fn remove_legacy_state_files(codex_home: &Path) {
         }
         let file_name = entry.file_name();
         let file_name = file_name.to_string_lossy();
-        if !should_remove_state_file(file_name.as_ref(), current_name.as_str()) {
+        if !should_remove_state_file(file_name.as_ref()) {
             continue;
         }
 
@@ -934,7 +933,7 @@ async fn remove_legacy_state_files(codex_home: &Path) {
     }
 }
 
-fn should_remove_state_file(file_name: &str, current_name: &str) -> bool {
+fn should_remove_state_file(file_name: &str) -> bool {
     let mut base_name = file_name;
     for suffix in ["-wal", "-shm", "-journal"] {
         if let Some(stripped) = file_name.strip_suffix(suffix) {
@@ -942,22 +941,8 @@ fn should_remove_state_file(file_name: &str, current_name: &str) -> bool {
             break;
         }
     }
-    if base_name == current_name {
-        return false;
-    }
-    let unversioned_name = format!("{STATE_DB_FILENAME}.sqlite");
-    if base_name == unversioned_name {
-        return true;
-    }
-
-    let Some(version_with_extension) = base_name.strip_prefix(&format!("{STATE_DB_FILENAME}_"))
-    else {
-        return false;
-    };
-    let Some(version_suffix) = version_with_extension.strip_suffix(".sqlite") else {
-        return false;
-    };
-    !version_suffix.is_empty() && version_suffix.chars().all(|ch| ch.is_ascii_digit())
+    // Unknown versions may be live databases owned by another build sharing CODEX_HOME.
+    matches!(base_name, "state.sqlite" | "state_2.sqlite")
 }
 
 fn push_thread_filters<'a>(
@@ -1070,6 +1055,12 @@ mod tests {
         let previous_version = STATE_DB_VERSION.saturating_sub(1);
         let unversioned_name = format!("{STATE_DB_FILENAME}.sqlite");
         for suffix in ["", "-wal", "-shm", "-journal"] {
+            tokio::fs::write(
+                codex_home.join(format!("state_5.sqlite{suffix}")),
+                b"other build",
+            )
+            .await
+            .unwrap();
             let path = codex_home.join(format!("{unversioned_name}{suffix}"));
             tokio::fs::write(path, b"legacy")
                 .await
@@ -1095,6 +1086,12 @@ mod tests {
             .expect("initialize runtime");
 
         for suffix in ["", "-wal", "-shm", "-journal"] {
+            assert_eq!(
+                tokio::fs::read(codex_home.join(format!("state_5.sqlite{suffix}")))
+                    .await
+                    .unwrap(),
+                b"other build"
+            );
             let legacy_path = codex_home.join(format!("{unversioned_name}{suffix}"));
             assert_eq!(
                 tokio::fs::try_exists(&legacy_path)
