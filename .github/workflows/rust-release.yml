@@ -562,6 +562,7 @@ jobs:
         run: |
           ./scripts/stage_npm_packages.py \
             --release-version "${{ steps.release_name.outputs.name }}" \
+            --workflow-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
             --package codex \
             --package codex-responses-api-proxy \
             --package codex-sdk

@@ -5,6 +5,7 @@ import argparse
 from contextlib import contextmanager
 import json
 import os
+import re
 import shutil
 import subprocess
 import tarfile
@@ -181,13 +182,12 @@ def main() -> int:
 
     workflow_url = args.workflow_url.strip()
 
-    workflow_id = workflow_url.rstrip("/").split("/")[-1]
-    print(f"Downloading native artifacts from workflow {workflow_id}...")
+    print(f"Downloading native artifacts from {workflow_url}...")
 
-    with _gha_group(f"Download native artifacts from workflow {workflow_id}"):
+    with _gha_group(f"Download native artifacts from {workflow_url}"):
         with tempfile.TemporaryDirectory(prefix="codex-native-artifacts-") as artifacts_dir_str:
             artifacts_dir = Path(artifacts_dir_str)
-            _download_artifacts(workflow_id, artifacts_dir)
+            _download_artifacts(workflow_url, artifacts_dir)
             install_binary_components(
                 artifacts_dir,
                 vendor_dir,
@@ -271,7 +271,16 @@ def fetch_rg(
     return [results[target] for target in targets]
 
 
-def _download_artifacts(workflow_id: str, dest_dir: Path) -> None:
+def _download_artifacts(workflow_url: str, dest_dir: Path) -> None:
+    url = urlparse(workflow_url)
+    run = re.fullmatch(
+        r"/([\w.-]+/[\w.-]+)/actions/runs/([0-9]+)(?:/attempts/[0-9]+)?/?",
+        url.path,
+        re.ASCII,
+    )
+    if url.scheme != "https" or url.netloc != "github.com" or run is None:
+        raise ValueError(f"Expected a GitHub Actions run URL, got {workflow_url!r}")
+    repo, workflow_id = run.groups()
     cmd = [
         "gh",
         "run",
@@ -279,7 +288,7 @@ def _download_artifacts(workflow_id: str, dest_dir: Path) -> None:
         "--dir",
         str(dest_dir),
         "--repo",
-        "openai/codex",
+        repo,
         workflow_id,
     ]
     subprocess.check_call(cmd)

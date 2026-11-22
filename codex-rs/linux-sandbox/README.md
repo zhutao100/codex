@@ -13,6 +13,8 @@ The standalone `codex-linux-sandbox` helper and `codex sandbox linux` use the sa
 
 The [release workflow](../../.github/workflows/rust-release.yml) builds a static [vendored resource](build-bwrap.sh) on the target architecture and binds its digest to the Rust binary. The release tarball and npm component carry the same bytes. Ordinary builds do not require a C build of bubblewrap.
 
+The Linux [DotSlash manifest](../../.github/dotslash-config.json) selects the complete tarball and runs its platform-named member. npm staging downloads the CLI and resource from the same repository and Actions run, including fork releases.
+
 The [Nix package](../default.nix) uses the same resource contract for its immutable store executable; it does not require `/usr/bin/bwrap` on NixOS.
 
 Qualify both paths in a disposable Linux guest: run the release without the system package, then an ordinary build with the distro package. Check allowed workspace writes, denied writes outside it and under `.git`, network policy, `NoNewPrivs`, retained-terminal input, and the MCP shell subprocess. A missing or mismatched release resource without a system launcher must leave the command's output file absent. A skipped or nested-sandbox test is not evidence of enforcement.
