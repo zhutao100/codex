@@ -119,6 +119,7 @@ async fn run_compact(
             &mut source,
             turn_context,
             &base_instructions,
+            context.source_token_adjustment,
         );
     let mut input = source.for_prompt_with_modalities(&turn_context.model_info.input_modalities);
     let tools = match &client_session.sampling_tools {

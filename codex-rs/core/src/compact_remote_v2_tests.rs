@@ -225,7 +225,7 @@ async fn tail_rewrite_preserves_calls_status_and_live_source() {
         text: String::new(),
     };
     let (count, savings) =
-        trim_function_call_history_to_fit_context_window(&mut working, &context, &base);
+        trim_function_call_history_to_fit_context_window(&mut working, &context, &base, 0);
     assert_eq!(count, 1);
     assert!(savings > 1000);
     assert_eq!(history.raw_items(), source);

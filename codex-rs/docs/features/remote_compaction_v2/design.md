@@ -26,7 +26,7 @@ For a boundary message, middle-truncate text while charging JSON escaping, item 
 
 The context target is the smaller available positive effective window or positive automatic-compaction threshold minus one; the subtraction applies to the automatic threshold. Subtract fixed costs for the encrypted summary, exact notes, instructions, tools and canonical context, then cap remaining retention at 64,000 approximate tokens. Reserve canonical context even when it will be seeded on the next turn. Reject fixed-content overflow. Arbitrary new input arriving after pre-turn compaction cannot be budgeted in advance.
 
-The separate [tool-output fitter](../../../core/src/compact_remote.rs) rewrites only a supported contiguous trailing output suffix, ignoring local snapshots. Preserve call IDs, arguments and success flags; stop at other content and never enlarge an already-small output. Keep the accumulator unclamped until the final estimate. This is not a general fitting policy for oversized user input or instructions.
+The separate [tool-output fitter](../../../core/src/compact_remote.rs) rewrites only a supported contiguous trailing output suffix, ignoring local snapshots. Automatic compaction carries forward the [pre-capture work estimate](../session-work-notes.md#fit-and-prefix-reuse); fitting the prepared source from the smaller notes response or re-estimating the covered history from ciphertext can both change the wrong outputs. Preserve call IDs, arguments and success flags; stop at other content and never enlarge an already-small output. Keep the accumulator unclamped until the final estimate. This is not a general fitting policy for oversized user input or instructions.
 
 ## Notes transaction and recovery
 

@@ -54,6 +54,8 @@ pub(crate) enum InitialContextInjection {
 pub(crate) struct CompactionContext<'a> {
     pub(crate) request: &'a Arc<TurnContext>,
     pub(crate) replacement: &'a Arc<TurnContext>,
+    /// Difference between ledger and byte estimates of the same pre-capture transcript.
+    pub(crate) source_token_adjustment: i64,
 }
 
 impl<'a> CompactionContext<'a> {
@@ -61,6 +63,7 @@ impl<'a> CompactionContext<'a> {
         Self {
             request: context,
             replacement: context,
+            source_token_adjustment: 0,
         }
     }
 }

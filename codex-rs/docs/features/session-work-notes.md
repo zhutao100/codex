@@ -6,12 +6,18 @@ Read this when changing compaction preparation or preserving in-progress work. W
 
 1. Before automatic compaction, request notes through ordinary sampling with a synthetic developer message tagged `<AUTO_COMPACT_WORK_NOTES_REQUEST>`. Capture also applies to pre-turn compaction and supported previous-model downshifts.
 2. Keep the normal model/instruction/tool surface. Reject tool execution at runtime with `ToolCallExecutionMode::RejectAll`; hiding tools would change the request prefix and model behavior.
-3. Reserve output headroom by trimming generated tool output only in a temporary capture prompt. Do not alter durable source history or the capture request to fit that prompt.
+3. Reserve output headroom against the literal source-model window. Fit from [work usage](#fit-and-prefix-reuse), not the serialized size of an already sampled prefix. Trim generated tool output newest first only in the temporary capture prompt; do not alter durable history or the capture request.
 4. Accept the assistant's output text when it begins, after leading whitespace, with `<AUTO_COMPACT_WORK_NOTES>`. Concatenate multipart output text exactly; do not parse plan tags or trim the stored notes, including text after the closing tag.
 5. Remove only the identified capture segment from compaction input, preserve control/snapshot items and later acknowledged input, and compact the remaining work history.
 6. Append the selected notes verbatim in a contextual user message after compaction. Preserve them in the exact replacement history used for replay.
 
 Capture makes at most two attempts. A final JSON output schema skips a new free-form notes capture. Failed/empty capture can compact using previously preserved notes; cancellation stops the operation instead of silently completing it. Manual compaction preserves existing or recoverable notes through the common preparation logic; it does not always initiate a new notes round.
+
+## Fit and prefix reuse
+
+Before capture, take the source model's positive work-usage baseline plus uncovered history and subtract any previous request-only review frame. Keep the difference from the same transcript's byte estimate for the transaction. This charges subsequent additions, omissions and actual output reductions as deltas for notes and streaming compaction. Opaque reasoning length can be a poor proxy for tokens; do not recount that whole prefix as new input. Without applicable work usage, fall back to byte estimates. On recovery, usage that already covers the capture request is not a measurement of the original source. The compatibility unary endpoint has a different request surface and keeps its own fit.
+
+When the work fits, the notes request should extend the ordinary input with the latest work and capture marker. The streaming compact request should match that work with the transient segment removed and the trigger appended. There are two intentional prefix breaks: a review-derived request's exact replacement-answer frame is absent from both auxiliary requests, and a previously installed notes wrapper is present during capture but removed from compaction input. Deleting that early wrapper on a second compaction precludes reuse of the subsequent ordinary prefix. Do not feed stale notes back to the summarizer or change ordinary review framing to chase a cache hit. A full WebSocket send does not by itself imply uncached input.
 
 ## Invariants
 

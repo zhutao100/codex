@@ -135,6 +135,17 @@ impl SessionState {
             .get_total_token_usage(server_reasoning_included)
     }
 
+    /// Cost of the work transcript, without the previous request-only review frame.
+    pub(crate) fn history_tokens_from_usage(&self) -> Option<i64> {
+        self.token_info()
+            .filter(|info| info.last_token_usage.total_tokens > 0)
+            .map(|_| {
+                self.get_total_token_usage(self.server_reasoning_included())
+                    .saturating_sub(self.history.request_context_tokens())
+                    .max(0)
+            })
+    }
+
     pub(crate) fn set_server_reasoning_included(&mut self, included: bool) {
         self.server_reasoning_included = included;
     }

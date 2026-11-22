@@ -101,6 +101,8 @@ async fn run_remote_compact_task_inner_impl(
             &mut source_history,
             turn_context.as_ref(),
             &base_instructions,
+            // The unary endpoint does not use the ordinary sampling request surface.
+            0,
         );
     if rewritten_outputs > 0 {
         info!(
@@ -177,13 +179,14 @@ pub(crate) fn trim_function_call_history_to_fit_context_window(
     history: &mut ContextManager,
     turn_context: &TurnContext,
     base_instructions: &BaseInstructions,
+    source_token_adjustment: i64,
 ) -> (usize, i64) {
     let Some(context_window) = turn_context.model_context_window() else {
         return (0, 0);
     };
     if history
         .estimate_token_count_with_base_instructions(base_instructions)
-        .is_none_or(|estimated_tokens| estimated_tokens <= context_window)
+        .is_none_or(|tokens| tokens.saturating_add(source_token_adjustment) <= context_window)
     {
         return (0, 0);
     }
@@ -195,7 +198,8 @@ pub(crate) fn trim_function_call_history_to_fit_context_window(
         .map(estimate_item_token_count)
         .map(i128::from)
         .sum::<i128>()
-        + approx_token_count(&base_instructions.text) as i128;
+        + approx_token_count(&base_instructions.text) as i128
+        + i128::from(source_token_adjustment);
     let original_tokens = tokens;
     let mut rewritten_outputs = 0;
     for item in items.iter_mut().rev() {

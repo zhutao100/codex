@@ -292,6 +292,104 @@ async fn mid_turn_notes_are_carried_exactly_and_transient_suffix_is_excluded() -
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_auto_compaction_fits_from_work_usage_and_preserves_the_eligible_prefix()
+-> Result<()> {
+    skip_if_no_network_unless_localhost!(Ok(()));
+    let server = responses::start_mock_server().await;
+    let test = test_codex()
+        .with_config(|config| {
+            config.model_context_window = Some(32_000);
+            config.model_auto_compact_token_limit = Some(27_000);
+            let overlay = config.model_overlay.get_or_insert_with(Default::default);
+            overlay.cross_model.experimental_supported_tools = Some(vec!["read_file".into()]);
+        })
+        .build(&server)
+        .await?;
+    let path = test.workspace_path("evidence.txt");
+    std::fs::write(&path, "observed evidence\n".repeat(120))?;
+    let arguments = json!({"file_path":path}).to_string();
+    let mut streams = Vec::new();
+    for epoch in 1..=2 {
+        let mut reasoning = responses::ev_reasoning_item("reasoning", &[], &[]);
+        // The opaque wire representation is large; the completed work request reports that it fits.
+        reasoning["item"]["encrypted_content"] = json!("A".repeat(240_000));
+        streams.extend([
+            responses::sse(vec![
+                reasoning,
+                responses::ev_function_call("early", "read_file", &arguments),
+                responses::ev_completed_with_tokens("work", 14_000),
+            ]),
+            responses::sse(vec![
+                responses::ev_function_call("last", "read_file", &arguments),
+                responses::ev_completed_with_tokens("near-limit", 28_000),
+            ]),
+            responses::sse(vec![
+                responses::ev_assistant_message("notes", &format!("{NOTES} {epoch}")),
+                responses::ev_completed_with_tokens("notes", 31_999),
+            ]),
+            compact_response(&format!("summary-{epoch}")),
+        ]);
+    }
+    streams.push(responses::sse(vec![responses::ev_completed("done")]));
+    let mock = responses::mount_sse_sequence(&server, streams).await;
+    test.codex
+        .submit(user_input("continue the same work"))
+        .await?;
+    complete(&test.codex).await;
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 9);
+    let mut previous_wrapper = None;
+    for (epoch, cycle) in requests.windows(5).step_by(4).enumerate() {
+        let [_, work, notes, compact, followup] = cycle else {
+            unreachable!()
+        };
+        let hot = work.input();
+        let capture = notes.input();
+        let (marker, source) = capture.split_last().unwrap();
+        assert!(
+            marker["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("<AUTO_COMPACT_WORK_NOTES_REQUEST>")
+        );
+        assert!(
+            source.starts_with(&hot),
+            "capture rewrote the sampled prefix"
+        );
+        for (request, call) in [(work, "early"), (notes, "last")] {
+            let (text, _) = request
+                .function_call_output_content_and_success(call)
+                .unwrap();
+            assert_eq!(text.unwrap().matches("observed evidence").count(), 120);
+        }
+
+        let compact_input = compact.input();
+        let (trigger, compact_source) = compact_input.split_last().unwrap();
+        assert_eq!(trigger, &json!({"type":"compaction_trigger"}));
+        assert!(
+            compact_source.iter().eq(source
+                .iter()
+                .filter(|item| Some(*item) != previous_wrapper.as_ref())),
+            "compaction may remove the old notes, not rewrite the work"
+        );
+        let mut replacement = followup.input();
+        if let Some(previous) = &previous_wrapper {
+            assert!(hot.contains(previous));
+            assert!(!replacement.contains(previous));
+        }
+        let wrapper = replacement.pop().unwrap();
+        assert!(
+            wrapper["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .ends_with(&format!("{NOTES} {}", epoch + 1))
+        );
+        previous_wrapper = Some(wrapper);
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn permanent_404_preserves_history_without_outer_retries() -> Result<()> {
     skip_if_no_network_unless_localhost!(Ok(()));
     let server = responses::start_mock_server().await;

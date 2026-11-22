@@ -11,6 +11,7 @@ use crate::truncate::approx_token_count;
 use crate::truncate::truncate_function_output_items_with_policy;
 use crate::truncate::truncate_text;
 use codex_protocol::models::FunctionCallOutputBody;
+use codex_protocol::models::FunctionCallOutputContentItem;
 use std::sync::atomic::Ordering;
 
 #[derive(Clone, Copy, Debug)]
@@ -28,8 +29,7 @@ const AUTO_COMPACT_WORK_NOTES_CAPTURE_MAX_ATTEMPTS: u8 = WORK_NOTES_CAPTURE_MAX_
 const AUTO_COMPACT_WORK_NOTES_TOOL_REJECT_REASON: &str = WORK_NOTES_TOOL_REJECT_REASON;
 const AUTO_COMPACT_WORK_NOTES_OUTPUT_TOKEN_RESERVE_MAX: i64 = 4_096;
 const AUTO_COMPACT_WORK_NOTES_OUTPUT_TOKEN_RESERVE_FRACTION: i64 = 20;
-const AUTO_COMPACT_WORK_NOTES_MIN_TOOL_OUTPUT_TOKENS: i64 = 128;
-const AUTO_COMPACT_WORK_NOTES_TOOL_OUTPUT_WRAPPER_TOKEN_ESTIMATE: usize = 256;
+const AUTO_COMPACT_WORK_NOTES_MIN_TOOL_OUTPUT_TOKENS: usize = 128;
 
 async fn inject_pre_compact_work_notes_request(sess: &Session, turn_context: &TurnContext) {
     let source_model = serde_json::Value::String(turn_context.model_info.slug.clone());
@@ -79,8 +79,9 @@ async fn captured_pre_compact_work_notes(
 
 async fn sampling_input_for_pre_compact_work_notes(
     sess: &Session,
-    turn_context: &TurnContext,
+    context: CompactionContext<'_>,
 ) -> Vec<ResponseItem> {
+    let turn_context = context.request;
     let mut input = sess.prompt_history(turn_context).await;
     let base_instructions = sess.get_base_instructions_for_turn(turn_context).await;
     if let Some(stats) = trim_pre_compact_work_notes_input_to_headroom(
@@ -88,7 +89,8 @@ async fn sampling_input_for_pre_compact_work_notes(
         &base_instructions,
         // Use the literal context window here; work_notes_input_token_target
         // already reserves output headroom for the final work notes.
-        turn_context.model_info.context_window,
+        turn_context.model_info.resolved_context_window(),
+        context.source_token_adjustment,
     ) {
         info!(
             turn_id = %turn_context.sub_id,
@@ -99,6 +101,33 @@ async fn sampling_input_for_pre_compact_work_notes(
         );
     }
     input
+}
+
+async fn compaction_source_token_adjustment(
+    sess: &Session,
+    turn_context: &TurnContext,
+    capture_start: Option<usize>,
+) -> i64 {
+    let base = sess.get_base_instructions_for_turn(turn_context).await;
+    let state = sess.state.lock().await;
+    // A response to an already fitted capture prompt does not measure the original work.
+    if capture_start.is_none_or(|start| state.history.last_usage_item_count() <= start)
+        && state
+            .previous_turn_settings
+            .as_ref()
+            .is_none_or(|previous| previous.model == turn_context.model_info.slug)
+        && state
+            .token_info()
+            .is_some_and(|info| info.last_token_usage.input_tokens > 0)
+        && let Some(tokens) = state.history_tokens_from_usage()
+        && let Some(local) = state
+            .history
+            .estimate_token_count_with_base_instructions(&base)
+    {
+        tokens.saturating_sub(local)
+    } else {
+        0
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,61 +141,33 @@ fn trim_pre_compact_work_notes_input_to_headroom(
     input: &mut [ResponseItem],
     base_instructions: &BaseInstructions,
     context_window: Option<i64>,
+    source_token_adjustment: i64,
 ) -> Option<WorkNotesPromptTrimStats> {
     let context_window = context_window?;
     let target_input_tokens = work_notes_input_token_target(context_window)?;
-    let estimated_tokens_before = estimate_work_notes_prompt_tokens(input, base_instructions);
+    let estimated_tokens_before = estimate_work_notes_prompt_tokens(input, base_instructions)
+        .saturating_add(source_token_adjustment);
     if estimated_tokens_before <= target_input_tokens {
         return None;
     }
 
     let trim_end = input
         .iter()
-        .rposition(is_work_notes_request_response_item)
+        .rposition(compact::is_work_notes_request_item)
         .unwrap_or(input.len());
     let mut estimated_tokens_after = estimated_tokens_before;
-    let mut changed = false;
-
-    for idx in (0..trim_end).rev() {
-        let mut item_was_trimmed = false;
-        while estimated_tokens_after > target_input_tokens {
-            let item_tokens = estimate_item_token_count(&input[idx]);
-            let minimum_item_tokens = if item_was_trimmed {
-                1
-            } else {
-                AUTO_COMPACT_WORK_NOTES_MIN_TOOL_OUTPUT_TOKENS
-            };
-            if item_tokens <= minimum_item_tokens {
-                break;
-            }
-
-            let excess_tokens = estimated_tokens_after.saturating_sub(target_input_tokens);
-            let target_item_tokens = item_tokens
-                .saturating_sub(excess_tokens)
-                .max(minimum_item_tokens);
-            if target_item_tokens >= item_tokens {
-                break;
-            }
-
-            if !truncate_generated_output_item_for_work_notes(
-                &mut input[idx],
-                usize::try_from(target_item_tokens).unwrap_or(usize::MAX),
-            ) {
-                break;
-            }
-
-            let new_estimate = estimate_work_notes_prompt_tokens(input, base_instructions);
-            changed = true;
-            item_was_trimmed = true;
-            if new_estimate >= estimated_tokens_after {
-                estimated_tokens_after = new_estimate;
-                break;
-            }
-            estimated_tokens_after = new_estimate;
+    for item in input[..trim_end].iter_mut().rev() {
+        let excess = estimated_tokens_after - target_input_tokens;
+        if excess <= 0 {
+            break;
+        }
+        if let Some((shortened, savings)) = fit_work_notes_output(item, excess) {
+            *item = shortened;
+            estimated_tokens_after -= savings;
         }
     }
 
-    changed.then_some(WorkNotesPromptTrimStats {
+    (estimated_tokens_after < estimated_tokens_before).then_some(WorkNotesPromptTrimStats {
         estimated_tokens_before,
         estimated_tokens_after,
         target_input_tokens,
@@ -198,64 +199,52 @@ fn estimate_work_notes_prompt_tokens(
         .fold(base_tokens, i64::saturating_add)
 }
 
-fn is_work_notes_request_response_item(item: &ResponseItem) -> bool {
-    let ResponseItem::Message { role, content, .. } = item else {
-        return false;
-    };
-    if role != "developer" {
-        return false;
-    }
-    compact::content_items_to_text(content)
-        .is_some_and(|text| text.contains(AUTO_COMPACT_WORK_NOTES_REQUEST_TAG))
-}
-
-fn truncate_generated_output_item_for_work_notes(
-    item: &mut ResponseItem,
-    target_item_tokens: usize,
-) -> bool {
-    let target_output_tokens = target_item_tokens
-        .saturating_sub(AUTO_COMPACT_WORK_NOTES_TOOL_OUTPUT_WRAPPER_TOKEN_ESTIMATE)
-        .max(1);
-    match item {
-        ResponseItem::FunctionCallOutput { output, .. } => match &mut output.body {
-            FunctionCallOutputBody::Text(text) => {
-                truncate_text_for_work_notes(text, target_output_tokens)
-            }
-            FunctionCallOutputBody::ContentItems(items) => {
-                let previous = items.clone();
-                *items = truncate_function_output_items_with_policy(
-                    items,
-                    TruncationPolicy::Tokens(target_output_tokens),
-                );
-                *items != previous
-            }
+fn fit_work_notes_output(item: &ResponseItem, excess: i64) -> Option<(ResponseItem, i64)> {
+    let text_tokens = match item {
+        ResponseItem::FunctionCallOutput { output, .. } => match &output.body {
+            FunctionCallOutputBody::Text(text) => approx_token_count(text),
+            FunctionCallOutputBody::ContentItems(items) => items
+                .iter()
+                .map(|item| match item {
+                    FunctionCallOutputContentItem::InputText { text } => approx_token_count(text),
+                    FunctionCallOutputContentItem::InputImage { .. } => 0,
+                })
+                .sum(),
         },
-        ResponseItem::CustomToolCallOutput { output, .. } => {
-            truncate_text_for_work_notes(output, target_output_tokens)
+        ResponseItem::CustomToolCallOutput { output, .. } => approx_token_count(output),
+        _ => return None,
+    };
+    if text_tokens <= AUTO_COMPACT_WORK_NOTES_MIN_TOOL_OUTPUT_TOKENS {
+        return None;
+    }
+    let before = estimate_item_token_count(item);
+    let mut budget = text_tokens
+        .saturating_sub(usize::try_from(excess).unwrap_or(usize::MAX))
+        .max(1);
+    loop {
+        // Fit the editable text, then charge the actual serialized delta including escapes and notices.
+        let policy = TruncationPolicy::Tokens(budget);
+        let mut shortened = item.clone();
+        match &mut shortened {
+            ResponseItem::FunctionCallOutput { output, .. } => match &mut output.body {
+                FunctionCallOutputBody::Text(text) => *text = truncate_text(text, policy),
+                FunctionCallOutputBody::ContentItems(items) => {
+                    *items = truncate_function_output_items_with_policy(items, policy);
+                }
+            },
+            ResponseItem::CustomToolCallOutput { output, .. } => {
+                *output = truncate_text(output, policy)
+            }
+            _ => unreachable!(),
         }
-        ResponseItem::Message { .. }
-        | ResponseItem::Reasoning { .. }
-        | ResponseItem::LocalShellCall { .. }
-        | ResponseItem::FunctionCall { .. }
-        | ResponseItem::WebSearchCall { .. }
-        | ResponseItem::CustomToolCall { .. }
-        | ResponseItem::Compaction { .. }
-        | ResponseItem::GhostSnapshot { .. }
-        | ResponseItem::CompactionTrigger {}
-        | ResponseItem::Other => false,
+        let savings = before - estimate_item_token_count(&shortened);
+        if savings >= excess || budget == 1 {
+            return (savings > 0).then_some((shortened, savings));
+        }
+        budget = budget
+            .saturating_sub(usize::try_from(excess.saturating_sub(savings)).unwrap_or(usize::MAX))
+            .max(1);
     }
-}
-
-fn truncate_text_for_work_notes(text: &mut String, target_tokens: usize) -> bool {
-    if approx_token_count(text) <= target_tokens {
-        return false;
-    }
-    let truncated = truncate_text(text, TruncationPolicy::Tokens(target_tokens));
-    if truncated == *text {
-        return false;
-    }
-    *text = truncated;
-    true
 }
 
 pub(super) fn insert_completion_review_instructions(
@@ -421,7 +410,7 @@ async fn run_turn_inner(
             &sess,
             CompactionContext {
                 request: &request_context,
-                replacement: &turn_context,
+                ..CompactionContext::new(&turn_context)
             },
             injection,
             reason,
@@ -615,11 +604,14 @@ async fn run_turn_inner(
     {
         compaction = FollowUpCompaction::Pending;
     }
+    let mut compact_context = CompactionContext::new(&turn_context);
     loop {
         if matches!(compaction, FollowUpCompaction::Pending) {
+            compact_context.source_token_adjustment =
+                compaction_source_token_adjustment(&sess, &turn_context, None).await;
             compaction = match begin_follow_up_compaction(
                 &sess,
-                &turn_context,
+                compact_context,
                 &mut client_session,
                 &cancellation_token,
             )
@@ -664,7 +656,7 @@ async fn run_turn_inner(
 
         // Construct the input that we will send to the model.
         let mut sampling_request_input = if capturing_notes {
-            sampling_input_for_pre_compact_work_notes(&sess, &turn_context).await
+            sampling_input_for_pre_compact_work_notes(&sess, compact_context).await
         } else {
             sess.prompt_history(turn_context.as_ref()).await
         };
@@ -705,31 +697,12 @@ async fn run_turn_inner(
             // Reuse compaction's usage baseline plus unreported local items.
             // Re-estimating the entire transcript from bytes can drift far
             // above reported usage, especially with long reasoning histories.
-            let (history_tokens, included_context_tokens) = {
-                let state = sess.state.lock().await;
-                state
-                    .token_info()
-                    .filter(|info| info.last_token_usage.total_tokens > 0)
-                    .map(|_| {
-                        (
-                            state.get_total_token_usage(state.server_reasoning_included()),
-                            state.history.request_context_tokens(),
-                        )
-                    })
-            }
-            .unwrap_or_else(|| {
-                (
-                    estimate_work_notes_prompt_tokens(&sampling_request_input, &base),
-                    0,
-                )
+            let usage = sess.state.lock().await.history_tokens_from_usage();
+            let history_tokens = usage.unwrap_or_else(|| {
+                estimate_work_notes_prompt_tokens(&sampling_request_input, &base)
             });
-            // Reported usage already includes the preceding request-only frame.
-            // Charge its replacement delta, not a second complete frame.
-            let estimate_prompt_tokens = |context_tokens: i64| {
-                history_tokens
-                    .saturating_add(context_tokens.saturating_sub(included_context_tokens))
-                    .max(context_tokens)
-            };
+            let estimate_prompt_tokens =
+                |context_tokens: i64| history_tokens.saturating_add(context_tokens);
             let target = turn_context
                 .model_context_window()
                 .unwrap_or_default()
@@ -904,7 +877,7 @@ async fn run_turn_inner(
                     }
                     if let Err(e) = run_auto_compact(
                         &sess,
-                        CompactionContext::new(&turn_context),
+                        compact_context,
                         notes,
                         InitialContextInjection::BeforeLastUserMessage,
                         Some(&mut client_session),
@@ -958,7 +931,7 @@ async fn run_turn_inner(
                 info!("Work-notes capture failed; compacting without notes: {e:#}");
                 match run_auto_compact(
                     &sess,
-                    CompactionContext::new(&turn_context),
+                    compact_context,
                     None,
                     InitialContextInjection::BeforeLastUserMessage,
                     Some(&mut client_session),
@@ -1019,17 +992,17 @@ async fn run_turn_inner(
 
 async fn begin_follow_up_compaction(
     sess: &Arc<Session>,
-    turn_context: &Arc<TurnContext>,
+    context: CompactionContext<'_>,
     client_session: &mut ModelClientSession,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<FollowUpCompaction> {
-    if turn_context.final_output_json_schema.is_none() {
-        inject_pre_compact_work_notes_request(sess, turn_context).await;
+    if context.request.final_output_json_schema.is_none() {
+        inject_pre_compact_work_notes_request(sess, context.request).await;
         return Ok(FollowUpCompaction::AwaitingNotes { attempts: 0 });
     }
     run_auto_compact(
         sess,
-        CompactionContext::new(turn_context),
+        context,
         None,
         InitialContextInjection::BeforeLastUserMessage,
         Some(client_session),
@@ -1145,7 +1118,7 @@ async fn maybe_run_previous_model_inline_compact(
         sess,
         CompactionContext {
             request: &previous_context,
-            replacement: turn_context,
+            ..CompactionContext::new(turn_context)
         },
         InitialContextInjection::DoNotInject,
         CompactionReason::ModelDownshift,
@@ -1233,7 +1206,7 @@ async fn run_auto_compact(
 
 async fn run_pre_turn_compact(
     sess: &Arc<Session>,
-    context: CompactionContext<'_>,
+    mut context: CompactionContext<'_>,
     injection: InitialContextInjection,
     reason: CompactionReason,
     cancellation_token: &CancellationToken,
@@ -1251,6 +1224,12 @@ async fn run_pre_turn_compact(
         (pending, has_following_input)
     };
     let mut attempts = pending.as_ref().map_or(0, |pending| pending.attempts);
+    context.source_token_adjustment = compaction_source_token_adjustment(
+        sess,
+        turn_context,
+        pending.as_ref().map(|pending| pending.request_index),
+    )
+    .await;
     let mut notes = pending.as_ref().and_then(|pending| pending.notes.clone());
     let mut client_session = sess
         .services
@@ -1269,7 +1248,7 @@ async fn run_pre_turn_compact(
         let turn_state = sess.turn_state_for_sub_id(&turn_context.sub_id).await;
         let skill_name_counts_lower = HashMap::new();
         while attempts < WORK_NOTES_CAPTURE_MAX_ATTEMPTS {
-            let input = sampling_input_for_pre_compact_work_notes(sess, turn_context).await;
+            let input = sampling_input_for_pre_compact_work_notes(sess, context).await;
             let output = run_sampling_request(
                 Arc::clone(sess),
                 Arc::clone(turn_context),
@@ -2735,10 +2714,14 @@ pub(crate) fn get_last_assistant_message_from_turn(responses: &[ResponseItem]) -
 #[cfg(test)]
 mod tests {
     use super::AUTO_COMPACT_WORK_NOTES_REQUEST_TAG;
+    use super::compaction_source_token_adjustment;
     use super::estimate_work_notes_prompt_tokens;
+    use super::inject_pre_compact_work_notes_request;
     use super::should_compact_with_previous_model;
     use super::trim_pre_compact_work_notes_input_to_headroom;
     use super::work_notes_input_token_target;
+    use crate::protocol::TokenUsage;
+    use crate::session::tests::make_session_and_context;
     use codex_protocol::models::BaseInstructions;
     use codex_protocol::models::ContentItem;
     use codex_protocol::models::FunctionCallOutputBody;
@@ -2786,6 +2769,51 @@ mod tests {
             Some(128_000),
             Some(32_000),
         ));
+    }
+
+    #[tokio::test]
+    async fn work_notes_recovery_only_calibrates_from_pre_capture_usage() {
+        let (sess, context) = make_session_and_context().await;
+        let work: ResponseItem = codex_protocol::models::DeveloperInstructions::new("work").into();
+        sess.record_conversation_items(&context, &[work]).await;
+        let history = sess.clone_history().await;
+        let start = history.raw_items().len();
+        let base = sess.get_base_instructions_for_turn(&context).await;
+        let local = history
+            .estimate_token_count_with_base_instructions(&base)
+            .unwrap();
+        let usage = TokenUsage {
+            input_tokens: 9_000,
+            total_tokens: 9_000,
+            ..Default::default()
+        };
+        sess.update_token_usage_info_with_request_context(
+            &context,
+            Some(&usage),
+            2_000,
+            true,
+            start,
+        )
+        .await;
+        inject_pre_compact_work_notes_request(&sess, &context).await;
+        assert_eq!(
+            compaction_source_token_adjustment(&sess, &context, Some(start)).await,
+            7_000 - local
+        );
+
+        // Recovered usage now covers a possibly trimmed capture, not the original work.
+        sess.update_token_usage_info_with_request_context(
+            &context,
+            Some(&usage),
+            0,
+            true,
+            start + 1,
+        )
+        .await;
+        assert_eq!(
+            compaction_source_token_adjustment(&sess, &context, Some(start)).await,
+            0
+        );
     }
 
     #[test]
@@ -2841,14 +2869,20 @@ mod tests {
             "fixture must exceed the target input budget before trimming"
         );
 
+        let adjustment = target + 500 - before;
         let stats = trim_pre_compact_work_notes_input_to_headroom(
             &mut input,
             &base_instructions,
             Some(context_window),
+            adjustment,
         )
         .expect("expected trimming");
 
-        assert_eq!(stats.estimated_tokens_before, before);
+        assert_eq!(stats.estimated_tokens_before, target + 500);
+        assert_eq!(
+            stats.estimated_tokens_after,
+            estimate_work_notes_prompt_tokens(&input, &base_instructions) + adjustment
+        );
         assert!(
             stats.estimated_tokens_after <= target,
             "after={} target={} before={}",
@@ -2924,6 +2958,7 @@ mod tests {
             &mut input,
             &base_instructions,
             Some(context_window),
+            0,
         )
         .expect("expected trimming");
 
