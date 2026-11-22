@@ -28,6 +28,7 @@ pub struct ConfigProfile {
     pub responses_transport: Option<super::types::ResponsesTransport>,
     pub compaction_mode: Option<super::types::CompactionMode>,
     pub windows: Option<super::types::WindowsConfig>,
+    pub agents: Option<super::AgentsToml>,
     /// Optional service tier request id for new turns. Recognized values include
     /// `priority`, `fast`, and `flex`; unknown values are passed through.
     pub service_tier: Option<String>,

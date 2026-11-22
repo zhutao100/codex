@@ -145,6 +145,9 @@
       "additionalProperties": false,
       "description": "Collection of common configuration options that a user can define as a unit in `config.toml`.",
       "properties": {
+        "agents": {
+          "$ref": "#/definitions/AgentsToml"
+        },
         "analytics": {
           "$ref": "#/definitions/AnalyticsConfigToml"
         },

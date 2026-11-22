@@ -1727,10 +1727,11 @@ impl Config {
 
         let history = cfg.history.unwrap_or_default();
 
-        let agent_max_threads = cfg
+        let agent_max_threads = config_profile
             .agents
             .as_ref()
             .and_then(|agents| agents.max_threads)
+            .or_else(|| cfg.agents.as_ref().and_then(|agents| agents.max_threads))
             .or(DEFAULT_AGENT_MAX_THREADS);
         if agent_max_threads == Some(0) {
             return Err(std::io::Error::new(
@@ -4342,6 +4343,49 @@ wire_api = "responses"
             Some("external-review")
         );
         assert!(config.model_providers.contains_key("external-review"));
+        Ok(())
+    }
+
+    #[test]
+    fn profile_agent_settings_override_individual_global_fields() -> std::io::Result<()> {
+        let home = TempDir::new()?;
+        let cfg: ConfigToml = toml::from_str(
+            r#"
+[agents]
+enabled = true
+max_threads = 3
+[profiles.solo.agents]
+enabled = false
+[profiles.solo.features]
+collab = true
+[profiles.team.agents]
+max_threads = 7
+[profiles.team.features]
+collab = false
+"#,
+        )
+        .unwrap();
+        for (profile, enabled, max_threads) in [
+            (None, true, 3),
+            (Some("solo"), false, 3),
+            (Some("team"), true, 7),
+        ] {
+            let config = Config::load_from_base_config_with_overrides(
+                cfg.clone(),
+                ConfigOverrides {
+                    config_profile: profile.map(str::to_owned),
+                    ..Default::default()
+                },
+                home.path().into(),
+            )?;
+            assert_eq!(
+                (
+                    config.features.enabled(Feature::Collab),
+                    config.agent_max_threads
+                ),
+                (enabled, Some(max_threads))
+            );
+        }
         Ok(())
     }
 

@@ -304,7 +304,12 @@ impl Features {
         }
 
         overrides.apply(&mut features);
-        if let Some(enabled) = cfg.agents.as_ref().and_then(|agents| agents.enabled) {
+        if let Some(enabled) = config_profile
+            .agents
+            .as_ref()
+            .and_then(|agents| agents.enabled)
+            .or_else(|| cfg.agents.as_ref().and_then(|agents| agents.enabled))
+        {
             if enabled {
                 features.enable(Feature::Collab);
             } else {
