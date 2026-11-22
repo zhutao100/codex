@@ -1180,7 +1180,7 @@ async fn test_pagination_cursor() {
             },
         ],
         next_cursor: Some(expected_cursor1.clone()),
-        num_scanned_files: 3, // scanned 05, 04, and peeked at 03 before breaking
+        num_scanned_files: 5, // the header timestamps, not local filenames, determine page order
         reached_scan_cap: false,
     };
     assert_eq!(page1, expected_page1);
@@ -1244,7 +1244,7 @@ async fn test_pagination_cursor() {
             },
         ],
         next_cursor: Some(expected_cursor2.clone()),
-        num_scanned_files: 5, // scanned 05, 04 (anchor), 03, 02, and peeked at 01
+        num_scanned_files: 5,
         reached_scan_cap: false,
     };
     assert_eq!(page2, expected_page2);
@@ -1284,7 +1284,7 @@ async fn test_pagination_cursor() {
             updated_at: updated_page3.first().cloned().flatten(),
         }],
         next_cursor: None,
-        num_scanned_files: 5, // scanned 05, 04 (anchor), 03, 02 (anchor), 01
+        num_scanned_files: 5,
         reached_scan_cap: false,
     };
     assert_eq!(page3, expected_page3);

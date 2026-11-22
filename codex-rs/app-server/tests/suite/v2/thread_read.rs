@@ -22,6 +22,92 @@ use tokio::time::timeout;
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[tokio::test]
+async fn shared_writer_preview_and_move_are_visible_to_both_read_apis() -> Result<()> {
+    use codex_app_server_protocol::GetConversationSummaryParams;
+    use codex_app_server_protocol::GetConversationSummaryResponse;
+    use codex_app_server_protocol::ThreadStartResponse;
+    use std::io::Write as _;
+    core_test_support::skip_if_no_network_unless_localhost!(Ok(()));
+    let home = TempDir::new()?;
+    create_config_toml(home.path(), "http://127.0.0.1:1")?;
+    let mut mcp = McpProcess::new(home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let id = mcp.send_thread_start_request(Default::default()).await?;
+    let reply = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(id)),
+    )
+    .await??;
+    let thread = to_response::<ThreadStartResponse>(reply)?.thread;
+    let active = thread.path.unwrap();
+    let thread_id = codex_protocol::ThreadId::from_string(&thread.id)?;
+    let db = codex_core::state_db::open_if_present(home.path(), "mock_provider")
+        .await
+        .unwrap();
+    assert!(
+        db.get_thread(thread_id)
+            .await?
+            .unwrap()
+            .first_user_message
+            .is_none()
+    );
+    let timestamp = std::fs::metadata(&active)?.modified()?;
+    let archived = home
+        .path()
+        .canonicalize()?
+        .join("archived_sessions")
+        .join(active.file_name().unwrap());
+    for (n, expected) in [&active, &archived].into_iter().enumerate() {
+        if n == 0 {
+            let mut writer = std::fs::File::options().append(true).open(&active)?;
+            writeln!(
+                writer,
+                "{}",
+                serde_json::json!({"timestamp":"2026-01-27T20:00:00Z","type":"event_msg","payload":{"type":"user_message","message":"written by the other CLI"}})
+            )?;
+            writer.set_modified(timestamp)?;
+        } else {
+            std::fs::create_dir_all(archived.parent().unwrap())?;
+            std::fs::rename(&active, &archived)?;
+        }
+        for include_turns in [false, true] {
+            let id = mcp
+                .send_thread_read_request(ThreadReadParams {
+                    thread_id: thread.id.clone(),
+                    include_turns,
+                })
+                .await?;
+            let reply = timeout(
+                DEFAULT_READ_TIMEOUT,
+                mcp.read_stream_until_response_message(RequestId::Integer(id)),
+            )
+            .await??;
+            let read = to_response::<ThreadReadResponse>(reply)?.thread;
+            assert_eq!(
+                (read.path.unwrap().canonicalize()?, read.preview.as_str()),
+                (expected.canonicalize()?, "written by the other CLI")
+            );
+        }
+        let id = mcp
+            .send_get_conversation_summary_request(GetConversationSummaryParams::ThreadId {
+                conversation_id: thread_id,
+            })
+            .await?;
+        let reply = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_response_message(RequestId::Integer(id)),
+        )
+        .await??;
+        let read = to_response::<GetConversationSummaryResponse>(reply)?.summary;
+        assert_eq!(
+            (read.path.canonicalize()?, read.preview.as_str()),
+            (expected.canonicalize()?, "written by the other CLI")
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn thread_read_returns_summary_without_turns() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;

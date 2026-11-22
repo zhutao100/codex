@@ -59,12 +59,17 @@ pub async fn get_state_db(config: &Config, otel: Option<&OtelManager>) -> Option
     if config.ephemeral {
         return None;
     }
-    open_existing(&config.codex_home, &config.model_provider_id, otel).await
+    open_existing(&config.codex_home, Some(&config.model_provider_id), otel).await
 }
 
 /// Open the index only if the file and a complete backfill already exist.
 pub async fn open_if_present(codex_home: &Path, default_provider: &str) -> Option<StateDbHandle> {
-    open_existing(codex_home, default_provider, None).await
+    open_existing(codex_home, Some(default_provider), None).await
+}
+
+/// A path-only caller does not own the fallback provider for legacy records.
+pub(crate) async fn index_for_path_lookup(home: &Path) -> Option<StateDbHandle> {
+    open_existing(home, None, None).await
 }
 
 /// Other builds may change JSONL without writing our journal. Certify membership and
@@ -122,7 +127,7 @@ pub(crate) async fn history_index(
 
 async fn open_existing(
     codex_home: &Path,
-    default_provider: &str,
+    default_provider: Option<&str>,
     otel: Option<&OtelManager>,
 ) -> Option<StateDbHandle> {
     let db_path = codex_state::state_db_path(codex_home);
@@ -131,12 +136,18 @@ async fn open_existing(
     }
     let runtime = codex_state::StateRuntime::init(
         codex_home.to_path_buf(),
-        default_provider.to_string(),
+        default_provider.unwrap_or_default().to_owned(),
         otel.cloned(),
     )
     .await
     .ok()?;
-    verified_index(runtime, default_provider, otel, false).await
+    if let Some(provider) = default_provider {
+        return verified_index(runtime, provider, otel, false).await;
+    }
+    let generation = missed_generation(codex_home).await.ok()?;
+    let state = runtime.get_backfill_state().await.ok()?;
+    (state.status == codex_state::BackfillStatus::Complete && state.generation >= generation)
+        .then_some(runtime)
 }
 
 const MISSED_INDEX_WRITES: &str = "state_index_misses";
@@ -526,20 +537,15 @@ pub async fn read_repair_rollout_path(
         }
     }
 
-    let default_provider = crate::rollout::list::read_session_meta_line(rollout_path)
+    let Some(provider) = crate::rollout::list::read_session_meta_line(rollout_path)
         .await
         .ok()
         .and_then(|meta| meta.meta.model_provider)
-        .unwrap_or_default();
-    reconcile_rollout(
-        Some(ctx),
-        rollout_path,
-        default_provider.as_str(),
-        None,
-        &[],
-        archived_only,
-    )
-    .await;
+    else {
+        // A configured reader can supply the fallback; never cache an invented provider.
+        return;
+    };
+    reconcile_rollout(Some(ctx), rollout_path, &provider, None, &[], archived_only).await;
 }
 
 /// Apply rollout items incrementally to SQLite.

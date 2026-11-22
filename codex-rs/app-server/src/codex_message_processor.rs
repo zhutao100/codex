@@ -2420,39 +2420,20 @@ impl CodexMessageProcessor {
         };
 
         let db_summary = read_summary_from_state_db_by_thread_id(&self.config, thread_uuid).await;
-        let mut rollout_path = db_summary.as_ref().map(|summary| summary.path.clone());
-        if rollout_path.is_none() || include_turns {
-            rollout_path =
-                match find_thread_path_by_id_str(&self.config.codex_home, &thread_uuid.to_string())
-                    .await
-                {
-                    Ok(Some(path)) => Some(path),
-                    Ok(None) => {
-                        if include_turns {
-                            None
-                        } else {
-                            rollout_path
-                        }
-                    }
-                    Err(err) => {
-                        self.send_invalid_request_error(
-                            request_id,
-                            format!("failed to locate thread id {thread_uuid}: {err}"),
-                        )
-                        .await;
-                        return;
-                    }
-                };
-        }
-
-        if include_turns && rollout_path.is_none() && db_summary.is_some() {
-            self.send_internal_error(
-                request_id,
-                format!("failed to locate rollout for thread {thread_uuid}"),
-            )
-            .await;
-            return;
-        }
+        let rollout_path = match &db_summary {
+            Some(summary) => Some(summary.path.clone()),
+            None => match find_history_rollout(&self.config.codex_home, thread_uuid).await {
+                Ok(path) => path,
+                Err(err) => {
+                    self.send_invalid_request_error(
+                        request_id,
+                        format!("failed to locate thread id {thread_uuid}: {err}"),
+                    )
+                    .await;
+                    return;
+                }
+            },
+        };
 
         let mut thread = if let Some(summary) = db_summary {
             summary_to_thread(summary)
@@ -2993,12 +2974,7 @@ impl CodexMessageProcessor {
                 }
             }
             GetConversationSummaryParams::ThreadId { conversation_id } => {
-                match codex_core::find_thread_path_by_id_str(
-                    &self.config.codex_home,
-                    &conversation_id.to_string(),
-                )
-                .await
-                {
+                match find_history_rollout(&self.config.codex_home, conversation_id).await {
                     Ok(Some(p)) => p,
                     _ => {
                         let error = JSONRPCErrorError {
@@ -5520,6 +5496,14 @@ async fn read_history_cwd_from_state_db(
     }
 }
 
+async fn find_history_rollout(home: &Path, id: ThreadId) -> std::io::Result<Option<PathBuf>> {
+    let id = id.to_string();
+    if let Some(path) = find_thread_path_by_id_str(home, &id).await? {
+        return Ok(Some(path));
+    }
+    find_archived_thread_path_by_id_str(home, &id).await
+}
+
 async fn read_summary_from_state_db_by_thread_id(
     config: &Config,
     thread_id: ThreadId,
@@ -5538,6 +5522,24 @@ async fn read_summary_from_state_db_context_by_thread_id(
         Ok(Some(metadata)) => metadata,
         Ok(None) | Err(_) => return None,
     };
+    // A shared-home writer may append the first message within the indexed second,
+    // or move the file without touching this build's journal.
+    let modified = tokio::fs::metadata(&metadata.rollout_path)
+        .await
+        .ok()?
+        .modified()
+        .ok()?;
+    if metadata.first_user_message.is_none()
+        || chrono::DateTime::<Utc>::from(modified).timestamp() != metadata.updated_at.timestamp()
+        || codex_core::read_session_meta_line(&metadata.rollout_path)
+            .await
+            .ok()?
+            .meta
+            .id
+            != thread_id
+    {
+        return None;
+    }
     Some(summary_from_state_db_metadata(
         metadata.id,
         metadata.rollout_path,
@@ -5691,7 +5693,8 @@ pub(crate) async fn read_summary_from_rollout(
         Some(session_meta.timestamp.as_str())
     };
     let updated_at = read_updated_at(path, created_at).await;
-    if let Some(summary) = extract_conversation_summary(
+    let event_preview = codex_core::read_rollout_preview(path).await?;
+    if let Some(mut summary) = extract_conversation_summary(
         path.to_path_buf(),
         &head,
         &session_meta,
@@ -5699,6 +5702,9 @@ pub(crate) async fn read_summary_from_rollout(
         fallback_provider,
         updated_at.clone(),
     ) {
+        if let Some(preview) = event_preview {
+            summary.preview = preview;
+        }
         return Ok(summary);
     }
 
@@ -5719,7 +5725,7 @@ pub(crate) async fn read_summary_from_rollout(
         timestamp,
         updated_at,
         path: path.to_path_buf(),
-        preview: String::new(),
+        preview: event_preview.unwrap_or_default(),
         model: None,
         model_provider,
         cwd: session_meta.cwd,

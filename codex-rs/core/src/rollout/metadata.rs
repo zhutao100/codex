@@ -361,7 +361,7 @@ async fn file_modified_time_utc(path: &Path) -> Option<DateTime<Utc>> {
     updated_at.with_nanosecond(0)
 }
 
-fn parse_timestamp_to_utc(ts: &str) -> Option<DateTime<Utc>> {
+pub(super) fn parse_timestamp_to_utc(ts: &str) -> Option<DateTime<Utc>> {
     const FILENAME_TS_FORMAT: &str = "%Y-%m-%dT%H-%M-%S";
     if let Ok(naive) = NaiveDateTime::parse_from_str(ts, FILENAME_TS_FORMAT) {
         let dt = DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc);
@@ -609,6 +609,139 @@ mod tests {
                 text_elements: vec![],
             },
         ))
+    }
+
+    #[tokio::test]
+    async fn providerless_path_lookup_defers_legacy_backfill_to_a_configured_reader()
+    -> anyhow::Result<()> {
+        let home = tempdir()?;
+        let mut config = crate::config::test_config();
+        config.codex_home = home.path().into();
+        config.model_provider_id = "configured-provider".into();
+        let db = crate::state_db::init_for_rollout(&config, None)
+            .await
+            .unwrap();
+        let id = Uuid::new_v4();
+        let path = write_rollout_in_sessions(
+            home.path(),
+            "2026-01-27T12-00-00",
+            "2026-01-27T20:00:00Z",
+            id,
+        );
+        let mut header: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+        header["payload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("model_provider");
+        writeln!(File::create(&path)?, "{header}")?;
+        append_picker_message(&path)?;
+        crate::state_db::note_missed_write(home.path()).await?;
+        assert_eq!(
+            crate::find_thread_path_by_id_str(home.path(), &id.to_string()).await?,
+            Some(path.clone())
+        );
+        let thread = ThreadId::from_string(&id.to_string())?;
+        assert!(db.get_thread(thread).await?.is_none());
+        let page = RolloutRecorder::list_threads(
+            home.path(),
+            5,
+            None,
+            crate::ThreadSortKey::CreatedAt,
+            &[],
+            Some(std::slice::from_ref(&config.model_provider_id)),
+            &config.model_provider_id,
+        )
+        .await?;
+        assert_eq!(
+            page.items.iter().map(|item| &item.path).collect::<Vec<_>>(),
+            [&path]
+        );
+        assert_eq!(
+            db.get_thread(thread).await?.unwrap().model_provider,
+            config.model_provider_id
+        );
+        Ok(())
+    }
+
+    #[test_case::test_case(false; "active")]
+    #[test_case::test_case(true; "archived")]
+    #[tokio::test]
+    async fn created_at_cursor_survives_both_reader_switches_with_local_filenames(
+        archived: bool,
+    ) -> anyhow::Result<()> {
+        let home = tempdir()?;
+        let mut config = crate::config::test_config();
+        config.codex_home = home.path().into();
+        let write = |filename, utc| -> anyhow::Result<PathBuf> {
+            let path = write_rollout_in_sessions(home.path(), filename, utc, Uuid::new_v4());
+            append_picker_message(&path)?;
+            if !archived {
+                return Ok(path);
+            }
+            let root = home.path().join(crate::rollout::ARCHIVED_SESSIONS_SUBDIR);
+            std::fs::create_dir_all(&root)?;
+            let target = root.join(path.file_name().unwrap());
+            std::fs::rename(path, &target)?;
+            Ok(target)
+        };
+        let oldest = write("2026-01-27T16-00-00", "2026-01-27T12:00:00Z")?;
+        let middle = write("2026-01-27T05-00-00", "2026-01-27T13:00:00Z")?;
+        let latest = write("2026-01-27T06-00-00", "2026-01-27T14:00:00Z")?;
+        crate::state_db::init_for_rollout(&config, None)
+            .await
+            .unwrap();
+        let mut cursor = None;
+        let mut inserted = None;
+        for i in 0..4 {
+            if i == 1 {
+                inserted = Some(write("2026-01-27T05-30-00", "2026-01-27T13:30:00Z")?);
+            }
+            if i == 2 {
+                crate::state_db::note_missed_write(home.path()).await?;
+            }
+            assert_eq!(
+                crate::state_db::history_index(home.path(), &config.model_provider_id, archived)
+                    .await
+                    .is_some(),
+                i != 1
+            );
+            let page = if archived {
+                RolloutRecorder::list_archived_threads(
+                    home.path(),
+                    1,
+                    cursor.as_ref(),
+                    crate::ThreadSortKey::CreatedAt,
+                    &[],
+                    None,
+                    &config.model_provider_id,
+                )
+                .await?
+            } else {
+                RolloutRecorder::list_threads(
+                    home.path(),
+                    1,
+                    cursor.as_ref(),
+                    crate::ThreadSortKey::CreatedAt,
+                    &[],
+                    None,
+                    &config.model_provider_id,
+                )
+                .await?
+            };
+            let expected = match i {
+                0 => &latest,
+                1 => inserted.as_ref().unwrap(),
+                2 => &middle,
+                _ => &oldest,
+            };
+            assert_eq!(
+                page.items.iter().map(|item| &item.path).collect::<Vec<_>>(),
+                [expected]
+            );
+            cursor = page.next_cursor;
+            assert_eq!(cursor.is_some(), i < 3);
+        }
+        Ok(())
     }
 
     #[tokio::test]
