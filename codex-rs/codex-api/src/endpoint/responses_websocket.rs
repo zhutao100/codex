@@ -113,7 +113,11 @@ impl ResponsesWebsocketConnection {
                     .send(Ok(ResponseEvent::ServerReasoningIncluded(true)))
                     .await;
             }
-            let mut guard = stream.lock().await;
+            let mut guard = tokio::select! {
+                biased;
+                _ = tx_event.closed() => return,
+                guard = stream.lock() => guard,
+            };
             let result = {
                 let Some(ws_stream) = guard.as_mut() else {
                     let _ = tx_event
@@ -124,15 +128,23 @@ impl ResponsesWebsocketConnection {
                     return;
                 };
 
-                run_websocket_response_stream(
+                tokio::select! {
+                    biased;
+                    _ = tx_event.closed() => {
+                        // The request may be partially written. Dropping the owner aborts the
+                        // pump immediately; this socket cannot be reused for another turn.
+                        guard.take();
+                        return;
+                    }
+                    result = run_websocket_response_stream(
                     ws_stream,
                     tx_event.clone(),
                     request_text,
                     idle_timeout,
                     telemetry,
                     turn_state.as_deref(),
-                )
-                .await
+                    ) => result,
+                }
             };
 
             if let Err(err) = result {

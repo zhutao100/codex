@@ -304,6 +304,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropping_the_consumer_aborts_a_partially_written_create() {
+        use super::super::ResponsesWebsocketConnection;
+        use crate::common::ResponseCreateWsRequest;
+        use crate::common::ResponsesWsRequest;
+        use tokio::io::AsyncReadExt;
+        let (socket, mut peer) = socket_pair(64).await;
+        let connection = ResponsesWebsocketConnection::new(
+            socket,
+            Duration::from_secs(60),
+            false,
+            None,
+            None,
+            None,
+        );
+        let request = ResponsesWsRequest::ResponseCreate(ResponseCreateWsRequest {
+            model: "x".repeat(FRAGMENT_SIZE + 1),
+            input: vec![].into(),
+            previous_response_id: None,
+            tools: vec![],
+            tool_choice: "auto".into(),
+            parallel_tool_calls: false,
+            reasoning: None,
+            store: false,
+            stream: true,
+            include: vec![],
+            service_tier: None,
+            prompt_cache_key: None,
+            text: None,
+            generate: None,
+            client_metadata: None,
+        });
+        let response = connection.stream_request(request, None).await.unwrap();
+        tokio::time::timeout(DEADLINE, async {
+            assert!(!peer.get_mut().fill_buf().await.unwrap().is_empty());
+            drop(response);
+            assert!(connection.is_closed().await);
+            let mut partial = Vec::new();
+            peer.get_mut().read_to_end(&mut partial).await.unwrap();
+            assert!(!partial.is_empty() && partial.len() < FRAGMENT_SIZE);
+        })
+        .await
+        .expect("cancellation must not wait for the upload timeout");
+    }
+
+    #[tokio::test]
     async fn heartbeat_is_answered_before_the_complete_request_arrives() {
         let (mut client, mut server) = socket_pair(1024).await;
         let text = "test".repeat(FRAGMENT_SIZE / 4 + 100);

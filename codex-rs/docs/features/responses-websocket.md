@@ -39,7 +39,7 @@ Create a fresh `ModelClientSession` for each logical turn. Reuse it for sampling
 |Event|Required behavior|
 |---|---|
 |Normal completed response|Permit same-turn incremental requests; permit physical caching when the client session ends.|
-|Pause/cancel while response is in flight, or mapper ends without completion|Do not return that connection to the cache. `/continue` starts a new client session and sends full surviving history.|
+|Pause/cancel while response is in flight, or mapper ends without completion|Dropping the response consumer interrupts a blocked upload or receive and retires the socket; it does not wait for an idle timeout. `/continue` starts a new client session and sends full surviving history.|
 |Pause after protocol completion during local processing|A healthy socket may survive; its logical request/response chain still does not cross into `/continue`.|
 |Successful compaction|Clear the logical chain; keep the socket only if its last response completed. The replacement becomes the next full request.|
 |History rewrite or changed request properties|Fail incremental eligibility and send full input.|
