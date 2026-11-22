@@ -21,7 +21,7 @@ use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
-use core_test_support::skip_if_no_network;
+use core_test_support::skip_if_no_network_unless_localhost;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
@@ -74,17 +74,17 @@ async fn request_user_input_round_trip_resolves_pending() -> anyhow::Result<()> 
 }
 
 async fn request_user_input_round_trip_for_mode(mode: ModeKind) -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+    skip_if_no_network_unless_localhost!(Ok(()));
 
     let server = start_mock_server().await;
 
-    let builder = test_codex();
+    let test = test_codex().build(&server).await?;
     let TestCodex {
         codex,
         cwd,
         session_configured,
         ..
-    } = builder.with_config(|_config| {}).build(&server).await?;
+    } = &test;
 
     let call_id = "user-input-call";
     let request_args = json!({
@@ -108,7 +108,7 @@ async fn request_user_input_round_trip_for_mode(mode: ModeKind) -> anyhow::Resul
         ev_function_call(call_id, "request_user_input", &request_args),
         ev_completed("resp-1"),
     ]);
-    responses::mount_sse_once(&server, first_response).await;
+    let first = responses::mount_sse_once(&server, first_response).await;
 
     let second_response = sse(vec![
         ev_assistant_message("msg-1", "thanks"),
@@ -144,7 +144,7 @@ async fn request_user_input_round_trip_for_mode(mode: ModeKind) -> anyhow::Resul
         })
         .await?;
 
-    let request = wait_for_event_match(&codex, |event| match event {
+    let request = wait_for_event_match(codex, |event| match event {
         EventMsg::RequestUserInput(request) => Some(request.clone()),
         _ => None,
     })
@@ -168,9 +168,16 @@ async fn request_user_input_round_trip_for_mode(mode: ModeKind) -> anyhow::Resul
         })
         .await?;
 
-    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    wait_for_event(codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
 
     let req = second_mock.single_request();
+    assert!(
+        first.single_request().body_json()["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "request_user_input")
+    );
     let output_text = call_output(&req, call_id);
     let output_json: Value = serde_json::from_str(&output_text)?;
     assert_eq!(
@@ -185,24 +192,20 @@ async fn request_user_input_round_trip_for_mode(mode: ModeKind) -> anyhow::Resul
     Ok(())
 }
 
-async fn assert_request_user_input_rejected<F>(mode_name: &str, build_mode: F) -> anyhow::Result<()>
-where
-    F: FnOnce(String) -> CollaborationMode,
-{
-    skip_if_no_network!(Ok(()));
+async fn assert_request_user_input_rejected(wire_mode: &str) -> anyhow::Result<()> {
+    skip_if_no_network_unless_localhost!(Ok(()));
 
     let server = start_mock_server().await;
 
-    let builder = test_codex();
+    let test = test_codex().build(&server).await?;
     let TestCodex {
         codex,
         cwd,
         session_configured,
         ..
-    } = builder.with_config(|_config| {}).build(&server).await?;
+    } = &test;
 
-    let mode_slug = mode_name.to_lowercase().replace(' ', "-");
-    let call_id = format!("user-input-{mode_slug}-call");
+    let call_id = format!("user-input-{wire_mode}-call");
     let request_args = json!({
         "questions": [{
             "id": "confirm_path",
@@ -224,7 +227,7 @@ where
         ev_function_call(&call_id, "request_user_input", &request_args),
         ev_completed("resp-1"),
     ]);
-    responses::mount_sse_once(&server, first_response).await;
+    let first = responses::mount_sse_once(&server, first_response).await;
 
     let second_response = sse(vec![
         ev_assistant_message("msg-1", "thanks"),
@@ -233,7 +236,15 @@ where
     let second_mock = responses::mount_sse_once(&server, second_response).await;
 
     let session_model = session_configured.model.clone();
-    let collaboration_mode = build_mode(session_model.clone());
+    let collaboration_mode = CollaborationMode {
+        mode: serde_json::from_value(json!(wire_mode))?,
+        settings: Settings {
+            model: session_model.clone(),
+            reasoning_effort: None,
+            developer_instructions: None,
+        },
+    };
+    assert_eq!(collaboration_mode.mode, ModeKind::Default);
 
     codex
         .submit(Op::UserTurn {
@@ -254,54 +265,34 @@ where
         })
         .await?;
 
-    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    wait_for_event(codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
 
     let req = second_mock.single_request();
+    assert!(
+        first.single_request().body_json()["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "request_user_input")
+    );
     let (output, success) = call_output_content_and_success(&req, &call_id);
     assert_eq!(success, None);
-    assert_eq!(
-        output,
-        format!("request_user_input is unavailable in {mode_name} mode")
-    );
+    assert_eq!(output, "request_user_input is unavailable in Default mode");
 
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn request_user_input_rejected_in_execute_mode_alias() -> anyhow::Result<()> {
-    assert_request_user_input_rejected("Execute", |model| CollaborationMode {
-        mode: ModeKind::Execute,
-        settings: Settings {
-            model,
-            reasoning_effort: None,
-            developer_instructions: None,
-        },
-    })
-    .await
+    assert_request_user_input_rejected("execute").await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn request_user_input_rejected_in_default_mode() -> anyhow::Result<()> {
-    assert_request_user_input_rejected("Default", |model| CollaborationMode {
-        mode: ModeKind::Default,
-        settings: Settings {
-            model,
-            reasoning_effort: None,
-            developer_instructions: None,
-        },
-    })
-    .await
+    assert_request_user_input_rejected("default").await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn request_user_input_rejected_in_pair_mode_alias() -> anyhow::Result<()> {
-    assert_request_user_input_rejected("Pair Programming", |model| CollaborationMode {
-        mode: ModeKind::PairProgramming,
-        settings: Settings {
-            model,
-            reasoning_effort: None,
-            developer_instructions: None,
-        },
-    })
-    .await
+    assert_request_user_input_rejected("pair_programming").await
 }
