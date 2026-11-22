@@ -221,6 +221,8 @@ use codex_protocol::protocol::USER_MESSAGE_BEGIN;
 use codex_protocol::user_input::UserInput as CoreInputItem;
 use codex_rmcp_client::perform_oauth_login_return_url;
 use codex_utils_json_to_toml::json_to_toml;
+use futures::FutureExt;
+use futures::future::BoxFuture;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::ffi::OsStr;
@@ -456,113 +458,98 @@ impl CodexMessageProcessor {
         Ok((review_request, hint))
     }
 
-    pub async fn process_request(&mut self, connection_id: ConnectionId, request: ClientRequest) {
-        let to_connection_request_id = |request_id| ConnectionRequestId {
+    // Build just the selected handler's future. An async match here keeps every handler's
+    // dispatch temporaries on the polling stack during nested session initialization.
+    pub fn process_request(
+        &mut self,
+        connection_id: ConnectionId,
+        request: ClientRequest,
+    ) -> BoxFuture<'_, ()> {
+        let to_connection_request_id = move |request_id| ConnectionRequestId {
             connection_id,
             request_id,
         };
 
         match request {
-            ClientRequest::Initialize { .. } => {
+            ClientRequest::Initialize { .. } => async move {
                 panic!("Initialize should be handled in MessageProcessor");
             }
+            .boxed(),
             // === v2 Thread/Turn APIs ===
-            ClientRequest::ThreadStart { request_id, params } => {
-                self.thread_start(to_connection_request_id(request_id), params)
-                    .await;
-            }
-            ClientRequest::ThreadResume { request_id, params } => {
-                self.thread_resume(to_connection_request_id(request_id), params)
-                    .await;
-            }
-            ClientRequest::ThreadFork { request_id, params } => {
-                self.thread_fork(to_connection_request_id(request_id), params)
-                    .await;
-            }
-            ClientRequest::ThreadArchive { request_id, params } => {
-                self.thread_archive(to_connection_request_id(request_id), params)
-                    .await;
-            }
-            ClientRequest::ThreadSetName { request_id, params } => {
-                self.thread_set_name(to_connection_request_id(request_id), params)
-                    .await;
-            }
-            ClientRequest::ThreadUnarchive { request_id, params } => {
-                self.thread_unarchive(to_connection_request_id(request_id), params)
-                    .await;
-            }
-            ClientRequest::ThreadCompactStart { request_id, params } => {
-                self.thread_compact_start(to_connection_request_id(request_id), params)
-                    .await;
-            }
-            ClientRequest::ThreadRollback { request_id, params } => {
-                self.thread_rollback(to_connection_request_id(request_id), params)
-                    .await;
-            }
-            ClientRequest::ThreadList { request_id, params } => {
-                self.thread_list(to_connection_request_id(request_id), params)
-                    .await;
-            }
-            ClientRequest::ThreadLoadedList { request_id, params } => {
-                self.thread_loaded_list(to_connection_request_id(request_id), params)
-                    .await;
-            }
-            ClientRequest::ThreadRead { request_id, params } => {
-                self.thread_read(to_connection_request_id(request_id), params)
-                    .await;
-            }
-            ClientRequest::SkillsList { request_id, params } => {
-                self.skills_list(to_connection_request_id(request_id), params)
-                    .await;
-            }
-            ClientRequest::SkillsRemoteRead { request_id, params } => {
-                self.skills_remote_read(to_connection_request_id(request_id), params)
-                    .await;
-            }
-            ClientRequest::SkillsRemoteWrite { request_id, params } => {
-                self.skills_remote_write(to_connection_request_id(request_id), params)
-                    .await;
-            }
-            ClientRequest::AppsList { request_id, params } => {
-                self.apps_list(to_connection_request_id(request_id), params)
-                    .await;
-            }
-            ClientRequest::SkillsConfigWrite { request_id, params } => {
-                self.skills_config_write(to_connection_request_id(request_id), params)
-                    .await;
-            }
-            ClientRequest::TurnStart { request_id, params } => {
-                self.turn_start(to_connection_request_id(request_id), params)
-                    .await;
-            }
-            ClientRequest::TurnInterrupt { request_id, params } => {
-                self.turn_interrupt(to_connection_request_id(request_id), params)
-                    .await;
-            }
-            ClientRequest::TurnActive { request_id, params } => {
-                self.turn_active(to_connection_request_id(request_id), params)
-                    .await;
-            }
-            ClientRequest::ReviewStart { request_id, params } => {
-                self.review_start(to_connection_request_id(request_id), params)
-                    .await;
-            }
+            ClientRequest::ThreadStart { request_id, params } => self
+                .thread_start(to_connection_request_id(request_id), params)
+                .boxed(),
+            ClientRequest::ThreadResume { request_id, params } => self
+                .thread_resume(to_connection_request_id(request_id), params)
+                .boxed(),
+            ClientRequest::ThreadFork { request_id, params } => self
+                .thread_fork(to_connection_request_id(request_id), params)
+                .boxed(),
+            ClientRequest::ThreadArchive { request_id, params } => self
+                .thread_archive(to_connection_request_id(request_id), params)
+                .boxed(),
+            ClientRequest::ThreadSetName { request_id, params } => self
+                .thread_set_name(to_connection_request_id(request_id), params)
+                .boxed(),
+            ClientRequest::ThreadUnarchive { request_id, params } => self
+                .thread_unarchive(to_connection_request_id(request_id), params)
+                .boxed(),
+            ClientRequest::ThreadCompactStart { request_id, params } => self
+                .thread_compact_start(to_connection_request_id(request_id), params)
+                .boxed(),
+            ClientRequest::ThreadRollback { request_id, params } => self
+                .thread_rollback(to_connection_request_id(request_id), params)
+                .boxed(),
+            ClientRequest::ThreadList { request_id, params } => self
+                .thread_list(to_connection_request_id(request_id), params)
+                .boxed(),
+            ClientRequest::ThreadLoadedList { request_id, params } => self
+                .thread_loaded_list(to_connection_request_id(request_id), params)
+                .boxed(),
+            ClientRequest::ThreadRead { request_id, params } => self
+                .thread_read(to_connection_request_id(request_id), params)
+                .boxed(),
+            ClientRequest::SkillsList { request_id, params } => self
+                .skills_list(to_connection_request_id(request_id), params)
+                .boxed(),
+            ClientRequest::SkillsRemoteRead { request_id, params } => self
+                .skills_remote_read(to_connection_request_id(request_id), params)
+                .boxed(),
+            ClientRequest::SkillsRemoteWrite { request_id, params } => self
+                .skills_remote_write(to_connection_request_id(request_id), params)
+                .boxed(),
+            ClientRequest::AppsList { request_id, params } => self
+                .apps_list(to_connection_request_id(request_id), params)
+                .boxed(),
+            ClientRequest::SkillsConfigWrite { request_id, params } => self
+                .skills_config_write(to_connection_request_id(request_id), params)
+                .boxed(),
+            ClientRequest::TurnStart { request_id, params } => self
+                .turn_start(to_connection_request_id(request_id), params)
+                .boxed(),
+            ClientRequest::TurnInterrupt { request_id, params } => self
+                .turn_interrupt(to_connection_request_id(request_id), params)
+                .boxed(),
+            ClientRequest::TurnActive { request_id, params } => self
+                .turn_active(to_connection_request_id(request_id), params)
+                .boxed(),
+            ClientRequest::ReviewStart { request_id, params } => self
+                .review_start(to_connection_request_id(request_id), params)
+                .boxed(),
             ClientRequest::NewConversation { request_id, params } => {
                 // Do not tokio::spawn() to process new_conversation()
                 // asynchronously because we need to ensure the conversation is
                 // created before processing any subsequent messages.
                 self.process_new_conversation(to_connection_request_id(request_id), params)
-                    .await;
+                    .boxed()
             }
-            ClientRequest::GetConversationSummary { request_id, params } => {
-                self.get_thread_summary(to_connection_request_id(request_id), params)
-                    .await;
-            }
-            ClientRequest::ListConversations { request_id, params } => {
-                self.handle_list_conversations(to_connection_request_id(request_id), params)
-                    .await;
-            }
-            ClientRequest::ModelList { request_id, params } => {
+            ClientRequest::GetConversationSummary { request_id, params } => self
+                .get_thread_summary(to_connection_request_id(request_id), params)
+                .boxed(),
+            ClientRequest::ListConversations { request_id, params } => self
+                .handle_list_conversations(to_connection_request_id(request_id), params)
+                .boxed(),
+            ClientRequest::ModelList { request_id, params } => async move {
                 let outgoing = self.outgoing.clone();
                 let thread_manager = self.thread_manager.clone();
                 let config = self.config.clone();
@@ -572,11 +559,11 @@ impl CodexMessageProcessor {
                     Self::list_models(outgoing, thread_manager, config, request_id, params).await;
                 });
             }
-            ClientRequest::ExperimentalFeatureList { request_id, params } => {
-                self.experimental_feature_list(to_connection_request_id(request_id), params)
-                    .await;
-            }
-            ClientRequest::CollaborationModeList { request_id, params } => {
+            .boxed(),
+            ClientRequest::ExperimentalFeatureList { request_id, params } => self
+                .experimental_feature_list(to_connection_request_id(request_id), params)
+                .boxed(),
+            ClientRequest::CollaborationModeList { request_id, params } => async move {
                 let outgoing = self.outgoing.clone();
                 let thread_manager = self.thread_manager.clone();
                 let request_id = to_connection_request_id(request_id);
@@ -586,157 +573,127 @@ impl CodexMessageProcessor {
                         .await;
                 });
             }
-            ClientRequest::MockExperimentalMethod { request_id, params } => {
-                self.mock_experimental_method(to_connection_request_id(request_id), params)
-                    .await;
-            }
-            ClientRequest::McpServerOauthLogin { request_id, params } => {
-                self.mcp_server_oauth_login(to_connection_request_id(request_id), params)
-                    .await;
-            }
-            ClientRequest::McpServerRefresh { request_id, params } => {
-                self.mcp_server_refresh(to_connection_request_id(request_id), params)
-                    .await;
-            }
-            ClientRequest::McpServerStatusList { request_id, params } => {
-                self.list_mcp_server_status(to_connection_request_id(request_id), params)
-                    .await;
-            }
-            ClientRequest::LoginAccount { request_id, params } => {
-                self.login_v2(to_connection_request_id(request_id), params)
-                    .await;
-            }
+            .boxed(),
+            ClientRequest::MockExperimentalMethod { request_id, params } => self
+                .mock_experimental_method(to_connection_request_id(request_id), params)
+                .boxed(),
+            ClientRequest::McpServerOauthLogin { request_id, params } => self
+                .mcp_server_oauth_login(to_connection_request_id(request_id), params)
+                .boxed(),
+            ClientRequest::McpServerRefresh { request_id, params } => self
+                .mcp_server_refresh(to_connection_request_id(request_id), params)
+                .boxed(),
+            ClientRequest::McpServerStatusList { request_id, params } => self
+                .list_mcp_server_status(to_connection_request_id(request_id), params)
+                .boxed(),
+            ClientRequest::LoginAccount { request_id, params } => self
+                .login_v2(to_connection_request_id(request_id), params)
+                .boxed(),
             ClientRequest::LogoutAccount {
                 request_id,
                 params: _,
-            } => {
-                self.logout_v2(to_connection_request_id(request_id)).await;
-            }
-            ClientRequest::CancelLoginAccount { request_id, params } => {
-                self.cancel_login_v2(to_connection_request_id(request_id), params)
-                    .await;
-            }
-            ClientRequest::GetAccount { request_id, params } => {
-                self.get_account(to_connection_request_id(request_id), params)
-                    .await;
-            }
-            ClientRequest::ResumeConversation { request_id, params } => {
-                self.handle_resume_conversation(to_connection_request_id(request_id), params)
-                    .await;
-            }
-            ClientRequest::ForkConversation { request_id, params } => {
-                self.handle_fork_conversation(to_connection_request_id(request_id), params)
-                    .await;
-            }
-            ClientRequest::ArchiveConversation { request_id, params } => {
-                self.archive_conversation(to_connection_request_id(request_id), params)
-                    .await;
-            }
-            ClientRequest::SendUserMessage { request_id, params } => {
-                self.send_user_message(to_connection_request_id(request_id), params)
-                    .await;
-            }
-            ClientRequest::SendUserTurn { request_id, params } => {
-                self.send_user_turn(to_connection_request_id(request_id), params)
-                    .await;
-            }
-            ClientRequest::InterruptConversation { request_id, params } => {
-                self.interrupt_conversation(to_connection_request_id(request_id), params)
-                    .await;
-            }
-            ClientRequest::AddConversationListener { request_id, params } => {
-                self.add_conversation_listener(to_connection_request_id(request_id), params)
-                    .await;
-            }
-            ClientRequest::RemoveConversationListener { request_id, params } => {
-                self.remove_thread_listener(to_connection_request_id(request_id), params)
-                    .await;
-            }
-            ClientRequest::GitDiffToRemote { request_id, params } => {
-                self.git_diff_to_origin(to_connection_request_id(request_id), params.cwd)
-                    .await;
-            }
-            ClientRequest::LoginApiKey { request_id, params } => {
-                self.login_api_key_v1(to_connection_request_id(request_id), params)
-                    .await;
-            }
+            } => self.logout_v2(to_connection_request_id(request_id)).boxed(),
+            ClientRequest::CancelLoginAccount { request_id, params } => self
+                .cancel_login_v2(to_connection_request_id(request_id), params)
+                .boxed(),
+            ClientRequest::GetAccount { request_id, params } => self
+                .get_account(to_connection_request_id(request_id), params)
+                .boxed(),
+            ClientRequest::ResumeConversation { request_id, params } => self
+                .handle_resume_conversation(to_connection_request_id(request_id), params)
+                .boxed(),
+            ClientRequest::ForkConversation { request_id, params } => self
+                .handle_fork_conversation(to_connection_request_id(request_id), params)
+                .boxed(),
+            ClientRequest::ArchiveConversation { request_id, params } => self
+                .archive_conversation(to_connection_request_id(request_id), params)
+                .boxed(),
+            ClientRequest::SendUserMessage { request_id, params } => self
+                .send_user_message(to_connection_request_id(request_id), params)
+                .boxed(),
+            ClientRequest::SendUserTurn { request_id, params } => self
+                .send_user_turn(to_connection_request_id(request_id), params)
+                .boxed(),
+            ClientRequest::InterruptConversation { request_id, params } => self
+                .interrupt_conversation(to_connection_request_id(request_id), params)
+                .boxed(),
+            ClientRequest::AddConversationListener { request_id, params } => self
+                .add_conversation_listener(to_connection_request_id(request_id), params)
+                .boxed(),
+            ClientRequest::RemoveConversationListener { request_id, params } => self
+                .remove_thread_listener(to_connection_request_id(request_id), params)
+                .boxed(),
+            ClientRequest::GitDiffToRemote { request_id, params } => self
+                .git_diff_to_origin(to_connection_request_id(request_id), params.cwd)
+                .boxed(),
+            ClientRequest::LoginApiKey { request_id, params } => self
+                .login_api_key_v1(to_connection_request_id(request_id), params)
+                .boxed(),
             ClientRequest::LoginChatGpt {
                 request_id,
                 params: _,
-            } => {
-                self.login_chatgpt_v1(to_connection_request_id(request_id))
-                    .await;
-            }
-            ClientRequest::CancelLoginChatGpt { request_id, params } => {
-                self.cancel_login_chatgpt(to_connection_request_id(request_id), params.login_id)
-                    .await;
-            }
+            } => self
+                .login_chatgpt_v1(to_connection_request_id(request_id))
+                .boxed(),
+            ClientRequest::CancelLoginChatGpt { request_id, params } => self
+                .cancel_login_chatgpt(to_connection_request_id(request_id), params.login_id)
+                .boxed(),
             ClientRequest::LogoutChatGpt {
                 request_id,
                 params: _,
-            } => {
-                self.logout_v1(to_connection_request_id(request_id)).await;
-            }
-            ClientRequest::GetAuthStatus { request_id, params } => {
-                self.get_auth_status(to_connection_request_id(request_id), params)
-                    .await;
-            }
+            } => self.logout_v1(to_connection_request_id(request_id)).boxed(),
+            ClientRequest::GetAuthStatus { request_id, params } => self
+                .get_auth_status(to_connection_request_id(request_id), params)
+                .boxed(),
             ClientRequest::GetUserSavedConfig {
                 request_id,
                 params: _,
-            } => {
-                self.get_user_saved_config(to_connection_request_id(request_id))
-                    .await;
-            }
-            ClientRequest::SetDefaultModel { request_id, params } => {
-                self.set_default_model(to_connection_request_id(request_id), params)
-                    .await;
-            }
+            } => self
+                .get_user_saved_config(to_connection_request_id(request_id))
+                .boxed(),
+            ClientRequest::SetDefaultModel { request_id, params } => self
+                .set_default_model(to_connection_request_id(request_id), params)
+                .boxed(),
             ClientRequest::GetUserAgent {
                 request_id,
                 params: _,
-            } => {
-                self.get_user_agent(to_connection_request_id(request_id))
-                    .await;
-            }
+            } => self
+                .get_user_agent(to_connection_request_id(request_id))
+                .boxed(),
             ClientRequest::UserInfo {
                 request_id,
                 params: _,
-            } => {
-                self.get_user_info(to_connection_request_id(request_id))
-                    .await;
-            }
-            ClientRequest::FuzzyFileSearch { request_id, params } => {
-                self.fuzzy_file_search(to_connection_request_id(request_id), params)
-                    .await;
-            }
-            ClientRequest::OneOffCommandExec { request_id, params } => {
-                self.exec_one_off_command(to_connection_request_id(request_id), params)
-                    .await;
-            }
-            ClientRequest::ExecOneOffCommand { request_id, params } => {
-                self.exec_one_off_command(to_connection_request_id(request_id), params.into())
-                    .await;
-            }
+            } => self
+                .get_user_info(to_connection_request_id(request_id))
+                .boxed(),
+            ClientRequest::FuzzyFileSearch { request_id, params } => self
+                .fuzzy_file_search(to_connection_request_id(request_id), params)
+                .boxed(),
+            ClientRequest::OneOffCommandExec { request_id, params } => self
+                .exec_one_off_command(to_connection_request_id(request_id), params)
+                .boxed(),
+            ClientRequest::ExecOneOffCommand { request_id, params } => self
+                .exec_one_off_command(to_connection_request_id(request_id), params.into())
+                .boxed(),
             ClientRequest::ConfigRead { .. }
             | ClientRequest::ConfigValueWrite { .. }
-            | ClientRequest::ConfigBatchWrite { .. } => {
+            | ClientRequest::ConfigBatchWrite { .. } => async move {
                 warn!("Config request reached CodexMessageProcessor unexpectedly");
             }
-            ClientRequest::ConfigRequirementsRead { .. } => {
+            .boxed(),
+            ClientRequest::ConfigRequirementsRead { .. } => async move {
                 warn!("ConfigRequirementsRead request reached CodexMessageProcessor unexpectedly");
             }
+            .boxed(),
             ClientRequest::GetAccountRateLimits {
                 request_id,
                 params: _,
-            } => {
-                self.get_account_rate_limits(to_connection_request_id(request_id))
-                    .await;
-            }
-            ClientRequest::FeedbackUpload { request_id, params } => {
-                self.upload_feedback(to_connection_request_id(request_id), params)
-                    .await;
-            }
+            } => self
+                .get_account_rate_limits(to_connection_request_id(request_id))
+                .boxed(),
+            ClientRequest::FeedbackUpload { request_id, params } => self
+                .upload_feedback(to_connection_request_id(request_id), params)
+                .boxed(),
         }
     }
 
