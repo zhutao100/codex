@@ -177,6 +177,35 @@ async fn list_apps_returns_connectors_with_accessible_flags() -> Result<()> {
         before_logout
     );
 
+    write_chatgpt_auth(
+        codex_home.path(),
+        ChatGptAuthFixture::new("second-token")
+            .account_id("account-456")
+            .chatgpt_user_id("user-456")
+            .chatgpt_account_id("account-456"),
+        AuthCredentialsStoreMode::File,
+    )?;
+    let next = mcp
+        .send_apps_list_request(AppsListParams {
+            limit: None,
+            cursor: None,
+        })
+        .await?;
+    let reply = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(next)),
+    )
+    .await??;
+    let listed: AppsListResponse = to_response(reply)?;
+    assert_eq!(
+        listed
+            .data
+            .into_iter()
+            .map(|app| (app.id, app.is_accessible))
+            .collect::<Vec<_>>(),
+        vec![("gamma".into(), true)]
+    );
+
     server_handle.abort();
     Ok(())
 }
@@ -298,12 +327,7 @@ struct AppsServerState {
 #[derive(Clone)]
 struct AppListMcpServer {
     tools: Arc<Vec<Tool>>,
-}
-
-impl AppListMcpServer {
-    fn new(tools: Arc<Vec<Tool>>) -> Self {
-        Self { tools }
-    }
+    second_account_tools: Arc<Vec<Tool>>,
 }
 
 impl ServerHandler for AppListMcpServer {
@@ -317,10 +341,19 @@ impl ServerHandler for AppListMcpServer {
     fn list_tools(
         &self,
         _request: Option<rmcp::model::PaginatedRequestParam>,
-        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+        context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
     ) -> impl std::future::Future<Output = Result<ListToolsResult, rmcp::ErrorData>> + Send + '_
     {
-        let tools = self.tools.clone();
+        let second_account = context
+            .extensions
+            .get::<axum::http::request::Parts>()
+            .and_then(|parts| parts.headers.get(AUTHORIZATION))
+            .is_some_and(|value| value == "Bearer second-token");
+        let tools = if second_account {
+            self.second_account_tools.clone()
+        } else {
+            self.tools.clone()
+        };
         async move {
             Ok(ListToolsResult {
                 tools: (*tools).clone(),
@@ -343,16 +376,16 @@ async fn start_apps_server(
         response: json!({ "apps": connectors, "next_token": null }),
     };
     let state = Arc::new(state);
-    let tools = Arc::new(tools);
+    let mcp_server = AppListMcpServer {
+        tools: Arc::new(tools),
+        second_account_tools: Arc::new(vec![connector_tool("gamma", "Gamma")?]),
+    };
 
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
 
     let mcp_service = StreamableHttpService::new(
-        {
-            let tools = tools.clone();
-            move || Ok(AppListMcpServer::new(tools.clone()))
-        },
+        move || Ok(mcp_server.clone()),
         Arc::new(LocalSessionManager::default()),
         StreamableHttpServerConfig::default(),
     );
@@ -380,6 +413,15 @@ async fn list_directory_connectors(
     state
         .requests
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    if headers
+        .get(AUTHORIZATION)
+        .is_some_and(|value| value == "Bearer second-token")
+        && headers
+            .get("chatgpt-account-id")
+            .is_some_and(|value| value == "account-456")
+    {
+        return Ok(Json(json!({ "apps": [], "next_token": null })));
+    }
     let bearer_ok = headers
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())

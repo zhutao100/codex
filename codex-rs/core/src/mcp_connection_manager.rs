@@ -12,8 +12,6 @@ use std::env;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::LazyLock;
-use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -167,13 +165,10 @@ pub(crate) struct ToolInfo {
 }
 
 #[derive(Clone)]
-struct CachedCodexAppsTools {
+struct ConnectionTools {
     expires_at: Instant,
     tools: Vec<ToolInfo>,
 }
-
-static CODEX_APPS_TOOLS_CACHE: LazyLock<StdMutex<Option<CachedCodexAppsTools>>> =
-    LazyLock::new(|| StdMutex::new(None));
 
 type ResponderMap = HashMap<(String, RequestId), oneshot::Sender<ElicitationResponse>>;
 
@@ -238,7 +233,7 @@ impl ElicitationRequestManager {
 #[derive(Clone)]
 struct ManagedClient {
     client: Arc<RmcpClient>,
-    tools: Vec<ToolInfo>,
+    tools: Arc<Mutex<ConnectionTools>>,
     tool_filter: ToolFilter,
     tool_timeout: Option<Duration>,
     server_supports_sandbox_state_capability: bool,
@@ -488,25 +483,26 @@ impl McpConnectionManager {
         for (server_name, managed_client) in &self.clients {
             let client = managed_client.client().await.ok();
             if let Some(client) = client {
-                let rmcp_client = client.client;
-                let tool_timeout = client.tool_timeout;
-                let tool_filter = client.tool_filter;
-                let mut server_tools = client.tools;
-
-                if server_name == CODEX_APPS_MCP_SERVER_NAME {
-                    match list_tools_for_client(server_name, &rmcp_client, tool_timeout).await {
-                        Ok(fresh_or_cached_tools) => {
-                            server_tools = fresh_or_cached_tools;
+                let mut snapshot = client.tools.lock().await;
+                if server_name == CODEX_APPS_MCP_SERVER_NAME
+                    && Instant::now() >= snapshot.expires_at
+                {
+                    match list_tools_for_client(server_name, &client.client, client.tool_timeout)
+                        .await
+                    {
+                        Ok(tools) => {
+                            snapshot.tools = tools;
+                            snapshot.expires_at = Instant::now() + CODEX_APPS_TOOLS_CACHE_TTL;
                         }
-                        Err(err) => {
-                            warn!(
-                                "Failed to refresh tools for MCP server '{server_name}', using startup snapshot: {err:#}"
-                            );
-                        }
+                        Err(err) => warn!(
+                            "Failed to refresh MCP tools for '{server_name}', retaining this connection's snapshot: {err:#}"
+                        ),
                     }
                 }
-
-                tools.extend(qualify_tools(filter_tools(server_tools, tool_filter)));
+                tools.extend(qualify_tools(filter_tools(
+                    snapshot.tools.clone(),
+                    client.tool_filter,
+                )));
             }
         }
         tools
@@ -943,7 +939,10 @@ async fn start_server_task(
 
     let managed = ManagedClient {
         client: Arc::clone(&client),
-        tools,
+        tools: Arc::new(Mutex::new(ConnectionTools {
+            tools,
+            expires_at: Instant::now() + CODEX_APPS_TOOLS_CACHE_TTL,
+        })),
         tool_timeout: Some(tool_timeout),
         tool_filter,
         server_supports_sandbox_state_capability,
@@ -997,50 +996,6 @@ async fn make_rmcp_client(
 }
 
 async fn list_tools_for_client(
-    server_name: &str,
-    client: &Arc<RmcpClient>,
-    timeout: Option<Duration>,
-) -> Result<Vec<ToolInfo>> {
-    if server_name == CODEX_APPS_MCP_SERVER_NAME
-        && let Some(cached_tools) = read_cached_codex_apps_tools()
-    {
-        return Ok(cached_tools);
-    }
-
-    let tools = list_tools_for_client_uncached(server_name, client, timeout).await?;
-    if server_name == CODEX_APPS_MCP_SERVER_NAME {
-        write_cached_codex_apps_tools(&tools);
-    }
-    Ok(tools)
-}
-
-fn read_cached_codex_apps_tools() -> Option<Vec<ToolInfo>> {
-    let mut cache_guard = CODEX_APPS_TOOLS_CACHE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let now = Instant::now();
-
-    if let Some(cached) = cache_guard.as_ref()
-        && now < cached.expires_at
-    {
-        return Some(cached.tools.clone());
-    }
-
-    *cache_guard = None;
-    None
-}
-
-fn write_cached_codex_apps_tools(tools: &[ToolInfo]) {
-    let mut cache_guard = CODEX_APPS_TOOLS_CACHE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    *cache_guard = Some(CachedCodexAppsTools {
-        expires_at: Instant::now() + CODEX_APPS_TOOLS_CACHE_TTL,
-        tools: tools.to_vec(),
-    });
-}
-
-async fn list_tools_for_client_uncached(
     server_name: &str,
     client: &Arc<RmcpClient>,
     timeout: Option<Duration>,

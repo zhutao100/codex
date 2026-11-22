@@ -35,6 +35,12 @@ pub struct CodexThread {
 /// Conduit for the bidirectional stream of messages that compose a thread
 /// (formerly called a conversation) in Codex.
 impl CodexThread {
+    pub(crate) async fn mcp_config_for_reload(
+        &self,
+        cloud: crate::config_loader::CloudRequirementsLoader,
+    ) -> std::io::Result<crate::config::Config> {
+        self.codex.session.mcp_config_for_reload(cloud).await
+    }
     pub(crate) async fn queue_trusted_mcp_refresh(
         &self,
         refresh: codex_protocol::protocol::McpServerRefreshConfig,
@@ -95,5 +101,91 @@ impl CodexThread {
             .as_ref()
             .map(|turn| turn.tasks.keys().cloned().collect())
             .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::AuthManager;
+    use crate::CodexAuth;
+    use crate::ThreadManager;
+    use crate::config::ConfigBuilder;
+    use crate::config::ConfigOverrides;
+    use crate::config::set_project_trust_level;
+    use codex_protocol::config_types::TrustLevel;
+    use pretty_assertions::assert_eq;
+    use std::collections::BTreeSet;
+
+    #[tokio::test]
+    async fn workspace_mcp_reload_preserves_session_flags_and_pending_installs()
+    -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let projects = tempfile::tempdir()?;
+        let auth = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("test"));
+        let manager = ThreadManager::new(home.path().into(), auth, SessionSource::Exec);
+        let mut threads = Vec::new();
+        let server = "command = 'unused'\nenabled = false\n";
+        for name in ["first", "second"] {
+            let project = projects.path().join(name);
+            std::fs::create_dir_all(project.join(".git"))?;
+            std::fs::create_dir_all(project.join(".codex"))?;
+            let project = project.canonicalize()?;
+            let file = project.join(".codex/config.toml");
+            std::fs::write(&file, format!("[mcp_servers.removed]\n{server}"))?;
+            set_project_trust_level(home.path(), &project, TrustLevel::Trusted)?;
+            let config = ConfigBuilder::default()
+                .codex_home(home.path().into())
+                .harness_overrides(ConfigOverrides {
+                    cwd: Some(project),
+                    ..Default::default()
+                })
+                .cli_overrides(vec![(
+                    "mcp_servers.flag".into(),
+                    server.parse::<toml::Table>()?.into(),
+                )])
+                .build()
+                .await?;
+            assert!(config.mcp_servers.get().contains_key("removed"));
+            let mode = config.mcp_oauth_credentials_store_mode;
+            let thread = manager.start_thread(config).await?.thread;
+            std::fs::write(file, format!("[mcp_servers.{name}]\n{server}"))?;
+            threads.push((name, thread, mode));
+        }
+        manager.refresh_mcp_servers(Default::default()).await?;
+        for (name, thread, mode) in threads {
+            let session = &thread.codex.session;
+            let mut expected = session.configured_mcp_servers().await;
+            assert_eq!(
+                expected.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+                [name, "flag"].into_iter().collect()
+            );
+            let new_server = expected[name].clone();
+            expected.insert("installed".into(), new_server.clone());
+            let turn = session.new_default_turn().await;
+            session
+                .refresh_mcp_servers_after_install(
+                    &turn,
+                    vec![("installed".into(), new_server)],
+                    mode,
+                )
+                .await;
+            assert_eq!(session.configured_mcp_servers().await, expected);
+            assert_eq!(
+                session
+                    .services
+                    .mcp_connection_manager
+                    .read()
+                    .await
+                    .configured_servers,
+                expected
+            );
+            thread.submit(Op::Shutdown).await?;
+            while !matches!(
+                thread.next_event().await?.msg,
+                crate::protocol::EventMsg::ShutdownComplete
+            ) {}
+        }
+        Ok(())
     }
 }

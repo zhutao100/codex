@@ -1,6 +1,44 @@
 use super::*;
 
 impl Session {
+    pub(crate) async fn mcp_config_for_reload(
+        &self,
+        cloud: crate::config_loader::CloudRequirementsLoader,
+    ) -> std::io::Result<Config> {
+        let (startup, cwd) = {
+            let state = self.state.lock().await;
+            let session = &state.session_configuration;
+            (
+                session.original_config_do_not_use.clone(),
+                session.cwd.clone(),
+            )
+        };
+        let flags = startup
+            .config_layer_stack
+            .layers_high_to_low()
+            .into_iter()
+            .find(|layer| {
+                matches!(
+                    layer.name,
+                    codex_app_server_protocol::ConfigLayerSource::SessionFlags
+                )
+            })
+            .and_then(|layer| layer.config.as_table())
+            .map(|flags| flags.clone().into_iter().collect())
+            .unwrap_or_default();
+        crate::config::ConfigBuilder::default()
+            .codex_home(startup.codex_home.clone())
+            .harness_overrides(crate::config::ConfigOverrides {
+                cwd: Some(cwd),
+                config_profile: startup.active_profile.clone(),
+                ..Default::default()
+            })
+            .cli_overrides(flags)
+            .cloud_requirements(cloud)
+            .build()
+            .await
+    }
+
     pub(crate) async fn queue_trusted_mcp_refresh(
         &self,
         refresh: McpServerRefreshConfig,

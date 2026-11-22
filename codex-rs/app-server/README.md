@@ -113,7 +113,7 @@ Raw Responses items in resume payloads and raw item notifications can include op
 - `skills/config/write` — write user-level skill config by path.
 - `mcpServer/oauth/login` — start an OAuth login for a configured MCP server; returns an `authorization_url` and later emits `mcpServer/oauthLogin/completed` once the browser flow finishes.
 - `tool/requestUserInput` — prompt the user with 1–3 short questions for a tool call and return their answers (experimental).
-- `config/mcpServer/reload` — reload MCP configuration and requirements from disk. Existing connections refresh on each thread's next active turn; a pending skill-install approval is rechecked against the reloaded requirements before any global config write. Returns `{}`.
+- `config/mcpServer/reload` — reread MCP configuration for each loaded thread's current working directory, profile and session overrides. Connections refresh on that thread's next active turn; a pending skill install is rechecked against its workspace's configuration and current requirements before any global config write. Returns `{}`.
 - `mcpServerStatus/list` — enumerate configured MCP servers with their tools, resources, resource templates, and auth status; supports cursor+limit pagination.
 - `feedback/upload` — submit a feedback report (classification + optional reason/logs and conversation_id); returns the tracking thread id.
 - `command/exec` — run a single command under the server sandbox without starting a thread/turn (handy for utilities and validation).
@@ -698,7 +698,7 @@ To enable or disable a skill by path:
 
 ## Apps
 
-Use `app/list` to fetch available apps (connectors). Each entry includes metadata like the app `id`, display `name`, `installUrl`, and whether it is currently accessible. Hosted directory requests use the current ChatGPT account. After logout, listing does not contact the directory with the previous account's credentials.
+Use `app/list` to fetch available apps (connectors). Each entry includes metadata like the app `id`, display `name`, `installUrl`, and whether it is currently accessible. Hosted directory requests use the current ChatGPT account, and accessibility comes from tools discovered on its MCP connection. Logout and account changes do not reuse the previous account's credentials or tools.
 
 ```json
 { "method": "app/list", "id": 50, "params": {

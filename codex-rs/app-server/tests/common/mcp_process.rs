@@ -690,6 +690,10 @@ impl McpProcess {
         self.send_request("fuzzyFileSearch", Some(params)).await
     }
 
+    pub async fn send_mcp_server_reload_request(&mut self) -> anyhow::Result<i64> {
+        self.send_request("config/mcpServer/reload", None).await
+    }
+
     async fn send_request(
         &mut self,
         method: &str,

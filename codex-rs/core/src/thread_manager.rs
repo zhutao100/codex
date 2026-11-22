@@ -220,13 +220,10 @@ impl ThreadManager {
         self.state.threads.read().await.keys().copied().collect()
     }
 
-    pub async fn refresh_mcp_servers(&self, config: &Config) -> serde_json::Result<()> {
-        let refresh = McpServerRefreshConfig {
-            mcp_servers: serde_json::to_value(config.mcp_servers.get())?,
-            mcp_oauth_credentials_store_mode: serde_json::to_value(
-                config.mcp_oauth_credentials_store_mode,
-            )?,
-        };
+    pub async fn refresh_mcp_servers(
+        &self,
+        cloud: crate::config_loader::CloudRequirementsLoader,
+    ) -> std::io::Result<usize> {
         let threads = self
             .state
             .threads
@@ -235,12 +232,22 @@ impl ThreadManager {
             .values()
             .cloned()
             .collect::<Vec<_>>();
+        let mut prepared = Vec::with_capacity(threads.len());
         for thread in threads {
-            thread
-                .queue_trusted_mcp_refresh(refresh.clone(), config.mcp_servers.clone())
-                .await;
+            let config = thread.mcp_config_for_reload(cloud.clone()).await?;
+            let refresh = McpServerRefreshConfig {
+                mcp_servers: serde_json::to_value(config.mcp_servers.get())?,
+                mcp_oauth_credentials_store_mode: serde_json::to_value(
+                    config.mcp_oauth_credentials_store_mode,
+                )?,
+            };
+            prepared.push((thread, refresh, config.mcp_servers));
         }
-        Ok(())
+        let refreshed = prepared.len();
+        for (thread, refresh, constraints) in prepared {
+            thread.queue_trusted_mcp_refresh(refresh, constraints).await;
+        }
+        Ok(refreshed)
     }
 
     pub fn subscribe_thread_created(&self) -> broadcast::Receiver<ThreadId> {

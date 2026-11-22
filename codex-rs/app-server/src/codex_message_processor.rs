@@ -3376,26 +3376,32 @@ impl CodexMessageProcessor {
     }
 
     async fn mcp_server_refresh(&self, request_id: ConnectionRequestId, _params: Option<()>) {
-        let config = match self.load_latest_config().await {
-            Ok(config) => config,
-            Err(error) => {
-                self.outgoing.send_error(request_id, error).await;
+        match self
+            .thread_manager
+            .refresh_mcp_servers(self.current_cloud_requirements())
+            .await
+        {
+            Ok(0) => {
+                // Without a thread, the server's own configuration is still validated.
+                if let Err(error) = self.load_latest_config().await {
+                    self.outgoing.send_error(request_id, error).await;
+                    return;
+                }
+            }
+            Ok(_) => {}
+            Err(err) => {
+                self.outgoing
+                    .send_error(
+                        request_id,
+                        JSONRPCErrorError {
+                            code: INTERNAL_ERROR_CODE,
+                            message: format!("failed to prepare MCP refresh: {err}"),
+                            data: None,
+                        },
+                    )
+                    .await;
                 return;
             }
-        };
-
-        if let Err(err) = self.thread_manager.refresh_mcp_servers(&config).await {
-            self.outgoing
-                .send_error(
-                    request_id,
-                    JSONRPCErrorError {
-                        code: INTERNAL_ERROR_CODE,
-                        message: format!("failed to prepare MCP refresh: {err}"),
-                        data: None,
-                    },
-                )
-                .await;
-            return;
         }
         let response = McpServerRefreshResponse {};
         self.outgoing.send_response(request_id, response).await;

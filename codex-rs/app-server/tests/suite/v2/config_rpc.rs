@@ -38,6 +38,30 @@ fn write_config(codex_home: &TempDir, contents: &str) -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_reload_without_threads_validates_current_config() -> Result<()> {
+    let home = TempDir::new()?;
+    let mut mcp = McpProcess::new(home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    write_config(&home, "[invalid\n")?;
+    let id = mcp.send_mcp_server_reload_request().await?;
+    let error = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(id)),
+    )
+    .await??;
+    assert!(error.error.message.contains("failed to reload config"));
+    write_config(&home, "")?;
+    let id = mcp.send_mcp_server_reload_request().await?;
+    let success = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(id)),
+    )
+    .await??;
+    assert_eq!(success.result, json!({}));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn config_read_returns_effective_and_layers() -> Result<()> {
     let codex_home = TempDir::new()?;
     write_config(
