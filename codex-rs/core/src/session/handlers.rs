@@ -770,8 +770,8 @@ pub async fn refresh_mcp_servers(sess: &Arc<Session>, refresh_config: McpServerR
 }
 
 pub async fn list_mcp_tools(sess: &Session, config: &Arc<Config>, sub_id: String) {
-    let mcp_connection_manager = sess.services.mcp_connection_manager.read().await;
     let auth = sess.services.auth_manager.auth().await;
+    let mcp_connection_manager = sess.current_mcp_manager().await;
     let mcp_servers = effective_mcp_servers(config, auth.as_ref());
     let snapshot = collect_mcp_snapshot_from_manager(
         &mcp_connection_manager,

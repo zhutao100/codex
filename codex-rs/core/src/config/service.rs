@@ -11,9 +11,6 @@ use crate::config_loader::LoaderOverrides;
 use crate::config_loader::load_config_layers_state;
 use crate::config_loader::merge_toml_values;
 use crate::path_utils;
-use crate::path_utils::SymlinkWritePaths;
-use crate::path_utils::resolve_symlink_write_paths;
-use crate::path_utils::write_atomically;
 use codex_app_server_protocol::Config as ApiConfig;
 use codex_app_server_protocol::ConfigBatchWriteParams;
 use codex_app_server_protocol::ConfigLayerMetadata;
@@ -268,7 +265,7 @@ impl ConfigService {
             .map_err(|err| ConfigServiceError::io("failed to load configuration", err))?;
         let user_layer = match layers.get_user_layer() {
             Some(layer) => Cow::Borrowed(layer),
-            None => Cow::Owned(create_empty_user_layer(&allowed_path).await?),
+            None => Cow::Owned(create_empty_user_layer(&self.codex_home, &allowed_path).await?),
         };
 
         if let Some(expected) = expected_version.as_deref()
@@ -389,47 +386,22 @@ impl ConfigService {
 }
 
 async fn create_empty_user_layer(
+    home: &std::path::Path,
     config_toml: &AbsolutePathBuf,
 ) -> Result<ConfigLayerEntry, ConfigServiceError> {
-    let SymlinkWritePaths {
-        read_path,
-        write_path,
-    } = resolve_symlink_write_paths(config_toml.as_path())
-        .map_err(|err| ConfigServiceError::io("failed to resolve user config path", err))?;
-    let toml_value = match read_path {
-        Some(path) => match tokio::fs::read_to_string(&path).await {
-            Ok(contents) => toml::from_str(&contents).map_err(|e| {
-                ConfigServiceError::toml("failed to parse existing user config.toml", e)
-            })?,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                write_empty_user_config(write_path.clone()).await?;
-                TomlValue::Table(toml::map::Map::new())
-            }
-            Err(err) => {
-                return Err(ConfigServiceError::io(
-                    "failed to read user config.toml",
-                    err,
-                ));
-            }
-        },
-        None => {
-            write_empty_user_config(write_path).await?;
-            TomlValue::Table(toml::map::Map::new())
-        }
-    };
+    let home = home.to_owned();
+    let toml_value = task::spawn_blocking(move || super::edit::read_or_create_user_config(&home))
+        .await
+        .map_err(|err| ConfigServiceError::anyhow("config persistence task panicked", err.into()))?
+        .map_err(|err| {
+            ConfigServiceError::anyhow("failed to read or create user config.toml", err)
+        })?;
     Ok(ConfigLayerEntry::new(
         ConfigLayerSource::User {
             file: config_toml.clone(),
         },
         toml_value,
     ))
-}
-
-async fn write_empty_user_config(write_path: PathBuf) -> Result<(), ConfigServiceError> {
-    task::spawn_blocking(move || write_atomically(&write_path, ""))
-        .await
-        .map_err(|err| ConfigServiceError::anyhow("config persistence task panicked", err.into()))?
-        .map_err(|err| ConfigServiceError::io("failed to create empty user config.toml", err))
 }
 
 fn parse_value(value: JsonValue) -> Result<Option<TomlValue>, String> {

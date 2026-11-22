@@ -272,9 +272,7 @@ impl Session {
                     .enabled(Feature::UseLinuxSandboxBwrap),
             };
             if let Err(e) = self
-                .services
-                .mcp_connection_manager
-                .read()
+                .current_mcp_manager()
                 .await
                 .notify_sandbox_state_change(&sandbox_state)
                 .await

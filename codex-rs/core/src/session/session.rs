@@ -410,7 +410,7 @@ impl Session {
         state.set_is_forked_session(forked_from_id.is_some());
 
         let services = SessionServices {
-            mcp_connection_manager: Arc::new(RwLock::new(McpConnectionManager::default())),
+            mcp_connection_manager: RwLock::default(),
             mcp_startup_cancellation_token: Mutex::new(CancellationToken::new()),
             unified_exec_manager: UnifiedExecProcessManager::default(),
             output_store: Default::default(),
@@ -505,10 +505,8 @@ impl Session {
         };
         let cancel_token = sess.mcp_startup_cancellation_token().await;
 
-        sess.services
-            .mcp_connection_manager
-            .write()
-            .await
+        let mut manager = McpConnectionManager::default();
+        manager
             .initialize(
                 &mcp_servers,
                 config.mcp_oauth_credentials_store_mode,
@@ -518,6 +516,7 @@ impl Session {
                 sandbox_state,
             )
             .await;
+        *sess.services.mcp_connection_manager.write().await = Arc::new(manager);
 
         // record_initial_history can emit events. We record only after the SessionConfiguredEvent is emitted.
         sess.record_initial_history(initial_history).await;

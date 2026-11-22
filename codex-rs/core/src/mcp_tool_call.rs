@@ -286,13 +286,7 @@ async fn lookup_mcp_tool_metadata(
     server: &str,
     tool_name: &str,
 ) -> Option<McpToolApprovalMetadata> {
-    let tools = sess
-        .services
-        .mcp_connection_manager
-        .read()
-        .await
-        .list_all_tools()
-        .await;
+    let tools = sess.current_mcp_manager().await.list_all_tools().await;
 
     tools.into_values().find_map(|tool_info| {
         if tool_info.server_name == server && tool_info.tool_name == tool_name {

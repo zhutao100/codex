@@ -698,7 +698,7 @@ To enable or disable a skill by path:
 
 ## Apps
 
-Use `app/list` to fetch available apps (connectors). Each entry includes metadata like the app `id`, display `name`, `installUrl`, and whether it is currently accessible. Hosted directory requests use the current ChatGPT account, and accessibility comes from tools discovered on its MCP connection. Logout and account changes do not reuse the previous account's credentials or tools.
+Use `app/list` to fetch available apps (connectors). Each entry includes metadata like the app `id`, display `name`, `installUrl`, and whether it is currently accessible. Hosted directory requests and tools use the current account. After logout or an account switch, an already-loaded thread also drops its old hosted tool connection before advertising or dispatching app tools.
 
 ```json
 { "method": "app/list", "id": 50, "params": {

@@ -129,18 +129,23 @@ pub(crate) fn with_codex_apps_mcp(
     auth: Option<&CodexAuth>,
     config: &Config,
 ) -> HashMap<String, McpServerConfig> {
-    if connectors_enabled
-        && (auth.is_some_and(CodexAuth::is_chatgpt_auth)
-            || codex_apps_mcp_bearer_token_env_var().is_some())
-    {
-        servers.insert(
-            CODEX_APPS_MCP_SERVER_NAME.to_string(),
-            codex_apps_mcp_server_config(config, auth),
-        );
+    if let Some(server) = hosted_apps_server(connectors_enabled, auth, config) {
+        servers.insert(CODEX_APPS_MCP_SERVER_NAME.to_string(), server);
     } else {
         servers.remove(CODEX_APPS_MCP_SERVER_NAME);
     }
     servers
+}
+
+pub(crate) fn hosted_apps_server(
+    connectors_enabled: bool,
+    auth: Option<&CodexAuth>,
+    config: &Config,
+) -> Option<McpServerConfig> {
+    (connectors_enabled
+        && (auth.is_some_and(CodexAuth::is_chatgpt_auth)
+            || codex_apps_mcp_bearer_token_env_var().is_some()))
+    .then(|| codex_apps_mcp_server_config(config, auth))
 }
 
 pub(crate) fn effective_mcp_servers(

@@ -506,9 +506,7 @@ async fn run_turn_inner(
         );
         let connector_slug_counts = if turn_context.config.features.enabled(Feature::Apps) {
             let mcp_tools = match sess
-                .services
-                .mcp_connection_manager
-                .read()
+                .current_mcp_manager()
                 .await
                 .list_all_tools()
                 .or_cancel(&cancellation_token)
@@ -1720,7 +1718,7 @@ async fn sampling_tool_router(
     tool_selection: SamplingRequestToolSelection<'_>,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<Arc<ToolRouter>> {
-    let mcp_connection_manager = sess.services.mcp_connection_manager.read().await;
+    let mcp_connection_manager = sess.current_mcp_manager().await;
     let has_mcp_servers = mcp_connection_manager.has_servers();
     let mut mcp_tools = mcp_connection_manager
         .list_all_tools()

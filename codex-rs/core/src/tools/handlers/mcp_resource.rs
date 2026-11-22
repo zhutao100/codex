@@ -283,9 +283,7 @@ async fn handle_list_resources(
             }
 
             let resources = session
-                .services
-                .mcp_connection_manager
-                .read()
+                .current_mcp_manager()
                 .await
                 .list_all_resources()
                 .await;
@@ -390,9 +388,7 @@ async fn handle_list_resource_templates(
             }
 
             let templates = session
-                .services
-                .mcp_connection_manager
-                .read()
+                .current_mcp_manager()
                 .await
                 .list_all_resource_templates()
                 .await;

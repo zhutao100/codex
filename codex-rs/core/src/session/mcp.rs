@@ -1,6 +1,53 @@
 use super::*;
 
 impl Session {
+    /// Keep workspace connections alive across login/logout, but never send a new request
+    /// through a hosted connection established with different account credentials.
+    pub(crate) async fn current_mcp_manager(&self) -> Arc<McpConnectionManager> {
+        let clients = &self.services.mcp_connection_manager;
+        if !self.features.enabled(Feature::Apps) {
+            return clients.read().await.clone();
+        }
+        let config = self.get_config().await;
+        let desired = || {
+            crate::mcp::hosted_apps_server(
+                true,
+                self.services.auth_manager.auth_cached().as_ref(),
+                &config,
+            )
+        };
+        let guard = clients.read().await;
+        if guard
+            .configured_servers
+            .get(crate::mcp::CODEX_APPS_MCP_SERVER_NAME)
+            == desired().as_ref()
+        {
+            return guard.clone();
+        }
+        drop(guard);
+        let sandbox_state = {
+            let state = self.state.lock().await;
+            let session = &state.session_configuration;
+            SandboxState {
+                sandbox_policy: session.sandbox_policy.get().clone(),
+                sandbox_cwd: session.cwd.clone(),
+                codex_linux_sandbox_exe: config.codex_linux_sandbox_exe.clone(),
+                use_linux_sandbox_bwrap: self.features.enabled(Feature::UseLinuxSandboxBwrap),
+            }
+        };
+        let mut guard = clients.write().await;
+        Arc::make_mut(&mut guard)
+            .rebind_hosted_apps(
+                desired(),
+                config.mcp_oauth_credentials_store_mode,
+                self.mcp_startup_cancellation_token().await,
+                self.get_tx_event(),
+                sandbox_state,
+            )
+            .await;
+        guard.clone()
+    }
+
     pub(crate) async fn mcp_config_for_reload(
         &self,
         cloud: crate::config_loader::CloudRequirementsLoader,
@@ -13,6 +60,9 @@ impl Session {
                 session.cwd.clone(),
             )
         };
+        if startup.bounded_explorer {
+            return Ok((*startup).clone());
+        }
         let flags = startup
             .config_layer_stack
             .layers_high_to_low()
@@ -55,9 +105,7 @@ impl Session {
         id: RequestId,
         response: ElicitationResponse,
     ) -> anyhow::Result<()> {
-        self.services
-            .mcp_connection_manager
-            .read()
+        self.current_mcp_manager()
             .await
             .resolve_elicitation(server_name, id, response)
             .await
@@ -68,9 +116,7 @@ impl Session {
         server: &str,
         params: Option<PaginatedRequestParam>,
     ) -> anyhow::Result<ListResourcesResult> {
-        self.services
-            .mcp_connection_manager
-            .read()
+        self.current_mcp_manager()
             .await
             .list_resources(server, params)
             .await
@@ -81,9 +127,7 @@ impl Session {
         server: &str,
         params: Option<PaginatedRequestParam>,
     ) -> anyhow::Result<ListResourceTemplatesResult> {
-        self.services
-            .mcp_connection_manager
-            .read()
+        self.current_mcp_manager()
             .await
             .list_resource_templates(server, params)
             .await
@@ -94,9 +138,7 @@ impl Session {
         server: &str,
         params: ReadResourceRequestParam,
     ) -> anyhow::Result<ReadResourceResult> {
-        self.services
-            .mcp_connection_manager
-            .read()
+        self.current_mcp_manager()
             .await
             .read_resource(server, params)
             .await
@@ -108,18 +150,14 @@ impl Session {
         tool: &str,
         arguments: Option<serde_json::Value>,
     ) -> anyhow::Result<CallToolResult> {
-        self.services
-            .mcp_connection_manager
-            .read()
+        self.current_mcp_manager()
             .await
             .call_tool(server, tool, arguments)
             .await
     }
 
     pub(crate) async fn parse_mcp_tool_name(&self, tool_name: &str) -> Option<(String, String)> {
-        self.services
-            .mcp_connection_manager
-            .read()
+        self.current_mcp_manager()
             .await
             .parse_tool_name(tool_name)
             .await
@@ -133,6 +171,10 @@ impl Session {
     ) {
         let auth = self.services.auth_manager.auth().await;
         let config = self.get_config().await;
+        // A bounded explorer has no MCP transports, including after a direct refresh request.
+        if config.bounded_explorer {
+            return;
+        }
         let constrained = match crate::mcp::constrain_servers(
             &config.mcp_servers,
             self.refreshed_mcp_constraints.read().await.as_ref(),
@@ -172,7 +214,8 @@ impl Session {
             .await;
 
         let mut manager = self.services.mcp_connection_manager.write().await;
-        *manager = refreshed_manager;
+        manager.retire_hosted_apps();
+        *manager = Arc::new(refreshed_manager);
     }
 
     pub(super) async fn refresh_mcp_servers_if_requested(&self, turn_context: &TurnContext) {
@@ -214,13 +257,7 @@ impl Session {
         added: Vec<(String, McpServerConfig)>,
         store_mode: OAuthCredentialsStoreMode,
     ) {
-        let running = self
-            .services
-            .mcp_connection_manager
-            .read()
-            .await
-            .configured_servers
-            .clone();
+        let running = self.current_mcp_manager().await.configured_servers.clone();
         let mut pending = self.pending_mcp_server_refresh_config.lock().await;
         let mut servers: HashMap<String, McpServerConfig> = pending
             .as_ref()
@@ -248,12 +285,7 @@ impl Session {
             return servers;
         }
         drop(pending);
-        self.services
-            .mcp_connection_manager
-            .read()
-            .await
-            .configured_servers
-            .clone()
+        self.current_mcp_manager().await.configured_servers.clone()
     }
 
     pub(super) async fn mcp_startup_cancellation_token(&self) -> CancellationToken {

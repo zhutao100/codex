@@ -15,7 +15,8 @@ use super::auth::McpOAuthLoginSupport;
 use super::auth::oauth_login_support;
 use super::effective_mcp_servers;
 use crate::config::Config;
-use crate::config::edit::ConfigEditsBuilder;
+use crate::config::edit::add_mcp_servers;
+#[cfg(test)]
 use crate::config::load_global_mcp_servers;
 use crate::config::types::McpServerConfig;
 use crate::config::types::McpServerTransportConfig;
@@ -223,47 +224,34 @@ async fn maybe_install_mcp_dependencies(
     let config = &turn_context.config;
     let codex_home = config.codex_home.clone();
 
-    let mut servers = match load_global_mcp_servers(&codex_home).await {
-        Ok(servers) => servers,
+    let current_constraints = sess.refreshed_mcp_constraints.read().await;
+    let mut installed = sess.configured_mcp_servers().await;
+    let auth = sess.services.auth_manager.auth().await;
+    let admission_config = config.clone();
+    let constraints = current_constraints.clone();
+    let cancellation = cancellation_token.clone();
+    let added = match add_mcp_servers(codex_home, move |latest| {
+        if cancellation.is_cancelled() {
+            return HashMap::new();
+        }
+        installed.extend(latest);
+        admit_candidates(
+            &admission_config,
+            constraints.as_ref(),
+            auth.as_ref(),
+            installed,
+            approved,
+        )
+    })
+    .await
+    {
+        Ok(added) if added.is_empty() => return,
+        Ok(added) => added,
         Err(err) => {
-            warn!("failed to load MCP servers while installing skill dependencies: {err}");
+            warn!("failed to persist MCP dependencies for mentioned skills: {err}");
             return;
         }
     };
-
-    let current_constraints = sess.refreshed_mcp_constraints.read().await;
-    let mut installed = sess.configured_mcp_servers().await;
-    for (name, server) in &servers {
-        installed
-            .entry(name.clone())
-            .or_insert_with(|| server.clone());
-    }
-    let auth = sess.services.auth_manager.auth().await;
-    let missing = admit_candidates(
-        config,
-        current_constraints.as_ref(),
-        auth.as_ref(),
-        installed,
-        approved,
-    );
-    if missing.is_empty() || cancellation_token.is_cancelled() {
-        return;
-    }
-    let mut added = Vec::new();
-    for (name, config) in missing {
-        servers.insert(name.clone(), config.clone());
-        added.push((name, config));
-    }
-
-    if let Err(err) = ConfigEditsBuilder::new(&codex_home)
-        .replace_mcp_servers(&servers)
-        .apply()
-        .await
-    {
-        warn!("failed to persist MCP dependencies for mentioned skills: {err}");
-        return;
-    }
-
     drop(current_constraints);
     for (name, server_config) in &added {
         let oauth_config = match oauth_login_support(&server_config.transport).await {

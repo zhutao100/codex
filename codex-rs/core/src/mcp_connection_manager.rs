@@ -260,6 +260,8 @@ impl ManagedClient {
 #[derive(Clone)]
 struct AsyncManagedClient {
     client: Shared<BoxFuture<'static, Result<ManagedClient, StartupOutcomeError>>>,
+    startup: CancellationToken,
+    retired: CancellationToken,
 }
 
 impl AsyncManagedClient {
@@ -272,6 +274,7 @@ impl AsyncManagedClient {
         elicitation_requests: ElicitationRequestManager,
     ) -> Self {
         let tool_filter = ToolFilter::from_config(&config);
+        let startup = cancel_token.clone();
         let fut = async move {
             if let Err(error) = validate_mcp_server_name(&server_name) {
                 return Err(error.into());
@@ -297,6 +300,8 @@ impl AsyncManagedClient {
         };
         Self {
             client: fut.boxed().shared(),
+            startup,
+            retired: CancellationToken::new(),
         }
     }
 
@@ -327,7 +332,7 @@ pub struct SandboxState {
 }
 
 /// A thin wrapper around a set of running [`RmcpClient`] instances.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct McpConnectionManager {
     pub(crate) configured_servers: HashMap<String, McpServerConfig>,
     clients: HashMap<String, AsyncManagedClient>,
@@ -335,6 +340,60 @@ pub(crate) struct McpConnectionManager {
 }
 
 impl McpConnectionManager {
+    pub(crate) fn retire_hosted_apps(&self) {
+        if let Some(previous) = self.clients.get(CODEX_APPS_MCP_SERVER_NAME) {
+            previous.startup.cancel();
+            previous.retired.cancel();
+        }
+    }
+
+    pub(crate) async fn rebind_hosted_apps(
+        &mut self,
+        server: Option<McpServerConfig>,
+        store_mode: OAuthCredentialsStoreMode,
+        cancel: CancellationToken,
+        tx: Sender<Event>,
+        sandbox_state: SandboxState,
+    ) {
+        let name = CODEX_APPS_MCP_SERVER_NAME;
+        if self.configured_servers.get(name) == server.as_ref() {
+            return;
+        }
+        self.retire_hosted_apps();
+        self.clients.remove(name);
+        self.elicitation_requests
+            .requests
+            .lock()
+            .await
+            .retain(|(server, _), _| server != name);
+        self.configured_servers.remove(name);
+        if let Some(config) = server {
+            self.configured_servers
+                .insert(name.to_owned(), config.clone());
+            let client = AsyncManagedClient::new(
+                name.to_owned(),
+                config,
+                store_mode,
+                if cancel.is_cancelled() {
+                    CancellationToken::new()
+                } else {
+                    cancel.child_token()
+                },
+                tx,
+                self.elicitation_requests.clone(),
+            );
+            self.clients.insert(name.to_owned(), client.clone());
+            tokio::spawn(async move {
+                if let Ok(ready) = client.client().await
+                    && !client.retired.is_cancelled()
+                    && let Err(err) = ready.notify_sandbox_state_change(&sandbox_state).await
+                {
+                    warn!("failed to notify sandbox state to rebound app connection: {err:#}");
+                }
+            });
+        }
+    }
+
     pub(crate) fn has_servers(&self) -> bool {
         !self.clients.is_empty()
     }
@@ -655,12 +714,35 @@ impl McpConnectionManager {
                 "tool '{tool}' is disabled for MCP server '{server}'"
             ));
         }
+        if server == CODEX_APPS_MCP_SERVER_NAME
+            && !client
+                .tools
+                .lock()
+                .await
+                .tools
+                .iter()
+                .any(|entry| entry.tool_name == tool)
+        {
+            return Err(anyhow!(
+                "tool '{tool}' is not available on the current app connection"
+            ));
+        }
 
-        let result: rmcp::model::CallToolResult = client
+        let call = client
             .client
-            .call_tool(tool.to_string(), arguments, client.tool_timeout)
-            .await
-            .with_context(|| format!("tool call failed for `{server}/{tool}`"))?;
+            .call_tool(tool.to_string(), arguments, client.tool_timeout);
+        let result = if server == CODEX_APPS_MCP_SERVER_NAME {
+            let lease = &self.clients[server].retired;
+            if lease.is_cancelled() {
+                return Err(anyhow!("app connection changed"));
+            }
+            call.or_cancel(lease)
+                .await
+                .map_err(|_| anyhow!("app connection changed"))?
+        } else {
+            call.await
+        }
+        .with_context(|| format!("tool call failed for `{server}/{tool}`"))?;
 
         let content = result
             .content

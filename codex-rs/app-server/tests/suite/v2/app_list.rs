@@ -41,6 +41,157 @@ use tokio::time::timeout;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[tokio::test]
+async fn loaded_thread_rebinds_app_tools_on_logout_and_login() -> Result<()> {
+    use app_test_support::ChatGptIdTokenClaims;
+    use app_test_support::encode_id_token;
+    use codex_app_server_protocol::ThreadStartResponse;
+    use codex_app_server_protocol::TurnStartParams;
+    use codex_app_server_protocol::UserInput;
+    use core_test_support::responses;
+
+    core_test_support::skip_if_no_network_unless_localhost!(Ok(()));
+    let model = responses::start_mock_server().await;
+    let (apps, task, _) = start_apps_server(vec![], vec![connector_tool("beta", "Beta")?]).await?;
+    let home = TempDir::new()?;
+    std::fs::write(
+        home.path().join("config.toml"),
+        format!(
+            r#"
+chatgpt_base_url = "{apps}"
+model_provider = "fixture"
+model = "mock-model"
+approval_policy = "never"
+[features]
+connectors = true
+[model_providers.fixture]
+name = "Fixture"
+base_url = "{}/v1"
+wire_api = "responses"
+"#,
+            model.uri()
+        ),
+    )?;
+    write_chatgpt_auth(
+        home.path(),
+        ChatGptAuthFixture::new("chatgpt-token")
+            .account_id("account-123")
+            .chatgpt_account_id("account-123"),
+        AuthCredentialsStoreMode::File,
+    )?;
+    let mut mcp = McpProcess::new(home.path()).await?;
+    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+    let start = mcp.send_thread_start_request(Default::default()).await?;
+    let reply = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(start)),
+    )
+    .await??;
+    let thread = to_response::<ThreadStartResponse>(reply)?.thread.id;
+    for (step, expected) in ["beta", "", "gamma"].into_iter().enumerate() {
+        let auth_request = match step {
+            1 => Some(mcp.send_logout_account_request().await?),
+            2 => {
+                let token = encode_id_token(
+                    &ChatGptIdTokenClaims::new()
+                        .chatgpt_account_id("account-456")
+                        .plan_type("pro"),
+                )?;
+                Some(
+                    mcp.send_chatgpt_auth_tokens_login_request(token, "second-token".into())
+                        .await?,
+                )
+            }
+            _ => None,
+        };
+        if let Some(id) = auth_request {
+            timeout(
+                DEFAULT_TIMEOUT,
+                mcp.read_stream_until_response_message(RequestId::Integer(id)),
+            )
+            .await??;
+        }
+        let done = responses::sse(vec![
+            responses::ev_assistant_message("answer", "done"),
+            responses::ev_completed("done"),
+        ]);
+        let mut bodies = vec![];
+        if step == 2 {
+            bodies.push(responses::sse(vec![
+                responses::ev_function_call("old-app", "mcp__codex_apps__connector_beta", "{}"),
+                responses::ev_completed("stale"),
+            ]));
+        }
+        bodies.push(done);
+        let mock = responses::mount_sse_sequence(&model, bodies).await;
+        let request = mcp
+            .send_turn_start_request(TurnStartParams {
+                thread_id: thread.clone(),
+                input: vec![
+                    UserInput::Text {
+                        text: "Use the selected apps".into(),
+                        text_elements: vec![],
+                    },
+                    UserInput::Mention {
+                        name: "Beta".into(),
+                        path: "app://beta".into(),
+                    },
+                    UserInput::Mention {
+                        name: "Gamma".into(),
+                        path: "app://gamma".into(),
+                    },
+                ],
+                ..Default::default()
+            })
+            .await?;
+        timeout(
+            DEFAULT_TIMEOUT,
+            mcp.read_stream_until_response_message(RequestId::Integer(request)),
+        )
+        .await??;
+        timeout(
+            DEFAULT_TIMEOUT,
+            mcp.read_stream_until_notification_message("turn/completed"),
+        )
+        .await??;
+        let posts = mock.requests();
+        let body = posts[0].body_json();
+        let tools: Vec<_> = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| {
+                tool["name"]
+                    .as_str()?
+                    .strip_prefix("mcp__codex_apps__connector_")
+            })
+            .collect();
+        assert_eq!(
+            tools,
+            if expected.is_empty() {
+                vec![]
+            } else {
+                vec![expected]
+            }
+        );
+        if step == 2 {
+            assert_eq!(posts.len(), 2);
+            assert!(
+                posts[1]
+                    .function_call_output_text("old-app")
+                    .unwrap()
+                    .contains("unknown")
+                    || posts[1]
+                        .function_call_output_text("old-app")
+                        .unwrap()
+                        .contains("unsupported")
+            );
+        }
+    }
+    task.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn list_apps_returns_empty_when_connectors_disabled() -> Result<()> {
     let codex_home = TempDir::new()?;
     let mut mcp = McpProcess::new(codex_home.path()).await?;

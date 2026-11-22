@@ -2082,7 +2082,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
 
     let file_watcher = Arc::new(FileWatcher::noop());
     let services = SessionServices {
-        mcp_connection_manager: Arc::new(RwLock::new(McpConnectionManager::default())),
+        mcp_connection_manager: RwLock::default(),
         mcp_startup_cancellation_token: Mutex::new(CancellationToken::new()),
         unified_exec_manager: UnifiedExecProcessManager::default(),
         output_store: Default::default(),
@@ -2229,7 +2229,7 @@ pub(crate) async fn make_session_and_context_with_rx() -> (
 
     let file_watcher = Arc::new(FileWatcher::noop());
     let services = SessionServices {
-        mcp_connection_manager: Arc::new(RwLock::new(McpConnectionManager::default())),
+        mcp_connection_manager: RwLock::default(),
         mcp_startup_cancellation_token: Mutex::new(CancellationToken::new()),
         unified_exec_manager: UnifiedExecProcessManager::default(),
         output_store: Default::default(),
@@ -2344,6 +2344,52 @@ async fn override_turn_context_updates_windows_level_in_delegated_config() {
             (level, level, level)
         );
     }
+}
+
+#[tokio::test]
+async fn explorer_reload_does_not_start_a_workspace_transport() -> anyhow::Result<()> {
+    core_test_support::skip_if_no_network_unless_localhost!(Ok(()));
+    let host = tempfile::tempdir()?;
+    let http = wiremock::MockServer::start().await;
+    std::fs::write(
+        host.path().join("config.toml"),
+        format!("[mcp_servers.probe]\nurl = '{}'\n", http.uri()),
+    )?;
+    let mut config = ConfigBuilder::default()
+        .codex_home(host.path().into())
+        .build()
+        .await?;
+    let unrestricted = serde_json::to_value(config.mcp_servers.get())?;
+    assert!(unrestricted.get("probe").is_some());
+    crate::agent::AgentRole::Explorer
+        .apply_to_config(&mut config)
+        .map_err(anyhow::Error::msg)?;
+    let (session, turn, _events) = make_session_and_context_with_rx().await;
+    session
+        .state
+        .lock()
+        .await
+        .session_configuration
+        .original_config_do_not_use = Arc::new(config);
+    let reload = session.mcp_config_for_reload(Default::default()).await?;
+    assert!(reload.mcp_servers.get().is_empty());
+    session
+        .queue_trusted_mcp_refresh(
+            McpServerRefreshConfig {
+                mcp_servers: unrestricted,
+                mcp_oauth_credentials_store_mode: serde_json::to_value(
+                    OAuthCredentialsStoreMode::Auto,
+                )?,
+            },
+            reload.mcp_servers,
+        )
+        .await;
+    session.refresh_mcp_servers_if_requested(&turn).await;
+    let manager = session.current_mcp_manager().await;
+    assert!(manager.list_all_tools().await.is_empty());
+    assert!(!manager.has_servers());
+    assert!(http.received_requests().await.unwrap().is_empty());
+    Ok(())
 }
 
 #[tokio::test]

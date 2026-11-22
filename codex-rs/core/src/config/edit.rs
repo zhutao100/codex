@@ -9,6 +9,7 @@ use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::TrustLevel;
 use codex_protocol::openai_models::ReasoningEffort;
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
 use tokio::task;
@@ -677,8 +678,33 @@ pub fn apply_blocking(
     if edits.is_empty() {
         return Ok(());
     }
+    edit_locked(codex_home, profile, |document| {
+        let mut mutated = false;
+        for edit in edits {
+            mutated |= document.apply(edit)?;
+        }
+        Ok((mutated, ()))
+    })
+}
 
+fn edit_locked<T>(
+    codex_home: &Path,
+    profile: Option<&str>,
+    edit: impl FnOnce(&mut ConfigDocument) -> anyhow::Result<(bool, T)>,
+) -> anyhow::Result<T> {
     let config_path = codex_home.join(CONFIG_TOML_FILE);
+    // Lock a stable sibling, not config.toml: the writer atomically replaces its inode.
+    let target = resolve_symlink_write_paths(&config_path)?.write_path;
+    let lock_path = target.with_added_extension("lock");
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let lock = std::fs::File::options()
+        .read(true)
+        .append(true)
+        .create(true)
+        .open(lock_path)?;
+    lock.lock()?;
     let write_paths = resolve_symlink_write_paths(&config_path)?;
     let serialized = match write_paths.read_path {
         Some(path) => match std::fs::read_to_string(&path) {
@@ -702,24 +728,68 @@ pub fn apply_blocking(
     });
 
     let mut document = ConfigDocument::new(doc, profile);
-    let mut mutated = false;
-
-    for edit in edits {
-        mutated |= document.apply(edit)?;
+    let (mutated, result) = edit(&mut document)?;
+    if mutated {
+        write_atomically(&write_paths.write_path, &document.doc.to_string()).with_context(
+            || {
+                format!(
+                    "failed to persist config.toml at {}",
+                    write_paths.write_path.display()
+                )
+            },
+        )?;
     }
+    Ok(result)
+}
 
-    if !mutated {
-        return Ok(());
-    }
+/// Materialize a previously missing config without truncating a concurrent writer's file.
+pub(super) fn read_or_create_user_config(home: &Path) -> anyhow::Result<toml::Value> {
+    edit_locked(home, None, |document| {
+        let contents = document.doc.to_string();
+        Ok((
+            contents.is_empty(),
+            toml::Value::Table(toml::from_str(&contents)?),
+        ))
+    })
+}
 
-    write_atomically(&write_paths.write_path, &document.doc.to_string()).with_context(|| {
-        format!(
-            "failed to persist config.toml at {}",
-            write_paths.write_path.display()
-        )
-    })?;
-
-    Ok(())
+/// Select and insert absent MCP entries against the same locked user document.
+pub(crate) async fn add_mcp_servers(
+    codex_home: PathBuf,
+    select: impl FnOnce(HashMap<String, McpServerConfig>) -> HashMap<String, McpServerConfig>
+    + Send
+    + 'static,
+) -> anyhow::Result<Vec<(String, McpServerConfig)>> {
+    task::spawn_blocking(move || {
+        edit_locked(&codex_home, None, |document| {
+            let raw: toml::Table = toml::from_str(&document.doc.to_string())?;
+            let servers = if let Some(table) = raw.get("mcp_servers") {
+                super::ensure_no_inline_bearer_tokens(table)?;
+                table.clone().try_into()?
+            } else {
+                HashMap::new()
+            };
+            let mut added = Vec::new();
+            for (name, config) in select(servers) {
+                if document
+                    .doc
+                    .get("mcp_servers")
+                    .and_then(|table| table.get(&name))
+                    .is_none()
+                    && document.write_value(
+                        Scope::Global,
+                        &["mcp_servers", &name],
+                        document_helpers::serialize_mcp_server(&config),
+                    )
+                {
+                    added.push((name, config));
+                }
+            }
+            Ok((!added.is_empty(), added))
+        })
+    })
+    .await
+    .context("MCP config persistence task panicked")?
 }
 
 /// Persist edits asynchronously by offloading the blocking writer.
@@ -1435,6 +1505,48 @@ existing = "value"
 gpt-5 = "gpt-5.1"
 "#;
         assert_eq!(contents, expected);
+    }
+
+    #[tokio::test]
+    async fn concurrent_mcp_additions_do_not_replace_each_other_or_restore_deleted_entries()
+    -> anyhow::Result<()> {
+        let home = tempdir()?;
+        std::fs::write(
+            home.path().join("config.toml"),
+            "model = 'unchanged'\n[mcp_servers.retired]\ncommand = 'old'\n",
+        )?;
+        let add = |name: &'static str| {
+            add_mcp_servers(home.path().into(), move |_| {
+                let server: McpServerConfig =
+                    toml::from_str(&format!("command = '{name}'")).unwrap();
+                HashMap::from([(name.to_owned(), server)])
+            })
+        };
+        let remove = apply(
+            home.path(),
+            None,
+            vec![ConfigEdit::ClearPath {
+                segments: vec!["mcp_servers".into(), "retired".into()],
+            }],
+        );
+        let (a, b, ()) = tokio::try_join!(add("first"), add("second"), remove)?;
+        assert_eq!((a.len(), b.len()), (1, 1));
+        let file: toml::Table =
+            toml::from_str(&std::fs::read_to_string(home.path().join("config.toml"))?)?;
+        assert_eq!(
+            file.get("model").and_then(toml::Value::as_str),
+            Some("unchanged")
+        );
+        assert_eq!(
+            file["mcp_servers"]
+                .as_table()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["first", "second"].into_iter().collect()
+        );
+        Ok(())
     }
 
     #[test]
