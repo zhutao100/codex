@@ -742,14 +742,19 @@ fn edit_locked<T>(
     Ok(result)
 }
 
-/// Materialize a previously missing config without truncating a concurrent writer's file.
-pub(super) fn read_or_create_user_config(home: &Path) -> anyhow::Result<toml::Value> {
+/// Plan and apply a batch against the same version of the user document.
+pub(super) fn update_user_config<T>(
+    home: &Path,
+    prepare: impl FnOnce(toml::Value) -> anyhow::Result<(Vec<ConfigEdit>, T)>,
+) -> anyhow::Result<T> {
     edit_locked(home, None, |document| {
-        let contents = document.doc.to_string();
-        Ok((
-            contents.is_empty(),
-            toml::Value::Table(toml::from_str(&contents)?),
-        ))
+        let value = toml::Value::Table(toml::from_str(&document.doc.to_string())?);
+        let (edits, response) = prepare(value)?;
+        let mut changed = false;
+        for edit in edits {
+            changed |= document.apply(&edit)?;
+        }
+        Ok((changed, response))
     })
 }
 

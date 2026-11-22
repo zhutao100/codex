@@ -1,7 +1,6 @@
 use super::CONFIG_TOML_FILE;
 use super::ConfigToml;
 use crate::config::edit::ConfigEdit;
-use crate::config::edit::ConfigEditsBuilder;
 use crate::config_loader::CloudRequirementsLoader;
 use crate::config_loader::ConfigLayerEntry;
 use crate::config_loader::ConfigLayerStack;
@@ -25,7 +24,6 @@ use codex_app_server_protocol::OverriddenMetadata;
 use codex_app_server_protocol::WriteStatus;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use serde_json::Value as JsonValue;
-use std::borrow::Cow;
 use std::path::Path;
 use std::path::PathBuf;
 use thiserror::Error;
@@ -263,13 +261,60 @@ impl ConfigService {
             .load_thread_agnostic_config()
             .await
             .map_err(|err| ConfigServiceError::io("failed to load configuration", err))?;
-        let user_layer = match layers.get_user_layer() {
-            Some(layer) => Cow::Borrowed(layer),
-            None => Cow::Owned(create_empty_user_layer(&self.codex_home, &allowed_path).await?),
-        };
+        self.write_user_layer(layers, provided_path, expected_version, edits)
+            .await
+    }
 
+    async fn write_user_layer(
+        &self,
+        layers: ConfigLayerStack,
+        provided_path: AbsolutePathBuf,
+        expected_version: Option<String>,
+        edits: Vec<(String, JsonValue, MergeStrategy)>,
+    ) -> Result<ConfigWriteResponse, ConfigServiceError> {
+        let home = self.codex_home.clone();
+        task::spawn_blocking(move || {
+            super::edit::update_user_config(&home, |raw| {
+                Ok(Self::prepare_edits(
+                    &layers,
+                    provided_path,
+                    &home,
+                    raw,
+                    expected_version,
+                    edits,
+                )?)
+            })
+        })
+        .await
+        .map_err(|err| ConfigServiceError::anyhow("config persistence task panicked", err.into()))?
+        .map_err(|err| {
+            err.downcast::<ConfigServiceError>().unwrap_or_else(|err| {
+                ConfigServiceError::anyhow("failed to persist config.toml", err)
+            })
+        })
+    }
+
+    fn prepare_edits(
+        layers: &ConfigLayerStack,
+        provided_path: AbsolutePathBuf,
+        base: &Path,
+        mut user_config: TomlValue,
+        expected_version: Option<String>,
+        edits: Vec<(String, JsonValue, MergeStrategy)>,
+    ) -> Result<(Vec<ConfigEdit>, ConfigWriteResponse), ConfigServiceError> {
+        let resolve = |value| {
+            crate::config_loader::resolve_relative_paths_in_config_toml(value, base)
+                .map_err(|err| ConfigServiceError::io("failed to resolve user config paths", err))
+        };
         if let Some(expected) = expected_version.as_deref()
-            && expected != user_layer.version
+            && expected
+                != ConfigLayerEntry::new(
+                    ConfigLayerSource::User {
+                        file: provided_path.clone(),
+                    },
+                    resolve(user_config.clone())?,
+                )
+                .version
         {
             return Err(ConfigServiceError::write(
                 ConfigWriteErrorCode::ConfigVersionConflict,
@@ -277,7 +322,6 @@ impl ConfigService {
             ));
         }
 
-        let mut user_config = user_layer.config.clone();
         let mut parsed_segments = Vec::new();
         let mut config_edits = Vec::new();
 
@@ -322,14 +366,15 @@ impl ConfigService {
             parsed_segments.push(segments);
         }
 
-        validate_config(&user_config).map_err(|err| {
+        let resolved = resolve(user_config)?;
+        validate_config(&resolved).map_err(|err| {
             ConfigServiceError::write(
                 ConfigWriteErrorCode::ConfigValidationError,
                 format!("Invalid configuration: {err}"),
             )
         })?;
 
-        let updated_layers = layers.with_user_config(&provided_path, user_config.clone());
+        let updated_layers = layers.with_user_config(&provided_path, resolved);
         let effective = updated_layers.effective_config();
         validate_config(&effective).map_err(|err| {
             ConfigServiceError::write(
@@ -338,35 +383,30 @@ impl ConfigService {
             )
         })?;
 
-        if !config_edits.is_empty() {
-            ConfigEditsBuilder::new(&self.codex_home)
-                .with_edits(config_edits)
-                .apply()
-                .await
-                .map_err(|err| ConfigServiceError::anyhow("failed to persist config.toml", err))?;
-        }
-
         let overridden = first_overridden_edit(&updated_layers, &effective, &parsed_segments);
         let status = overridden
             .as_ref()
             .map(|_| WriteStatus::OkOverridden)
             .unwrap_or(WriteStatus::Ok);
 
-        Ok(ConfigWriteResponse {
-            status,
-            version: updated_layers
-                .get_user_layer()
-                .ok_or_else(|| {
-                    ConfigServiceError::write(
-                        ConfigWriteErrorCode::UserLayerNotFound,
-                        "user layer not found in updated layers",
-                    )
-                })?
-                .version
-                .clone(),
-            file_path: provided_path,
-            overridden_metadata: overridden,
-        })
+        Ok((
+            config_edits,
+            ConfigWriteResponse {
+                status,
+                version: updated_layers
+                    .get_user_layer()
+                    .ok_or_else(|| {
+                        ConfigServiceError::write(
+                            ConfigWriteErrorCode::UserLayerNotFound,
+                            "user layer not found in updated layers",
+                        )
+                    })?
+                    .version
+                    .clone(),
+                file_path: provided_path,
+                overridden_metadata: overridden,
+            },
+        ))
     }
 
     /// Loads a "thread-agnostic" config, which means the config layers do not
@@ -383,25 +423,6 @@ impl ConfigService {
         )
         .await
     }
-}
-
-async fn create_empty_user_layer(
-    home: &std::path::Path,
-    config_toml: &AbsolutePathBuf,
-) -> Result<ConfigLayerEntry, ConfigServiceError> {
-    let home = home.to_owned();
-    let toml_value = task::spawn_blocking(move || super::edit::read_or_create_user_config(&home))
-        .await
-        .map_err(|err| ConfigServiceError::anyhow("config persistence task panicked", err.into()))?
-        .map_err(|err| {
-            ConfigServiceError::anyhow("failed to read or create user config.toml", err)
-        })?;
-    Ok(ConfigLayerEntry::new(
-        ConfigLayerSource::User {
-            file: config_toml.clone(),
-        },
-        toml_value,
-    ))
 }
 
 fn parse_value(value: JsonValue) -> Result<Option<TomlValue>, String> {
@@ -912,6 +933,66 @@ output_token_replay = true
         );
         assert_eq!(result.status, WriteStatus::Ok);
         assert!(result.overridden_metadata.is_none());
+    }
+
+    #[tokio::test]
+    async fn rpc_merge_and_expected_version_use_the_locked_user_document() -> anyhow::Result<()> {
+        let home = tempdir()?;
+        let service = ConfigService::new_with_defaults(home.path().into());
+        let path = AbsolutePathBuf::resolve_path_against_base(CONFIG_TOML_FILE, home.path())?;
+        std::fs::write(
+            &path,
+            "[tui]\nsyntax_highlight_theme = 'vscode:./theme.json'\n",
+        )?;
+        let before = service.load_thread_agnostic_config().await?;
+        let version = before.get_user_layer().unwrap().version.clone();
+        // The RPC has loaded all layers. A skill writes before the RPC acquires the edit lock.
+        crate::config::edit::add_mcp_servers(home.path().into(), |_| {
+            std::collections::HashMap::from([(
+                "skill".into(),
+                toml::from_str("command = 'skill'").unwrap(),
+            )])
+        })
+        .await?;
+        let edits = || {
+            vec![(
+                "mcp_servers".into(),
+                serde_json::json!({"rpc": {"command": "rpc"}}),
+                MergeStrategy::Upsert,
+            )]
+        };
+        let stale = service
+            .write_user_layer(before.clone(), path.clone(), Some(version), edits())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            stale.write_error_code(),
+            Some(ConfigWriteErrorCode::ConfigVersionConflict)
+        );
+        let result = service
+            .write_user_layer(before, path, None, edits())
+            .await?;
+        let after = service.load_thread_agnostic_config().await?;
+        let layer = after.get_user_layer().unwrap();
+        assert_eq!(result.version, layer.version);
+        assert!(
+            std::fs::read_to_string(home.path().join(CONFIG_TOML_FILE))?
+                .contains("vscode:./theme.json")
+        );
+        service
+            .write_value(ConfigValueWriteParams {
+                file_path: None,
+                key_path: "model".into(),
+                value: serde_json::json!("second-write"),
+                merge_strategy: MergeStrategy::Replace,
+                expected_version: Some(result.version),
+            })
+            .await?;
+        assert_eq!(
+            serde_json::to_value(&layer.config["mcp_servers"])?,
+            serde_json::json!({"rpc":{"command":"rpc"}, "skill":{"command":"skill"}})
+        );
+        Ok(())
     }
 
     #[tokio::test]
