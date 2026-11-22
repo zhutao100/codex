@@ -14,14 +14,12 @@ use std::path::PathBuf;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::RolloutItem;
-use codex_protocol::protocol::USER_MESSAGE_BEGIN;
 use serde::Deserialize;
 use serde::Serialize;
 use tokio::io::AsyncBufReadExt;
 
 const SESSION_INDEX_FILE: &str = "session_index.jsonl";
 const READ_CHUNK_SIZE: usize = 8192;
-const IMAGE_ONLY_USER_MESSAGE_PLACEHOLDER: &str = "[Image]";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SessionIndexEntry {
@@ -345,33 +343,13 @@ async fn find_rollout_path_by_id(
     super::list::find_archived_thread_path_by_id_str(codex_home, &id).await
 }
 
-fn strip_user_message_prefix(text: &str) -> &str {
-    match text.find(USER_MESSAGE_BEGIN) {
-        Some(idx) => text[idx + USER_MESSAGE_BEGIN.len()..].trim(),
-        None => text.trim(),
-    }
-}
-
 fn first_user_message_from_items(items: &[RolloutItem]) -> Option<String> {
-    for item in items {
-        if let RolloutItem::EventMsg(EventMsg::UserMessage(user)) = item {
-            let message = strip_user_message_prefix(user.message.as_str());
-            if !message.is_empty() {
-                return Some(message.to_string());
-            }
-
-            if user
-                .images
-                .as_ref()
-                .is_some_and(|images| !images.is_empty())
-                || !user.local_images.is_empty()
-            {
-                return Some(IMAGE_ONLY_USER_MESSAGE_PLACEHOLDER.to_string());
-            }
+    items.iter().find_map(|item| match item {
+        RolloutItem::EventMsg(EventMsg::UserMessage(user)) => {
+            user.history_preview().map(str::to_owned)
         }
-    }
-
-    None
+        _ => None,
+    })
 }
 
 async fn find_first_user_message_by_id(
@@ -701,7 +679,7 @@ mod tests {
         ));
         assert_eq!(
             first_user_message_from_items(&[image_only]),
-            Some(IMAGE_ONLY_USER_MESSAGE_PLACEHOLDER.to_string())
+            Some("[Image]".to_string())
         );
     }
 

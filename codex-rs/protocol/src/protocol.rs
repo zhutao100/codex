@@ -1626,6 +1626,32 @@ pub struct UserMessageEvent {
     pub text_elements: Vec<crate::user_input::TextElement>,
 }
 
+impl UserMessageEvent {
+    pub fn history_text(&self) -> &str {
+        self.message
+            .split_once(USER_MESSAGE_BEGIN)
+            .map_or(self.message.as_str(), |(_, text)| text)
+            .trim()
+    }
+
+    /// The first displayable message in a rollout, without exposing image data or paths.
+    pub fn history_preview(&self) -> Option<&str> {
+        let text = self.history_text();
+        if !text.is_empty() {
+            Some(text)
+        } else if self
+            .images
+            .as_ref()
+            .is_some_and(|images| !images.is_empty())
+            || !self.local_images.is_empty()
+        {
+            Some("[Image]")
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
 pub struct AgentMessageDeltaEvent {
     pub delta: String,

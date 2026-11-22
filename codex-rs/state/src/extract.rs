@@ -4,12 +4,8 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::TurnContextItem;
-use codex_protocol::protocol::USER_MESSAGE_BEGIN;
-use codex_protocol::protocol::UserMessageEvent;
 use serde::Serialize;
 use serde_json::Value;
-
-const IMAGE_ONLY_USER_MESSAGE_PLACEHOLDER: &str = "[Image]";
 
 /// Apply a rollout item to the metadata structure.
 pub fn apply_rollout_item(
@@ -69,10 +65,10 @@ fn apply_event_msg(metadata: &mut ThreadMetadata, event: &EventMsg) {
         }
         EventMsg::UserMessage(user) => {
             if metadata.first_user_message.is_none() {
-                metadata.first_user_message = user_message_preview(user);
+                metadata.first_user_message = user.history_preview().map(str::to_owned);
             }
             if metadata.title.is_empty() {
-                let title = strip_user_message_prefix(user.message.as_str());
+                let title = user.history_text();
                 if !title.is_empty() {
                     metadata.title = title.to_string();
                 }
@@ -84,29 +80,6 @@ fn apply_event_msg(metadata: &mut ThreadMetadata, event: &EventMsg) {
 
 fn apply_response_item(_metadata: &mut ThreadMetadata, _item: &ResponseItem) {
     // Title and first_user_message are derived from EventMsg::UserMessage only.
-}
-
-fn strip_user_message_prefix(text: &str) -> &str {
-    match text.find(USER_MESSAGE_BEGIN) {
-        Some(idx) => text[idx + USER_MESSAGE_BEGIN.len()..].trim(),
-        None => text.trim(),
-    }
-}
-
-fn user_message_preview(user: &UserMessageEvent) -> Option<String> {
-    let message = strip_user_message_prefix(user.message.as_str());
-    if !message.is_empty() {
-        return Some(message.to_string());
-    }
-    if user
-        .images
-        .as_ref()
-        .is_some_and(|images| !images.is_empty())
-        || !user.local_images.is_empty()
-    {
-        return Some(IMAGE_ONLY_USER_MESSAGE_PLACEHOLDER.to_string());
-    }
-    None
 }
 
 /// Scalar sources are stored without quotes; data-bearing sources retain their JSON object.
@@ -199,10 +172,7 @@ mod tests {
 
         apply_rollout_item(&mut metadata, &item, "test-provider");
 
-        assert_eq!(
-            metadata.first_user_message.as_deref(),
-            Some(super::IMAGE_ONLY_USER_MESSAGE_PLACEHOLDER)
-        );
+        assert_eq!(metadata.first_user_message.as_deref(), Some("[Image]"));
         assert_eq!(metadata.title, "");
     }
 

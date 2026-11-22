@@ -617,6 +617,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn image_only_previews_agree_before_and_after_indexing() -> anyhow::Result<()> {
+        let home = tempdir()?;
+        let mut config = crate::config::test_config();
+        config.codex_home = home.path().into();
+        let path = write_rollout_in_sessions(
+            home.path(),
+            "2026-01-27T12-00-00",
+            "2026-01-27T12:00:00Z",
+            Uuid::new_v4(),
+        );
+        let image = RolloutItem::EventMsg(codex_protocol::protocol::EventMsg::UserMessage(
+            codex_protocol::protocol::UserMessageEvent {
+                message: String::new(),
+                client_user_message_id: None,
+                images: None,
+                local_images: vec!["image.png".into()],
+                text_elements: vec![],
+            },
+        ));
+        let mut file = File::options().append(true).open(&path)?;
+        for item in [user_message("   "), image, user_message("later text")] {
+            writeln!(
+                file,
+                "{}",
+                serde_json::to_string(&RolloutLine {
+                    timestamp: "2026-01-27T12:00:00Z".into(),
+                    item
+                })?
+            )?;
+        }
+        for indexed in [false, true] {
+            if indexed {
+                crate::state_db::init_for_rollout(&config, None)
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                crate::state_db::history_index(home.path(), &config.model_provider_id, false)
+                    .await
+                    .is_some(),
+                indexed
+            );
+            let page = RolloutRecorder::list_threads(
+                home.path(),
+                5,
+                None,
+                crate::ThreadSortKey::CreatedAt,
+                &[],
+                None,
+                &config.model_provider_id,
+            )
+            .await?;
+            assert_eq!(
+                page.items
+                    .iter()
+                    .map(|item| (&item.path, item.first_user_message.as_deref()))
+                    .collect::<Vec<_>>(),
+                [(&path, Some("[Image]"))]
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn providerless_path_lookup_defers_legacy_backfill_to_a_configured_reader()
     -> anyhow::Result<()> {
         let home = tempdir()?;

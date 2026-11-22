@@ -22,7 +22,6 @@ use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
-use codex_protocol::protocol::USER_MESSAGE_BEGIN;
 
 /// Returned page of thread (thread) summaries.
 #[derive(Debug, Default, PartialEq)]
@@ -539,7 +538,7 @@ async fn read_head_summary(path: &Path, head_limit: usize) -> io::Result<HeadTai
 
     while lines_scanned < head_limit
         || (summary.saw_session_meta
-            && !summary.saw_user_event
+            && summary.first_user_message.is_none()
             && lines_scanned < head_limit + USER_EVENT_SCAN_LIMIT)
     {
         let line_opt = lines.next_line().await?;
@@ -599,16 +598,13 @@ async fn read_head_summary(path: &Path, head_limit: usize) -> io::Result<HeadTai
                 if let EventMsg::UserMessage(user) = ev {
                     summary.saw_user_event = true;
                     if summary.first_user_message.is_none() {
-                        let message = strip_user_message_prefix(user.message.as_str()).to_string();
-                        if !message.is_empty() {
-                            summary.first_user_message = Some(message);
-                        }
+                        summary.first_user_message = user.history_preview().map(str::to_owned);
                     }
                 }
             }
         }
 
-        if summary.saw_session_meta && summary.saw_user_event {
+        if summary.saw_session_meta && summary.first_user_message.is_some() {
             break;
         }
     }
@@ -660,13 +656,6 @@ async fn read_head_records(path: &Path, limit: usize) -> io::Result<Vec<serde_js
     }
 
     Ok(head)
-}
-
-fn strip_user_message_prefix(text: &str) -> &str {
-    match text.find(USER_MESSAGE_BEGIN) {
-        Some(idx) => text[idx + USER_MESSAGE_BEGIN.len()..].trim(),
-        None => text.trim(),
-    }
 }
 
 /// Read the SessionMetaLine from the head of a rollout file for reuse by
