@@ -362,6 +362,80 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_terminal_write_does_not_follow_a_reused_process_id() -> anyhow::Result<()> {
+        use crate::protocol::EventMsg;
+        use crate::protocol::ReviewDecision;
+        use crate::session::tests::make_session_and_context_with_rx;
+
+        skip_if_sandbox!(Ok(()));
+        let (session, mut launch, events) = make_session_and_context_with_rx().await;
+        let initial = Arc::get_mut(&mut launch).expect("turn not submitted");
+        initial.approval_policy = AskForApproval::Never;
+        initial.sandbox_policy = SandboxPolicy::DangerFullAccess;
+        let (_, mut restricted) = make_session_and_context().await;
+        restricted.approval_policy = AskForApproval::OnRequest;
+        restricted.sandbox_policy = SandboxPolicy::new_read_only_policy();
+        let restricted = Arc::new(restricted);
+        let command = "read -r line && printf 'received:%s\\n' \"$line\"";
+        let id = exec_command(&session, &launch, command, 50)
+            .await?
+            .process_id
+            .expect("retained terminal");
+        let approval = || async {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if let EventMsg::ExecApprovalRequest(request) = events.recv().await.unwrap().msg
+                    {
+                        break request;
+                    }
+                }
+            })
+            .await
+            .expect("approval request")
+        };
+
+        *session.active_turn.lock().await = Some(crate::state::ActiveTurn::default());
+        let (cancelled, ()) = tokio::join!(
+            write_stdin(&session, &restricted, &id, "cancelled\n", 50),
+            async {
+                let request = approval().await;
+                assert_eq!(request.command, vec!["write_stdin", &id, "cancelled\n"]);
+                assert!(request.proposed_execpolicy_amendment.is_none());
+                session.active_turn.lock().await.take();
+            }
+        );
+        assert!(matches!(
+            cancelled,
+            Err(UnifiedExecError::StdinNotAuthorized)
+        ));
+
+        *session.active_turn.lock().await = Some(crate::state::ActiveTurn::default());
+        let (stale, ()) = tokio::join!(
+            write_stdin(&session, &restricted, &id, "stale\n", 50),
+            async {
+                let request = approval().await;
+                session
+                    .services
+                    .unified_exec_manager
+                    .release_process_id(&id)
+                    .await;
+                let replacement = exec_command(&session, &launch, command, 50).await.unwrap();
+                assert_eq!(replacement.process_id.as_deref(), Some(id.as_str()));
+                session
+                    .notify_approval(&request.turn_id, ReviewDecision::Approved)
+                    .await;
+            }
+        );
+        assert!(
+            matches!(stale, Err(UnifiedExecError::UnknownProcessId { process_id }) if process_id == id)
+        );
+        let result = write_stdin(&session, &launch, &id, "fresh\n", 1000).await?;
+        assert!(result.output.contains("received:fresh"));
+        assert!(!result.output.contains("stale"));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unified_exec_persists_across_requests() -> anyhow::Result<()> {
         skip_if_sandbox!(Ok(()));
 
