@@ -46,6 +46,7 @@ pub(crate) struct SessionConfiguration {
 
     /// Base instructions for the session.
     pub(super) base_instructions: String,
+    pub(super) uses_catalog_base_instructions: bool,
 
     /// Compact prompt override.
     pub(super) compact_prompt: Option<String>,

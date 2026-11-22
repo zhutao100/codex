@@ -386,12 +386,11 @@ impl Codex {
             .map_err(|err| CodexErr::Fatal(format!("failed to load rules: {err}")))?;
 
         let config = Arc::new(config);
-        let _ = models_manager
-            .list_models(
-                &config,
-                crate::models_manager::manager::RefreshStrategy::OnlineIfUncached,
-            )
-            .await;
+        if let Some(model) = config.model.as_deref() {
+            models_manager
+                .refresh_for_selected_model(model, &config)
+                .await;
+        }
         let model = models_manager
             .get_default_model(
                 &config.model,
@@ -407,7 +406,7 @@ impl Codex {
         let final_instruction_override = models_manager
             .get_final_instruction_override(model.as_str(), &config)
             .await;
-        let base_instructions = resolve_session_base_instructions(
+        let (base_instructions, uses_catalog_base_instructions) = resolve_session_base_instructions(
             &config,
             &model_info,
             &conversation_history,
@@ -465,6 +464,7 @@ impl Codex {
             user_instructions,
             personality: config.personality,
             base_instructions,
+            uses_catalog_base_instructions,
             compact_prompt: config.compact_prompt.clone(),
             approval_policy: config.approval_policy.clone(),
             sandbox_policy: config.sandbox_policy.clone(),
@@ -578,20 +578,26 @@ fn resolve_session_base_instructions(
     model_info: &ModelInfo,
     conversation_history: &InitialHistory,
     final_instruction_override: Option<&str>,
-) -> String {
+) -> (String, bool) {
     // Priority order:
     // 1. config.base_instructions override
     // 2. model_overlay final instruction override
     // 3. conversation history => session_meta.base_instructions
     // 4. base_instructions for current model
-    config
+    if let Some(text) = config
         .base_instructions
-        .clone()
-        .or_else(|| final_instruction_override.map(ToOwned::to_owned))
-        .or_else(|| conversation_history.get_base_instructions().map(|s| s.text))
-        .unwrap_or_else(|| {
-            ModelsManager::effective_model_instructions(model_info, config.personality, None)
-        })
+        .as_deref()
+        .or(final_instruction_override)
+    {
+        return (text.to_owned(), false);
+    }
+    if let Some(saved) = conversation_history.get_base_instructions() {
+        return (saved.text, false);
+    }
+    (
+        ModelsManager::effective_model_instructions(model_info, config.personality, None),
+        true,
+    )
 }
 
 fn resolve_current_base_instructions(
@@ -613,7 +619,9 @@ fn base_instruction_settings_changed(
     next: &SessionConfiguration,
 ) -> bool {
     previous.collaboration_mode.model() != next.collaboration_mode.model()
-        || previous.personality != next.personality
+        || (previous.uses_catalog_base_instructions
+            && (previous.personality == Some(Personality::None))
+                != (next.personality == Some(Personality::None)))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1023,6 +1031,8 @@ impl Session {
                 &model_info,
                 final_instruction_override.as_deref(),
             );
+            updated.uses_catalog_base_instructions =
+                per_turn_config.base_instructions.is_none() && final_instruction_override.is_none();
         }
 
         let mut state = self.state.lock().await;

@@ -422,7 +422,7 @@ fn session_base_instructions_use_overlay_final_before_history() {
         Some("overlay final instructions"),
     );
 
-    assert_eq!(resolved, "overlay final instructions");
+    assert_eq!(resolved, ("overlay final instructions".to_owned(), false));
 }
 
 #[test]
@@ -438,7 +438,7 @@ fn session_base_instructions_keep_config_override_strongest() {
         Some("overlay final instructions"),
     );
 
-    assert_eq!(resolved, "config instructions");
+    assert_eq!(resolved, ("config instructions".to_owned(), false));
 }
 
 #[test]
@@ -1680,6 +1680,7 @@ async fn set_rate_limits_retains_previous_credits() {
         developer_instructions: config.developer_instructions.clone(),
         user_instructions: config.user_instructions.clone(),
         personality: config.personality,
+        uses_catalog_base_instructions: config.base_instructions.is_none(),
         base_instructions: config
             .base_instructions
             .clone()
@@ -1765,6 +1766,7 @@ async fn set_rate_limits_updates_plan_type_when_present() {
         developer_instructions: config.developer_instructions.clone(),
         user_instructions: config.user_instructions.clone(),
         personality: config.personality,
+        uses_catalog_base_instructions: config.base_instructions.is_none(),
         base_instructions: config
             .base_instructions
             .clone()
@@ -2044,6 +2046,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         developer_instructions: config.developer_instructions.clone(),
         user_instructions: config.user_instructions.clone(),
         personality: config.personality,
+        uses_catalog_base_instructions: config.base_instructions.is_none(),
         base_instructions: config
             .base_instructions
             .clone()
@@ -2190,6 +2193,7 @@ pub(crate) async fn make_session_and_context_with_rx() -> (
         developer_instructions: config.developer_instructions.clone(),
         user_instructions: config.user_instructions.clone(),
         personality: config.personality,
+        uses_catalog_base_instructions: config.base_instructions.is_none(),
         base_instructions: config
             .base_instructions
             .clone()

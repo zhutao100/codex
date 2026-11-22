@@ -144,11 +144,12 @@ async fn resume_includes_initial_messages_from_reasoning_events() -> Result<()> 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resume_switches_models_preserves_base_instructions() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    core_test_support::skip_if_no_network_unless_localhost!(Ok(()));
 
     let server = start_mock_server().await;
     let mut builder = test_codex().with_config(|config| {
         config.model = Some("gpt-5.2".to_string());
+        config.base_instructions = Some("Instructions from the original rollout.".into());
     });
     let initial = builder.build(&server).await?;
     let codex = Arc::clone(&initial.codex);
@@ -199,37 +200,37 @@ async fn resume_switches_models_preserves_base_instructions() -> Result<()> {
 
     let mut resume_builder = test_codex().with_config(|config| {
         config.model = Some("gpt-5.2-codex".to_string());
+        config.personality = Some(codex_protocol::config_types::Personality::None);
     });
     let resumed = resume_builder.resume(&server, home, rollout_path).await?;
-    resumed
-        .codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "Resume with different model".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
+    for personality in [
+        codex_protocol::config_types::Personality::Friendly,
+        codex_protocol::config_types::Personality::Pragmatic,
+    ] {
+        resumed
+            .codex
+            .submit(Op::UserTurn {
+                items: vec![UserInput::Text {
+                    text: "Continue with the persisted instructions".into(),
+                    text_elements: vec![],
+                }],
+                final_output_json_schema: None,
+                cwd: resumed.cwd_path().to_path_buf(),
+                approval_policy: codex_core::protocol::AskForApproval::Never,
+                sandbox_policy: codex_core::protocol::SandboxPolicy::new_read_only_policy(),
+                model: "gpt-5.2-codex".into(),
+                effort: None,
+                summary: codex_protocol::config_types::ReasoningSummary::Auto,
+                collaboration_mode: None,
+                personality: Some(personality),
+                service_tier: None,
+            })
+            .await?;
+        wait_for_event(&resumed.codex, |event| {
+            matches!(event, EventMsg::TurnComplete(_))
         })
-        .await?;
-    wait_for_event(&resumed.codex, |event| {
-        matches!(event, EventMsg::TurnComplete(_))
-    })
-    .await;
-
-    resumed
-        .codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "Second turn after resume".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-        })
-        .await?;
-    wait_for_event(&resumed.codex, |event| {
-        matches!(event, EventMsg::TurnComplete(_))
-    })
-    .await;
+        .await;
+    }
 
     let requests = resumed_mock.requests();
     assert_eq!(requests.len(), 2, "expected two resumed requests");

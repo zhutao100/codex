@@ -143,7 +143,7 @@ impl ModelsManager {
     // todo(aibrahim): look if we can tighten it to pub(crate)
     /// Look up model metadata, applying remote overrides and config adjustments.
     pub async fn get_model_info(&self, model: &str, config: &Config) -> ModelInfo {
-        if config.model_provider_id != "openai" {
+        if !Self::uses_openai_catalog(model, config) {
             return Self::construct_model_info_offline(model, config);
         }
         let remote_models = self.remote_models.read().await;
@@ -167,8 +167,11 @@ impl ModelsManager {
         config: &Config,
     ) -> Option<String> {
         let overlay = config.model_overlay.as_ref()?;
-        let remote_models = self.remote_models.read().await;
-        let mut candidates = remote_models.clone();
+        let mut candidates = if Self::uses_openai_catalog(model, config) {
+            self.remote_models.read().await.clone()
+        } else {
+            Self::load_remote_models_from_file().unwrap_or_default()
+        };
         for entry in &overlay.models {
             if !candidates
                 .iter()
@@ -181,6 +184,23 @@ impl ModelsManager {
             .map(|candidate| candidate.slug)
             .unwrap_or_else(|| model.to_string());
         overlay.final_instruction_override_for_slug(&matched_slug)
+    }
+
+    fn uses_openai_catalog(model: &str, config: &Config) -> bool {
+        config
+            .overlay_model_provider_id_for_model(model)
+            .unwrap_or(&config.model_provider_id)
+            == "openai"
+    }
+
+    pub(crate) async fn refresh_for_selected_model(&self, model: &str, config: &Config) {
+        if Self::uses_openai_catalog(model, config)
+            && let Err(err) = self
+                .refresh_openai_catalog(RefreshStrategy::OnlineIfUncached)
+                .await
+        {
+            error!("failed to refresh selected model catalog: {err}");
+        }
     }
 
     pub(crate) fn effective_model_instructions(
@@ -312,6 +332,10 @@ impl ModelsManager {
         if config.model_provider_id != "openai" {
             return Ok(());
         }
+        self.refresh_openai_catalog(refresh_strategy).await
+    }
+
+    async fn refresh_openai_catalog(&self, refresh_strategy: RefreshStrategy) -> CoreResult<()> {
         if self.auth_manager.auth_mode() != Some(AuthMode::Chatgpt) {
             if matches!(
                 refresh_strategy,
@@ -825,6 +849,13 @@ mod tests {
         expected.effective_context_window_percent = 98;
 
         assert_eq!(model_info, expected);
+        config.model_overlay.as_mut().unwrap().models[0].model_provider = Some("other".into());
+        let offline = ModelsManager::construct_model_info_offline("cache-only-model", &config);
+        assert_ne!(offline.display_name, expected.display_name);
+        assert_eq!(
+            manager.get_model_info("cache-only-model", &config).await,
+            offline
+        );
     }
 
     #[tokio::test]

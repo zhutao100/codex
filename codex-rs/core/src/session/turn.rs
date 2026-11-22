@@ -2549,10 +2549,9 @@ async fn try_run_sampling_request(
             }
             ResponseEvent::ModelsEtag(etag) => {
                 // Update internal state with latest models etag
-                let config = sess.get_config().await;
                 sess.services
                     .models_manager
-                    .refresh_if_new_etag(etag, &config)
+                    .refresh_if_new_etag(etag, &turn_context.config)
                     .await;
             }
             ResponseEvent::Completed {

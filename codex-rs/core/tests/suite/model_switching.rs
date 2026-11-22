@@ -134,15 +134,21 @@ async fn model_change_appends_model_instructions_developer_message() -> Result<(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn overlay_model_provider_routes_initial_model_to_provider() -> Result<()> {
+    skip_if_no_network!(Ok(()));
     let primary_server = start_mock_server().await;
     let secondary_server = start_mock_server().await;
-    let secondary_mock =
-        mount_sse_once(&secondary_server, sse_completed("secondary-initial")).await;
+    let secondary_mock = core_test_support::responses::mount_response_once(
+        &secondary_server,
+        core_test_support::responses::sse_response(sse_completed("secondary-initial"))
+            .insert_header("X-Models-Etag", "\"secondary-etag\""),
+    )
+    .await;
 
     let custom_model = "deepseek-v4-pro";
     let secondary_base_url = format!("{}/v1", secondary_server.uri());
     let mut builder = test_codex()
         .with_model(custom_model)
+        .with_auth(codex_core::CodexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_config(move |config| {
             config.model_providers.insert(
                 "deepseek".to_string(),
@@ -187,6 +193,15 @@ async fn overlay_model_provider_routes_initial_model_to_provider() -> Result<()>
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     let secondary_request = secondary_mock.single_request();
+    assert!(
+        !primary_server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|request| request.url.path().ends_with("/models")),
+        "foreign startup and its response ETag must not fetch the default provider catalog"
+    );
     assert_eq!(
         secondary_request.body_json()["model"].as_str(),
         Some(custom_model)
