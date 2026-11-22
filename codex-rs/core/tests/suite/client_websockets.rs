@@ -1386,6 +1386,82 @@ fn websocket_provider(server: &WebSocketTestServer) -> ModelProviderInfo {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_switch_discards_active_and_cached_socket_continuations() -> anyhow::Result<()> {
+    use base64::Engine as _;
+    use codex_core::auth::AuthCredentialsStoreMode;
+
+    skip_if_no_network_unless_localhost!(Ok(()));
+    let server = start_websocket_server_with_headers(
+        ["a", "b", "c"]
+            .map(|id| WebSocketConnectionConfig {
+                requests: vec![vec![
+                    ev_turn_state_metadata(X_CODEX_TURN_STATE_HEADER, json!(format!("route-{id}"))),
+                    ev_response_created(id),
+                    ev_completed(id),
+                ]],
+                response_headers: vec![],
+                keep_open: true,
+            })
+            .into(),
+    )
+    .await;
+    let home = TempDir::new()?;
+    let login = |account: &str| -> anyhow::Result<()> {
+        let claims = json!({"https://api.openai.com/auth": {"chatgpt_account_id": account}});
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims.to_string());
+        let auth = json!({
+            "auth_mode": "chatgpt",
+            "tokens": {"id_token": format!("e30.{payload}.sig"), "access_token": format!("token-{account}"), "refresh_token": "refresh", "account_id": account},
+            "last_refresh": chrono::Utc::now(),
+        });
+        std::fs::write(home.path().join("auth.json"), serde_json::to_vec(&auth)?)?;
+        Ok(())
+    };
+    login("a")?;
+    let manager = AuthManager::shared(home.path().into(), false, AuthCredentialsStoreMode::File);
+    let harness = websocket_harness_with_auth(&server, false, Some(manager.clone())).await;
+    let mut session = harness.client.new_session();
+    let mut input = Vec::new();
+    for account in ["a", "b", "c"] {
+        if account != "a" {
+            login(account)?;
+            manager.reload();
+        }
+        if account == "c" {
+            drop(session);
+            session = harness.client.new_session();
+        }
+        input.push(message_item(account));
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            stream_until_complete(&mut session, &harness, &prompt_with_input(input.clone())),
+        )
+        .await?;
+    }
+    let handshakes = server.handshakes();
+    let connections = server.connections();
+    assert_eq!((handshakes.len(), connections.len()), (3, 3));
+    for (i, id) in ["a", "b", "c"].into_iter().enumerate() {
+        assert_eq!(
+            handshakes[i].header("authorization"),
+            Some(format!("Bearer token-{id}"))
+        );
+        assert_eq!(
+            handshakes[i].header("chatgpt-account-id").as_deref(),
+            Some(id)
+        );
+        assert_eq!(handshakes[i].header(X_CODEX_TURN_STATE_HEADER), None);
+        assert_eq!(connections[i].len(), 1);
+        let body = connections[i][0].body_json();
+        assert_eq!(body.get("previous_response_id"), None);
+        assert_eq!(body["client_metadata"].get(X_CODEX_TURN_STATE_HEADER), None);
+        assert_eq!(body["input"].as_array().unwrap().len(), i + 1);
+    }
+    server.shutdown().await;
+    Ok(())
+}
+
 async fn websocket_harness(server: &WebSocketTestServer) -> WebsocketTestHarness {
     websocket_harness_with_runtime_metrics(server, false).await
 }
@@ -1393,6 +1469,14 @@ async fn websocket_harness(server: &WebSocketTestServer) -> WebsocketTestHarness
 async fn websocket_harness_with_runtime_metrics(
     server: &WebSocketTestServer,
     runtime_metrics_enabled: bool,
+) -> WebsocketTestHarness {
+    websocket_harness_with_auth(server, runtime_metrics_enabled, None).await
+}
+
+async fn websocket_harness_with_auth(
+    server: &WebSocketTestServer,
+    runtime_metrics_enabled: bool,
+    request_auth: Option<Arc<AuthManager>>,
 ) -> WebsocketTestHarness {
     let provider = websocket_provider(server);
     let codex_home = TempDir::new().unwrap();
@@ -1426,7 +1510,7 @@ async fn websocket_harness_with_runtime_metrics(
     let effort = None;
     let summary = ReasoningSummary::Auto;
     let client = ModelClient::new(
-        None,
+        request_auth,
         conversation_id,
         provider.clone(),
         SessionSource::Exec,

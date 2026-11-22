@@ -432,6 +432,27 @@ pub(crate) struct CoreAuthProvider {
     account_id: Option<String>,
 }
 
+/// Equality of the credentials actually sent on a handshake, including provider overrides.
+/// The cache need not retain or log bearer tokens or account IDs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SocketAuth {
+    pub(crate) mode: Option<AuthMode>,
+    token: Option<[u8; 32]>,
+    account: Option<[u8; 32]>,
+}
+
+impl CoreAuthProvider {
+    pub(crate) fn socket_auth(&self, mode: Option<AuthMode>) -> SocketAuth {
+        use sha2::Digest;
+        let digest = |s: &String| sha2::Sha256::digest(s.as_bytes()).into();
+        SocketAuth {
+            mode,
+            token: self.token.as_ref().map(digest),
+            account: self.account_id.as_ref().map(digest),
+        }
+    }
+}
+
 impl ApiAuthProvider for CoreAuthProvider {
     fn bearer_token(&self) -> Option<String> {
         self.token.clone()

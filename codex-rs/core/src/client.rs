@@ -20,6 +20,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
 use crate::api_bridge::CoreAuthProvider;
+use crate::api_bridge::SocketAuth;
 use crate::api_bridge::map_api_error;
 use crate::api_bridge::resolve_request_auth;
 use crate::auth::AuthMode;
@@ -156,7 +157,7 @@ pub struct ModelClientSession {
     client: ModelClient,
     provider: ModelProviderInfo,
     connection: Option<ApiWebSocketConnection>,
-    connection_auth_mode: Option<Option<AuthMode>>,
+    request_auth: Option<SocketAuth>,
     continuation_reset_reason: Option<&'static str>,
     websocket_last_request: Option<ResponseCreateWsRequest>,
     websocket_last_response_rx: Option<oneshot::Receiver<LastResponse>>,
@@ -183,15 +184,15 @@ struct LastResponse {
 
 struct CachedWebsocketConnection {
     provider: ModelProviderInfo,
-    auth_mode: Option<AuthMode>,
+    auth: SocketAuth,
     connection: ApiWebSocketConnection,
 }
 
 impl std::fmt::Debug for CachedWebsocketConnection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CachedWebsocketConnection")
-            .field("provider", &self.provider)
-            .field("auth_mode", &self.auth_mode)
+            .field("provider", &self.provider.name)
+            .field("auth_mode", &self.auth.mode)
             .finish_non_exhaustive()
     }
 }
@@ -263,7 +264,7 @@ impl ModelClient {
             client: self.clone(),
             provider,
             connection: None,
-            connection_auth_mode: None,
+            request_auth: None,
             continuation_reset_reason: None,
             websocket_last_request: None,
             websocket_last_response_rx: None,
@@ -433,7 +434,7 @@ impl ModelClient {
     fn take_cached_websocket_connection(
         &self,
         provider: &ModelProviderInfo,
-        auth_mode: Option<AuthMode>,
+        auth: SocketAuth,
     ) -> Option<ApiWebSocketConnection> {
         let mut cached = self
             .state
@@ -442,7 +443,10 @@ impl ModelClient {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let connection = cached.take()?;
 
-        if connection.provider == *provider && connection.auth_mode == auth_mode {
+        if connection.auth != auth {
+            return None;
+        }
+        if connection.provider == *provider {
             Some(connection.connection)
         } else {
             *cached = Some(connection);
@@ -453,7 +457,7 @@ impl ModelClient {
     fn store_cached_websocket_connection(
         &self,
         provider: ModelProviderInfo,
-        auth_mode: Option<AuthMode>,
+        auth: SocketAuth,
         connection: ApiWebSocketConnection,
     ) {
         let mut cached = self
@@ -463,7 +467,7 @@ impl ModelClient {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *cached = Some(CachedWebsocketConnection {
             provider,
-            auth_mode,
+            auth,
             connection,
         });
     }
@@ -506,8 +510,15 @@ impl ModelClientSession {
             self.continuation_reset_reason.get_or_insert(reason);
         }
         self.connection = None;
-        self.connection_auth_mode = None;
         self.clear_websocket_continuation();
+    }
+
+    fn bind_request_auth(&mut self, auth: SocketAuth) {
+        if self.request_auth.is_some_and(|previous| previous != auth) {
+            self.invalidate_websocket("auth_changed");
+            self.turn_state = Arc::new(OnceLock::new());
+        }
+        self.request_auth = Some(auth);
     }
 
     fn take_cacheable_connection(&mut self) -> Option<ApiWebSocketConnection> {
@@ -766,19 +777,15 @@ impl ModelClientSession {
         otel_manager: &OtelManager,
         api_provider: codex_api::Provider,
         api_auth: CoreAuthProvider,
-        auth_mode: Option<AuthMode>,
+        auth: SocketAuth,
         options: &ApiResponsesOptions,
     ) -> std::result::Result<&ApiWebSocketConnection, ApiError> {
-        if self.connection.is_some() && self.connection_auth_mode != Some(auth_mode) {
-            self.invalidate_websocket("other");
-        }
         if self.connection.is_none()
             && let Some(connection) = self
                 .client
-                .take_cached_websocket_connection(&self.provider, auth_mode)
+                .take_cached_websocket_connection(&self.provider, auth)
         {
             self.connection = Some(connection);
-            self.connection_auth_mode = Some(auth_mode);
         }
 
         let needs_new = match self.connection.as_ref() {
@@ -813,7 +820,6 @@ impl ModelClientSession {
                     .await
                     .map_err(|_| ApiError::Transport(TransportError::Timeout))??;
             self.connection = Some(new_conn);
-            self.connection_auth_mode = Some(auth_mode);
         }
 
         self.connection.as_ref().ok_or(ApiError::Stream(
@@ -838,7 +844,7 @@ impl ModelClientSession {
     /// `text` controls used for output schemas.
     #[allow(clippy::too_many_arguments)]
     async fn stream_responses_api(
-        &self,
+        &mut self,
         prompt: &Prompt,
         model_info: &ModelInfo,
         otel_manager: &OtelManager,
@@ -872,6 +878,7 @@ impl ModelClientSession {
             }
             let api_provider = self.provider.to_api_provider(request_auth.auth_mode)?;
             let api_auth = request_auth.provider;
+            self.bind_request_auth(api_auth.socket_auth(request_auth.auth_mode));
             let transport = ReqwestTransport::new(build_reqwest_client());
             let (request_telemetry, sse_telemetry) = Self::build_streaming_telemetry(otel_manager);
             let compression = self.responses_request_compression(request_auth.auth_mode);
@@ -939,6 +946,8 @@ impl ModelClientSession {
             }
             let api_provider = self.provider.to_api_provider(request_auth.auth_mode)?;
             let api_auth = request_auth.provider;
+            let socket_auth = api_auth.socket_auth(request_auth.auth_mode);
+            self.bind_request_auth(socket_auth);
             let compression = self.responses_request_compression(request_auth.auth_mode);
 
             let options = self.build_responses_options(
@@ -955,7 +964,7 @@ impl ModelClientSession {
                     otel_manager,
                     api_provider.clone(),
                     api_auth.clone(),
-                    request_auth.auth_mode,
+                    socket_auth,
                     &options,
                 )
                 .await
@@ -1115,7 +1124,7 @@ impl Drop for ModelClientSession {
             return;
         }
 
-        let Some(auth_mode) = self.connection_auth_mode else {
+        let Some(auth) = self.request_auth else {
             return;
         };
         let Some(connection) = self.take_cacheable_connection() else {
@@ -1123,7 +1132,7 @@ impl Drop for ModelClientSession {
         };
 
         self.client
-            .store_cached_websocket_connection(self.provider.clone(), auth_mode, connection);
+            .store_cached_websocket_connection(self.provider.clone(), auth, connection);
     }
 }
 
@@ -1693,7 +1702,7 @@ mod tests {
 
         client.store_cached_websocket_connection(
             provider.clone(),
-            Some(AuthMode::ApiKey),
+            CoreAuthProvider::default().socket_auth(Some(AuthMode::ApiKey)),
             connection,
         );
 
@@ -1701,18 +1710,27 @@ mod tests {
         other_provider.name = "other-provider".to_string();
         assert!(
             client
-                .take_cached_websocket_connection(&other_provider, Some(AuthMode::ApiKey))
+                .take_cached_websocket_connection(
+                    &other_provider,
+                    CoreAuthProvider::default().socket_auth(Some(AuthMode::ApiKey))
+                )
                 .is_none()
         );
         assert!(
             client
-                .take_cached_websocket_connection(&provider, Some(AuthMode::Chatgpt))
+                .take_cached_websocket_connection(
+                    &provider,
+                    CoreAuthProvider::default().socket_auth(Some(AuthMode::Chatgpt))
+                )
                 .is_none()
         );
         assert!(
             client
-                .take_cached_websocket_connection(&provider, Some(AuthMode::ApiKey))
-                .is_some()
+                .take_cached_websocket_connection(
+                    &provider,
+                    CoreAuthProvider::default().socket_auth(Some(AuthMode::ApiKey))
+                )
+                .is_none()
         );
 
         server.shutdown().await;
@@ -1729,14 +1747,17 @@ mod tests {
 
         client.store_cached_websocket_connection(
             provider.clone(),
-            Some(AuthMode::ApiKey),
+            CoreAuthProvider::default().socket_auth(Some(AuthMode::ApiKey)),
             connection,
         );
         let mut session = client.new_session();
         assert!(session.try_switch_fallback_transport(&test_otel_manager()));
         assert!(
             client
-                .take_cached_websocket_connection(&provider, Some(AuthMode::ApiKey))
+                .take_cached_websocket_connection(
+                    &provider,
+                    CoreAuthProvider::default().socket_auth(Some(AuthMode::ApiKey))
+                )
                 .is_none()
         );
 
@@ -1755,7 +1776,8 @@ mod tests {
         {
             let mut session = client.new_session();
             session.connection = Some(connection);
-            session.connection_auth_mode = Some(Some(AuthMode::ApiKey));
+            session.request_auth =
+                Some(CoreAuthProvider::default().socket_auth(Some(AuthMode::ApiKey)));
             session.websocket_last_request = Some(ws_request(vec![user_message_item("hello")]));
             let (_pending_tx, pending_rx) = oneshot::channel();
             session.websocket_last_response_rx = Some(pending_rx);
@@ -1765,7 +1787,10 @@ mod tests {
 
         assert!(
             client
-                .take_cached_websocket_connection(&provider, Some(AuthMode::ApiKey))
+                .take_cached_websocket_connection(
+                    &provider,
+                    CoreAuthProvider::default().socket_auth(Some(AuthMode::ApiKey))
+                )
                 .is_some()
         );
 
@@ -1783,7 +1808,8 @@ mod tests {
             {
                 let mut session = client.new_session();
                 session.connection = Some(connect_test_websocket(&provider).await);
-                session.connection_auth_mode = Some(Some(AuthMode::ApiKey));
+                session.request_auth =
+                    Some(CoreAuthProvider::default().socket_auth(Some(AuthMode::ApiKey)));
                 session.websocket_last_request = Some(ws_request(vec![user_message_item("notes")]));
                 let (sender, receiver) = oneshot::channel();
                 if completed {
@@ -1799,7 +1825,10 @@ mod tests {
             }
             assert_eq!(
                 client
-                    .take_cached_websocket_connection(&provider, Some(AuthMode::ApiKey))
+                    .take_cached_websocket_connection(
+                        &provider,
+                        CoreAuthProvider::default().socket_auth(Some(AuthMode::ApiKey))
+                    )
                     .is_some(),
                 completed,
             );

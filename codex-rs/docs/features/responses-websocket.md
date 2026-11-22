@@ -27,9 +27,9 @@ If any condition fails, send a full `response.create` with no previous response 
 |State|Lifetime and rule|
 |---|---|
 |Local conversation history|Session-owned; required for restart and full requests.|
-|Physical socket|May be cached between client sessions, scoped by provider configuration and auth mode. A closed cached socket is replaced before use.|
-|Last full request and completed response ID/output|Client-session scoped; discarded at a logical turn boundary.|
-|`x-codex-turn-state`|Fresh `OnceLock` per client session. Capture from response header/metadata and send through request-scoped `response.create.client_metadata`; never carry the prior turn's token into a new turn.|
+|Physical socket|May be cached between client sessions only for the same provider and effective handshake credentials (auth mode, bearer token, and account ID). A closed socket, account switch, or token rotation requires a new handshake.|
+|Last full request and completed response ID/output|Client-session scoped; discarded at a logical turn boundary or credential change. A new account receives a full request from local history.|
+|`x-codex-turn-state`|Capture from response headers/metadata and send through request-scoped `response.create.client_metadata`. Neither a new turn nor a credential change within a turn inherits the prior routing token.|
 |HTTP fallback selection|Session-owned and sticky once activated.|
 
 Create a fresh `ModelClientSession` for each logical turn. Reuse it for sampling rounds and retries within that turn. Across turns, reuse only a healthy physical connection; the next turn's first request is full. Cross-turn response-chain caching would require an explicit history/durability commit contract and is not implemented.
