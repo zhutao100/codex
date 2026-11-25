@@ -1,5 +1,6 @@
 //! Opt-in comparisons of completed, provider-projected logical requests. Never used to select a request.
 use super::*;
+use codex_api::ResponsesStorage;
 use codex_protocol::protocol::TokenUsage;
 use serde::Serialize;
 use std::hash::BuildHasher;
@@ -28,6 +29,7 @@ struct Completed {
     input: Vec<Stamp>,
     output: Vec<Stamp>,
     surface: [u64; 5],
+    storage: ResponsesStorage,
 }
 
 #[derive(Default)]
@@ -69,8 +71,11 @@ impl CacheTrace {
         Some(writer.0.finish())
     }
 
-    fn stamp(&self, item: &ResponseItem) -> Option<Stamp> {
-        Some((item.item_type(), self.hash(item)?))
+    fn stamp(&self, item: &ResponseItem, storage: ResponsesStorage) -> Option<Stamp> {
+        Some((
+            item.item_type(),
+            self.hash(&(item, storage.attached_id(item)))?,
+        ))
     }
 
     pub(super) fn installed(&self) {
@@ -96,6 +101,7 @@ pub(super) struct Pending {
     sent: Instant,
     epoch: u64,
     surface: [u64; 5],
+    storage: ResponsesStorage,
     input: Vec<Stamp>,
     previous: Option<Arc<Completed>>,
     work: Option<Arc<Completed>>,
@@ -109,6 +115,7 @@ impl ModelClientSession {
         model: &str,
         prompt: &ApiPrompt,
         options: &ApiResponsesOptions,
+        storage: impl FnOnce() -> ResponsesStorage,
         transport: &'static str,
         reason: &'static str,
         validated_parent: Option<&str>,
@@ -116,6 +123,7 @@ impl ModelClientSession {
         if !codex_api::telemetry::prompt_cache_trace_enabled() {
             return None;
         }
+        let storage = storage();
         let trace = &self.client.state.cache_trace;
         let (epoch, previous, work) = {
             let h = trace
@@ -136,7 +144,7 @@ impl ModelClientSession {
                 &options.include,
                 &options.service_tier,
                 &options.prompt_cache_key,
-                options.store_override,
+                storage.store(),
             ))?,
         ];
         let mut input = Vec::with_capacity(prompt.input.items.len());
@@ -144,13 +152,13 @@ impl ModelClientSession {
         // sends need independent signatures; hash one item at a time, never retain its contents.
         if let Some(parent) = previous
             .as_ref()
-            .filter(|p| Some(p.id.as_str()) == validated_parent)
+            .filter(|p| Some(p.id.as_str()) == validated_parent && p.storage == storage)
         {
             input.extend_from_slice(&parent.input);
             input.extend_from_slice(&parent.output);
         }
         for item in prompt.input.items.get(input.len()..)? {
-            input.push(trace.stamp(item)?);
+            input.push(trace.stamp(item, storage)?);
         }
         Some(Pending {
             trace: Arc::clone(trace),
@@ -177,6 +185,7 @@ impl ModelClientSession {
             sent: Instant::now(),
             epoch,
             surface,
+            storage,
             input,
             previous,
             work,
@@ -244,7 +253,7 @@ impl Pending {
     pub(super) fn complete(self, id: &str, usage: Option<&TokenUsage>, output: &[ResponseItem]) {
         let Some(stamps) = output
             .iter()
-            .map(|item| self.trace.stamp(item))
+            .map(|item| self.trace.stamp(item, self.storage))
             .collect::<Option<Vec<_>>>()
         else {
             return;
@@ -280,7 +289,7 @@ impl Pending {
                 .map(|p| compare(&self.input, p, self.surface, self.epoch, self.operation));
             tracing::debug!(target: "codex_core::cache_trace",
                 thread_id = %self.thread, response_id = id, operation = ?self.operation,
-                transport = self.transport, transport_reason = self.reason, http_fallback_cause = self.fallback_cause,
+                transport = self.transport, transport_reason = self.reason, storage = ?self.storage, http_fallback_cause = self.fallback_cause,
                 http_retries = self.http_retries, attempt = self.attempt, epoch = self.epoch,
                 baseline, baseline_id = prior.as_ref().map(|p| p.id.as_str()),
                 baseline_epoch = prior.as_ref().map(|p| p.epoch),
@@ -304,6 +313,7 @@ impl Pending {
             input: self.input,
             output: stamps,
             surface: self.surface,
+            storage: self.storage,
         });
         let mut h = self
             .trace
@@ -336,6 +346,7 @@ mod tests {
             input: vec![work, ("message", 3), ("message", 4)],
             output: vec![],
             surface: [0; 5],
+            storage: ResponsesStorage::Disabled,
         };
         for (input, expected) in [
             (vec![work, trigger], "sibling_suffix"),
@@ -371,6 +382,7 @@ mod tests {
             input: vec![prompt],
             output: vec![output],
             surface: settings,
+            storage: ResponsesStorage::Disabled,
         };
         for (items, surface, shape, shared, changed) in [
             (

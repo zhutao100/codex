@@ -493,7 +493,8 @@ impl RolloutRecorder {
                     RolloutItem::PostTurnCompletionReviewState(item) => {
                         items.push(RolloutItem::PostTurnCompletionReviewState(item));
                     }
-                    item @ RolloutItem::TokenUsageContext { .. } => {
+                    item @ (RolloutItem::ToolOutputPolicy { .. }
+                    | RolloutItem::TokenUsageContext { .. }) => {
                         items.push(item);
                     }
                     RolloutItem::EventMsg(ev) => {
@@ -564,6 +565,7 @@ impl RolloutRecorder {
             if matches!(
                 item,
                 RolloutItem::PostTurnCompletionReviewState(_)
+                    | RolloutItem::ToolOutputPolicy { .. }
                     | RolloutItem::TokenUsageContext { .. }
             ) {
                 continue;

@@ -1,11 +1,13 @@
 use super::*;
 use crate::compact::CompactionContext;
-use crate::compact::WORK_NOTES_CAPTURE_MAX_ATTEMPTS;
 use crate::compact::WORK_NOTES_SOURCE_MODEL_PREFIX;
 use crate::compact::WORK_NOTES_TOOL_REJECT_REASON;
 use crate::compact::pending_work_notes;
 use crate::compact_remote_v2::CompactionReason;
+use crate::completion_review::AcceptedReviewInput;
+use crate::completion_review::DeferredCaptureSource;
 use crate::completion_review::ReviewSampling;
+use crate::completion_review::WorkNotesCheckpoint;
 use crate::context_manager::estimate_item_token_count;
 use crate::session_prefix::is_turn_aborted_marker;
 use crate::truncate::approx_token_count;
@@ -19,15 +21,40 @@ use std::sync::atomic::Ordering;
 enum FollowUpCompaction {
     Idle,
     Pending,
-    AwaitingNotes {
-        attempts: u8,
-    },
+    AwaitingNotes,
     /// Recheck the projected prompt before sampling; do not compact it again without model progress.
     Compacted,
 }
 
-const AUTO_COMPACT_WORK_NOTES_CAPTURE_MAX_ATTEMPTS: u8 = WORK_NOTES_CAPTURE_MAX_ATTEMPTS;
-const AUTO_COMPACT_WORK_NOTES_TOOL_REJECT_REASON: &str = WORK_NOTES_TOOL_REJECT_REASON;
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SamplingPurpose {
+    Work,
+    ExplorerReport,
+    WorkNotes,
+}
+
+impl SamplingPurpose {
+    fn tool_execution(self) -> ToolCallExecutionMode {
+        match self {
+            Self::Work => ToolCallExecutionMode::Normal,
+            Self::ExplorerReport => ToolCallExecutionMode::RejectAll {
+                reason: "Exploration evidence budget exhausted; report partial coverage.",
+            },
+            Self::WorkNotes => ToolCallExecutionMode::RejectAll {
+                reason: WORK_NOTES_TOOL_REJECT_REASON,
+            },
+        }
+    }
+
+    fn cache_operation(self) -> crate::client::CacheOperation {
+        use crate::client::CacheOperation;
+        match self {
+            Self::Work | Self::ExplorerReport => CacheOperation::Work,
+            Self::WorkNotes => CacheOperation::Notes,
+        }
+    }
+}
+
 const AUTO_COMPACT_WORK_NOTES_OUTPUT_TOKEN_RESERVE_MAX: i64 = 4_096;
 const AUTO_COMPACT_WORK_NOTES_OUTPUT_TOKEN_RESERVE_FRACTION: i64 = 20;
 const AUTO_COMPACT_WORK_NOTES_MIN_TOOL_OUTPUT_TOKENS: usize = 128;
@@ -74,13 +101,24 @@ async fn inject_pre_compact_work_notes_request(sess: &Session, turn_context: &Tu
 async fn captured_pre_compact_work_notes(
     sess: &Session,
     turn_context: &TurnContext,
-) -> CodexResult<Option<String>> {
-    let pending = pending_work_notes(sess.clone_history().await.raw_items());
+) -> CodexResult<(Option<String>, u8)> {
+    let (pending, remaining) = {
+        let state = sess.state.lock().await;
+        (
+            pending_work_notes(state.history.raw_items()),
+            state
+                .completion_review
+                .pending_compaction
+                .as_ref()
+                .and_then(|d| d.notes_remaining)
+                .unwrap_or_default(),
+        )
+    };
     if let Err(error) = &pending {
         sess.send_event(turn_context, EventMsg::Error(error.to_error_event(None)))
             .await;
     }
-    pending.map(|pending| pending.and_then(|pending| pending.notes))
+    pending.map(|pending| (pending.and_then(|pending| pending.notes), remaining))
 }
 
 async fn sampling_input_for_pre_compact_work_notes(
@@ -134,7 +172,7 @@ pub(crate) async fn compaction_source_token_adjustment(
         && state
             .token_info()
             .is_some_and(|info| info.last_token_usage.input_tokens > 0)
-        && let Some(tokens) = state.history_tokens_from_usage(&turn_context.model_info.slug)
+        && let Some(tokens) = state.helper_tokens_from_usage(&turn_context.model_info.slug)
         && let Some(local) = state
             .history
             .estimate_token_count_with_base_instructions(&base)
@@ -348,9 +386,8 @@ async fn run_turn_inner(
         .config
         .bounded_explorer
         .then(|| Instant::now() + EXPLORER_DEADLINE);
-    let model_info = turn_context.model_info.clone();
     if !sess
-        .start_completion_review_main_task(&turn_context.sub_id)
+        .start_completion_review_main_task(&turn_context.sub_id, &turn_context)
         .await
     {
         sess.send_event(
@@ -366,16 +403,68 @@ async fn run_turn_inner(
         .await;
         return None;
     }
-    let auto_compact_limit = model_info.auto_compact_token_limit().unwrap_or(i64::MAX);
-    let mut total_usage_tokens = sess.get_total_token_usage().await;
+    let incoming = turn_context;
+    let incoming_limit = incoming
+        .model_info
+        .auto_compact_token_limit()
+        .unwrap_or(i64::MAX);
+    let owed = {
+        let state = sess.state.lock().await;
+        state.completion_review.owed_settings.clone().filter(|_| {
+            state
+                .completion_review
+                .pending_inputs
+                .iter()
+                .any(AcceptedReviewInput::is_uninstalled_steering)
+        })
+    };
+    let owed_context = if let Some(settings) = owed {
+        match sess
+            .turn_context_for_task_settings(&incoming, &settings)
+            .await
+        {
+            Ok(context) => {
+                let state = sess.state.lock().await;
+                let review = &state.completion_review;
+                let limit = context
+                    .model_info
+                    .auto_compact_token_limit()
+                    .unwrap_or(i64::MAX)
+                    .min(incoming_limit);
+                (review.awaiting_compact_followup
+                    || review.pending_compaction.is_some()
+                    || review.defer_new_prompt_frame
+                    || state.get_total_token_usage(state.server_reasoning_included()) >= limit
+                    || state
+                        .history
+                        .raw_items()
+                        .iter()
+                        .rev()
+                        .any(compact::is_work_notes_request_item))
+                .then_some(context)
+            }
+            Err(error) => {
+                sess.send_event(&incoming, EventMsg::Error(error.to_error_event(None)))
+                    .await;
+                return None;
+            }
+        }
+    } else {
+        None
+    };
+    let mut turn_context = owed_context.as_ref().unwrap_or(&incoming);
+    let mut auto_compact_limit = turn_context
+        .model_info
+        .auto_compact_token_limit()
+        .unwrap_or(i64::MAX);
 
     let event = EventMsg::TurnStarted(TurnStartedEvent {
         model_context_window: turn_context.model_context_window(),
         collaboration_mode_kind: turn_context.collaboration_mode.mode,
     });
-    sess.send_event(&turn_context, event).await;
+    sess.send_event(turn_context, event).await;
     let turn_state = sess.turn_state_for_sub_id(&turn_context.sub_id).await;
-    let recovery_revisions = sess.completion_review_input_recovery_revisions().await;
+    let mut recovery_revisions = sess.completion_review_input_recovery_revisions().await;
     if let Some(checkpoint) = continuation.as_ref() {
         let remove_interrupted_abort = checkpoint.source == TurnContinuationSource::Interrupted;
         sess.prepare_history_for_continuation(remove_interrupted_abort)
@@ -391,67 +480,64 @@ async fn run_turn_inner(
         })
         .await;
     }
-    let mut recovered_notes = false;
+    let mut compacted_on_entry = false;
     let pending_notes = match pending_work_notes(sess.clone_history().await.raw_items()) {
         Ok(pending) => pending,
         Err(error) => {
-            sess.send_event(&turn_context, EventMsg::Error(error.to_error_event(None)))
+            sess.send_event(turn_context, EventMsg::Error(error.to_error_event(None)))
                 .await;
             return None;
         }
     };
-    let deferred_model = {
+    let (saved_source, queued_steering, fresh_before_admission) = {
         let state = sess.state.lock().await;
         let review = &state.completion_review;
-        review.defer_new_prompt_frame.then(|| {
+        (
+            review.recovery_capture_source(&turn_context.model_info.slug),
             review
-                .deferred_capture_model
-                .clone()
-                .unwrap_or_else(|| turn_context.model_info.slug.clone())
-        })
+                .pending_inputs
+                .iter()
+                .any(AcceptedReviewInput::is_uninstalled_steering),
+            review
+                .pending_inputs
+                .iter()
+                .any(AcceptedReviewInput::awaits_pre_turn_check),
+        )
     };
-    if pending_notes.is_some() || deferred_model.is_some() {
+    let injection = if continuation.is_some() || queued_steering {
+        InitialContextInjection::BeforeLastUserMessage
+    } else {
+        InitialContextInjection::DoNotInject
+    };
+    if pending_notes.is_some() || saved_source.is_some() {
         // Selection is durable before the capture marker. Finish either checkpoint before
         // admitting pending input or re-evaluating the candidate against a wider window.
-        let injection = if continuation.is_some() {
-            InitialContextInjection::BeforeLastUserMessage
-        } else {
-            InitialContextInjection::DoNotInject
+        let marker_model = pending_notes
+            .as_ref()
+            .and_then(|p| p.source_model.as_deref());
+        let source = match &saved_source {
+            Some(DeferredCaptureSource::Settings(source)) => {
+                sess.turn_context_for_task_settings(turn_context, source)
+                    .await
+            }
+            Some(DeferredCaptureSource::LegacyModel(model)) => {
+                work_notes_request_context(&sess, turn_context, marker_model.or(Some(model))).await
+            }
+            None => work_notes_request_context(&sess, turn_context, marker_model).await,
         };
-        let request_context = match work_notes_request_context(
-            &sess,
-            &turn_context,
-            pending_notes
-                .as_ref()
-                .and_then(|p| p.source_model.as_deref())
-                .or(deferred_model.as_deref()),
-        )
-        .await
-        {
+        let request_context = match source {
             Ok(context) => context,
             Err(error) => {
-                sess.send_event(&turn_context, EventMsg::Error(error.to_error_event(None)))
+                sess.send_event(turn_context, EventMsg::Error(error.to_error_event(None)))
                     .await;
                 return None;
             }
         };
-        let reason = if request_context
-            .model_context_window()
-            .zip(turn_context.model_context_window())
-            .is_some_and(|(source, target)| source > target)
-        {
-            CompactionReason::ModelDownshift
-        } else {
-            CompactionReason::TokenLimit
-        };
         if let Err(error) = run_pre_turn_compact(
             &sess,
-            CompactionContext {
-                request: &request_context,
-                ..CompactionContext::new(&turn_context)
-            },
+            &request_context,
+            turn_context,
             injection,
-            reason,
             &cancellation_token,
         )
         .await
@@ -459,169 +545,142 @@ async fn run_turn_inner(
             info!("Recovering compaction notes failed: {error:#}");
             return None;
         }
-        recovered_notes = true;
-        total_usage_tokens = sess.get_total_token_usage().await;
+        compacted_on_entry = true;
     }
-    if !recovery_revisions.is_empty() {
-        sess.seed_initial_context_if_needed(&turn_context).await;
-    }
-    for revision in recovery_revisions {
-        if !sess
-            .install_completion_review_input(&turn_context, revision, true)
-            .await
-        {
-            return None;
-        }
-    }
-
-    let mut compaction = if recovered_notes {
-        FollowUpCompaction::Compacted
+    // Reconcile on explicit continuation before measuring its source. Pending input has
+    // precedence over an undelivered job and must not be appended to the work being captured.
+    let resumed_job = if !compacted_on_entry
+        && continuation.is_some()
+        && recovery_revisions.is_empty()
+        && turn_context.tools_config.exec_job_completion
+        && !cancellation_token.is_cancelled()
+        && let Some(state) = turn_state.as_ref()
+    {
+        crate::unified_exec::jobs::reconcile(&sess, turn_context, state, &cancellation_token).await
     } else {
-        FollowUpCompaction::Idle
+        false
     };
-    let (explicit_app_paths, skill_name_counts_lower) = if continuation.is_some() {
-        (Vec::new(), HashMap::new())
+    let total_usage_tokens = sess.get_total_token_usage().await;
+    // An older steer may be waiting even before any compaction decision was journaled.
+    // Check both the outgoing work and incoming capacity before choosing the first sampler.
+    let at_limit = total_usage_tokens >= auto_compact_limit
+        || (owed_context.is_some() && total_usage_tokens >= incoming_limit);
+    let (over_limit_work, review_active, installed, admission_checked) = {
+        let state = sess.state.lock().await;
+        (
+            at_limit
+                && !state.completion_review.awaiting_compact_followup
+                && (continuation.is_none()
+                    || fresh_before_admission
+                    || queued_steering
+                    || resumed_job
+                    || history_needs_continuation(state.history.raw_items())),
+            state.completion_review.replacement_answer_required,
+            state.completion_review.awaiting_compact_followup,
+            continuation.is_some()
+                && !fresh_before_admission
+                && state.completion_review.unsampled_fresh_model.as_deref()
+                    == Some(turn_context.model_info.slug.as_str()),
+        )
+    };
+    // Until the destination actually samples work, even a review-budget checkpoint below
+    // its regular trigger belongs to the larger model which measured the outgoing prefix.
+    let check_outgoing = !compacted_on_entry && !installed && !admission_checked;
+    let mut source_context = if check_outgoing && (at_limit || review_active) {
+        match work_notes_request_context(&sess, turn_context, None).await {
+            Ok(source) => source,
+            Err(error) => {
+                sess.send_event(turn_context, EventMsg::Error(error.to_error_event(None)))
+                    .await;
+                return None;
+            }
+        }
     } else {
-        match maybe_run_previous_model_inline_compact(
+        Arc::clone(turn_context)
+    };
+    let downshift = should_compact_with_previous_model(
+        &source_context.model_info.slug,
+        &turn_context.model_info.slug,
+        total_usage_tokens,
+        auto_compact_limit,
+        source_context.model_context_window(),
+        turn_context.model_context_window(),
+    );
+    if check_outgoing && (downshift || over_limit_work) {
+        let injection = if fresh_before_admission && !queued_steering {
+            InitialContextInjection::DoNotInject
+        } else {
+            injection
+        };
+        if let Err(error) = run_pre_turn_compact(
             &sess,
-            &turn_context,
-            total_usage_tokens,
+            &source_context,
+            turn_context,
+            injection,
             &cancellation_token,
         )
         .await
         {
-            Ok(true) => {
-                compaction = FollowUpCompaction::Compacted;
-                total_usage_tokens = sess.get_total_token_usage().await;
-            }
-            Ok(false) => {}
-            Err(e) => {
-                info!("Previous-model compaction failed before turn sampling: {e:#}");
-                return None;
-            }
+            info!("Compaction before input admission failed: {error:#}");
+            return None;
         }
-
-        if total_usage_tokens >= auto_compact_limit {
-            if let Err(e) = run_pre_turn_compact(
-                &sess,
-                CompactionContext::new(&turn_context),
-                InitialContextInjection::DoNotInject,
-                CompactionReason::TokenLimit,
-                &cancellation_token,
-            )
-            .await
-            {
-                info!("Auto-compaction failed before turn sampling: {e:#}");
-                return None;
-            }
-            compaction = FollowUpCompaction::Compacted;
+        source_context = Arc::clone(turn_context);
+        compacted_on_entry = true;
+    }
+    let mut compaction = if compacted_on_entry || installed {
+        FollowUpCompaction::Compacted
+    } else {
+        if owed_context.is_some() {
+            // No replacement means no intervening response: admit steer and fresh prompt together.
+            turn_context = &incoming;
+            source_context = Arc::clone(turn_context);
+            auto_compact_limit = incoming_limit;
         }
-
-        sess.record_context_updates_and_set_reference_context_item(turn_context.as_ref())
-            .await;
-
-        let skills_outcome = Some(
-            sess.services
-                .skills_manager
-                .skills_for_cwd(&turn_context.cwd, false, &turn_context.config)
-                .await,
-        );
-
-        let (skill_name_counts, skill_name_counts_lower) = skills_outcome.as_ref().map_or_else(
-            || (HashMap::new(), HashMap::new()),
-            |outcome| build_skill_name_counts(&outcome.skills, &outcome.disabled_paths),
-        );
-        let connector_slug_counts = if turn_context.config.features.enabled(Feature::Apps) {
-            let mcp_tools = match sess
-                .current_mcp_manager()
-                .await
-                .list_all_tools()
-                .or_cancel(&cancellation_token)
-                .await
-            {
-                Ok(mcp_tools) => mcp_tools,
-                Err(_) => return None,
-            };
-            let connectors = connectors::accessible_connectors_from_mcp_tools(&mcp_tools);
-            build_connector_slug_counts(&connectors)
-        } else {
-            HashMap::new()
-        };
-        let mentioned_skills = skills_outcome.as_ref().map_or_else(Vec::new, |outcome| {
-            collect_explicit_skill_mentions(
-                &input,
-                &outcome.skills,
-                &outcome.disabled_paths,
-                &skill_name_counts,
-                &connector_slug_counts,
-            )
+        FollowUpCompaction::Idle
+    };
+    let (mut after_compaction, awaiting_compact_followup) = {
+        let state = sess.state.lock().await;
+        let barrier = state
+            .completion_review
+            .pending_inputs
+            .iter()
+            .find(|input| {
+                state.completion_review.awaiting_compact_followup && input.is_uninstalled_steering()
+            })
+            .map(|i| i.revision);
+        // A later accepted revision cannot overtake an earlier deferred one.
+        let after = barrier.map_or_else(Vec::new, |revision| {
+            recovery_revisions.split_off(recovery_revisions.partition_point(|r| *r < revision))
         });
-        let explicit_app_paths = collect_explicit_app_paths(&input);
+        (after, state.completion_review.awaiting_compact_followup)
+    };
+    if !compacted_on_entry {
+        sess.activate_mcp_context(turn_context).await;
+    }
+    admit_recovered_inputs(
+        &sess,
+        turn_context,
+        &recovery_revisions,
+        &cancellation_token,
+    )
+    .await?;
 
-        maybe_prompt_and_install_mcp_dependencies(
-            sess.as_ref(),
-            turn_context.as_ref(),
-            &cancellation_token,
-            &mentioned_skills,
-        )
-        .await;
-
-        let otel_manager = turn_context.otel_manager.clone();
-        let thread_id = sess.conversation_id.to_string();
-        let tracking = build_track_events_context(turn_context.model_info.slug.clone(), thread_id);
-        let SkillInjections {
-            items: skill_items,
-            warnings: skill_warnings,
-        } = build_skill_injections(
-            &mentioned_skills,
-            Some(&otel_manager),
-            &sess.services.analytics_events_client,
-            tracking.clone(),
-        )
-        .await;
-
-        for message in skill_warnings {
-            sess.send_event(&turn_context, EventMsg::Warning(WarningEvent { message }))
-                .await;
-        }
-
-        if let Some(revision) = sess
-            .initial_completion_review_input_revision(&turn_context.sub_id)
-            .await
-        {
-            if !sess
-                .install_completion_review_input(&turn_context, revision, true)
-                .await
-            {
-                return None;
-            }
-        } else {
-            let response_item: ResponseItem = ResponseInputItem::from(input.clone()).into();
-            sess.record_user_prompt_and_emit_turn_item(
-                turn_context.as_ref(),
-                &input,
-                response_item,
-                None,
-            )
-            .await;
-        }
-
-        if !skill_items.is_empty() {
-            sess.record_conversation_items(&turn_context, &skill_items)
-                .await;
-        }
-
-        (explicit_app_paths, skill_name_counts_lower)
+    let mut initial_input = (!input.is_empty()).then_some(input);
+    let mut skill_names = if initial_input.is_none() || !after_compaction.is_empty() {
+        connector_skill_names(&sess, turn_context).await
+    } else {
+        HashMap::new()
     };
 
-    sess.record_completion_review_advisory(&turn_context).await;
+    let mut check_advisory = true;
+    let mut activate_before_admission = false;
     let mut last_agent_message: Option<String> = None;
-    let mut can_drain_pending_input = input.is_empty() && !recovered_notes;
+    let mut can_drain_pending_input = initial_input.is_none() && !awaiting_compact_followup;
     // Although from the perspective of codex.rs, TurnDiffTracker has the lifecycle of a Task which contains
     // many turns, from the perspective of the user, it is a single turn.
     let turn_diff_tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
 
-    let turn_metadata_header = turn_context.resolve_turn_metadata_header().await;
+    let mut turn_metadata_header = turn_context.resolve_turn_metadata_header().await;
     // `ModelClientSession` is turn-scoped and caches WebSocket + sticky routing state, so we reuse
     // one instance across retries within this turn.
     let mut client_session = sess
@@ -632,32 +691,42 @@ async fn run_turn_inner(
     let mut explorer_rounds = 0;
     let mut explorer_limited = false;
 
-    if turn_context.tools_config.exec_job_completion
-        && continuation.is_some()
-        && let Some(state) = turn_state.as_ref()
-        && !cancellation_token.is_cancelled()
-        && crate::unified_exec::jobs::reconcile(&sess, &turn_context, state, &cancellation_token)
-            .await
-        && sess.get_total_token_usage().await >= auto_compact_limit
-    {
-        compaction = FollowUpCompaction::Pending;
-    }
-    let mut compact_context = CompactionContext::new(&turn_context);
+    let mut compact_context = CompactionContext::new(turn_context);
     loop {
         if matches!(compaction, FollowUpCompaction::Pending) {
+            if !Arc::ptr_eq(&source_context, turn_context)
+                && RegularTaskSettings::from_turn(&source_context)
+                    != RegularTaskSettings::from_turn(turn_context)
+            {
+                if let Err(error) = run_pre_turn_compact(
+                    &sess,
+                    &source_context,
+                    turn_context,
+                    InitialContextInjection::BeforeLastUserMessage,
+                    &cancellation_token,
+                )
+                .await
+                {
+                    info!("Review checkpoint on the outgoing model failed: {error:#}");
+                    return None;
+                }
+                source_context = Arc::clone(turn_context);
+                compaction = FollowUpCompaction::Compacted;
+                continue;
+            }
             // Tool execution may have invalidated the sampled scope (e.g. human clarification).
             // Freeze the authoritative selection at the checkpoint, not the last loop iteration.
-            compact_context.review_frames = match sess.compaction_review_frames(&turn_context).await
+            compact_context.review_frames = match sess.compaction_review_frames(turn_context).await
             {
                 Ok(frames) => frames,
                 Err(error) => {
-                    sess.send_event(&turn_context, EventMsg::Error(error.to_error_event(None)))
+                    sess.send_event(turn_context, EventMsg::Error(error.to_error_event(None)))
                         .await;
                     return None;
                 }
             };
             compact_context.source_token_adjustment =
-                compaction_source_token_adjustment(&sess, &turn_context).await;
+                compaction_source_token_adjustment(&sess, turn_context).await;
             compaction = match begin_follow_up_compaction(
                 &sess,
                 &compact_context,
@@ -673,14 +742,33 @@ async fn run_turn_inner(
                 }
             };
         }
-        let capturing_notes = matches!(compaction, FollowUpCompaction::AwaitingNotes { .. });
-        // Note that pending_input would be something like a message the user
-        // submitted through the UI while the model was running. Though the UI
-        // may support this, the model might not.
-        //
-        // During pre-compact work-notes capture, defer pending input until after compaction so
-        // the notes reflect the pre-interruption history and ordering is preserved.
-        let pending_input = if can_drain_pending_input && !capturing_notes {
+        let capturing_notes = matches!(compaction, FollowUpCompaction::AwaitingNotes);
+        // Neither capture nor the first ordinary sample of a replacement admits steering.
+        // A final-output schema reaches Compacted directly, without an intervening notes round.
+        can_drain_pending_input &= matches!(compaction, FollowUpCompaction::Idle);
+        if can_drain_pending_input {
+            if activate_before_admission {
+                sess.activate_mcp_context(turn_context).await;
+                skill_names = connector_skill_names(&sess, turn_context).await;
+                activate_before_admission = false;
+            }
+            admit_recovered_inputs(&sess, turn_context, &after_compaction, &cancellation_token)
+                .await?;
+            after_compaction.clear();
+        }
+        if !capturing_notes
+            && after_compaction.is_empty()
+            && let Some(input) = initial_input.take()
+        {
+            let revision = sess
+                .initial_completion_review_input_revision(&turn_context.sub_id)
+                .await;
+            skill_names =
+                admit_new_turn_input(&sess, turn_context, &input, revision, &cancellation_token)
+                    .await?;
+            can_drain_pending_input = false;
+        }
+        let pending_input = if can_drain_pending_input {
             match turn_state.as_ref() {
                 Some(turn_state) => sess.take_pending_input_for_turn_state(turn_state).await,
                 None => Vec::new(),
@@ -691,11 +779,7 @@ async fn run_turn_inner(
         if !pending_input.is_empty() {
             for pending_input_item in pending_input {
                 if !sess
-                    .install_pending_completion_review_input(
-                        &turn_context,
-                        pending_input_item,
-                        true,
-                    )
+                    .install_pending_completion_review_input(turn_context, pending_input_item, true)
                     .await
                 {
                     return None;
@@ -703,12 +787,33 @@ async fn run_turn_inner(
             }
         }
 
+        if check_advisory && !capturing_notes {
+            match sess
+                .admit_completion_review_advisory(
+                    turn_context,
+                    &source_context,
+                    matches!(compaction, FollowUpCompaction::Idle),
+                )
+                .await
+            {
+                Ok(true) => check_advisory = false,
+                Ok(false) => {
+                    compaction = FollowUpCompaction::Pending;
+                    continue;
+                }
+                Err(error) => {
+                    sess.send_event(turn_context, EventMsg::Error(error.to_error_event(None)))
+                        .await;
+                    return None;
+                }
+            }
+        }
         // Construct the input that we will send to the model.
         let mut sampling_request_input = if capturing_notes {
             match sampling_input_for_pre_compact_work_notes(&sess, &compact_context).await {
                 Ok(input) => input,
                 Err(error) => {
-                    sess.send_event(&turn_context, EventMsg::Error(error.to_error_event(None)))
+                    sess.send_event(turn_context, EventMsg::Error(error.to_error_event(None)))
                         .await;
                     return None;
                 }
@@ -739,7 +844,8 @@ async fn run_turn_inner(
         if !capturing_notes {
             match sess
                 .review_sampling(
-                    &turn_context,
+                    turn_context,
+                    &source_context,
                     &sampling_request_input[..work_end],
                     matches!(compaction, FollowUpCompaction::Idle),
                 )
@@ -747,7 +853,7 @@ async fn run_turn_inner(
             {
                 Ok(ReviewSampling::Ready(frames)) => {
                     if let Err(error) = frames.insert(&mut sampling_request_input, None) {
-                        sess.send_event(&turn_context, EventMsg::Error(error.to_error_event(None)))
+                        sess.send_event(turn_context, EventMsg::Error(error.to_error_event(None)))
                             .await;
                         return None;
                     }
@@ -755,11 +861,10 @@ async fn run_turn_inner(
                 }
                 Ok(ReviewSampling::Compact) => {
                     compaction = FollowUpCompaction::Pending;
-                    can_drain_pending_input = false;
                     continue;
                 }
                 Err(error) => {
-                    sess.send_event(&turn_context, EventMsg::Error(error.to_error_event(None)))
+                    sess.send_event(turn_context, EventMsg::Error(error.to_error_event(None)))
                         .await;
                     return None;
                 }
@@ -775,33 +880,25 @@ async fn run_turn_inner(
             })
             .map(|user_message| user_message.message())
             .collect::<Vec<String>>();
-        let tool_selection = SamplingRequestToolSelection {
-            explicit_app_paths: &explicit_app_paths,
-            skill_name_counts_lower: &skill_name_counts_lower,
-        };
-        let tool_execution_mode = if capturing_notes {
-            ToolCallExecutionMode::RejectAll {
-                reason: AUTO_COMPACT_WORK_NOTES_TOOL_REJECT_REASON,
-            }
+        let purpose = if capturing_notes {
+            SamplingPurpose::WorkNotes
         } else if explorer_limited {
-            ToolCallExecutionMode::RejectAll {
-                reason: "Exploration evidence budget exhausted; report partial coverage.",
-            }
+            SamplingPurpose::ExplorerReport
         } else {
-            ToolCallExecutionMode::Normal
+            SamplingPurpose::Work
         };
         let sampling_cancel = cancellation_token.child_token();
         let sampling = run_sampling_request(
             Arc::clone(&sess),
-            Arc::clone(&turn_context),
+            Arc::clone(turn_context),
             turn_state.clone(),
             Arc::clone(&turn_diff_tracker),
             &mut client_session,
             turn_metadata_header.as_deref(),
             sampling_request_input,
             request_context_tokens,
-            tool_selection,
-            tool_execution_mode,
+            &skill_names,
+            purpose,
             sampling_cancel.clone(),
         );
         let result = if let Some(deadline) = explorer_deadline {
@@ -838,9 +935,13 @@ async fn run_turn_inner(
             Ok(sampling_request_output) => {
                 let SamplingRequestResult {
                     needs_follow_up,
-                    model_needs_follow_up,
                     last_agent_message: sampling_request_last_agent_message,
                 } = sampling_request_output;
+                let needs_follow_up =
+                    needs_follow_up || !after_compaction.is_empty() || initial_input.is_some();
+                if !capturing_notes && !Arc::ptr_eq(&source_context, turn_context) {
+                    source_context = Arc::clone(turn_context);
+                }
                 if explorer_limited && !capturing_notes {
                     last_agent_message = sampling_request_last_agent_message;
                     break;
@@ -853,7 +954,7 @@ async fn run_turn_inner(
                 {
                     crate::unified_exec::jobs::await_after_tools(
                         &sess,
-                        &turn_context,
+                        turn_context,
                         state,
                         &cancellation_token,
                     )
@@ -878,23 +979,21 @@ async fn run_turn_inner(
                     "post sampling token usage"
                 );
 
-                if let FollowUpCompaction::AwaitingNotes { attempts } = compaction {
-                    let notes = match captured_pre_compact_work_notes(&sess, &turn_context).await {
-                        Ok(notes) => notes,
-                        Err(_) => return None,
-                    };
+                if capturing_notes {
+                    let (notes, remaining) =
+                        match captured_pre_compact_work_notes(&sess, turn_context).await {
+                            Ok(notes) => notes,
+                            Err(_) => return None,
+                        };
                     if notes.is_none() {
-                        let attempts = attempts + 1;
-                        if attempts < AUTO_COMPACT_WORK_NOTES_CAPTURE_MAX_ATTEMPTS {
+                        if remaining > 0 {
                             info!(
-                                "Work-notes capture yielded no notes; retrying capture ({attempts}/{AUTO_COMPACT_WORK_NOTES_CAPTURE_MAX_ATTEMPTS})"
+                                remaining,
+                                "Work-notes capture yielded no notes; retrying capture"
                             );
-                            compaction = FollowUpCompaction::AwaitingNotes { attempts };
                             continue;
                         }
-                        info!(
-                            "Work-notes capture yielded no notes; compacting without notes after {attempts} attempts"
-                        );
+                        info!("Work-notes capture exhausted; compacting without new notes");
                     }
                     if let Err(e) = run_auto_compact(
                         &sess,
@@ -910,16 +1009,33 @@ async fn run_turn_inner(
                         info!("Auto-compaction failed after work-notes capture: {e:#}");
                         return None;
                     }
-                    can_drain_pending_input = false;
                     compaction = FollowUpCompaction::Compacted;
                     continue;
                 }
 
                 // A successful ordinary round can add fresh tool work to compact.
                 compaction = FollowUpCompaction::Idle;
-                if token_limit_reached && needs_follow_up {
+                if !Arc::ptr_eq(turn_context, &incoming) {
+                    // The old request completed before the deferred prompt or its settings
+                    // could take effect. Keep its measured model as the outgoing source.
+                    source_context = Arc::clone(turn_context);
+                    if turn_context.model_provider_id != incoming.model_provider_id {
+                        client_session = sess
+                            .services
+                            .model_client
+                            .new_session_with_provider(incoming.provider.clone());
+                    }
+                    turn_context = &incoming;
+                    compact_context = CompactionContext::new(turn_context);
+                    turn_metadata_header = turn_context.resolve_turn_metadata_header().await;
+                    activate_before_admission = true;
+                    auto_compact_limit = turn_context
+                        .model_info
+                        .auto_compact_token_limit()
+                        .unwrap_or(i64::MAX);
+                }
+                if needs_follow_up && total_usage_tokens >= auto_compact_limit {
                     compaction = FollowUpCompaction::Pending;
-                    can_drain_pending_input = !model_needs_follow_up;
                     continue;
                 }
 
@@ -969,7 +1085,6 @@ async fn run_turn_inner(
                         return None;
                     }
                 }
-                can_drain_pending_input = false;
                 compaction = FollowUpCompaction::Compacted;
                 continue;
             }
@@ -987,13 +1102,13 @@ async fn run_turn_inner(
                     codex_error_info: Some(CodexErrorInfo::BadRequest),
                     client_user_message_id: None,
                 });
-                sess.send_event(&turn_context, event).await;
+                sess.send_event(turn_context, event).await;
                 break;
             }
             Err(e) => {
                 info!("Turn error: {e:#}");
                 let event = EventMsg::Error(e.to_error_event(None));
-                sess.send_event(&turn_context, event).await;
+                sess.send_event(turn_context, event).await;
                 // let the user continue the conversation
                 break;
             }
@@ -1011,15 +1126,155 @@ async fn run_turn_inner(
     }
 }
 
+async fn admit_recovered_inputs(
+    sess: &Arc<Session>,
+    context: &Arc<TurnContext>,
+    revisions: &[u64],
+    cancellation: &CancellationToken,
+) -> Option<()> {
+    for &revision in revisions {
+        let Some((fresh, prepared)) = sess
+            .state
+            .lock()
+            .await
+            .completion_review
+            .pending_inputs
+            .iter()
+            .find(|input| input.revision == revision)
+            .map(|input| {
+                (
+                    input.needs_fresh_admission().then(|| input.content.clone()),
+                    input.has_prepared_prompt(),
+                )
+            })
+        else {
+            continue;
+        };
+        if let Some(input) = fresh {
+            admit_new_turn_input(sess, context, &input, Some(revision), cancellation).await?;
+        } else {
+            if !prepared {
+                sess.seed_initial_context_if_needed(context).await;
+            }
+            if !sess
+                .install_completion_review_input(context, revision, true)
+                .await
+            {
+                return None;
+            }
+        }
+    }
+    Some(())
+}
+
+/// Install a fresh user revision and its skill context together, in admission order.
+async fn admit_new_turn_input(
+    sess: &Arc<Session>,
+    turn_context: &Arc<TurnContext>,
+    input: &[UserInput],
+    revision: Option<u64>,
+    cancellation_token: &CancellationToken,
+) -> Option<HashMap<String, usize>> {
+    let skills = sess
+        .services
+        .skills_manager
+        .skills_for_cwd(&turn_context.cwd, false, &turn_context.config)
+        .await;
+    let (skill_name_counts, skill_names) =
+        build_skill_name_counts(&skills.skills, &skills.disabled_paths);
+    let connector_slug_counts = if turn_context.config.features.enabled(Feature::Apps) {
+        let mcp_tools = sess
+            .current_mcp_manager()
+            .await
+            .list_all_tools()
+            .or_cancel(cancellation_token)
+            .await
+            .ok()?;
+        let connectors = connectors::accessible_connectors_from_mcp_tools(&mcp_tools);
+        build_connector_slug_counts(&connectors)
+    } else {
+        HashMap::new()
+    };
+    let mentioned_skills = collect_explicit_skill_mentions(
+        input,
+        &skills.skills,
+        &skills.disabled_paths,
+        &skill_name_counts,
+        &connector_slug_counts,
+    );
+
+    maybe_prompt_and_install_mcp_dependencies(
+        sess.as_ref(),
+        turn_context.as_ref(),
+        cancellation_token,
+        &mentioned_skills,
+    )
+    .await;
+
+    let otel_manager = turn_context.otel_manager.clone();
+    let thread_id = sess.conversation_id.to_string();
+    let tracking = build_track_events_context(turn_context.model_info.slug.clone(), thread_id);
+    let SkillInjections {
+        items: skill_items,
+        warnings: skill_warnings,
+    } = build_skill_injections(
+        &mentioned_skills,
+        Some(&otel_manager),
+        &sess.services.analytics_events_client,
+        tracking.clone(),
+    )
+    .await;
+
+    for message in skill_warnings {
+        sess.send_event(turn_context, EventMsg::Warning(WarningEvent { message }))
+            .await;
+    }
+
+    if let Some(revision) = revision {
+        if !sess
+            .install_review_input_with_skills(turn_context, revision, true, Some(skill_items))
+            .await
+        {
+            return None;
+        }
+    } else {
+        sess.record_context_updates_and_set_reference_context_item(turn_context)
+            .await;
+        sess.state.lock().await.completion_review.explicit_app_paths =
+            collect_explicit_app_paths(input);
+        let response_item: ResponseItem = ResponseInputItem::from(input.to_vec()).into();
+        sess.record_user_prompt_and_emit_turn_item(
+            turn_context.as_ref(),
+            input,
+            response_item,
+            None,
+        )
+        .await;
+        if !skill_items.is_empty() {
+            sess.record_conversation_items(turn_context, &skill_items)
+                .await;
+        }
+    }
+    Some(skill_names)
+}
+
 async fn begin_follow_up_compaction(
     sess: &Arc<Session>,
     context: &CompactionContext<'_>,
     client_session: &mut ModelClientSession,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<FollowUpCompaction> {
-    if context.request.final_output_json_schema.is_none() {
+    let decision = sess
+        .checkpoint_auto_compaction(
+            context.request,
+            InitialContextInjection::BeforeLastUserMessage,
+            context.source_token_adjustment,
+            0,
+        )
+        .await?;
+    if decision.notes_remaining.unwrap_or_default() > 0 {
         inject_pre_compact_work_notes_request(sess, context.request).await;
-        return Ok(FollowUpCompaction::AwaitingNotes { attempts: 0 });
+        return Ok(FollowUpCompaction::AwaitingNotes);
     }
     run_auto_compact(
         sess,
@@ -1047,15 +1302,18 @@ async fn work_notes_request_context(
         };
     }
 
-    // Older captures predate the source-model line. A downshift begins before
-    // recording the new user turn, so its previous-turn context still identifies
-    // the larger source model. Completed notes may have replaced the usage count.
-    if let Some(previous) = sess.previous_turn_settings().await
-        && previous.model != current.model_info.slug
+    // Before a marker (or for a legacy marker), keep the measured, larger work model.
+    // Fall back to the previous user-turn model only if the ledger has no owner.
+    let source = sess
+        .state
+        .lock()
+        .await
+        .work_source_model()
+        .map(str::to_owned);
+    if let Some(previous) = source
+        && previous != current.model_info.slug
     {
-        let context = sess
-            .turn_context_with_model(current, &previous.model)
-            .await?;
+        let context = sess.turn_context_with_model(current, &previous).await?;
         if context
             .model_context_window()
             .zip(current.model_context_window())
@@ -1067,87 +1325,6 @@ async fn work_notes_request_context(
     Ok(Arc::clone(current))
 }
 
-async fn maybe_run_previous_model_inline_compact(
-    sess: &Arc<Session>,
-    turn_context: &Arc<TurnContext>,
-    total_usage_tokens: i64,
-    cancellation_token: &CancellationToken,
-) -> CodexResult<bool> {
-    let Some(previous_turn_settings) = sess.previous_turn_settings().await else {
-        return Ok(false);
-    };
-    let current_model = turn_context.model_info.slug.as_str();
-    let current_auto_compact_limit = turn_context
-        .model_info
-        .auto_compact_token_limit()
-        .unwrap_or(i64::MAX);
-    if previous_turn_settings.model == current_model
-        || total_usage_tokens <= current_auto_compact_limit
-    {
-        info!(
-            turn_id = %turn_context.sub_id,
-            previous_model = previous_turn_settings.model.as_str(),
-            current_model,
-            total_usage_tokens,
-            current_auto_compact_limit,
-            should_compact = false,
-            "model downshift compaction decision"
-        );
-        return Ok(false);
-    }
-
-    let previous_context = match sess
-        .turn_context_with_model(turn_context.as_ref(), &previous_turn_settings.model)
-        .await
-    {
-        Ok(context) => context,
-        Err(error) => {
-            sess.send_event(turn_context, EventMsg::Error(error.to_error_event(None)))
-                .await;
-            return Err(error);
-        }
-    };
-    let previous_model = previous_context.model_info.slug.as_str();
-    let previous_context_window = previous_context.model_context_window();
-    let current_context_window = turn_context.model_context_window();
-    let should_compact = should_compact_with_previous_model(
-        previous_model,
-        current_model,
-        total_usage_tokens,
-        current_auto_compact_limit,
-        previous_context_window,
-        current_context_window,
-    );
-
-    info!(
-        turn_id = %turn_context.sub_id,
-        previous_model,
-        current_model,
-        previous_context_window,
-        current_context_window,
-        total_usage_tokens,
-        current_auto_compact_limit,
-        should_compact,
-        "model downshift compaction decision"
-    );
-
-    if !should_compact {
-        return Ok(false);
-    }
-
-    run_pre_turn_compact(
-        sess,
-        CompactionContext {
-            request: &previous_context,
-            ..CompactionContext::new(turn_context)
-        },
-        InitialContextInjection::DoNotInject,
-        CompactionReason::ModelDownshift,
-        cancellation_token,
-    )
-    .await
-}
-
 fn should_compact_with_previous_model(
     previous_model: &str,
     current_model: &str,
@@ -1156,7 +1333,7 @@ fn should_compact_with_previous_model(
     previous_context_window: Option<i64>,
     current_context_window: Option<i64>,
 ) -> bool {
-    if previous_model == current_model || total_usage_tokens <= current_auto_compact_limit {
+    if previous_model == current_model || total_usage_tokens < current_auto_compact_limit {
         return false;
     }
 
@@ -1180,6 +1357,8 @@ async fn run_auto_compact(
         return Err(CodexErr::TurnAborted);
     }
     let implementation = compaction_implementation(turn_context);
+    sess.advance_work_notes(WorkNotesCheckpoint::BeforeCompact)
+        .await?;
     turn_context.otel_manager.counter(
         "codex.task.compact",
         1,
@@ -1217,25 +1396,41 @@ async fn run_auto_compact(
             .await
         }
     };
-    if result.as_ref().is_ok_and(|compacted| *compacted)
-        && let Some(client_session) = client_session.as_mut()
-    {
-        client_session.reset_after_compaction();
+    if result.as_ref().is_ok_and(|compacted| *compacted) {
+        if !Arc::ptr_eq(context.request, context.replacement) {
+            sess.activate_mcp_context(context.replacement).await;
+        }
+        if let Some(client_session) = client_session.as_mut() {
+            client_session.reset_after_compaction();
+        }
     }
     result
 }
 
 async fn run_pre_turn_compact(
     sess: &Arc<Session>,
-    mut context: CompactionContext<'_>,
+    turn_context: &Arc<TurnContext>,
+    destination: &Arc<TurnContext>,
     injection: InitialContextInjection,
-    reason: CompactionReason,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<bool> {
-    let turn_context = context.request;
+    let mut context = CompactionContext {
+        request: turn_context,
+        ..CompactionContext::new(destination)
+    };
+    let reason = if turn_context
+        .model_context_window()
+        .zip(destination.model_context_window())
+        .is_some_and(|(source, target)| source > target)
+    {
+        CompactionReason::ModelDownshift
+    } else {
+        CompactionReason::TokenLimit
+    };
     if cancellation_token.is_cancelled() {
         return Err(CodexErr::TurnAborted);
     }
+    sess.activate_mcp_context(turn_context).await;
     let (pending, has_following_input) = {
         let history = sess.clone_history().await;
         let pending = pending_work_notes(history.raw_items())?;
@@ -1244,7 +1439,6 @@ async fn run_pre_turn_compact(
             .is_some_and(|pending| pending.capture_end < history.raw_items().len());
         (pending, has_following_input)
     };
-    let mut attempts = pending.as_ref().map_or(0, |pending| pending.attempts);
     context.review_frames = match sess.compaction_review_frames(turn_context).await {
         Ok(frame) => frame,
         Err(error) => {
@@ -1254,24 +1448,30 @@ async fn run_pre_turn_compact(
         }
     };
     context.source_token_adjustment = compaction_source_token_adjustment(sess, turn_context).await;
+    let decision = sess
+        .checkpoint_auto_compaction(
+            turn_context,
+            injection,
+            context.source_token_adjustment,
+            pending.as_ref().map_or(0, |p| p.attempts),
+        )
+        .await?;
+    context.source_token_adjustment = decision.source_token_adjustment;
     let mut notes = pending.as_ref().and_then(|pending| pending.notes.clone());
+    let mut remaining = decision.notes_remaining.unwrap_or_default();
     let mut client_session = sess
         .services
         .model_client
         .new_session_with_provider(turn_context.provider.clone());
-    if notes.is_none()
-        && turn_context.final_output_json_schema.is_none()
-        && attempts < WORK_NOTES_CAPTURE_MAX_ATTEMPTS
-        && !has_following_input
-    {
+    if notes.is_none() && remaining > 0 && !has_following_input {
         if pending.is_none() {
             inject_pre_compact_work_notes_request(sess, turn_context).await;
         }
         let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
         let metadata = turn_context.resolve_turn_metadata_header().await;
         let turn_state = sess.turn_state_for_sub_id(&turn_context.sub_id).await;
-        let skill_name_counts_lower = HashMap::new();
-        while attempts < WORK_NOTES_CAPTURE_MAX_ATTEMPTS {
+        let skill_names = connector_skill_names(sess, turn_context).await;
+        while remaining > 0 {
             let input = sampling_input_for_pre_compact_work_notes(sess, &context).await?;
             let output = run_sampling_request(
                 Arc::clone(sess),
@@ -1282,20 +1482,15 @@ async fn run_pre_turn_compact(
                 metadata.as_deref(),
                 input,
                 context.review_frame_tokens(),
-                SamplingRequestToolSelection {
-                    explicit_app_paths: &[],
-                    skill_name_counts_lower: &skill_name_counts_lower,
-                },
-                ToolCallExecutionMode::RejectAll {
-                    reason: WORK_NOTES_TOOL_REJECT_REASON,
-                },
+                &skill_names,
+                SamplingPurpose::WorkNotes,
                 cancellation_token.child_token(),
             )
             .await;
             match output {
                 Ok(_) => {
-                    notes = captured_pre_compact_work_notes(sess, turn_context).await?;
-                    attempts += 1;
+                    (notes, remaining) =
+                        captured_pre_compact_work_notes(sess, turn_context).await?;
                     if notes.is_some() {
                         break;
                     }
@@ -1312,7 +1507,7 @@ async fn run_pre_turn_compact(
         sess,
         &context,
         notes,
-        injection,
+        decision.placement,
         Some(&mut client_session),
         reason,
         cancellation_token,
@@ -1559,11 +1754,6 @@ fn codex_apps_connector_id(tool: &crate::mcp_connection_manager::ToolInfo) -> Op
     tool.connector_id.as_deref()
 }
 
-struct SamplingRequestToolSelection<'a> {
-    explicit_app_paths: &'a [String],
-    skill_name_counts_lower: &'a HashMap<String, usize>,
-}
-
 #[allow(clippy::too_many_arguments)]
 #[instrument(level = "trace",
     skip_all,
@@ -1582,20 +1772,17 @@ async fn run_sampling_request(
     turn_metadata_header: Option<&str>,
     input: Vec<ResponseItem>,
     request_context_tokens: i64,
-    tool_selection: SamplingRequestToolSelection<'_>,
-    tool_execution_mode: ToolCallExecutionMode,
+    skill_names: &HashMap<String, usize>,
+    purpose: SamplingPurpose,
     cancellation_token: CancellationToken,
 ) -> CodexResult<SamplingRequestResult> {
-    client_session.cache_operation = match tool_execution_mode {
-        ToolCallExecutionMode::Normal => crate::client::CacheOperation::Work,
-        ToolCallExecutionMode::RejectAll { .. } => crate::client::CacheOperation::Notes,
-    };
+    client_session.cache_operation = purpose.cache_operation();
     let mut input_item_count = sess.state.lock().await.history.raw_items().len();
     let router = sampling_tool_router(
         &sess,
         &turn_context,
         &input,
-        tool_selection,
+        skill_names,
         &cancellation_token,
     )
     .await?;
@@ -1630,7 +1817,7 @@ async fn run_sampling_request(
             &prompt,
             request_context_tokens,
             input_item_count,
-            tool_execution_mode,
+            purpose,
             cancellation_token.child_token(),
         )
         .await
@@ -1720,11 +1907,23 @@ async fn run_sampling_request(
     }
 }
 
+async fn connector_skill_names(sess: &Session, context: &TurnContext) -> HashMap<String, usize> {
+    if !context.features.enabled(Feature::Apps) {
+        return HashMap::new();
+    }
+    let skills = sess
+        .services
+        .skills_manager
+        .skills_for_cwd(&context.cwd, false, &context.config)
+        .await;
+    build_skill_name_counts(&skills.skills, &skills.disabled_paths).1
+}
+
 async fn sampling_tool_router(
     sess: &Session,
     turn_context: &TurnContext,
     input: &[ResponseItem],
-    tool_selection: SamplingRequestToolSelection<'_>,
+    skill_names: &HashMap<String, usize>,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<Arc<ToolRouter>> {
     let mcp_connection_manager = sess.current_mcp_manager().await;
@@ -1736,11 +1935,12 @@ async fn sampling_tool_router(
     let hosted_binding = mcp_connection_manager.hosted_binding();
     let connectors_for_tools = if turn_context.config.features.enabled(Feature::Apps) {
         let connectors = connectors::accessible_connectors_from_mcp_tools(&mcp_tools);
+        let state = sess.state.lock().await;
         Some(filter_connectors_for_input(
             connectors,
             input,
-            tool_selection.explicit_app_paths,
-            tool_selection.skill_name_counts_lower,
+            &state.completion_review.explicit_app_paths,
+            skill_names,
         ))
     } else {
         None
@@ -1762,31 +1962,16 @@ pub(crate) async fn compaction_tool_specs(
     input: &[ResponseItem],
     cancellation_token: &CancellationToken,
 ) -> CodexResult<Vec<crate::client_common::tools::ToolSpec>> {
-    let skills = sess
-        .services
-        .skills_manager
-        .skills_for_cwd(&turn_context.cwd, false, &turn_context.config)
-        .await;
-    let (_, skill_name_counts_lower) =
-        build_skill_name_counts(&skills.skills, &skills.disabled_paths);
-    let router = sampling_tool_router(
-        sess,
-        turn_context,
-        input,
-        SamplingRequestToolSelection {
-            explicit_app_paths: &[],
-            skill_name_counts_lower: &skill_name_counts_lower,
-        },
-        cancellation_token,
-    )
-    .await?;
+    sess.activate_mcp_context(turn_context).await;
+    let skill_names = connector_skill_names(sess, turn_context).await;
+    let router =
+        sampling_tool_router(sess, turn_context, input, &skill_names, cancellation_token).await?;
     Ok(router.specs())
 }
 
 #[derive(Debug)]
 struct SamplingRequestResult {
     needs_follow_up: bool,
-    model_needs_follow_up: bool,
     last_agent_message: Option<String>,
 }
 
@@ -2339,7 +2524,7 @@ async fn try_run_sampling_request(
     prompt: &Prompt,
     request_context_tokens: i64,
     input_item_count: usize,
-    tool_execution_mode: ToolCallExecutionMode,
+    purpose: SamplingPurpose,
     cancellation_token: CancellationToken,
 ) -> CodexResult<SamplingRequestResult> {
     feedback_tags!(
@@ -2365,6 +2550,7 @@ async fn try_run_sampling_request(
         .or_cancel(&cancellation_token)
         .await??;
 
+    let tool_execution_mode = purpose.tool_execution();
     let tool_runtime = ToolCallRuntime::new(
         Arc::clone(&router),
         Arc::clone(&sess),
@@ -2374,7 +2560,6 @@ async fn try_run_sampling_request(
     .with_execution_mode(tool_execution_mode);
     let mut queued_calls = Vec::new();
     let mut needs_follow_up = false;
-    let mut model_needs_follow_up = false;
     let mut last_agent_message: Option<String> = None;
     let mut active_item: Option<TurnItem> = None;
     let mut should_emit_turn_diff = false;
@@ -2487,7 +2672,6 @@ async fn try_run_sampling_request(
                     last_agent_message = Some(agent_message);
                 }
                 if output_result.needs_follow_up {
-                    model_needs_follow_up = true;
                     needs_follow_up = true;
                 }
             }
@@ -2564,6 +2748,14 @@ async fn try_run_sampling_request(
                 end_turn,
                 ..
             } => {
+                if purpose == SamplingPurpose::WorkNotes {
+                    sess.advance_work_notes(WorkNotesCheckpoint::CompletedResponse)
+                        .await?;
+                } else if !sess.finish_ordinary_input().await {
+                    return Err(CodexErr::Fatal(
+                        "Could not persist ordinary input completion.".into(),
+                    ));
+                }
                 progress_trace_state.finalize(&sess, &turn_context).await;
                 if let Some(state) = plan_mode_state.as_mut() {
                     flush_proposed_plan_segments_all(&sess, &turn_context, state).await;
@@ -2579,7 +2771,6 @@ async fn try_run_sampling_request(
                 should_emit_turn_diff = true;
 
                 if let Some(false) = end_turn {
-                    model_needs_follow_up = true;
                     needs_follow_up = true;
                 }
                 if let Some(turn_state) = turn_state.as_ref() {
@@ -2588,7 +2779,6 @@ async fn try_run_sampling_request(
 
                 break Ok(SamplingRequestResult {
                     needs_follow_up,
-                    model_needs_follow_up,
                     last_agent_message,
                 });
             }

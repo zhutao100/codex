@@ -9,7 +9,6 @@ use crate::context_manager::ContextManager;
 use crate::error::CodexErr;
 use crate::error::Result as CodexResult;
 use crate::preserved_work_notes::PRESERVED_WORK_NOTES_MESSAGE_PREFIX;
-use crate::protocol::CompactedItem;
 use crate::protocol::EventMsg;
 use crate::protocol::TurnStartedEvent;
 use crate::protocol::WarningEvent;
@@ -45,7 +44,7 @@ pub(crate) struct PreparedCompactionInput {
     pub(crate) preserved_work_notes: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum InitialContextInjection {
     DoNotInject,
     BeforeLastUserMessage,
@@ -289,18 +288,13 @@ async fn run_compact_task_inner(
         .cloned()
         .collect();
     new_history.extend(ghost_snapshots);
-    let replacement_history = Some(new_history.clone());
     client_session.reset_after_compaction();
 
-    let compacted_item = CompactedItem {
-        message: summary_text.clone(),
-        replacement_history,
-    };
     sess.replace_compacted_history(
         context.replacement,
         new_history,
         reference_context_item,
-        compacted_item,
+        summary_text,
     )
     .await;
 

@@ -303,6 +303,65 @@ fn usage_boundary_keeps_unreported_model_output(includes_reasoning: bool) {
 }
 
 #[test]
+fn helper_fit_uses_measured_work_only_for_a_known_unchanged_user_boundary() {
+    let reasoning = reasoning_with_encrypted_content(64_000);
+    let reserve = estimate_item_token_count(&reasoning);
+    let mut history =
+        create_history_with_items(vec![user_msg("first"), reasoning, user_msg("second")]);
+    assert_eq!(history.helper_tokens_from_usage("source", false), None);
+    history.update_token_info(
+        &TokenUsage {
+            input_tokens: 700,
+            output_tokens: 100,
+            total_tokens: 800,
+            ..Default::default()
+        },
+        None,
+        history.raw_items().len(),
+    );
+    history.set_measured_context(40, None);
+    let tool = custom_tool_call_output("tail", "new result");
+    let policy = TruncationPolicy::Tokens(10_000);
+    history.record_items([&tool], policy);
+    let work = 800 - 40 + estimate_item_token_count(&tool);
+    assert_eq!(history.helper_tokens_from_usage("source", false), None);
+    assert_eq!(history.work_usage_without_frames(false), work + reserve);
+
+    let marker: ResponseItem = codex_protocol::models::DeveloperInstructions::new(
+        crate::compact::AUTO_COMPACT_WORK_NOTES_REQUEST_TAG.to_owned(),
+    )
+    .into();
+    for (source, expected) in [(None, None), (Some("source"), Some(work))] {
+        let mut captured = history.clone();
+        captured.set_measured_context(40, source.map(str::to_owned));
+        let start = captured.raw_items().len();
+        captured.record_session_item(&marker, policy, false);
+        assert_eq!(
+            captured
+                .work_notes_baseline_at(start, "source")
+                .map(|b| b.work_tokens),
+            expected
+        );
+        assert!(captured.work_notes_baseline_at(start, "other").is_none());
+    }
+    history.set_measured_context(40, Some("source".into()));
+    history.record_items([&user_msg("not yet measured")], policy);
+    let conservative = history.work_usage_without_frames(false);
+    assert_eq!(
+        history.helper_tokens_from_usage("source", false),
+        Some(conservative)
+    );
+    let start = history.raw_items().len();
+    history.record_session_item(&marker, policy, false);
+    assert_eq!(
+        history
+            .work_notes_baseline_at(start, "source")
+            .map(|b| b.work_tokens),
+        Some(conservative)
+    );
+}
+
+#[test]
 fn total_token_usage_includes_all_items_after_last_model_generated_item() {
     let assistant = assistant_msg("assistant boundary");
     let trailing_user = user_msg("tail user message");

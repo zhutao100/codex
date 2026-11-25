@@ -2,10 +2,13 @@
 
 use std::path::PathBuf;
 
+use crate::compact::InitialContextInjection;
 use crate::context_manager::estimate_item_token_count;
+use crate::session::RegularTaskSettings;
 use codex_protocol::models::DeveloperInstructions;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::TurnContextItem;
 use codex_protocol::user_input::UserInput;
 use serde::Deserialize;
 use serde::Serialize;
@@ -193,6 +196,12 @@ pub(crate) struct ReviewHandoff {
     pub(crate) advisory_recorded: bool,
 }
 
+impl ReviewHandoff {
+    pub(crate) fn advisory_item(&self) -> ResponseItem {
+        DeveloperInstructions::new(self.advisory.clone()).into()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum ReviewInputInstallation {
     Accepted,
@@ -201,12 +210,67 @@ pub(crate) enum ReviewInputInstallation {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct InputContextProjection {
+    pub(crate) items: Vec<ResponseItem>,
+    pub(crate) reference: TurnContextItem,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct AcceptedReviewInput {
     pub(crate) revision: u64,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    new_task: bool,
     pub(crate) content: Vec<UserInput>,
     pub(crate) client_id: Option<String>,
     pub(crate) response_item: ResponseItem,
     pub(crate) installation: ReviewInputInstallation,
+    /// Frozen during fresh prompt installation. Replay removes the recorded prefix;
+    /// `None` means the prompt's selections have not been resolved yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) remaining_skill_items: Option<Vec<ResponseItem>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) remaining_context: Option<InputContextProjection>,
+}
+
+impl AcceptedReviewInput {
+    pub(crate) fn is_uninstalled_steering(&self) -> bool {
+        !self.new_task && self.installation != ReviewInputInstallation::Recorded
+    }
+
+    pub(crate) fn needs_fresh_admission(&self) -> bool {
+        self.new_task && self.remaining_skill_items.is_none()
+    }
+
+    pub(crate) fn awaits_pre_turn_check(&self) -> bool {
+        self.new_task && self.installation == ReviewInputInstallation::Accepted
+    }
+
+    pub(crate) fn has_prepared_prompt(&self) -> bool {
+        self.remaining_skill_items.is_some()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct AutoCompactionDecision {
+    pub(crate) source: RegularTaskSettings,
+    pub(crate) placement: InitialContextInjection,
+    pub(crate) source_token_adjustment: i64,
+    /// Zero commits the compact phase. Older records lack per-response capture progress.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) notes_remaining: Option<u8>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum WorkNotesCheckpoint {
+    CompletedResponse,
+    BeforeCompact,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum DeferredCaptureSource {
+    Settings(Box<RegularTaskSettings>),
+    LegacyModel(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -216,9 +280,29 @@ pub(crate) struct CompletionReviewState {
     pub(crate) input_revision: u64,
     pub(crate) consumed_input_revision: u64,
     pub(crate) pending_inputs: Vec<AcceptedReviewInput>,
+    /// `Compacted` opens this barrier; an ordinary completion closes it, even without usage.
+    #[serde(default)]
+    pub(crate) awaiting_compact_followup: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) pending_compaction: Option<AutoCompactionDecision>,
+    /// Admission passed the pre-turn check; the new projection is not outgoing measured work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) unsampled_fresh_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) owed_settings: Option<RegularTaskSettings>,
+    /// Typed app mentions have no representation in a Responses user message.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) explicit_app_paths: Vec<String>,
+    /// Selections admitted together but not yet used by a completed ordinary request.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) unsampled_app_paths: Vec<String>,
     pub(crate) replacement_answer_required: bool,
     pub(crate) main_task_id: Option<String>,
     pub(crate) recovery_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) recovery_settings: Option<RegularTaskSettings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) recovery_output_schema: Option<serde_json::Value>,
     pub(crate) request_frame: ReviewRequestFrame,
     pub(crate) episode: Option<CompletedTurnForReview>,
     pub(crate) attempt: Option<ReviewTicket>,
@@ -228,8 +312,12 @@ pub(crate) struct CompletionReviewState {
     /// A checkpoint must finish with the outgoing frames, even if resumed with more headroom.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) defer_new_prompt_frame: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) deferred_capture_model: Option<String>,
+    #[serde(
+        default,
+        alias = "deferred_capture_model",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) deferred_capture_source: Option<DeferredCaptureSource>,
 }
 
 impl Default for CompletionReviewState {
@@ -240,9 +328,17 @@ impl Default for CompletionReviewState {
             input_revision: 0,
             consumed_input_revision: 0,
             pending_inputs: Vec::new(),
+            awaiting_compact_followup: false,
+            pending_compaction: None,
+            unsampled_fresh_model: None,
+            owed_settings: None,
+            explicit_app_paths: Vec::new(),
+            unsampled_app_paths: Vec::new(),
             replacement_answer_required: false,
             main_task_id: None,
             recovery_model: None,
+            recovery_settings: None,
+            recovery_output_schema: None,
             request_frame: ReviewRequestFrame {
                 text_only: true,
                 exact: true,
@@ -253,16 +349,32 @@ impl Default for CompletionReviewState {
             handoff: None,
             prompt_frames: ReviewPromptFrames::default(),
             defer_new_prompt_frame: false,
-            deferred_capture_model: None,
+            deferred_capture_source: None,
         }
     }
 }
 
 impl CompletionReviewState {
+    pub(crate) fn recovery_capture_source(
+        &self,
+        fallback_model: &str,
+    ) -> Option<DeferredCaptureSource> {
+        if let Some(decision) = &self.pending_compaction {
+            return Some(DeferredCaptureSource::Settings(Box::new(
+                decision.source.clone(),
+            )));
+        }
+        self.defer_new_prompt_frame.then(|| {
+            self.deferred_capture_source
+                .clone()
+                .unwrap_or_else(|| DeferredCaptureSource::LegacyModel(fallback_model.to_owned()))
+        })
+    }
+
     pub(crate) fn clear_prompt_frames(&mut self) {
         self.prompt_frames = ReviewPromptFrames::default();
         self.defer_new_prompt_frame = false;
-        self.deferred_capture_model = None;
+        self.deferred_capture_source = None;
     }
 
     pub(crate) fn invalidate_request_provenance(&mut self) {
@@ -313,6 +425,11 @@ impl CompletionReviewState {
         true
     }
 
+    pub(crate) fn set_main_task(&mut self, turn_id: &str, model: &str) {
+        self.main_task_id = Some(turn_id.to_owned());
+        self.recovery_model = Some(model.to_owned());
+    }
+
     pub(crate) fn accept_input(
         &mut self,
         new_task: bool,
@@ -320,8 +437,18 @@ impl CompletionReviewState {
         client_id: Option<String>,
     ) -> u64 {
         if new_task {
+            if self.owed_settings.is_none()
+                && self
+                    .pending_inputs
+                    .iter()
+                    .any(AcceptedReviewInput::is_uninstalled_steering)
+            {
+                self.owed_settings = self.recovery_settings.take();
+            }
+            self.recovery_settings = None;
             self.replacement_answer_required = false;
             self.recovery_model = None;
+            self.recovery_output_schema = None;
         }
         if let Some(episode) = self.eligible_episode() {
             let mut prior = episode.request_frame.prior_user_rounds.clone();
@@ -341,10 +468,13 @@ impl CompletionReviewState {
         self.handoff = None;
         self.pending_inputs.push(AcceptedReviewInput {
             revision: self.input_revision,
+            new_task,
             response_item: ResponseInputItem::from(content.clone()).into(),
             content,
             client_id,
             installation: ReviewInputInstallation::Accepted,
+            remaining_skill_items: None,
+            remaining_context: None,
         });
         self.input_revision
     }
@@ -356,6 +486,19 @@ impl CompletionReviewState {
             return;
         };
         let input = self.pending_inputs.remove(index);
+        if input.new_task {
+            self.owed_settings = None;
+            self.explicit_app_paths
+                .clone_from(&self.unsampled_app_paths);
+        }
+        let selected = crate::mentions::collect_explicit_app_paths(&input.content);
+        if !selected.is_empty() {
+            for paths in [&mut self.explicit_app_paths, &mut self.unsampled_app_paths] {
+                paths.extend_from_slice(&selected);
+                paths.sort_unstable();
+                paths.dedup();
+            }
+        }
         for item in input.content {
             let message = match item {
                 UserInput::Text { text, .. } => text,
@@ -379,14 +522,58 @@ impl CompletionReviewState {
     }
 
     pub(crate) fn observe_input_installation(&mut self, item: &ResponseItem) -> bool {
-        let Some(input) = self.pending_inputs.iter_mut().find(|input| {
+        if let Some(context) = self
+            .pending_inputs
+            .iter_mut()
+            .filter_map(|input| input.remaining_context.as_mut())
+            .find(|context| context.items.first() == Some(item))
+        {
+            context.items.remove(0);
+            return false;
+        }
+        if let Some(input) = self.pending_inputs.iter_mut().find(|input| {
             input.installation == ReviewInputInstallation::Installing
+                && input.remaining_context.is_none()
                 && input.response_item == *item
+        }) {
+            input.installation = ReviewInputInstallation::Recorded;
+            return true;
+        }
+        if let Some(skills) = self
+            .pending_inputs
+            .iter_mut()
+            .filter(|input| input.installation == ReviewInputInstallation::Recorded)
+            .filter_map(|input| input.remaining_skill_items.as_mut())
+            .find(|skills| skills.first() == Some(item))
+        {
+            skills.remove(0);
+        }
+        false
+    }
+
+    pub(crate) fn observe_input_reference(&mut self, reference: &TurnContextItem) -> bool {
+        let Some(input) = self.pending_inputs.iter_mut().find(|input| {
+            input
+                .remaining_context
+                .as_ref()
+                .is_some_and(|c| c.items.is_empty() && c.reference == *reference)
         }) else {
             return false;
         };
-        input.installation = ReviewInputInstallation::Recorded;
+        input.remaining_context = None;
         true
+    }
+
+    /// Older writers persisted the canonical reference immediately *before* the
+    /// installing snapshot. Only a fresh, prepared input on that model owns it.
+    pub(crate) fn owns_legacy_prepared_reference(&self, reference: &TurnContextItem) -> bool {
+        self.recovery_model.as_ref() == Some(&reference.model)
+            && self.pending_inputs.iter().any(|input| {
+                input.new_task
+                    && input.installation == ReviewInputInstallation::Installing
+                    && input.has_prepared_prompt()
+                    && input.remaining_context.is_none()
+            })
     }
 
     pub(crate) fn capture(&mut self, turn_id: String, cwd: PathBuf, text: String) {
@@ -421,6 +608,8 @@ impl CompletionReviewState {
         self.replacement_answer_required = false;
         self.main_task_id = None;
         self.recovery_model = None;
+        self.recovery_settings = None;
+        self.recovery_output_schema = None;
     }
 
     pub(crate) fn begin_review(&mut self, automatic: bool) -> Option<ReviewTicket> {
@@ -445,6 +634,12 @@ impl CompletionReviewState {
 
     pub(crate) fn rebranch(&mut self) {
         self.clear_prompt_frames();
+        self.awaiting_compact_followup = false;
+        self.pending_compaction = None;
+        self.unsampled_fresh_model = None;
+        self.owed_settings = None;
+        self.recovery_settings = None;
+        self.unsampled_app_paths.clear();
         self.history_generation = Uuid::new_v4().to_string();
         if let Some(episode) = self.episode.as_mut() {
             episode.history_generation = self.history_generation.clone();
@@ -453,6 +648,7 @@ impl CompletionReviewState {
         self.main_task_id = None;
         self.replacement_answer_required = false;
         self.recovery_model = None;
+        self.recovery_output_schema = None;
     }
 
     pub(crate) fn from_rollout(value: &serde_json::Value) -> Option<Self> {

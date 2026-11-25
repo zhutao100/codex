@@ -24,6 +24,15 @@ impl From<TruncationPolicy> for ProtocolTruncationPolicy {
     }
 }
 
+impl From<ProtocolTruncationPolicy> for TruncationPolicy {
+    fn from(value: ProtocolTruncationPolicy) -> Self {
+        match value {
+            ProtocolTruncationPolicy::Bytes(bytes) => Self::Bytes(bytes),
+            ProtocolTruncationPolicy::Tokens(tokens) => Self::Tokens(tokens),
+        }
+    }
+}
+
 impl From<TruncationPolicyConfig> for TruncationPolicy {
     fn from(config: TruncationPolicyConfig) -> Self {
         match config.mode {

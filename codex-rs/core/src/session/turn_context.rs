@@ -235,30 +235,24 @@ impl Session {
         updates: SessionSettingsUpdate,
     ) -> ConstraintResult<Arc<TurnContext>> {
         let final_output_json_schema = updates.final_output_json_schema.clone();
-        let (session_configuration, sandbox_policy_changed) =
-            match self.apply_settings_update(updates).await {
-                Ok(result) => result,
-                Err(err) => {
-                    self.send_event_raw(Event {
-                        id: sub_id.clone(),
-                        msg: EventMsg::Error(ErrorEvent {
-                            message: err.to_string(),
-                            codex_error_info: Some(CodexErrorInfo::BadRequest),
-                            client_user_message_id: None,
-                        }),
-                    })
-                    .await;
-                    return Err(err);
-                }
-            };
+        let session_configuration = match self.apply_settings_update(updates).await {
+            Ok(result) => result,
+            Err(err) => {
+                self.send_event_raw(Event {
+                    id: sub_id.clone(),
+                    msg: EventMsg::Error(ErrorEvent {
+                        message: err.to_string(),
+                        codex_error_info: Some(CodexErrorInfo::BadRequest),
+                        client_user_message_id: None,
+                    }),
+                })
+                .await;
+                return Err(err);
+            }
+        };
 
         Ok(self
-            .new_turn_from_configuration(
-                sub_id,
-                session_configuration,
-                final_output_json_schema,
-                sandbox_policy_changed,
-            )
+            .new_turn_from_configuration(sub_id, session_configuration, final_output_json_schema)
             .await)
     }
 
@@ -267,25 +261,8 @@ impl Session {
         sub_id: String,
         session_configuration: SessionConfiguration,
         final_output_json_schema: Option<Option<Value>>,
-        sandbox_policy_changed: bool,
     ) -> Arc<TurnContext> {
         let per_turn_config = Self::build_per_turn_config(&session_configuration);
-
-        if sandbox_policy_changed {
-            let sandbox_state = SandboxState {
-                sandbox_policy: per_turn_config.sandbox_policy.get().clone(),
-                codex_linux_sandbox_exe: per_turn_config.codex_linux_sandbox_exe.clone(),
-                sandbox_cwd: per_turn_config.cwd.clone(),
-            };
-            if let Err(e) = self
-                .current_mcp_manager()
-                .await
-                .notify_sandbox_state_change(&sandbox_state)
-                .await
-            {
-                warn!("Failed to notify sandbox state change to MCP servers: {e:#}");
-            }
-        }
 
         let model_info = self
             .services
@@ -332,8 +309,34 @@ impl Session {
             let state = self.state.lock().await;
             state.session_configuration.clone()
         };
-        self.new_turn_from_configuration(sub_id, session_configuration, None, false)
+        self.new_turn_from_configuration(sub_id, session_configuration, None)
             .await
+    }
+
+    /// Project a separately owned request without changing the admitted session's configuration.
+    pub(super) async fn turn_context_for_task_settings(
+        &self,
+        source: &TurnContext,
+        settings: &RegularTaskSettings,
+    ) -> CodexResult<Arc<TurnContext>> {
+        let updates = settings.updates(None);
+        let mut configuration = self
+            .state
+            .lock()
+            .await
+            .session_configuration
+            .apply(&updates)
+            .map_err(|err| CodexErr::Fatal(err.to_string()))?;
+        (configuration.provider_id, configuration.provider) = configuration
+            .original_config_do_not_use
+            .resolve_model_provider_for_model(settings.mode.model())?;
+        Ok(self
+            .new_turn_from_configuration(
+                source.sub_id.clone(),
+                configuration,
+                updates.final_output_json_schema,
+            )
+            .await)
     }
 
     pub(crate) async fn turn_context_with_model(
@@ -341,25 +344,10 @@ impl Session {
         source: &TurnContext,
         model: &str,
     ) -> CodexResult<Arc<TurnContext>> {
-        let mut session_configuration = {
-            let state = self.state.lock().await;
-            state.session_configuration.clone()
-        };
-        session_configuration.collaboration_mode = session_configuration
-            .collaboration_mode
-            .with_updates(Some(model.to_string()), None, None);
-        let (provider_id, provider) = session_configuration
-            .original_config_do_not_use
-            .resolve_model_provider_for_model(model)?;
-        session_configuration.provider_id = provider_id;
-        session_configuration.provider = provider;
-        Ok(self
-            .new_turn_from_configuration(
-                source.sub_id.clone(),
-                session_configuration,
-                Some(source.final_output_json_schema.clone()),
-                false,
-            )
-            .await)
+        let mut settings = RegularTaskSettings::from_turn(source);
+        settings.mode = settings
+            .mode
+            .with_updates(Some(model.to_owned()), None, None);
+        self.turn_context_for_task_settings(source, &settings).await
     }
 }

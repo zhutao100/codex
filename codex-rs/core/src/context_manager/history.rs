@@ -23,7 +23,7 @@ use std::ops::Deref;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WorkNotesBaseline {
     index: usize,
-    model: Option<String>,
+    model: String,
     pub(crate) work_tokens: i64,
     item_tokens: i64,
 }
@@ -117,14 +117,51 @@ impl ContextManager {
             .max(0)
     }
 
+    /// Fit a helper extending measured input on the same model. The capacity reserve
+    /// for older reasoning is not another input delta. A new user boundary can change
+    /// which reasoning is rendered, so do not extrapolate across an unmeasured one.
+    pub(crate) fn helper_tokens_from_usage(
+        &self,
+        model: &str,
+        reasoning_included: bool,
+    ) -> Option<i64> {
+        let usage = &self.token_info.as_ref()?.last_token_usage;
+        if usage.total_tokens <= 0 {
+            return None;
+        }
+        if usage.input_tokens == 0 {
+            // Local replacement estimate, not a measurement of the old history.
+            return self
+                .usage_source_model()
+                .is_none()
+                .then(|| self.work_usage_without_frames(reasoning_included));
+        }
+        if self.usage_source_model() != Some(model) {
+            return None;
+        }
+        if self.items[self.last_usage_item_count..]
+            .iter()
+            .any(is_user_turn_boundary)
+        {
+            return Some(self.work_usage_without_frames(reasoning_included));
+        }
+        Some(
+            usage
+                .total_tokens
+                .saturating_add(self.uncovered_item_tokens())
+                .saturating_sub(self.request_context_tokens)
+                .max(0),
+        )
+    }
+
     pub(crate) fn work_notes_baseline_at(
         &self,
         index: usize,
         model: &str,
     ) -> Option<&WorkNotesBaseline> {
-        self.work_notes_baseline.as_ref().filter(|b| {
-            b.index == index && b.model.as_deref().is_none_or(|measured| measured == model)
-        })
+        self.work_notes_baseline
+            .as_ref()
+            .filter(|b| b.index == index && b.model == model)
     }
 
     pub(crate) fn record_session_item(
@@ -132,22 +169,16 @@ impl ContextManager {
         item: &ResponseItem,
         policy: TruncationPolicy,
         reasoning_included: bool,
-        legacy_user_model: Option<&str>,
     ) {
         if crate::compact::is_work_notes_request_item(item) {
-            self.work_notes_baseline = self
-                .token_info
-                .as_ref()
-                .filter(|info| info.last_token_usage.input_tokens > 0)
-                .map(|_| WorkNotesBaseline {
+            self.work_notes_baseline = self.usage_source_model().and_then(|model| {
+                Some(WorkNotesBaseline {
                     index: self.items.len(),
-                    model: self
-                        .usage_source_model()
-                        .or(legacy_user_model)
-                        .map(str::to_owned),
-                    work_tokens: self.work_usage_without_frames(reasoning_included),
+                    model: model.to_owned(),
+                    work_tokens: self.helper_tokens_from_usage(model, reasoning_included)?,
                     item_tokens: self.total_item_tokens,
-                });
+                })
+            });
         }
         self.record_items([item], policy);
     }
@@ -431,10 +462,14 @@ impl ContextManager {
         last_tokens.saturating_add(self.get_unreported_token_usage(server_reasoning_included))
     }
 
-    pub(crate) fn get_unreported_token_usage(&self, server_reasoning_included: bool) -> i64 {
-        let unreported_tokens = self.item_token_estimates[self.last_usage_item_count..]
+    fn uncovered_item_tokens(&self) -> i64 {
+        self.item_token_estimates[self.last_usage_item_count..]
             .iter()
-            .fold(0i64, |acc, estimate| acc.saturating_add(*estimate));
+            .fold(0i64, |acc, estimate| acc.saturating_add(*estimate))
+    }
+
+    pub(crate) fn get_unreported_token_usage(&self, server_reasoning_included: bool) -> i64 {
+        let unreported_tokens = self.uncovered_item_tokens();
         if server_reasoning_included {
             unreported_tokens
         } else {

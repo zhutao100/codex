@@ -19,6 +19,49 @@ pub enum Compression {
     Zstd,
 }
 
+/// Transport-specific storage settings applied to the logical Responses input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponsesStorage {
+    Disabled,
+    Enabled,
+    AzureStoredIds,
+}
+
+impl ResponsesStorage {
+    pub fn http(provider: &Provider, store_override: Option<bool>) -> Self {
+        let azure = provider.is_azure_responses_endpoint();
+        match (store_override.unwrap_or(azure), azure) {
+            (true, true) => Self::AzureStoredIds,
+            (true, false) => Self::Enabled,
+            (false, _) => Self::Disabled,
+        }
+    }
+
+    pub fn websocket(store: bool) -> Self {
+        if store { Self::Enabled } else { Self::Disabled }
+    }
+
+    pub fn store(self) -> bool {
+        self != Self::Disabled
+    }
+
+    pub fn attached_id(self, item: &ResponseItem) -> Option<&str> {
+        if self == Self::AzureStoredIds
+            && let ResponseItem::Reasoning { id, .. }
+            | ResponseItem::Message { id: Some(id), .. }
+            | ResponseItem::WebSearchCall { id: Some(id), .. }
+            | ResponseItem::FunctionCall { id: Some(id), .. }
+            | ResponseItem::LocalShellCall { id: Some(id), .. }
+            | ResponseItem::CustomToolCall { id: Some(id), .. } = item
+            && !id.is_empty()
+        {
+            Some(id)
+        } else {
+            None
+        }
+    }
+}
+
 /// Assembled request body plus headers for a Responses stream request.
 pub struct ResponsesRequest {
     pub body: Value,
@@ -122,9 +165,7 @@ impl<'a> ResponsesRequestBuilder<'a> {
             .ok_or_else(|| ApiError::Stream("missing input for responses request".into()))?;
         let tools = self.tools.unwrap_or_default();
 
-        let store = self
-            .store_override
-            .unwrap_or_else(|| provider.is_azure_responses_endpoint());
+        let storage = ResponsesStorage::http(provider, self.store_override);
 
         let req = ResponsesApiRequest {
             model,
@@ -133,7 +174,7 @@ impl<'a> ResponsesRequestBuilder<'a> {
             tool_choice: "auto",
             parallel_tool_calls: self.parallel_tool_calls,
             reasoning: self.reasoning,
-            store,
+            store: storage.store(),
             stream: true,
             include: self.include,
             service_tier: self.service_tier,
@@ -144,8 +185,8 @@ impl<'a> ResponsesRequestBuilder<'a> {
         let mut body = serde_json::to_value(&req)
             .map_err(|e| ApiError::Stream(format!("failed to encode responses request: {e}")))?;
 
-        if store && provider.is_azure_responses_endpoint() {
-            attach_item_ids(&mut body, input);
+        if storage == ResponsesStorage::AzureStoredIds {
+            attach_item_ids(&mut body, input, storage);
         }
 
         let mut headers = self.headers;
@@ -162,7 +203,7 @@ impl<'a> ResponsesRequestBuilder<'a> {
     }
 }
 
-fn attach_item_ids(payload_json: &mut Value, input: &ResponsesInput) {
+fn attach_item_ids(payload_json: &mut Value, input: &ResponsesInput, storage: ResponsesStorage) {
     let Some(input_value) = payload_json.get_mut("input") else {
         return;
     };
@@ -175,20 +216,10 @@ fn attach_item_ids(payload_json: &mut Value, input: &ResponsesInput) {
         .skip(usize::from(input.base.is_some()))
         .zip(&input.items)
     {
-        if let ResponseItem::Reasoning { id, .. }
-        | ResponseItem::Message { id: Some(id), .. }
-        | ResponseItem::WebSearchCall { id: Some(id), .. }
-        | ResponseItem::FunctionCall { id: Some(id), .. }
-        | ResponseItem::LocalShellCall { id: Some(id), .. }
-        | ResponseItem::CustomToolCall { id: Some(id), .. } = item
+        if let Some(id) = storage.attached_id(item)
+            && let Some(obj) = value.as_object_mut()
         {
-            if id.is_empty() {
-                continue;
-            }
-
-            if let Some(obj) = value.as_object_mut() {
-                obj.insert("id".to_string(), Value::String(id.clone()));
-            }
+            obj.insert("id".to_string(), Value::String(id.to_owned()));
         }
     }
 }

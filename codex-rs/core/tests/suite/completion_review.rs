@@ -40,11 +40,15 @@ fn configure_recovery_models_with_limit(config: &mut Config, auto_compact_limit:
     configure_recovery_windows(config, auto_compact_limit, 24_000);
 }
 
-fn configure_recovery_windows(config: &mut Config, auto_compact_limit: i64, main_window: i64) {
+fn configure_recovery_windows(
+    config: &mut Config,
+    auto_compact_limit: i64,
+    main_window: i64,
+) -> &mut ModelOverlay {
     config.model = Some("completion-recovery-small".into());
     config.review_model = Some("completion-recovery-large".into());
     config.compaction_mode = codex_core::config::types::CompactionMode::Auto;
-    config.model_overlay = Some(ModelOverlay {
+    config.model_overlay.insert(ModelOverlay {
         models: [
             ("completion-recovery-small", main_window),
             ("completion-recovery-large", 128_000),
@@ -63,7 +67,15 @@ fn configure_recovery_windows(config: &mut Config, auto_compact_limit: i64, main
         })
         .collect(),
         ..Default::default()
-    });
+    })
+}
+
+fn recovery_with_effort(window: i64) -> impl FnOnce(&mut Config) {
+    move |cfg| {
+        configure_recovery_windows(cfg, 200_000, window)
+            .cross_model
+            .supports_reasoning_summaries = Some(true);
+    }
 }
 
 const REVIEW_WORK_NOTES: &str =
@@ -340,7 +352,7 @@ async fn automatic_review_continues_past_three_with_only_initial_and_latest_answ
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn automatic_clean_review_persists_five_recoverable_checkpoints() {
+async fn automatic_clean_review_checkpoints_admission_sampling_and_review() {
     skip_if_no_network_unless_localhost!();
     let server = MockServer::start().await;
     let requests = mount_sse_sequence(
@@ -393,6 +405,7 @@ async fn automatic_clean_review_persists_five_recoverable_checkpoints() {
                     .map(|input| &input["installation"])
                     .collect::<Vec<_>>(),
                 state["consumed_input_revision"],
+                state["unsampled_fresh_model"].is_string(),
                 !state["main_task_id"].is_null(),
                 !state["episode"].is_null(),
                 !state["attempt"].is_null(),
@@ -402,11 +415,12 @@ async fn automatic_clean_review_persists_five_recoverable_checkpoints() {
     assert_eq!(
         serde_json::json!(checkpoints),
         serde_json::json!([
-            [["Accepted"], 0, true, false, false],
-            [["Installing"], 0, true, false, false],
-            [[], 1, true, false, false],
-            [[], 1, false, true, true],
-            [[], 1, false, true, false],
+            [["Accepted"], 0, false, true, false, false],
+            [["Installing"], 0, true, true, false, false],
+            [[], 1, true, true, false, false],
+            [[], 1, false, true, false, false],
+            [[], 1, false, false, true, true],
+            [[], 1, false, false, true, false],
         ])
     );
     let final_state = states.last().unwrap();
@@ -1255,26 +1269,133 @@ async fn compaction_replays_the_sampled_optional_reference_choice(
     Ok(())
 }
 
-#[test_case::test_case(false; "small handoff fits both helpers")]
-#[test_case::test_case(true; "oversized unsampled handoff deferred across failed installation and restart")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claimed_review_restores_the_uninterrupted_wire_settings() -> anyhow::Result<()> {
+    skip_if_no_network_unless_localhost!(Ok(()));
+    let server = MockServer::start().await;
+    let home = Arc::new(TempDir::new()?);
+    let requests = mount_sse_sequence(
+        &server,
+        vec![
+            answer("Candidate."),
+            verdict("Inspect the work again.", true),
+            answer("Replacement."),
+            answer("Restored."),
+        ],
+    )
+    .await;
+    let codex =
+        new_conversation_for_server(&server, home.clone(), recovery_with_effort(24_000)).await;
+    let mut settings = context_override(None, None);
+    let Op::OverrideTurnContext {
+        effort,
+        service_tier,
+        ..
+    } = &mut settings
+    else {
+        unreachable!()
+    };
+    *effort = Some(Some(codex_protocol::openai_models::ReasoningEffort::High));
+    *service_tier = Some("priority".into());
+    codex.submit(settings).await?;
+    submit_request(&codex, "Verify the result.").await;
+    wait_for_event(&codex, |e| matches!(e, EventMsg::TurnComplete(_))).await;
+    codex.submit(Op::ReviewCompletedTurn).await?;
+    wait_for_event(&codex, |e| match e {
+        EventMsg::Error(error) => panic!("handoff failed: {}", error.message),
+        EventMsg::TurnComplete(e) => e.last_agent_message.as_deref() == Some("Replacement."),
+        _ => false,
+    })
+    .await;
+    let path = codex.rollout_path().context("rollout")?;
+    codex.submit(Op::Shutdown).await?;
+    wait_for_event(&codex, |e| matches!(e, EventMsg::ShutdownComplete)).await;
+    let raw = std::fs::read_to_string(&path)?;
+    let mut end = 0;
+    for line in raw.split_inclusive('\n') {
+        end += line.len();
+        if let RolloutItem::PostTurnCompletionReviewState(s) =
+            serde_json::from_str::<RolloutLine>(line)?.item
+            && s["handoff"]["disposition"]["Started"].is_object()
+            && s["main_task_id"].is_null()
+        {
+            break;
+        }
+    }
+    assert!(end < raw.len(), "claim before the main task starts");
+    std::fs::write(&path, &raw[..end])?;
+    let resumed =
+        resume_conversation_for_server(&server, home, path, recovery_with_effort(24_000)).await;
+    resumed.submit(Op::Continue).await?;
+    wait_for_event(&resumed, |e| match e {
+        EventMsg::Error(error) => panic!("restart failed: {}", error.message),
+        EventMsg::TurnComplete(e) => e.last_agent_message.as_deref() == Some("Restored."),
+        _ => false,
+    })
+    .await;
+    let sent = requests.requests();
+    assert_eq!(sent.len(), 4);
+    let work = sent[2].body_json();
+    assert_eq!(work["service_tier"], "priority");
+    assert_eq!(work["reasoning"]["effort"], "high");
+    let restored = sent[3].body_json();
+    for key in [
+        "input",
+        "tools",
+        "model",
+        "text",
+        "reasoning",
+        "service_tier",
+        "include",
+        "parallel_tool_calls",
+        "store",
+    ] {
+        assert!(work[key] == restored[key], "claimed review changed {key}");
+    }
+    resumed.submit(Op::Shutdown).await?;
+    wait_for_event(&resumed, |e| matches!(e, EventMsg::ShutdownComplete)).await;
+    Ok(())
+}
+
+#[test_case::test_case(false, false; "small handoff fits both helpers")]
+#[test_case::test_case(true, false; "oversized unsampled frame")]
+#[test_case::test_case(false, true; "oversized unadmitted advisory")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn new_review_compacts_the_previous_sampled_work_across_restart(
-    defer: bool,
+    large_candidate: bool,
+    large_advice: bool,
 ) -> anyhow::Result<()> {
     skip_if_no_network_unless_localhost!(Ok(()));
     let server = MockServer::start().await;
     let advice = "Verify the outstanding evidence.";
-    let candidate =
-        "Second candidate, sampled under the first review.".repeat(if defer { 820 } else { 1 });
+    let incoming = if large_advice {
+        format!(
+            "DELAYED-ADVICE: {}",
+            "Check this result against the supplied evidence. ".repeat(810)
+        )
+    } else {
+        advice.into()
+    };
+    let defer = large_candidate || large_advice;
+    let candidate = "Second candidate, sampled under the first review."
+        .repeat(if large_candidate { 820 } else { 1 });
     let candidate = candidate.as_str();
     let mut replies = vec![
+        sse(vec![
+            ev_function_call(
+                "hot-tool",
+                "update_plan",
+                r#"{"plan":[{"step":"Read the evidence","status":"completed"}]}"#,
+            ),
+            ev_completed("tool"),
+        ]),
         answer("First candidate."),
         verdict(advice, true),
         sse(vec![
             ev_assistant_message("candidate", candidate),
             ev_completed_with_tokens("candidate", 14_600),
         ]),
-        verdict(advice, true),
+        verdict(&incoming, true),
         answer(REVIEW_WORK_NOTES),
     ];
     if defer {
@@ -1300,7 +1421,8 @@ async fn new_review_compacts_the_previous_sampled_work_across_restart(
     }
     let requests = mount_sse_sequence(&server, replies).await;
     let home = Arc::new(TempDir::new()?);
-    let codex = new_conversation_for_server(&server, home.clone(), configure_recovery_models).await;
+    let codex =
+        new_conversation_for_server(&server, home.clone(), recovery_with_effort(24_000)).await;
     submit_request(&codex, "Verify both results.").await;
     wait_for_event(&codex, |e| matches!(e, EventMsg::TurnComplete(_))).await;
     codex.submit(Op::ReviewCompletedTurn).await?;
@@ -1312,7 +1434,7 @@ async fn new_review_compacts_the_previous_sampled_work_across_restart(
         &server,
         home.clone(),
         path.clone(),
-        configure_recovery_models,
+        recovery_with_effort(24_000),
     )
     .await;
     resumed.submit(Op::ReviewCompletedTurn).await?;
@@ -1321,11 +1443,13 @@ async fn new_review_compacts_the_previous_sampled_work_across_restart(
         resumed.submit(Op::Shutdown).await?;
         wait_for_event(&resumed, |e| matches!(e, EventMsg::ShutdownComplete)).await;
         // The deferred choice belongs to this capture, not to the new process's headroom.
-        let active =
-            resume_conversation_for_server(&server, home.clone(), path.clone(), |config| {
-                configure_recovery_windows(config, 200_000, 64_000);
-            })
-            .await;
+        let active = resume_conversation_for_server(
+            &server,
+            home.clone(),
+            path.clone(),
+            recovery_with_effort(64_000),
+        )
+        .await;
         active.submit(Op::Continue).await?;
         active
     } else {
@@ -1339,7 +1463,7 @@ async fn new_review_compacts_the_previous_sampled_work_across_restart(
         _ => false,
     })
     .await;
-    let captured = requests.requests();
+    let captured = &requests.requests()[1..];
     assert_eq!(captured.len(), 7 + usize::from(defer));
     if defer {
         assert_eq!(captured[5].input(), captured[6].input());
@@ -1348,9 +1472,16 @@ async fn new_review_compacts_the_previous_sampled_work_across_restart(
     let cycle = [captured[4].clone(), captured[5].clone(), last.clone()];
     assert_review_compaction_cycle(&cycle);
     let hot = captured[2].input();
+    assert!(
+        hot.iter()
+            .any(|i| i["call_id"] == "hot-tool" && i["type"] == "function_call_output")
+    );
     for helper in &captured[4..6] {
         let input = helper.input();
         assert!(input.starts_with(&hot));
+        if large_advice {
+            assert!(!helper.body_json().to_string().contains("DELAYED-ADVICE"));
+        }
         assert_eq!(input[hot.len()]["content"][0]["text"], candidate);
         let source_frame = followup_frame(helper).context("outgoing frame")?;
         assert_eq!(source_frame.contains(candidate), !defer);
@@ -1369,10 +1500,25 @@ async fn new_review_compacts_the_previous_sampled_work_across_restart(
             .count(),
         1
     );
-    assert!(
-        followup_frame(last)
-            .is_some_and(|frame| frame.contains(candidate) && frame.contains(advice))
-    );
+    let assert_replacement = |request: &ResponsesRequest| -> anyhow::Result<()> {
+        let frame = followup_frame(request).context("current candidate frame")?;
+        assert!(frame.contains(candidate));
+        if large_advice {
+            let items = request.input();
+            assert_eq!(
+                items
+                    .iter()
+                    .filter_map(|i| i["content"][0]["text"].as_str())
+                    .filter(|s| s.contains(&incoming))
+                    .count(),
+                1
+            );
+        } else {
+            assert!(frame.contains(advice));
+        }
+        Ok(())
+    };
+    assert_replacement(last)?;
     if defer {
         resumed.submit(Op::Shutdown).await?;
         wait_for_event(&resumed, |e| matches!(e, EventMsg::ShutdownComplete)).await;
@@ -1410,19 +1556,26 @@ async fn new_review_compacts_the_previous_sampled_work_across_restart(
         ] {
             // Only truncate the disposable fixture, with its writer shut down.
             std::fs::write(&path, &original.as_bytes()[..cut])?;
-            let active =
-                resume_conversation_for_server(&server, home.clone(), path.clone(), move |cfg| {
-                    configure_recovery_windows(
-                        cfg,
-                        200_000,
-                        if before_marker { 64_000 } else { 24_000 },
-                    );
-                })
-                .await;
+            let active = resume_conversation_for_server(
+                &server,
+                home.clone(),
+                path.clone(),
+                recovery_with_effort(if before_marker { 64_000 } else { 24_000 }),
+            )
+            .await;
             if before_marker {
-                active
-                    .submit(context_override(None, Some("completion-recovery-large")))
-                    .await?;
+                let mut settings = context_override(None, Some("completion-recovery-large"));
+                let Op::OverrideTurnContext {
+                    effort,
+                    service_tier,
+                    ..
+                } = &mut settings
+                else {
+                    unreachable!()
+                };
+                *effort = Some(Some(codex_protocol::openai_models::ReasoningEffort::High));
+                *service_tier = Some("priority".into());
+                active.submit(settings).await?;
             }
             active.submit(Op::Continue).await?;
             wait_for_event(&active, |e| match e {
@@ -1431,29 +1584,332 @@ async fn new_review_compacts_the_previous_sampled_work_across_restart(
                 _ => false,
             })
             .await;
-            let all = requests.requests();
+            let all = &requests.requests()[1..];
             let new = &all[sent..];
             assert_eq!(new.len(), if before_marker { 3 } else { 1 });
             if before_marker {
                 assert_review_compaction_cycle(new);
-                assert_eq!(new[0].input(), captured[4].input());
-                assert_eq!(new[1].input(), captured[5].input());
-                assert_eq!(new[0].body_json()["model"], "completion-recovery-small");
-                assert_eq!(new[1].body_json()["model"], "completion-recovery-small");
-                assert_eq!(new[2].body_json()["model"], "completion-recovery-large");
+                for (helper, original) in new[..2].iter().zip(&captured[4..6]) {
+                    let body = helper.body_json();
+                    assert_eq!(body["model"], "completion-recovery-small");
+                    assert!(body == original.body_json(), "helper changed on retarget");
+                    assert_ne!(body["service_tier"], "priority");
+                    assert_ne!(body["reasoning"]["effort"], "high");
+                }
+                let target = new[2].body_json();
+                assert_eq!(target["model"], "completion-recovery-large");
+                assert_eq!(target["reasoning"]["effort"], "high");
+                assert_eq!(target["service_tier"], "priority");
             }
             let ordinary = new.last().context("ordinary replacement")?;
             assert!(ordinary.input().iter().any(|i| i["type"] == "compaction"));
-            assert!(
-                followup_frame(ordinary)
-                    .is_some_and(|frame| frame.contains(candidate) && frame.contains(advice))
-            );
+            assert_replacement(ordinary)?;
             sent = all.len();
             active.submit(Op::Shutdown).await?;
             wait_for_event(&active, |e| matches!(e, EventMsg::ShutdownComplete)).await;
         }
     }
     server.verify().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn continued_downshift_checkpoints_review_on_source_below_auto_limit() -> anyhow::Result<()> {
+    skip_if_no_network_unless_localhost!(Ok(()));
+    use core_test_support::responses::mount_response_sequence;
+    use core_test_support::responses::sse_response;
+    use std::time::Duration;
+    let server = MockServer::start().await;
+    let test = test_codex()
+        .with_config(|cfg| {
+            configure_recovery_models_with_limit(cfg, 23_000);
+            cfg.model = Some("completion-recovery-large".into());
+        })
+        .build(&server)
+        .await?;
+    let mut reasoning = ev_reasoning_item("source-reasoning", &[], &[]);
+    reasoning["item"]["encrypted_content"] = serde_json::json!("x".repeat(100_000));
+    let initial = mount_response_sequence(
+        &server,
+        vec![
+            sse_response(answer("Initial candidate.")),
+            sse_response(verdict("Verify the work.", true)),
+            sse_response(sse(vec![
+                reasoning,
+                ev_function_call(
+                    "b-plan",
+                    "update_plan",
+                    r#"{"plan":[{"step":"Verify","status":"completed"}]}"#,
+                ),
+                ev_completed_with_tokens("b-work", 16_000),
+            ])),
+            sse_response(answer("Unused.")).set_delay(Duration::from_secs(10)),
+        ],
+    )
+    .await;
+    test.submit_turn("Verify the evidence.").await?;
+    test.codex.submit(Op::ReviewCompletedTurn).await?;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while initial.requests().len() < 4 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await?;
+    test.codex.submit(Op::Pause).await?;
+    wait_for_event(&test.codex, |e| matches!(e, EventMsg::TurnPaused(_))).await;
+    test.codex
+        .submit(context_override(None, Some("completion-recovery-small")))
+        .await?;
+    let checkpoint = mount_sse_sequence(
+        &server,
+        vec![
+            answer(REVIEW_WORK_NOTES),
+            compacted_answer(),
+            answer("Finished on A."),
+        ],
+    )
+    .await;
+    test.codex.submit(Op::Continue).await?;
+    wait_for_event(&test.codex, |e| match e {
+        EventMsg::Error(err) => panic!("{}", err.message),
+        EventMsg::TurnComplete(_) => true,
+        _ => false,
+    })
+    .await;
+    let actual = checkpoint.requests();
+    assert_review_compaction_cycle(&actual);
+    let hot = initial.requests()[3].input();
+    for req in &actual[..2] {
+        assert_eq!(req.body_json()["model"], "completion-recovery-large");
+        let items = req.input();
+        assert_eq!(&items[..items.len() - 1], hot.as_slice());
+    }
+    assert_eq!(actual[2].body_json()["model"], "completion-recovery-small");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admitted_job_checkpoints_before_the_next_review_has_an_anchor() -> anyhow::Result<()> {
+    skip_if_no_network_unless_localhost!(Ok(()));
+    let server = MockServer::start().await;
+    let test = test_codex()
+        .with_config(|config| {
+            configure_recovery_models_with_limit(config, 8_000);
+            config.features.enable(Feature::UnifiedExec);
+            config.features.enable(Feature::ExecJobCompletion);
+        })
+        .build(&server)
+        .await?;
+    let tool_round = |id: &str| {
+        sse(vec![
+            ev_function_call(
+                id,
+                "update_plan",
+                r#"{"plan":[{"step":"Inspect evidence","status":"completed"}]}"#,
+            ),
+            ev_completed_with_tokens(id, 4_000),
+        ])
+    };
+    let work = mount_sse_sequence(&server, vec![
+        answer("Initial candidate."),
+        verdict("Run the evidence job.", true),
+        sse(vec![ev_function_call("registered", "exec_command",
+            r#"{"cmd":"sleep 0.8; exit 12","shell":"/bin/sh","login":false,"yield_time_ms":250,"wait_for_completion":true}"#),
+            ev_completed_with_tokens("register", 3_000)]),
+        tool_round("later-one"), tool_round("later-two"),
+        sse(vec![ev_assistant_message("candidate", "Report the measured exit code."), ev_completed_with_tokens("hot", 9_000)]),
+    ]).await;
+    test.submit_turn("Verify the job evidence.").await?;
+    test.codex.submit(Op::ReviewCompletedTurn).await?;
+    wait_for_event(&test.codex, |e| matches!(e, EventMsg::TurnComplete(t) if t.last_agent_message.as_deref() == Some("Report the measured exit code."))).await;
+    let original = work.requests();
+    let registration = original[5]
+        .function_call_output_text("registered")
+        .context("job registration output")?;
+    assert!(
+        registration.contains("Awaiting background job"),
+        "{registration}"
+    );
+    let dir = test
+        .home
+        .path()
+        .join("exec-jobs")
+        .join(test.session_configured.session_id.to_string());
+    let record = std::fs::read_dir(dir)?
+        .next()
+        .context("expected a durable job")??;
+    let ledger: serde_json::Value = serde_json::from_slice(&std::fs::read(record.path())?)?;
+    assert_eq!(ledger["admitted"], true);
+    let review = mount_sse_sequence(
+        &server,
+        vec![
+            verdict("Check the second review.", true),
+            answer(REVIEW_WORK_NOTES),
+            compacted_answer(),
+            answer("Verified."),
+        ],
+    )
+    .await;
+    test.codex.submit(Op::ReviewCompletedTurn).await?;
+    wait_for_event(&test.codex, |e| match e {
+        EventMsg::Error(err) => panic!("{}", err.message),
+        EventMsg::TurnComplete(t) => t.last_agent_message.as_deref() == Some("Verified."),
+        _ => false,
+    })
+    .await;
+    let requests = review.requests();
+    assert_eq!(requests.len(), 4);
+    assert_review_compaction_cycle(&requests[1..]);
+    let hot = original[5].input();
+    assert!(hot.iter().any(|i| {
+        i["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("Background job outcome "))
+    }));
+    for id in ["later-one", "later-two"] {
+        assert!(
+            hot.iter()
+                .any(|i| i["type"] == "function_call_output" && i["call_id"] == id)
+        );
+    }
+    for helper in &requests[1..3] {
+        let items = helper.input();
+        assert!(items.starts_with(&hot));
+        assert_eq!(items.len(), hot.len() + 2);
+        assert_eq!(
+            items[hot.len()]["content"][0]["text"],
+            "Report the measured exit code."
+        );
+        assert_eq!(followup_frame(helper), followup_frame(&original[5]));
+        assert_eq!(
+            helper.body_json()["tools"],
+            original[5].body_json()["tools"]
+        );
+        assert!(
+            !helper
+                .body_json()
+                .to_string()
+                .contains("Check the second review.")
+        );
+    }
+    assert_eq!(
+        requests[3]
+            .message_input_texts("developer")
+            .iter()
+            .filter(|text| text.contains("Check the second review."))
+            .count(),
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn app_tools_match_work_across_review_notes_and_recovered_compaction() -> anyhow::Result<()> {
+    skip_if_no_network_unless_localhost!(Ok(()));
+    let server = MockServer::start().await;
+    core_test_support::responses::mount_app_catalog(&server, &["Todoist", "Calendar"]).await;
+    let traffic = mount_sse_sequence(
+        &server,
+        vec![
+            answer("Original candidate."),
+            verdict("Verify the work.", true),
+            sse(vec![
+                ev_function_call(
+                    "plan",
+                    "update_plan",
+                    r#"{"plan":[{"step":"Verify","status":"completed"}]}"#,
+                ),
+                ev_completed_with_tokens("work", 14_600),
+            ]),
+            answer(REVIEW_WORK_NOTES),
+            compacted_answer(),
+            answer("Verified."),
+            answer(REVIEW_WORK_NOTES),
+            compacted_answer(),
+            answer("Resumed."),
+        ],
+    )
+    .await;
+    let home = Arc::new(TempDir::new()?);
+    let skill = home.path().join("skills/todoist");
+    std::fs::create_dir_all(&skill)?;
+    std::fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: todoist\ndescription: Test task lists.\n---\nTask lists.\n",
+    )?;
+    let builder = || {
+        let base = server.uri();
+        let cwd = home.path().to_owned();
+        test_codex()
+            .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+            .with_home(home.clone())
+            .with_config(move |cfg| {
+                configure_recovery_models(cfg);
+                cfg.cwd = cwd;
+                cfg.features.enable(Feature::Apps);
+                cfg.chatgpt_base_url = base;
+            })
+    };
+    let test = builder().build(&server).await?;
+    test.codex
+        .submit(Op::UserInput {
+            items: vec![
+                UserInput::Text {
+                    text: "Use $todoist to check the task.".into(),
+                    text_elements: vec![],
+                },
+                UserInput::Mention {
+                    name: "Calendar".into(),
+                    path: "app://Calendar".into(),
+                },
+            ],
+            final_output_json_schema: None,
+        })
+        .await?;
+    wait_for_event(&test.codex, |e| matches!(e, EventMsg::TurnComplete(_))).await;
+    test.codex.submit(Op::ReviewCompletedTurn).await?;
+    wait_for_event(&test.codex, |e| match e {
+        EventMsg::Error(e) => panic!("{}", e.message),
+        EventMsg::TurnComplete(t) => t.last_agent_message.as_deref() == Some("Verified."),
+        _ => false,
+    })
+    .await;
+    test.codex.submit(Op::Shutdown).await?;
+    wait_for_event(&test.codex, |e| matches!(e, EventMsg::ShutdownComplete)).await;
+    let path = test.session_configured.rollout_path.as_ref().unwrap();
+    let rollout = std::fs::read_to_string(path)?;
+    let mut cut = None;
+    let mut end = 0;
+    for line in rollout.split_inclusive('\n') {
+        end += line.len();
+        if let RolloutItem::ResponseItem(ResponseItem::Message { role, content, .. }) =
+            serde_json::from_str::<RolloutLine>(line)?.item
+            && role == "developer"
+            && serde_json::to_string(&content)?.contains("<AUTO_COMPACT_WORK_NOTES_REQUEST>")
+        {
+            cut = Some(end);
+            break;
+        }
+    }
+    std::fs::write(path, &rollout.as_bytes()[..cut.context("notes marker")?])?;
+    let resumed = builder()
+        .resume(&server, home.clone(), path.clone())
+        .await?;
+    resumed.codex.submit(Op::Continue).await?;
+    wait_for_event(&resumed.codex, |e| matches!(e, EventMsg::TurnComplete(_))).await;
+    let captured = traffic.requests();
+    assert_eq!(captured.len(), 9);
+    let tools = &captured[0].body_json()["tools"];
+    let names = tools.to_string();
+    assert!(
+        names.contains("probe_Calendar") && !names.contains("probe_Todoist"),
+        "expected only the explicitly selected app"
+    );
+    for i in [2, 3, 4, 5, 6, 7, 8] {
+        assert_eq!(&captured[i].body_json()["tools"], tools, "request {i}");
+    }
+    assert_eq!(captured[3].input(), captured[6].input());
+    assert_eq!(captured[4].input(), captured[7].input());
     Ok(())
 }
 
@@ -2191,6 +2647,7 @@ async fn compacted_legacy_resume_cannot_review_a_referential_request_as_complete
         let mut legacy = vec![
             session_meta,
             RolloutItem::Compacted(CompactedItem {
+                checkpoint: None,
                 message: String::new(),
                 replacement_history: Some(vec![ResponseItem::Compaction {
                     encrypted_content: "opaque original user requirements".into(),

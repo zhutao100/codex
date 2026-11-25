@@ -174,6 +174,7 @@ async fn request_context_usage_replays_atomic_prefixes_and_duplicate_token_event
     let records = [
         records[1].clone(),
         RolloutItem::Compacted(CompactedItem {
+            checkpoint: None,
             message: String::new(),
             replacement_history: Some(Vec::new()),
         }),
@@ -618,6 +619,7 @@ async fn rollout_reconstruction_review_output_does_not_commit_previous_settings(
         RolloutItem::ResponseItem(user_message("first")),
         RolloutItem::ResponseItem(assistant_message("first reply")),
         RolloutItem::Compacted(CompactedItem {
+            checkpoint: None,
             message: "summary".to_string(),
             replacement_history: Some(replacement_history),
         }),
@@ -658,6 +660,7 @@ async fn rollout_reconstruction_clears_reference_context_item_after_legacy_compa
         RolloutItem::ResponseItem(user_message("hello")),
         RolloutItem::ResponseItem(assistant_message("hi")),
         RolloutItem::Compacted(CompactedItem {
+            checkpoint: None,
             message: "summary".to_string(),
             replacement_history: None,
         }),
@@ -695,6 +698,7 @@ async fn rollout_reconstruction_ignores_adjacent_context_after_legacy_compaction
         RolloutItem::ResponseItem(user_message("hello")),
         RolloutItem::ResponseItem(assistant_message("hi")),
         RolloutItem::Compacted(CompactedItem {
+            checkpoint: None,
             message: "summary".to_string(),
             replacement_history: None,
         }),
@@ -734,6 +738,7 @@ async fn rollout_reconstruction_restores_reference_context_item_after_replacemen
         RolloutItem::ResponseItem(user_message("hello")),
         RolloutItem::ResponseItem(assistant_message("hi")),
         RolloutItem::Compacted(CompactedItem {
+            checkpoint: None,
             message: "summary".to_string(),
             replacement_history: Some(replacement_history.clone()),
         }),
@@ -776,6 +781,7 @@ async fn rollout_reconstruction_suppresses_standalone_compaction_continuation() 
         RolloutItem::ResponseItem(user_message("hello")),
         RolloutItem::ResponseItem(assistant_message("hi")),
         RolloutItem::Compacted(CompactedItem {
+            checkpoint: None,
             message: "summary".to_string(),
             replacement_history: Some(replacement_history.clone()),
         }),
@@ -884,6 +890,7 @@ async fn rollout_reconstruction_thread_rollback_restores_compaction_epoch_metada
         RolloutItem::ResponseItem(user_message("first")),
         RolloutItem::ResponseItem(assistant_message("first reply")),
         RolloutItem::Compacted(CompactedItem {
+            checkpoint: None,
             message: "summary".to_string(),
             replacement_history: Some(replacement_history.clone()),
         }),
@@ -934,6 +941,7 @@ async fn rollout_reconstruction_thread_rollback_crossing_compaction_clears_metad
         RolloutItem::ResponseItem(user_message("first")),
         RolloutItem::ResponseItem(assistant_message("first reply")),
         RolloutItem::Compacted(CompactedItem {
+            checkpoint: None,
             message: "summary".to_string(),
             replacement_history: Some(replacement_history),
         }),
@@ -1451,17 +1459,12 @@ async fn replace_compacted_history_sets_reference_context_item() {
         .set_previous_turn_settings(Some(previous_turn_settings.clone()))
         .await;
     let replacement_history = vec![user_message("summary")];
-    let compacted_item = CompactedItem {
-        message: "summary".to_string(),
-        replacement_history: Some(replacement_history.clone()),
-    };
-
     session
         .replace_compacted_history(
             &turn_context,
             replacement_history.clone(),
             Some(reference_context_item.clone()),
-            compacted_item,
+            "summary".into(),
         )
         .await;
 
@@ -1491,13 +1494,8 @@ async fn replace_compacted_history_clears_reference_context_item() {
         .record_context_updates_and_set_reference_context_item(&turn_context)
         .await;
     let replacement_history = vec![user_message("summary")];
-    let compacted_item = CompactedItem {
-        message: "summary".to_string(),
-        replacement_history: Some(replacement_history.clone()),
-    };
-
     session
-        .replace_compacted_history(&turn_context, replacement_history, None, compacted_item)
+        .replace_compacted_history(&turn_context, replacement_history, None, "summary".into())
         .await;
 
     assert_eq!(session.reference_context_item().await, None);
@@ -3298,6 +3296,7 @@ async fn sample_rollout(
     let rebuilt1 = compact::build_compacted_history(Vec::new(), &user_messages1, summary1);
     live_history.replace(rebuilt1);
     rollout_items.push(RolloutItem::Compacted(CompactedItem {
+        checkpoint: None,
         message: summary1.to_string(),
         replacement_history: None,
     }));
@@ -3338,6 +3337,7 @@ async fn sample_rollout(
     let rebuilt2 = compact::build_compacted_history(Vec::new(), &user_messages2, summary2);
     live_history.replace(rebuilt2);
     rollout_items.push(RolloutItem::Compacted(CompactedItem {
+        checkpoint: None,
         message: summary2.to_string(),
         replacement_history: None,
     }));

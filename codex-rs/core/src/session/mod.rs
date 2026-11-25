@@ -22,6 +22,7 @@ use crate::compact::compaction_implementation;
 use crate::compact::run_inline_auto_compact_task;
 use crate::compact_remote::run_inline_remote_auto_compact_task;
 use crate::completion_review::CompletionReviewState;
+use crate::completion_review::InputContextProjection;
 use crate::connectors;
 use crate::exec_policy::ExecPolicyManager;
 use crate::features::FEATURES;
@@ -239,6 +240,7 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::CompactedItem;
+use codex_protocol::protocol::CompactionCheckpoint;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::NonSteerableTurnKind;
 use codex_protocol::user_input::UserInput;
@@ -257,6 +259,7 @@ pub(crate) mod turn_context;
 
 use self::handlers::submission_loop;
 use self::rollout_reconstruction::ReconstructedRollout;
+pub(crate) use self::session::RegularTaskSettings;
 use self::session::Session;
 use self::session::SessionConfiguration;
 pub(crate) use self::session::SessionSettingsUpdate;
@@ -630,6 +633,31 @@ pub(crate) enum ThreadNameSource {
 }
 
 impl SessionState {
+    fn regular_continuation_directory_matches(&self) -> bool {
+        !self.completion_review.replacement_answer_required
+            || self
+                .completion_review
+                .episode
+                .as_ref()
+                .is_some_and(|episode| episode.cwd == self.session_configuration.cwd)
+    }
+
+    fn base_instructions_for_turn(&self, turn_context: &TurnContext) -> BaseInstructions {
+        let selected = &self.session_configuration;
+        let text = if selected.collaboration_mode.model() == turn_context.collaboration_mode.model()
+            && selected.personality == turn_context.personality
+        {
+            selected.base_instructions.clone()
+        } else {
+            resolve_current_base_instructions(
+                &turn_context.config,
+                &turn_context.model_info,
+                turn_context.final_instruction_override.as_deref(),
+            )
+        };
+        BaseInstructions { text }
+    }
+
     /// Preserve the sampled mode and its instructions, not a historical model or effort override.
     fn mode_for_continuation(&self) -> CollaborationMode {
         let mut mode = self.session_configuration.collaboration_mode.clone();
@@ -897,20 +925,10 @@ impl Session {
         &self,
         turn_context: &TurnContext,
     ) -> BaseInstructions {
-        let state = self.state.lock().await;
-        let selected = &state.session_configuration;
-        let text = if selected.collaboration_mode.model() == turn_context.collaboration_mode.model()
-            && selected.personality == turn_context.personality
-        {
-            selected.base_instructions.clone()
-        } else {
-            resolve_current_base_instructions(
-                &turn_context.config,
-                &turn_context.model_info,
-                turn_context.final_instruction_override.as_deref(),
-            )
-        };
-        BaseInstructions { text }
+        self.state
+            .lock()
+            .await
+            .base_instructions_for_turn(turn_context)
     }
 
     async fn record_initial_history(&self, conversation_history: InitialHistory) {
@@ -1022,8 +1040,8 @@ impl Session {
     pub(crate) async fn apply_settings_update(
         &self,
         updates: SessionSettingsUpdate,
-    ) -> ConstraintResult<(SessionConfiguration, bool)> {
-        let (mut updated, sandbox_policy_changed, refresh_base_instructions) = {
+    ) -> ConstraintResult<SessionConfiguration> {
+        let (mut updated, refresh_base_instructions) = {
             let state = self.state.lock().await;
             let current = state.session_configuration.clone();
             let updated = match current.apply(&updates) {
@@ -1033,9 +1051,8 @@ impl Session {
                     return Err(err);
                 }
             };
-            let sandbox_policy_changed = current.sandbox_policy != updated.sandbox_policy;
             let refresh_base_instructions = base_instruction_settings_changed(&current, &updated);
-            (updated, sandbox_policy_changed, refresh_base_instructions)
+            (updated, refresh_base_instructions)
         };
 
         if refresh_base_instructions {
@@ -1062,7 +1079,7 @@ impl Session {
 
         let mut state = self.state.lock().await;
         state.session_configuration = updated.clone();
-        Ok((updated, sandbox_policy_changed))
+        Ok(updated)
     }
 
     async fn get_config(&self) -> std::sync::Arc<Config> {
@@ -1659,7 +1676,8 @@ impl Session {
         items: &[ResponseItem],
     ) {
         self.record_into_history(items, turn_context).await;
-        self.persist_rollout_response_items(items).await;
+        self.persist_rollout_response_items(items, turn_context.truncation_policy)
+            .await;
         self.send_raw_response_items(turn_context, items).await;
     }
 
@@ -1755,26 +1773,39 @@ impl Session {
         turn_context: &TurnContext,
         items: Vec<ResponseItem>,
         reference_context_item: Option<TurnContextItem>,
-        compacted_item: CompactedItem,
+        message: String,
     ) {
+        let replacement_history = Some(items.clone());
         // Order the new epoch's marker with snapshots that carry old frame anchors.
         let review_installation = self.completion_review_installation.lock().await;
-        let base = self.get_base_instructions().await;
-        {
+        let checkpoint = {
             let mut state = self.state.lock().await;
+            let base = state.base_instructions_for_turn(turn_context);
             state.replace_history(items);
             state
                 .history
                 .reestimate_usage(&base, turn_context.model_context_window());
             state.set_server_reasoning_included(true);
             state.completion_review.clear_prompt_frames();
+            state.completion_review.pending_compaction = None;
+            state.completion_review.awaiting_compact_followup = true;
             state
                 .history
                 .set_reference_context_item(reference_context_item.clone());
             state.initial_context_seeded = reference_context_item.is_some();
-        }
+            state.token_info().map(|usage| {
+                Box::new(CompactionCheckpoint {
+                    usage,
+                    injected_context: reference_context_item.clone(),
+                })
+            })
+        };
 
-        let mut rollout_items = vec![RolloutItem::Compacted(compacted_item)];
+        let mut rollout_items = vec![RolloutItem::Compacted(CompactedItem {
+            message,
+            replacement_history,
+            checkpoint,
+        })];
         if let Some(reference_context_item) = reference_context_item {
             rollout_items.push(RolloutItem::TurnContext(reference_context_item));
         }
@@ -1785,11 +1816,13 @@ impl Session {
         self.send_token_count_event(turn_context).await;
     }
 
+    #[cfg(test)]
     pub(crate) async fn reference_context_item(&self) -> Option<TurnContextItem> {
         let state = self.state.lock().await;
         state.history.reference_context_item()
     }
 
+    #[cfg(test)]
     pub(crate) async fn previous_turn_settings(&self) -> Option<PreviousTurnSettings> {
         let state = self.state.lock().await;
         state.previous_turn_settings.clone()
@@ -1817,8 +1850,22 @@ impl Session {
         &self,
         turn_context: &TurnContext,
     ) {
-        let reference_context_item = self.reference_context_item().await;
-        let previous_turn_settings = self.previous_turn_settings().await;
+        let context = self.plan_input_context(turn_context).await;
+        self.record_input_context(turn_context, context).await;
+    }
+
+    async fn plan_input_context(&self, turn_context: &TurnContext) -> InputContextProjection {
+        let (reference_context_item, previous_turn_settings) = {
+            let state = self.state.lock().await;
+            // A replacement already contains the installed destination's context. Diff
+            // against its reference, not the model of a user input before compaction.
+            let previous = if state.completion_review.awaiting_compact_followup {
+                None
+            } else {
+                state.previous_turn_settings.clone()
+            };
+            (state.history.reference_context_item(), previous)
+        };
 
         let update_items = if let Some(reference_context_item) = reference_context_item.as_ref() {
             if reference_context_item.collaboration_mode.is_some() {
@@ -1839,20 +1886,30 @@ impl Session {
             self.build_initial_context(turn_context).await
         };
 
-        if !update_items.is_empty() {
-            self.record_conversation_items(turn_context, &update_items)
+        InputContextProjection {
+            items: update_items,
+            reference: turn_context.to_turn_context_item(),
+        }
+    }
+
+    async fn record_input_context(
+        &self,
+        turn_context: &TurnContext,
+        context: InputContextProjection,
+    ) {
+        if !context.items.is_empty() {
+            self.record_conversation_items(turn_context, &context.items)
                 .await;
         }
 
-        let current_context_item = turn_context.to_turn_context_item();
-        self.persist_rollout_items(&[RolloutItem::TurnContext(current_context_item.clone())])
+        self.persist_rollout_items(&[RolloutItem::TurnContext(context.reference.clone())])
             .await;
 
         let mut state = self.state.lock().await;
         state.initial_context_seeded = true;
         state
             .history
-            .set_reference_context_item(Some(current_context_item));
+            .set_reference_context_item(Some(context.reference));
     }
 
     pub(crate) async fn seed_initial_context_if_needed(&self, turn_context: &TurnContext) {
@@ -1868,12 +1925,23 @@ impl Session {
         self.flush_rollout().await;
     }
 
-    async fn persist_rollout_response_items(&self, items: &[ResponseItem]) {
-        let rollout_items: Vec<RolloutItem> = items
-            .iter()
-            .cloned()
-            .map(RolloutItem::ResponseItem)
-            .collect();
+    async fn persist_rollout_response_items(
+        &self,
+        items: &[ResponseItem],
+        policy: crate::truncate::TruncationPolicy,
+    ) {
+        let mut rollout_items = Vec::with_capacity(items.len());
+        for item in items {
+            if let ResponseItem::FunctionCallOutput { call_id, .. }
+            | ResponseItem::CustomToolCallOutput { call_id, .. } = item
+            {
+                rollout_items.push(RolloutItem::ToolOutputPolicy {
+                    call_id: call_id.clone(),
+                    policy: policy.into(),
+                });
+            }
+            rollout_items.push(RolloutItem::ResponseItem(item.clone()));
+        }
         self.persist_rollout_items(&rollout_items).await;
     }
 
@@ -1915,15 +1983,8 @@ impl Session {
             items.push(DeveloperInstructions::new(developer_instructions.to_string()).into());
         }
         // Add developer instructions from collaboration_mode if they exist and are non-empty
-        let collaboration_mode = self
-            .state
-            .lock()
-            .await
-            .session_configuration
-            .collaboration_mode
-            .clone();
         if let Some(collab_instructions) =
-            DeveloperInstructions::from_collaboration_mode(&collaboration_mode)
+            DeveloperInstructions::from_collaboration_mode(&turn_context.collaboration_mode)
         {
             items.push(collab_instructions.into());
         }
@@ -2340,12 +2401,7 @@ impl Session {
             .pending_continuation
             .as_ref()
             .is_some_and(|checkpoint| checkpoint.target == PendingContinuationTarget::Regular)
-            && state.completion_review.replacement_answer_required
-            && state
-                .completion_review
-                .episode
-                .as_ref()
-                .is_none_or(|episode| episode.cwd != state.session_configuration.cwd)
+            && !state.regular_continuation_directory_matches()
         {
             return Err(CodexErr::UnsupportedOperation(
                 "Cannot continue review-derived main work in a different working directory. Return to the completed task's directory and use /continue, or start a new request for the current directory."

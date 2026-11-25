@@ -10,6 +10,7 @@ use codex_core::protocol::Op;
 use codex_core::protocol::RolloutItem;
 use codex_core::protocol::RolloutLine;
 use codex_protocol::items::TurnItem;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::user_input::UserInput;
 use core_test_support::responses;
@@ -288,6 +289,153 @@ async fn mid_turn_notes_are_carried_exactly_and_transient_suffix_is_excluded() -
     let replacements = replacement_history(&rollout);
     assert_eq!(input[0], compact["input"][0]);
     assert_eq!(serde_json::to_value(&replacements[0])?, json!(&input[1..]));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn measured_second_user_turn_preserves_helper_prefix_without_reasoning_header() -> Result<()>
+{
+    skip_if_no_network_unless_localhost!(Ok(()));
+    let server = responses::start_mock_server().await;
+    let builder = || {
+        test_codex().with_config(|cfg| {
+            cfg.model_context_window = Some(32_000);
+            cfg.model_auto_compact_token_limit = Some(27_000);
+            cfg.model_overlay
+                .get_or_insert_with(Default::default)
+                .cross_model
+                .experimental_supported_tools = Some(vec!["read_file".into()]);
+        })
+    };
+    let test = builder().build(&server).await?;
+    let path = test.workspace_path("evidence.txt");
+    std::fs::write(&path, "original evidence\n".repeat(120))?;
+    let args = json!({"file_path": path}).to_string();
+    let mut reasoning = responses::ev_reasoning_item("past", &[], &[]);
+    reasoning["item"]["encrypted_content"] = json!("A".repeat(240_000));
+    let reply = |id, text, tokens| {
+        responses::sse(vec![
+            responses::ev_assistant_message(id, text),
+            responses::ev_completed_with_tokens(id, tokens),
+        ])
+    };
+    let helpers = || {
+        [
+            reply("notes", NOTES, 14_000),
+            compact_response("summary"),
+            reply("done", "Finished.", 3_000),
+        ]
+    };
+    let streams = [
+        responses::sse(vec![
+            reasoning,
+            responses::ev_function_call("early", "read_file", &args),
+            responses::ev_completed_with_tokens("work", 8_000),
+        ]),
+        reply("first", "Initial task done.", 10_000),
+        responses::sse(vec![
+            responses::ev_function_call("tail", "read_file", &args),
+            responses::ev_completed_with_tokens("second", 14_000),
+        ]),
+    ]
+    .into_iter()
+    .chain(helpers())
+    .collect();
+    let mock = responses::mount_sse_sequence(&server, streams).await;
+    test.submit_turn("Read the evidence.").await?;
+    test.submit_turn("Check the evidence again.").await?;
+    let captured = mock.requests();
+    assert_eq!(captured.len(), 6);
+    let work = captured[2].input();
+    let notes = captured[3].input();
+    let (marker, prefix) = notes.split_last().unwrap();
+    assert!(
+        marker["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("<AUTO_COMPACT_WORK_NOTES_REQUEST>")
+    );
+    assert!(prefix.starts_with(&work), "notes changed measured work");
+    assert_eq!(prefix.len(), work.len() + 2);
+    for req in &captured[3..5] {
+        for call in ["early", "tail"] {
+            let (text, _) = req.function_call_output_content_and_success(call).unwrap();
+            assert_eq!(text.unwrap().matches("original evidence").count(), 120);
+        }
+    }
+    let compact = captured[4].input();
+    let (trigger, source) = compact.split_last().unwrap();
+    assert_eq!(trigger, &json!({"type":"compaction_trigger"}));
+    assert!(
+        source == prefix,
+        "notes and V2 did not share the measured work"
+    );
+    test.codex.submit(Op::Shutdown).await?;
+    wait_for_event(&test.codex, |e| matches!(e, EventMsg::ShutdownComplete)).await;
+
+    // Lose the process after the marker, before notes usage can replace measured work.
+    let path = test.session_configured.rollout_path.as_ref().unwrap();
+    let rollout = std::fs::read_to_string(path)?;
+    let mut cutoff = 0;
+    for line in rollout.split_inclusive('\n') {
+        cutoff += line.len();
+        let record: RolloutLine = serde_json::from_str(line)?;
+        if let RolloutItem::ResponseItem(ResponseItem::Message { role, content, .. }) = record.item
+            && role == "developer"
+            && content.iter().any(|part| matches!(part, ContentItem::InputText { text } if text.starts_with("<AUTO_COMPACT_WORK_NOTES_REQUEST>")))
+        {
+            break;
+        }
+    }
+    assert!(cutoff < rollout.len());
+    for measured in [true, false] {
+        let prefix = &rollout[..cutoff];
+        if measured {
+            std::fs::write(path, prefix)?;
+        } else {
+            let mut legacy = Vec::new();
+            for line in prefix.lines() {
+                let mut record: RolloutLine = serde_json::from_str(line)?;
+                if let RolloutItem::TokenUsageContext { source_model, .. } = &mut record.item {
+                    *source_model = None;
+                } else if let RolloutItem::PostTurnCompletionReviewState(s) = &mut record.item {
+                    // Legacy writers recorded neither measurement ownership nor a frozen fit decision.
+                    s.as_object_mut().unwrap().remove("pending_compaction");
+                }
+                serde_json::to_writer(&mut legacy, &record)?;
+                legacy.push(b'\n');
+            }
+            std::fs::write(path, legacy)?;
+        }
+        let restart = responses::start_mock_server().await;
+        let replay = responses::mount_sse_sequence(&restart, helpers().into()).await;
+        let resumed = builder()
+            .resume(&restart, test.home.clone(), path.clone())
+            .await?;
+        resumed.codex.submit(Op::Continue).await?;
+        complete(&resumed.codex).await;
+        let replayed = replay.requests();
+        assert_eq!(replayed.len(), 3);
+        if measured {
+            assert!(
+                replayed[0].input() == notes,
+                "notes prefix changed on replay"
+            );
+            assert!(
+                replayed[1].input() == compact,
+                "compact prefix changed on replay"
+            );
+        } else {
+            // The legacy user-turn hint matches the requested model, but this alone
+            // cannot discount the oversized reasoning from the local input estimate.
+            let (text, _) = replayed[0]
+                .function_call_output_content_and_success("early")
+                .unwrap();
+            assert!(text.unwrap().matches("original evidence").count() < 120);
+        }
+        resumed.codex.submit(Op::Shutdown).await?;
+        wait_for_event(&resumed.codex, |e| matches!(e, EventMsg::ShutdownComplete)).await;
+    }
     Ok(())
 }
 
@@ -692,11 +840,23 @@ async fn restart_after_compact_failure_recovers_notes_before_sampling() -> Resul
         config.model_provider.stream_max_retries = Some(0);
         config.model_context_window = Some(32_000);
         config.model_auto_compact_token_limit = Some(27_000);
-        config
-            .model_overlay
-            .get_or_insert_with(Default::default)
-            .cross_model
-            .experimental_supported_tools = Some(vec!["read_file".into()]);
+        let overlay = config.model_overlay.get_or_insert_with(Default::default);
+        overlay.cross_model.experimental_supported_tools = Some(vec!["read_file".into()]);
+        overlay.cross_model.truncation_policy =
+            Some(codex_protocol::openai_models::TruncationPolicyConfig::bytes(600));
+        overlay
+            .models
+            .push(codex_core::models_manager::overlay::ModelOverlayEntry {
+                slug: "calibration-b".into(),
+                model_provider: None,
+                final_instruction_override: None,
+                patch: codex_core::models_manager::overlay::ModelInfoPatch {
+                    truncation_policy: Some(
+                        codex_protocol::openai_models::TruncationPolicyConfig::bytes(5_000),
+                    ),
+                    ..Default::default()
+                },
+            });
     };
     let test = test_codex().with_config(configure).build(&server).await?;
     let warm = responses::mount_response_sequence(
@@ -740,7 +900,7 @@ async fn restart_after_compact_failure_recovers_notes_before_sampling() -> Resul
         })
         .await?;
     let path = test.workspace_path("evidence.txt");
-    std::fs::write(&path, "unmodified trailing evidence\n".repeat(150))?;
+    std::fs::write(&path, "unmodified trailing evidence\n".repeat(320))?;
     let mut reasoning = responses::ev_reasoning_item("reasoning", &[], &[]);
     reasoning["item"]["encrypted_content"] = json!("A".repeat(240_000));
     let initial = responses::mount_sse_sequence(
@@ -773,12 +933,18 @@ async fn restart_after_compact_failure_recovers_notes_before_sampling() -> Resul
             .all(|r| r.body_json()["model"] == "calibration-b")
     );
     let before_restart = sent[2].input();
-    assert!(before_restart.iter().any(|item| {
-        item["type"] == "function_call_output"
-            && item["output"]
-                .to_string()
-                .contains("unmodified trailing evidence")
-    }));
+    let admitted = before_restart
+        .iter()
+        .find(|i| i["type"] == "function_call_output" && i["call_id"] == "work")
+        .unwrap()["output"]
+        .as_str()
+        .unwrap();
+    assert!(admitted.contains("unmodified trailing evidence"));
+    assert!(
+        (1_000..7_000).contains(&admitted.len()),
+        "admitted {} bytes",
+        admitted.len()
+    );
     let notes_input = sent[1].input();
     assert_eq!(
         &notes_input[..notes_input.len() - 1],

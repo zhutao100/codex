@@ -75,6 +75,48 @@ async fn completed_session() -> (Arc<Session>, Arc<TurnContext>) {
     (session, context)
 }
 
+#[tokio::test]
+async fn legacy_prepared_prompt_owns_its_reference_but_not_a_user_boundary() {
+    let (session, context) = make_session_and_context().await;
+    let reference = context.to_turn_context_item();
+    for fresh in [true, false] {
+        let mut review = CompletionReviewState::default();
+        review.accept_input(
+            fresh,
+            vec![UserInput::Text {
+                text: "Accepted input".into(),
+                text_elements: vec![],
+            }],
+            None,
+        );
+        review.set_main_task("original", &reference.model);
+        let pending = &mut review.pending_inputs[0];
+        pending.installation = ReviewInputInstallation::Installing;
+        pending.remaining_skill_items = Some(vec![]);
+        let saved = serde_json::to_value(review).unwrap();
+        assert!(
+            saved["pending_inputs"][0]
+                .get("remaining_context")
+                .is_none()
+        );
+        let replay = session
+            .reconstruct_history_from_rollout(
+                &context,
+                &[
+                    RolloutItem::TurnContext(reference.clone()),
+                    RolloutItem::PostTurnCompletionReviewState(saved),
+                ],
+            )
+            .await;
+        assert_eq!(
+            replay.reference_context_item,
+            fresh.then(|| reference.clone())
+        );
+        assert_eq!(replay.previous_turn_settings, None);
+        assert!(replay.history.is_empty());
+    }
+}
+
 async fn complete_new_request(
     session: &Arc<Session>,
     context: &Arc<TurnContext>,
@@ -92,7 +134,7 @@ async fn complete_new_request(
     );
     assert!(
         session
-            .start_completion_review_main_task(&context.sub_id)
+            .start_completion_review_main_task(&context.sub_id, context)
             .await
     );
     session
@@ -188,7 +230,7 @@ async fn review_delegate_keeps_transcript_without_completion_review_state() {
     );
     assert!(
         session
-            .start_completion_review_main_task(&context.sub_id)
+            .start_completion_review_main_task(&context.sub_id, &context)
             .await
     );
     let answer = assistant_message("review evaluation");
@@ -236,7 +278,7 @@ async fn completion_review_capture_uses_task_result_not_assistant_role() {
         .await;
     assert!(
         session
-            .start_completion_review_main_task(&context.sub_id)
+            .start_completion_review_main_task(&context.sub_id, &context)
             .await
     );
     session
@@ -281,7 +323,7 @@ async fn completion_review_captures_consumed_steering_without_progress_round() {
     );
     assert!(
         session
-            .start_completion_review_main_task(&context.sub_id)
+            .start_completion_review_main_task(&context.sub_id, &context)
             .await
     );
     session
@@ -328,7 +370,7 @@ async fn completion_review_late_input_remains_unreviewed_until_consumed() {
         .await;
     assert!(
         session
-            .start_completion_review_main_task(&context.sub_id)
+            .start_completion_review_main_task(&context.sub_id, &context)
             .await
     );
     session
@@ -344,7 +386,7 @@ async fn completion_review_late_input_remains_unreviewed_until_consumed() {
     }
     assert!(
         session
-            .start_completion_review_main_task(&context.sub_id)
+            .start_completion_review_main_task(&context.sub_id, &context)
             .await
     );
     session
@@ -394,13 +436,16 @@ async fn completion_review_handoff_is_claimed_once_and_survives_compaction() {
             &context,
             vec![assistant_message("compacted")],
             None,
-            CompactedItem {
-                message: "compacted".into(),
-                replacement_history: Some(vec![assistant_message("compacted")]),
-            },
+            "compacted".into(),
         )
         .await;
-    assert_eq!(session.state.lock().await.completion_review, snapshot);
+    assert_eq!(
+        session.state.lock().await.completion_review,
+        crate::completion_review::CompletionReviewState {
+            awaiting_compact_followup: true,
+            ..snapshot
+        }
+    );
     let prompt = session
         .completion_review_main_instructions(true)
         .await
@@ -409,8 +454,18 @@ async fn completion_review_handoff_is_claimed_once_and_survives_compaction() {
     assert!(prompt.contains("original request"));
     assert!(prompt.contains(" initial complete answer\n"));
     assert!(prompt.contains("advisory plus replacement contract"));
-    session.record_completion_review_advisory(&context).await;
-    session.record_completion_review_advisory(&context).await;
+    assert!(
+        session
+            .admit_completion_review_advisory(&context, &context, false)
+            .await
+            .expect("admit advice")
+    );
+    assert!(
+        session
+            .admit_completion_review_advisory(&context, &context, false)
+            .await
+            .expect("admit advice")
+    );
     assert_eq!(
         session
             .clone_history()
@@ -562,11 +617,7 @@ async fn completion_review_automatic_capture_failure_cannot_authorize_review() {
         .enable(Feature::AutoPostTurnCompletionReview);
     let (_home, path) = attach_recorder(&session, &context).await;
     let revision = session
-        .accept_completion_review_input(
-            &steer_text_input("complete request"),
-            true,
-            Some(&context.sub_id),
-        )
+        .accept_completion_review_input(&steer_text_input("complete request"), true, Some(&context))
         .await
         .unwrap();
     assert!(
@@ -633,15 +684,7 @@ async fn completion_review_started_resumes_stop_before_sampling_on_failed_owner_
                 encrypted_content: "compacted paused main work".into(),
             }];
             session
-                .replace_compacted_history(
-                    &context,
-                    replacement.clone(),
-                    None,
-                    CompactedItem {
-                        message: String::new(),
-                        replacement_history: Some(replacement),
-                    },
-                )
+                .replace_compacted_history(&context, replacement, None, String::new())
                 .await;
             session.persist_completion_review().await;
         }
@@ -843,7 +886,7 @@ async fn completion_review_model_override_retargets_only_pending_main_work_durab
         if steered {
             assert!(
                 session
-                    .start_completion_review_main_task("main-followup")
+                    .start_completion_review_main_task("main-followup", &context)
                     .await
             );
             let revision = session
@@ -865,6 +908,9 @@ async fn completion_review_model_override_retargets_only_pending_main_work_durab
         let mut expected_checkpoint = checkpoint;
         if target == PendingContinuationTarget::Regular {
             expected.recovery_model = Some(model.into());
+            if let Some(settings) = &mut expected.recovery_settings {
+                settings.mode = mode.clone();
+            }
             if let Some(handoff) = expected.handoff.as_mut() {
                 handoff.model = model.into();
             }
@@ -999,6 +1045,7 @@ async fn completion_review_compacted_legacy_resume_and_fork_keep_unknown_request
                 RolloutItem::ResponseItem(user_message("original request")),
                 RolloutItem::ResponseItem(assistant_message("option one: scan; option two: index")),
                 RolloutItem::Compacted(CompactedItem {
+                    checkpoint: None,
                     message: String::new(),
                     replacement_history: Some(vec![ResponseItem::Compaction {
                         encrypted_content: "opaque prior user requirements".into(),
@@ -1064,6 +1111,7 @@ async fn completion_review_trusted_compacted_resume_and_fork_preserve_referentia
         let state = session.state.lock().await.completion_review.clone();
         let rollout = vec![
             RolloutItem::Compacted(CompactedItem {
+                checkpoint: None,
                 message: String::new(),
                 replacement_history: Some(vec![ResponseItem::Compaction {
                     encrypted_content: "opaque prior user requirements".into(),
@@ -1138,7 +1186,7 @@ async fn completion_review_stale_tickets_cannot_prepare_or_claim_advice() {
     );
     assert!(
         session
-            .start_completion_review_main_task(&context.sub_id)
+            .start_completion_review_main_task(&context.sub_id, &context)
             .await
     );
     session
@@ -1170,7 +1218,7 @@ async fn completion_review_old_task_cannot_capture_or_schedule_a_newer_candidate
     let original = session.completed_turn_for_review().await;
     assert!(
         session
-            .start_completion_review_main_task("newer-main")
+            .start_completion_review_main_task("newer-main", &context)
             .await
     );
     session
@@ -1314,7 +1362,12 @@ impl SessionTask for ReviewInstallationTask {
         self.enter.notified().await;
         let session = session.clone_session();
         if self.main {
-            session.record_completion_review_advisory(&context).await;
+            assert!(
+                session
+                    .admit_completion_review_advisory(&context, &context, false)
+                    .await
+                    .expect("admit advice")
+            );
         } else {
             session
                 .prepare_completion_review_handoff(
@@ -1427,18 +1480,14 @@ async fn completion_review_coalesced_input_replays_each_emitted_prefix() {
     let (session, context, _) = make_session_and_context_with_rx().await;
     let (_home, path) = attach_recorder(&session, &context).await;
     let revision = session
-        .accept_completion_review_input(
-            &steer_text_input("complete request"),
-            true,
-            Some(&context.sub_id),
-        )
+        .accept_completion_review_input(&steer_text_input("complete request"), true, Some(&context))
         .await
         .unwrap();
     let accepted = session.state.lock().await.completion_review.clone();
     let body = accepted.pending_inputs[0].response_item.clone();
     assert!(
         session
-            .start_completion_review_main_task(&context.sub_id)
+            .start_completion_review_main_task(&context.sub_id, &context)
             .await
     );
     assert!(
@@ -1602,7 +1651,7 @@ async fn completion_review_input_installation_replays_every_durable_boundary() {
         );
         assert!(
             resumed
-                .start_completion_review_main_task(&resumed_context.sub_id)
+                .start_completion_review_main_task(&resumed_context.sub_id, &resumed_context)
                 .await
         );
         resumed
@@ -1762,7 +1811,7 @@ impl SessionTask for CompletingReviewTask {
         assert!(
             session
                 .clone_session()
-                .start_completion_review_main_task(&context.sub_id)
+                .start_completion_review_main_task(&context.sub_id, &context)
                 .await
         );
         self.ready.notify_one();
@@ -1878,7 +1927,7 @@ impl SessionTask for InputInstallationTask {
         let session = session.clone_session();
         assert!(
             session
-                .start_completion_review_main_task(&context.sub_id)
+                .start_completion_review_main_task(&context.sub_id, &context)
                 .await
         );
         self.ready.notify_one();

@@ -219,7 +219,7 @@ impl Session {
                 .await;
         }
         let review_input_revision = if task_kind == TaskKind::Regular && !input.is_empty() {
-            self.accept_completion_review_input(&input, true, Some(&turn_context.sub_id))
+            self.accept_completion_review_input(&input, true, Some(&turn_context))
                 .await
         } else {
             None

@@ -25,9 +25,9 @@ Do not substitute one representation for another. `record_conversation_items` ad
 
 ## Replay metadata and compaction epochs
 
-`reconstruct_history_from_rollout` processes history and metadata together. A `TurnContext` is a pending candidate until the matching real user boundary commits it. Bare or canceled context records cannot hydrate previous-turn settings. A review's synthetic user item can update its reference context without claiming a new ordinary previous model.
+`reconstruct_history_from_rollout` processes history and metadata together. Only a real user boundary commits previous-turn settings. The [fresh-input journal](steering-and-queue.md#request-ordering) can establish its own reference as soon as its preceding context items and matching `TurnContext` have been written, without advancing the user turn. A bare or canceled context record has no such authority. A review's synthetic user item can update its reference without claiming a new ordinary previous model.
 
-An exact compaction replacement starts a new replay epoch: clear pending context and the reference baseline, preserve previous-turn settings, and use the replacement as the opaque history base. An immediately adjacent context record can establish the replacement's reference baseline for mid-turn continuation; it does not change previous-turn settings.
+An exact compaction replacement starts a new replay epoch. `Compacted.checkpoint` commits the destination-local token estimate, lifetime totals, and optional already-injected reference with the replacement itself. The estimate covers exactly the replacement and is not a model measurement. Preserve previous-turn settings; do not reestimate a new marker against startup instructions or hydrate a fresh pre-turn reference from them. Older markers can use the adjacent injected reference and separately recorded usage where available.
 
 Legacy compaction records without `replacement_history` are rebuilt from surviving user messages and their summary with an empty initial-context prefix. Injecting resume-time initial context at a historical compaction point changes history and is incorrect.
 

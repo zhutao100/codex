@@ -120,6 +120,7 @@ impl Session {
         let mut latest_compaction_tail_kind = CompactionTailKind::None;
         let mut checkpoint_after_latest_compaction = false;
         let mut completion_review: Option<CompletionReviewState> = None;
+        let mut awaiting_compact_followup = false;
 
         for (index, item) in rollout_items.iter().enumerate() {
             match item {
@@ -128,14 +129,29 @@ impl Session {
                     let input_installed = completion_review
                         .as_mut()
                         .is_some_and(|review| review.observe_input_installation(response_item));
+                    let policy = match (
+                        response_item,
+                        index.checked_sub(1).map(|i| &rollout_items[i]),
+                    ) {
+                        (
+                            ResponseItem::FunctionCallOutput { call_id, .. }
+                            | ResponseItem::CustomToolCallOutput { call_id, .. },
+                            Some(RolloutItem::ToolOutputPolicy {
+                                call_id: owner,
+                                policy,
+                            }),
+                        ) if owner == call_id => Some(*policy),
+                        _ => pending_context
+                            .as_ref()
+                            .or(current_metadata.reference_context_item.as_ref())
+                            .and_then(|context| context.truncation_policy),
+                    };
                     history.record_session_item(
                         response_item,
-                        turn_context.truncation_policy,
+                        policy
+                            .map(Into::into)
+                            .unwrap_or(turn_context.truncation_policy),
                         server_reasoning_included,
-                        current_metadata
-                            .previous_turn_settings
-                            .as_ref()
-                            .map(|p| p.model.as_str()),
                     );
                     if is_user_turn_boundary_response_item(response_item) {
                         if turn::is_review_rollout_user_message(response_item) {
@@ -156,9 +172,14 @@ impl Session {
                         checkpoint_after_latest_compaction = true;
                     }
                 }
+                RolloutItem::ToolOutputPolicy { .. } => {}
                 RolloutItem::Compacted(compacted) => {
+                    // The marker alone commits a fresh history. A steer can still arrive
+                    // before its first ordinary continuation, even if none was queued at install.
+                    awaiting_compact_followup = true;
                     superseded_usage = history.token_info();
                     if let Some(review) = completion_review.as_mut() {
+                        review.pending_compaction = None;
                         review.clear_prompt_frames();
                     }
                     let has_exact_replacement = compacted.replacement_history.is_some();
@@ -173,32 +194,84 @@ impl Session {
                         );
                         history.replace(rebuilt);
                     }
-                    // The marker commits the new history even if the process never writes the
-                    // following usage checkpoint. An unmeasured legacy history stays unmeasured.
-                    if superseded_usage.is_some() {
-                        history.reestimate_usage(&base, turn_context.model_context_window());
+                    // A committed marker does not depend on the startup model or on a
+                    // subsequent reference/usage write making it to disk.
+                    let installed = compacted
+                        .checkpoint
+                        .as_ref()
+                        .filter(|_| has_exact_replacement);
+                    if let Some(checkpoint) = installed {
+                        history.set_token_info_with_boundary(
+                            Some(checkpoint.usage.clone()),
+                            history.raw_items().len(),
+                        );
+                        server_reasoning_included = true;
+                    } else if superseded_usage.is_some() {
+                        let destination = match rollout_items.get(index + 1) {
+                            Some(RolloutItem::TurnContext(ctx)) if has_exact_replacement => {
+                                Some(ctx.model.as_str())
+                            }
+                            _ => completion_review
+                                .as_ref()
+                                .and_then(|r| r.recovery_model.as_deref()),
+                        };
+                        let destination = if let Some(model) =
+                            destination.filter(|model| *model != turn_context.model_info.slug)
+                        {
+                            self.turn_context_with_model(turn_context, model).await.ok()
+                        } else {
+                            None
+                        };
+                        if let Some(destination) = destination {
+                            let base = self.get_base_instructions_for_turn(&destination).await;
+                            history.reestimate_usage(&base, destination.model_context_window());
+                        } else {
+                            history.reestimate_usage(&base, turn_context.model_context_window());
+                        }
                         server_reasoning_included = true;
                     }
-                    current_metadata.reference_context_item = None;
+                    current_metadata.reference_context_item =
+                        installed.and_then(|c| c.injected_context.clone());
                     pending_context = None;
                     current_epoch.reset_to_base(current_metadata.clone());
-                    awaiting_adjacent_post_compaction_context = has_exact_replacement;
-                    latest_compaction_tail_kind = CompactionTailKind::StandaloneOrPreTurn;
+                    awaiting_adjacent_post_compaction_context = has_exact_replacement
+                        && (installed.is_none()
+                            || current_metadata.reference_context_item.is_some());
+                    latest_compaction_tail_kind =
+                        if current_metadata.reference_context_item.is_some() {
+                            CompactionTailKind::MidTurnWithInjectedContext
+                        } else {
+                            CompactionTailKind::StandaloneOrPreTurn
+                        };
                     checkpoint_after_latest_compaction = false;
                 }
                 RolloutItem::TurnContext(item) => {
-                    if awaiting_adjacent_post_compaction_context {
+                    if awaiting_adjacent_post_compaction_context
+                        && current_metadata
+                            .reference_context_item
+                            .as_ref()
+                            .is_none_or(|r| r == item)
+                    {
                         current_metadata.reference_context_item = Some(item.clone());
                         current_epoch.base_metadata.reference_context_item = Some(item.clone());
                         latest_compaction_tail_kind =
                             CompactionTailKind::MidTurnWithInjectedContext;
-                        awaiting_adjacent_post_compaction_context = false;
                     } else {
+                        if completion_review
+                            .as_mut()
+                            .is_some_and(|r| r.observe_input_reference(item))
+                        {
+                            // The installation journal owns this reference, but only the actual
+                            // user message below it can advance the user turn or rollback epoch.
+                            current_metadata.reference_context_item = Some(item.clone());
+                        }
                         pending_context = Some(item.clone());
                     }
+                    awaiting_adjacent_post_compaction_context = false;
                 }
                 RolloutItem::EventMsg(EventMsg::ThreadRolledBack(rollback)) => {
                     completion_review = None;
+                    awaiting_compact_followup = false;
                     awaiting_adjacent_post_compaction_context = false;
                     history.drop_last_n_user_turns(rollback.num_turns);
                     let turns_to_drop = usize::try_from(rollback.num_turns).unwrap_or(usize::MAX);
@@ -222,6 +295,23 @@ impl Session {
                 }
                 RolloutItem::PostTurnCompletionReviewState(value) => {
                     completion_review = CompletionReviewState::from_rollout(value);
+                    if let Some(RolloutItem::TurnContext(reference)) =
+                        index.checked_sub(1).map(|i| &rollout_items[i])
+                        && pending_context.as_ref() == Some(reference)
+                        && completion_review
+                            .as_ref()
+                            .is_some_and(|r| r.owns_legacy_prepared_reference(reference))
+                    {
+                        current_metadata.reference_context_item = Some(reference.clone());
+                    }
+                    if value["awaiting_compact_followup"] == false {
+                        awaiting_compact_followup = false;
+                    } else if !awaiting_compact_followup
+                        && let Some(review) = &mut completion_review
+                    {
+                        // A positive ordinary receipt can precede the owner's release snapshot.
+                        review.owed_settings = None;
+                    }
                     if value["episode"]["automatic_reviews_started"].as_u64() == Some(3)
                         && let Some(review) = completion_review.as_mut()
                         && let Some(handoff) = legacy_capped_handoff(
@@ -242,6 +332,12 @@ impl Session {
                     last_usage_item_count,
                 } => {
                     awaiting_adjacent_post_compaction_context = false;
+                    if awaiting_compact_followup && info.last_token_usage.input_tokens > 0 {
+                        awaiting_compact_followup = false;
+                        if let Some(review) = &mut completion_review {
+                            review.owed_settings = None;
+                        }
+                    }
                     if let Some(covered_item_count) = last_usage_item_count {
                         // Continuation cleanup can remove a previously covered suffix.
                         history.set_token_info_with_boundary(
@@ -278,6 +374,9 @@ impl Session {
             }
         }
 
+        if let Some(review) = &mut completion_review {
+            review.awaiting_compact_followup = awaiting_compact_followup;
+        }
         let token_usage = history.token_info().map(|info| ReconstructedTokenUsage {
             info,
             source_model: history.usage_source_model().map(str::to_owned),
@@ -299,66 +398,43 @@ impl Session {
                 .iter()
                 .rposition(|item| matches!(item, ResponseItem::Compaction { .. }))
                 .is_some_and(|index| turn::tail_needs_continuation(&history[index + 1..]));
+        // A pre-turn capture uses the resume-selected destination. After installation
+        // the adjacent reference owns that destination, even when the older task still
+        // owns the response or has unconsumed input.
+        let regular_model = if pending_notes {
+            Some(turn_context.model_info.slug.clone())
+        } else if latest_compaction_tail_kind == CompactionTailKind::MidTurnWithInjectedContext
+            && !checkpoint_after_latest_compaction
+        {
+            current_metadata
+                .reference_context_item
+                .as_ref()
+                .map(|item| item.model.clone())
+        } else {
+            current_metadata
+                .previous_turn_settings
+                .as_ref()
+                .map(|settings| settings.model.clone())
+        };
         let mut pending_continuation = ((history_needs_continuation(&history)
             || encrypted_only_continuation)
             && !suppress_compaction_continuation)
             .then(|| PendingContinuation {
                 source: TurnContinuationSource::Interrupted,
                 continued_from_turn_id: None,
-                // Pre-turn capture may precede the destination's first user
-                // boundary. Keep the resume-selected destination for work;
-                // recovery resolves the capture's source model separately.
-                model: if pending_notes {
-                    Some(turn_context.model_info.slug.clone())
-                } else if latest_compaction_tail_kind
-                    == CompactionTailKind::MidTurnWithInjectedContext
-                    && !checkpoint_after_latest_compaction
-                {
-                    current_metadata
-                        .reference_context_item
-                        .as_ref()
-                        .map(|context| context.model.clone())
-                } else {
-                    current_metadata
-                        .previous_turn_settings
-                        .as_ref()
-                        .map(|settings| settings.model.clone())
-                },
+                model: regular_model.clone(),
                 pause_reason: None,
                 target: PendingContinuationTarget::Regular,
             });
-        let interrupted_main_model = completion_review
-            .as_ref()
-            .and_then(|review| review.recovery_model.clone())
-            .or_else(|| {
-                if pending_notes {
-                    Some(turn_context.model_info.slug.clone())
-                } else {
-                    current_metadata
-                        .previous_turn_settings
-                        .as_ref()
-                        .map(|settings| settings.model.clone())
-                }
-            });
         if let Some(review) = completion_review.as_ref()
-            && !review.pending_inputs.is_empty()
+            && (!review.pending_inputs.is_empty()
+                || (review.main_task_id.is_some()
+                    && !review.request_frame.current_user_messages.is_empty()))
         {
             pending_continuation = Some(PendingContinuation {
                 source: TurnContinuationSource::Interrupted,
                 continued_from_turn_id: review.main_task_id.clone(),
-                model: interrupted_main_model.clone(),
-                pause_reason: None,
-                target: PendingContinuationTarget::Regular,
-            });
-        }
-        if let Some(review) = completion_review.as_ref()
-            && let Some(main_task_id) = review.main_task_id.as_ref()
-            && !review.request_frame.current_user_messages.is_empty()
-        {
-            pending_continuation = Some(PendingContinuation {
-                source: TurnContinuationSource::Interrupted,
-                continued_from_turn_id: Some(main_task_id.clone()),
-                model: interrupted_main_model,
+                model: review.recovery_model.clone().or(regular_model),
                 pause_reason: None,
                 target: PendingContinuationTarget::Regular,
             });

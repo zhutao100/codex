@@ -94,13 +94,8 @@ impl SessionState {
         I::Item: std::ops::Deref<Target = ResponseItem>,
     {
         let reasoning = self.server_reasoning_included();
-        let previous_model = self
-            .previous_turn_settings
-            .as_ref()
-            .map(|p| p.model.as_str());
         for item in items {
-            self.history
-                .record_session_item(&item, policy, reasoning, previous_model);
+            self.history.record_session_item(&item, policy, reasoning);
         }
     }
 
@@ -149,6 +144,15 @@ impl SessionState {
             .get_total_token_usage(server_reasoning_included)
     }
 
+    /// A model selected by `/continue` can measure new work without a new user turn.
+    pub(crate) fn work_source_model(&self) -> Option<&str> {
+        self.history.usage_source_model().or_else(|| {
+            self.previous_turn_settings
+                .as_ref()
+                .map(|p| p.model.as_str())
+        })
+    }
+
     /// Cost of the work transcript, without the previous request-only review frame.
     pub(crate) fn history_tokens_from_usage(&self, model: &str) -> Option<i64> {
         self.token_info()
@@ -156,19 +160,18 @@ impl SessionState {
                 info.last_token_usage.total_tokens > 0
                     && (info.last_token_usage.input_tokens == 0
                         || self
-                            .history
-                            .usage_source_model()
-                            .or_else(|| {
-                                self.previous_turn_settings
-                                    .as_ref()
-                                    .map(|p| p.model.as_str())
-                            })
+                            .work_source_model()
                             .is_none_or(|measured| measured == model))
             })
             .map(|_| {
                 self.history
                     .work_usage_without_frames(self.server_reasoning_included())
             })
+    }
+
+    pub(crate) fn helper_tokens_from_usage(&self, model: &str) -> Option<i64> {
+        self.history
+            .helper_tokens_from_usage(model, self.server_reasoning_included())
     }
 
     pub(crate) fn set_server_reasoning_included(&mut self, included: bool) {
