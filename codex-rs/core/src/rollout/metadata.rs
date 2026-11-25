@@ -63,6 +63,7 @@ pub(crate) fn builder_from_items(
         | RolloutItem::Compacted(_)
         | RolloutItem::TurnContext(_)
         | RolloutItem::ToolOutputPolicy { .. }
+        | RolloutItem::SampledInstructions { .. }
         | RolloutItem::TokenUsageContext { .. }
         | RolloutItem::PostTurnCompletionReviewState(_)
         | RolloutItem::EventMsg(_) => None,
@@ -469,6 +470,7 @@ mod tests {
             source: SessionSource::default(),
             model_provider: Some("openai".to_string()),
             base_instructions: None,
+            catalog_instructions_source: None,
             dynamic_tools: None,
         };
         let session_meta_line = SessionMetaLine {
@@ -1472,6 +1474,7 @@ mod tests {
             source: SessionSource::default(),
             model_provider: Some("test-provider".to_string()),
             base_instructions: None,
+            catalog_instructions_source: None,
             dynamic_tools: None,
         };
         let session_meta_line = SessionMetaLine {

@@ -38,6 +38,28 @@ pub async fn mount_app_catalog(server: &MockServer, names: &[&str]) {
     mount_app_catalog_with_capabilities(server, names, serde_json::json!({"tools":{}})).await;
 }
 
+/// Refresh ordinary MCP servers backed by the loopback catalog. An empty list removes them.
+pub fn refresh_catalog_servers(
+    server: &MockServer,
+    names: &[&str],
+) -> codex_protocol::protocol::Op {
+    let servers: serde_json::Map<_, _> = names
+        .iter()
+        .map(|name| {
+            (
+                (*name).to_owned(),
+                serde_json::json!({"url": format!("{}/api/codex/apps", server.uri())}),
+            )
+        })
+        .collect();
+    codex_protocol::protocol::Op::RefreshMcpServers {
+        config: codex_protocol::protocol::McpServerRefreshConfig {
+            mcp_servers: Value::Object(servers),
+            mcp_oauth_credentials_store_mode: serde_json::json!("auto"),
+        },
+    }
+}
+
 pub async fn mount_app_catalog_with_capabilities(
     server: &MockServer,
     names: &[&str],

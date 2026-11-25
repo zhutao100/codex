@@ -110,6 +110,8 @@ use crate::client::ModelClient;
 use crate::client::ModelClientSession;
 use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
+use crate::client_common::SampledReasoning;
+use crate::client_common::ToolSurface;
 use crate::codex_thread::ThreadConfigSnapshot;
 use crate::compact::InitialContextInjection;
 use crate::compact::collect_user_messages;
@@ -593,8 +595,15 @@ fn resolve_session_base_instructions(
     {
         return (text.to_owned(), false);
     }
-    if let Some(saved) = conversation_history.get_base_instructions() {
-        return (saved.text, false);
+    if let Some((saved, origin)) = conversation_history.base_instruction_snapshot() {
+        let Some(origin) = origin else {
+            return (saved.text.clone(), false);
+        };
+        if origin.model == model_info.slug
+            && origin.personality_disabled == (config.personality == Some(Personality::None))
+        {
+            return (saved.text.clone(), true);
+        }
     }
     (
         ModelsManager::effective_model_instructions(model_info, config.personality, None),
@@ -633,6 +642,24 @@ pub(crate) enum ThreadNameSource {
 }
 
 impl SessionState {
+    fn recorded_base_id(&self, text: &str) -> Option<ThreadId> {
+        self.recorded_bases
+            .iter()
+            .find(|(_, saved)| saved == text)
+            .map(|(id, _)| *id)
+    }
+
+    fn sampled_settings(
+        &self,
+        context: &TurnContext,
+        base: &BaseInstructions,
+    ) -> RegularTaskSettings {
+        let mut settings = RegularTaskSettings::from_turn(context);
+        settings.recorded_base = self.recorded_base_id(&base.text);
+        settings.sampled_reasoning = Some(context.sampled_reasoning());
+        settings
+    }
+
     fn regular_continuation_directory_matches(&self) -> bool {
         !self.completion_review.replacement_answer_required
             || self
@@ -644,8 +671,11 @@ impl SessionState {
 
     fn base_instructions_for_turn(&self, turn_context: &TurnContext) -> BaseInstructions {
         let selected = &self.session_configuration;
-        let text = if selected.collaboration_mode.model() == turn_context.collaboration_mode.model()
-            && selected.personality == turn_context.personality
+        let text = if let Some(base) = &turn_context.config.base_instructions {
+            base.clone()
+        } else if selected.collaboration_mode.model() == turn_context.collaboration_mode.model()
+            && (selected.personality == turn_context.personality
+                || !selected.uses_catalog_base_instructions)
         {
             selected.base_instructions.clone()
         } else {
@@ -932,6 +962,32 @@ impl Session {
     }
 
     async fn record_initial_history(&self, conversation_history: InitialHistory) {
+        {
+            let items = match &conversation_history {
+                InitialHistory::New => &[][..],
+                InitialHistory::Forked(items) => items.as_slice(),
+                InitialHistory::Resumed(resumed) => &resumed.history,
+            };
+            let mut state = self.state.lock().await;
+            let mut bases: Vec<_> = items
+                .iter()
+                .filter_map(|item| match item {
+                    RolloutItem::SampledInstructions { id, text } => Some((*id, text.clone())),
+                    RolloutItem::SessionMeta(line) => Some((
+                        line.meta.id,
+                        line.meta.base_instructions.as_ref()?.text.clone(),
+                    )),
+                    _ => None,
+                })
+                .collect();
+            if !matches!(conversation_history, InitialHistory::Resumed(_)) {
+                bases.push((
+                    self.conversation_id,
+                    state.session_configuration.base_instructions.clone(),
+                ));
+            }
+            state.recorded_bases = bases;
+        }
         let turn_context = self.new_default_turn().await;
         match conversation_history {
             InitialHistory::New => {
@@ -983,10 +1039,22 @@ impl Session {
                 self.replace_with_reconstructed_rollout(reconstructed).await;
                 {
                     let mut state = self.state.lock().await;
-                    state.completion_review =
-                        completion_review::completion_review_for_fork(&rollout_items)
-                            .unwrap_or_else(CompletionReviewState::for_unknown_history);
-                    state.completion_review.rebranch();
+                    let mut fork = completion_review::completion_review_for_fork(&rollout_items)
+                        .unwrap_or_else(CompletionReviewState::for_unknown_history);
+                    fork.rebranch();
+                    // A copied capture is unfinished history, not an inherited review operation.
+                    if state
+                        .history
+                        .raw_items()
+                        .iter()
+                        .any(compact::is_work_notes_request_item)
+                    {
+                        fork.pending_compaction = state.completion_review.pending_compaction.take();
+                        fork.explicit_app_paths =
+                            std::mem::take(&mut state.completion_review.explicit_app_paths);
+                    }
+                    fork.last_work_settings = state.completion_review.last_work_settings.take();
+                    state.completion_review = fork;
                     state.pending_continuation = None;
                 }
 
@@ -1013,6 +1081,10 @@ impl Session {
             state
                 .history
                 .set_measured_context(usage.request_context_tokens, usage.source_model);
+            state.history.measured_item_tokens = usage.measured_item_tokens;
+            state.history.measured_format_delta = usage.measured_format_delta;
+            state.history.measured_base_tokens = usage.measured_base_tokens;
+            state.history.measured_tool_tokens = usage.measured_tool_tokens;
             state.history.work_notes_baseline = usage.work_notes_baseline;
             state.set_server_reasoning_included(usage.server_reasoning_included);
         } else {
@@ -1786,8 +1858,7 @@ impl Session {
                 .history
                 .reestimate_usage(&base, turn_context.model_context_window());
             state.set_server_reasoning_included(true);
-            state.completion_review.clear_prompt_frames();
-            state.completion_review.pending_compaction = None;
+            state.completion_review.forget_compaction_source();
             state.completion_review.awaiting_compact_followup = true;
             state
                 .history
@@ -2021,6 +2092,32 @@ impl Session {
         state.clone_history()
     }
 
+    pub(crate) async fn has_work_notes_request(&self) -> bool {
+        self.state
+            .lock()
+            .await
+            .history
+            .raw_items()
+            .iter()
+            .rev()
+            .any(compact::is_work_notes_request_item)
+    }
+
+    pub(crate) async fn prepare_history_for_compaction(
+        &self,
+        notes: Option<String>,
+        frames: &crate::completion_review::ReviewPromptFrames,
+    ) -> CodexResult<compact::PreparedCompactionInput> {
+        let (history, journal) = {
+            let state = self.state.lock().await;
+            (
+                state.clone_history(),
+                state.completion_review.capture_journal().cloned(),
+            )
+        };
+        compact::prepare_history_for_compaction(history, notes, Some(frames), journal.as_ref())
+    }
+
     pub(crate) async fn prompt_history(&self, turn_context: &TurnContext) -> Vec<ResponseItem> {
         let items = {
             let state = self.state.lock().await;
@@ -2039,6 +2136,7 @@ impl Session {
         request_context_tokens: i64,
         server_reasoning_included: bool,
         input_item_count: usize,
+        prompt: &Prompt,
     ) {
         let record_context = {
             let mut state = self.state.lock().await;
@@ -2052,6 +2150,16 @@ impl Session {
                     request_context_tokens,
                     Some(turn_context.model_info.slug.clone()),
                 );
+                state
+                    .history
+                    .mark_measured_projection(crate::context_manager::HelperProjection {
+                        images: turn_context.supports_image_inputs(),
+                        structured_outputs: prompt.tools.structured_outputs,
+                    });
+                state.history.measured_base_tokens = Some(crate::truncate::approx_token_count(
+                    &prompt.base_instructions.text,
+                ) as i64);
+                state.history.measured_tool_tokens = Some(prompt.tools.tokens());
                 state.set_server_reasoning_included(server_reasoning_included);
                 true
             } else {
@@ -2089,6 +2197,10 @@ impl Session {
                     request_context_tokens: state.history.request_context_tokens(),
                     server_reasoning_included: state.server_reasoning_included(),
                     last_usage_item_count: Some(state.history.last_usage_item_count()),
+                    measured_item_tokens: state.history.measured_item_tokens,
+                    measured_format_delta: state.history.measured_format_delta,
+                    measured_base_tokens: state.history.measured_base_tokens,
+                    measured_tool_tokens: state.history.measured_tool_tokens,
                 })
         };
         if let Some(item) = item {

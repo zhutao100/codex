@@ -705,6 +705,7 @@ mod tests {
                     source: SessionSource::Cli,
                     model_provider: None,
                     base_instructions: None,
+                    catalog_instructions_source: None,
                     dynamic_tools: None,
                 },
                 git: None,

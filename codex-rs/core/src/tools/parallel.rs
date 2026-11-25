@@ -21,6 +21,9 @@ use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseInputItem;
 
+pub(crate) const INCOMPLETE_TOOL_BATCH_REASON: &str =
+    "The response ended before the tool batch was accepted. This call was not executed.";
+
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) enum ToolCallExecutionMode {
     #[default]

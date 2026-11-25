@@ -20,6 +20,7 @@ pub fn apply_rollout_item(
         RolloutItem::ResponseItem(item) => apply_response_item(metadata, item),
         RolloutItem::Compacted(_)
         | RolloutItem::ToolOutputPolicy { .. }
+        | RolloutItem::SampledInstructions { .. }
         | RolloutItem::TokenUsageContext { .. }
         | RolloutItem::PostTurnCompletionReviewState(_) => {}
     }

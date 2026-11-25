@@ -654,41 +654,46 @@ async fn schema_checkpoint_defers_steering_and_keeps_jointly_admitted_apps(
     let requests = traffic.requests();
     assert_eq!(requests.len(), replies.len());
     // One wiremock records both protocols, so this is arrival order, not a clock comparison.
-    let mut order = Vec::new();
-    for post in &apps
-        .received_requests()
-        .await
-        .context("recorded MCP and model calls")?[start..]
-    {
-        if post.method.as_str() != "POST" {
-            continue;
-        }
-        let body: Value = post.body_json()?;
-        if body["method"] == codex_core::MCP_SANDBOX_STATE_METHOD {
-            let policy = body["params"]["sandboxPolicy"]["type"]
-                .as_str()
-                .context("published policy")?;
-            let expected_cwd = if policy == "read-only" {
-                cwd.path()
-            } else {
-                &next_cwd
-            };
-            assert_eq!(
-                body["params"]["sandboxCwd"],
-                serde_json::to_value(expected_cwd)?
-            );
-            order.push(policy.to_owned());
-        } else if body["method"] == "tools/call" {
-            order.push(
-                body["params"]["name"]
+    let wire_order = |posts: &[wiremock::Request]| -> anyhow::Result<Vec<String>> {
+        let mut order = Vec::new();
+        for post in posts {
+            if post.method.as_str() != "POST" {
+                continue;
+            }
+            let body: Value = post.body_json()?;
+            if body["method"] == codex_core::MCP_SANDBOX_STATE_METHOD {
+                let policy = body["params"]["sandboxPolicy"]["type"]
                     .as_str()
-                    .context("executed MCP tool")?
-                    .to_owned(),
-            );
-        } else if post.url.path() == "/v1/responses" {
-            order.push(body["model"].as_str().context("sampled model")?.to_owned());
+                    .context("published policy")?;
+                let expected_cwd = if policy == "read-only" {
+                    cwd.path()
+                } else {
+                    &next_cwd
+                };
+                assert_eq!(
+                    body["params"]["sandboxCwd"],
+                    serde_json::to_value(expected_cwd)?
+                );
+                order.push(policy.to_owned());
+            } else if body["method"] == "tools/call" {
+                order.push(
+                    body["params"]["name"]
+                        .as_str()
+                        .context("executed MCP tool")?
+                        .to_owned(),
+                );
+            } else if post.url.path() == "/v1/responses" {
+                order.push(body["model"].as_str().context("sampled model")?.to_owned());
+            }
         }
-    }
+        Ok(order)
+    };
+    let order = wire_order(
+        &apps
+            .received_requests()
+            .await
+            .context("recorded MCP and model calls")?[start..],
+    )?;
     let mut expected = Vec::new();
     if !below_limit || order.first().is_some_and(|s| s == "read-only") {
         expected.push("read-only");
@@ -720,6 +725,36 @@ async fn schema_checkpoint_defers_steering_and_keeps_jointly_admitted_apps(
             &["Calendar", "Tasks"],
         )?;
         stop(resume.codex.clone()).await?;
+        // After the old job returned, no further response is owed to it. Its completed
+        // work still owns the very next compact, despite the matching model names.
+        truncate_after(&|i| {
+            matches!(i,
+                RolloutItem::ResponseItem(codex_protocol::models::ResponseItem::FunctionCallOutput {call_id,..}) if call_id == "old-probe"
+            )
+        })?;
+        let start = apps.received_requests().await.context("recording")?.len();
+        let recovered = responses::mount_sse_sequence(&apps, replies[1..].to_vec()).await;
+        let replay = builder(limit)
+            .resume(&apps, test.home.clone(), path.clone())
+            .await?;
+        replay.codex.submit(Op::Continue).await?;
+        complete(replay.codex.clone()).await;
+        stop(replay.codex.clone()).await?;
+        let retried = recovered.requests();
+        assert_eq!(retried.len(), 3);
+        for (idx, (actual, original)) in retried.iter().zip(&requests[1..]).enumerate() {
+            assert!(
+                actual.body_json() == original.body_json(),
+                "request {idx} after the owed tool result"
+            );
+        }
+        let order = wire_order(&apps.received_requests().await.context("recording")?[start..])?;
+        assert!(
+            order.ends_with(
+                &["read-only", target, "workspace-write", target, target].map(str::to_owned)
+            ),
+            "recovery wire order: {order:?}"
+        );
         return Ok(());
     }
     if below_limit {

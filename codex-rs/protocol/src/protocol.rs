@@ -1830,20 +1830,25 @@ impl InitialHistory {
     }
 
     pub fn get_base_instructions(&self) -> Option<BaseInstructions> {
-        // TODO: SessionMeta should (in theory) always be first in the history, so we can probably only check the first item?
-        match self {
-            InitialHistory::New => None,
-            InitialHistory::Resumed(resumed) => {
-                resumed.history.iter().find_map(|item| match item {
-                    RolloutItem::SessionMeta(meta_line) => meta_line.meta.base_instructions.clone(),
-                    _ => None,
-                })
-            }
-            InitialHistory::Forked(items) => items.iter().find_map(|item| match item {
-                RolloutItem::SessionMeta(meta_line) => meta_line.meta.base_instructions.clone(),
-                _ => None,
-            }),
-        }
+        self.base_instruction_snapshot()
+            .map(|(base, _)| base.clone())
+    }
+
+    pub fn base_instruction_snapshot(
+        &self,
+    ) -> Option<(&BaseInstructions, Option<&CatalogInstructionsSource>)> {
+        let items = match self {
+            Self::New => return None,
+            Self::Resumed(resumed) => &resumed.history,
+            Self::Forked(items) => items,
+        };
+        items.iter().find_map(|item| match item {
+            RolloutItem::SessionMeta(line) => Some((
+                line.meta.base_instructions.as_ref()?,
+                line.meta.catalog_instructions_source.as_ref(),
+            )),
+            _ => None,
+        })
     }
 
     pub fn get_dynamic_tools(&self) -> Option<Vec<DynamicToolSpec>> {
@@ -1926,11 +1931,14 @@ impl fmt::Display for SubAgentSource {
     }
 }
 
-/// SessionMeta contains session-level data that doesn't correspond to a specific turn.
-///
-/// NOTE: There used to be an `instructions` field here, which stored user_instructions, but we
-/// now save that on TurnContext. base_instructions stores the base instructions for the session,
-/// and should be used when there is no config override.
+/// The catalog selection that rendered the adjacent saved base instructions.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
+pub struct CatalogInstructionsSource {
+    pub model: String,
+    pub personality_disabled: bool,
+}
+
+/// Session-level data. Per-turn user instructions are stored on `TurnContext`.
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, TS)]
 pub struct SessionMeta {
     pub id: ThreadId,
@@ -1947,6 +1955,10 @@ pub struct SessionMeta {
     /// but may be missing for older sessions. If not present, fall back to rendering the base_instructions
     /// from ModelsManager.
     pub base_instructions: Option<BaseInstructions>,
+    /// Absent for pinned instruction text and for older rollouts of unknown origin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub catalog_instructions_source: Option<CatalogInstructionsSource>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dynamic_tools: Option<Vec<DynamicToolSpec>>,
 }
@@ -1963,6 +1975,7 @@ impl Default for SessionMeta {
             source: SessionSource::default(),
             model_provider: None,
             base_instructions: None,
+            catalog_instructions_source: None,
             dynamic_tools: None,
         }
     }
@@ -1979,6 +1992,11 @@ pub struct SessionMetaLine {
 #[derive(Serialize, Deserialize, Debug, Clone, JsonSchema, TS)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum RolloutItem {
+    /// Immutable host dictionary entry for a sampled base absent from the session headers.
+    SampledInstructions {
+        id: ThreadId,
+        text: String,
+    },
     SessionMeta(SessionMetaLine),
     ResponseItem(ResponseItem),
     /// Admission limit for the immediately following raw tool result, not model input.
@@ -2005,6 +2023,22 @@ pub enum RolloutItem {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional, type = "number")]
         last_usage_item_count: Option<usize>,
+        /// Host estimate of the originally covered, model-projected items, not billed usage.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional, type = "number")]
+        measured_item_tokens: Option<i64>,
+        /// Signed change from formatting paired tool results on the measured request.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional, type = "number")]
+        measured_format_delta: Option<i64>,
+        /// Local instruction cost in the measured request, for same-model admission deltas.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional, type = "number")]
+        measured_base_tokens: Option<i64>,
+        /// Local cost of the ordered tool schemas advertised by the measured request.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional, type = "number")]
+        measured_tool_tokens: Option<i64>,
     },
     EventMsg(EventMsg),
 }

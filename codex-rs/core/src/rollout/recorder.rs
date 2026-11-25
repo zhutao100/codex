@@ -45,6 +45,7 @@ use crate::session_prefix::is_turn_aborted_marker;
 use crate::state_db;
 use crate::state_db::StateDbHandle;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::CatalogInstructionsSource;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::ResumedHistory;
 use codex_protocol::protocol::RolloutItem;
@@ -78,6 +79,7 @@ pub enum RolloutRecorderParams {
         source: SessionSource,
         model_provider_id: String,
         base_instructions: BaseInstructions,
+        catalog_instructions_source: Option<CatalogInstructionsSource>,
         dynamic_tools: Vec<DynamicToolSpec>,
     },
     Resume {
@@ -111,6 +113,7 @@ impl RolloutRecorderParams {
             source,
             model_provider_id,
             base_instructions,
+            catalog_instructions_source: None,
             dynamic_tools,
         }
     }
@@ -300,6 +303,7 @@ impl RolloutRecorder {
                 source,
                 model_provider_id,
                 base_instructions,
+                catalog_instructions_source,
                 dynamic_tools,
             } => {
                 let LogFileInfo {
@@ -330,6 +334,7 @@ impl RolloutRecorder {
                         source,
                         model_provider: Some(model_provider_id.clone()),
                         base_instructions: Some(base_instructions),
+                        catalog_instructions_source,
                         dynamic_tools: if dynamic_tools.is_empty() {
                             None
                         } else {
@@ -494,6 +499,7 @@ impl RolloutRecorder {
                         items.push(RolloutItem::PostTurnCompletionReviewState(item));
                     }
                     item @ (RolloutItem::ToolOutputPolicy { .. }
+                    | RolloutItem::SampledInstructions { .. }
                     | RolloutItem::TokenUsageContext { .. }) => {
                         items.push(item);
                     }
@@ -566,6 +572,7 @@ impl RolloutRecorder {
                 item,
                 RolloutItem::PostTurnCompletionReviewState(_)
                     | RolloutItem::ToolOutputPolicy { .. }
+                    | RolloutItem::SampledInstructions { .. }
                     | RolloutItem::TokenUsageContext { .. }
             ) {
                 continue;
@@ -578,21 +585,7 @@ impl RolloutRecorder {
             }
         }
 
-        if let Some(index) = first_dangling_tool_call_line_index(&kept_lines) {
-            let snapshots = kept_lines
-                .drain(index..)
-                .filter(|(_, item)| {
-                    matches!(
-                        item,
-                        RolloutItem::ResponseItem(ResponseItem::GhostSnapshot { .. })
-                            | RolloutItem::PostTurnCompletionReviewState(_)
-                            | RolloutItem::TokenUsageContext { .. }
-                    )
-                })
-                .collect::<Vec<_>>();
-            kept_lines.extend(snapshots);
-            changed = true;
-        }
+        changed |= trim_incomplete_rollout_tail(&mut kept_lines);
 
         if changed {
             let mut cleaned = kept_lines
@@ -866,46 +859,38 @@ fn is_interrupted_abort_signal(item: &RolloutItem) -> bool {
     }
 }
 
-fn first_dangling_tool_call_line_index(lines: &[(String, RolloutItem)]) -> Option<usize> {
-    let last_user_line_index = lines.iter().rposition(|(_line, item)| {
+fn trim_incomplete_rollout_tail(lines: &mut Vec<(String, RolloutItem)>) -> bool {
+    let Some(last_boundary) = lines.iter().rposition(|(_, item)| {
         matches!(item, RolloutItem::Compacted(_))
-            || matches!(item, RolloutItem::ResponseItem(response_item) if is_user_turn_boundary(response_item))
-    })?;
-
-    let mut open_calls: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    let mut first_incomplete_local_shell: Option<usize> = None;
-    for (line_index, (_line, item)) in lines.iter().enumerate().skip(last_user_line_index + 1) {
-        match item {
-            RolloutItem::ResponseItem(item) if crate::compact::is_work_notes_request_item(item) => {
-                // Keep capture calls and notes for recovery even if their
-                // rejected outputs were not recorded before interruption.
-                return None;
-            }
-            RolloutItem::ResponseItem(ResponseItem::FunctionCall { call_id, .. })
-            | RolloutItem::ResponseItem(ResponseItem::CustomToolCall { call_id, .. }) => {
-                open_calls.entry(call_id.clone()).or_insert(line_index);
-            }
-            RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput { call_id, .. })
-            | RolloutItem::ResponseItem(ResponseItem::CustomToolCallOutput { call_id, .. }) => {
-                open_calls.remove(call_id);
-            }
-            RolloutItem::ResponseItem(ResponseItem::LocalShellCall { status, .. })
-                if !matches!(status, codex_protocol::models::LocalShellStatus::Completed) =>
-            {
-                first_incomplete_local_shell = Some(
-                    first_incomplete_local_shell
-                        .map_or(line_index, |current| current.min(line_index)),
-                );
-            }
-            _ => {}
-        }
-    }
-
-    open_calls
-        .values()
-        .copied()
-        .chain(first_incomplete_local_shell)
-        .min()
+            || matches!(item, RolloutItem::ResponseItem(r) if is_user_turn_boundary(r) || matches!(r, ResponseItem::Compaction { .. }))
+    }) else { return false; };
+    let tail = lines
+        .iter()
+        .enumerate()
+        .skip(last_boundary + 1)
+        .filter_map(|(i, (_, item))| match item {
+            RolloutItem::ResponseItem(r) => Some((i, r)),
+            _ => None,
+        });
+    let Some(batch) = crate::context_manager::incomplete_tool_batch(tail) else {
+        return false;
+    };
+    let mut pos = 0;
+    lines.retain(|(_, item)| {
+        let keep = batch.keep(pos)
+            || match item {
+                RolloutItem::ResponseItem(ResponseItem::GhostSnapshot { .. })
+                | RolloutItem::PostTurnCompletionReviewState(_)
+                | RolloutItem::SampledInstructions { .. }
+                | RolloutItem::TokenUsageContext { .. } => true,
+                // Admission policy precedes its output. Replay additionally matches the call ID.
+                RolloutItem::ToolOutputPolicy { .. } => batch.keep(pos + 1),
+                _ => false,
+            };
+        pos += 1;
+        keep
+    });
+    true
 }
 
 impl From<codex_state::ThreadsPage> for ThreadsPage {

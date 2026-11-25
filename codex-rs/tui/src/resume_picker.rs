@@ -1556,6 +1556,7 @@ mod tests {
                 source: SessionSource::Cli,
                 model_provider: Some(String::from("openai")),
                 base_instructions: None,
+                catalog_instructions_source: None,
                 dynamic_tools: None,
             };
             let meta_line = RolloutLine {

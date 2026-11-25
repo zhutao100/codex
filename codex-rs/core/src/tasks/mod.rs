@@ -422,12 +422,7 @@ impl Session {
             .await;
             return;
         }
-        if task_kind == TaskKind::Regular
-            && !matches!(
-                crate::compact::pending_work_notes(self.clone_history().await.raw_items()),
-                Ok(None)
-            )
-        {
+        if task_kind == TaskKind::Regular && self.has_work_notes_request().await {
             // A failed compact leaves its capture transaction in history.
             // Pending input was acknowledged above and remains outside that
             // segment. Preserve continuation instead of treating notes as the

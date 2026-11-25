@@ -5,11 +5,14 @@ pub use codex_api::common::ResponseEvent;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::openai_models::ModelInfo;
+use codex_protocol::openai_models::ReasoningEffort;
 use futures::Stream;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
 use tokio::sync::mpsc;
@@ -30,12 +33,12 @@ pub const REVIEW_EXIT_INTERRUPTED_TMPL: &str =
 /// API request payload for a single model turn
 #[derive(Default, Debug, Clone)]
 pub struct Prompt {
-    /// Conversation context input items.
+    /// Model-facing input. Select tools before fitting or sending tool results.
     pub input: Vec<ResponseItem>,
 
     /// Tools available to the model, including additional tools sourced from
     /// external MCP servers.
-    pub(crate) tools: Vec<ToolSpec>,
+    pub(crate) tools: ToolSurface,
 
     /// Whether parallel tool calls are permitted for this prompt.
     pub(crate) parallel_tool_calls: bool,
@@ -49,70 +52,147 @@ pub struct Prompt {
     pub output_schema: Option<Value>,
 }
 
-impl Prompt {
-    pub(crate) fn get_formatted_input(&self) -> Vec<ResponseItem> {
-        let mut input = self.input.clone();
+/// The same ordered inventory is used for admission, sampling and its usage record.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ToolSurface {
+    wire: Arc<[Value]>,
+    tokens: i64,
+    pub(crate) structured_outputs: bool,
+}
 
-        // when using the *Freeform* apply_patch tool specifically, tool outputs
-        // should be structured text, not json. Do NOT reserialize when using
-        // the Function tool - note that this differs from the check above for
-        // instructions. We declare the result as a named variable for clarity.
-        let is_freeform_apply_patch_tool_present = self.tools.iter().any(|tool| match tool {
-            ToolSpec::Freeform(f) => f.name == "apply_patch",
-            _ => false,
-        });
-        if is_freeform_apply_patch_tool_present {
-            reserialize_shell_outputs(&mut input);
-        }
+impl ToolSurface {
+    pub(crate) fn new(specs: &[ToolSpec]) -> Result<Self> {
+        let wire = crate::tools::spec::create_tools_json_for_responses_api(specs)?;
+        let tokens = if wire.is_empty() {
+            0
+        } else {
+            crate::truncate::approx_token_count(&serde_json::to_string(&wire)?) as i64
+        };
+        Ok(Self {
+            wire: wire.into(),
+            tokens,
+            structured_outputs: specs
+                .iter()
+                .any(|tool| matches!(tool, ToolSpec::Freeform(f) if f.name == "apply_patch")),
+        })
+    }
 
-        input
+    pub(crate) fn tokens(&self) -> i64 {
+        self.tokens
+    }
+    pub(crate) fn wire(&self) -> &[Value] {
+        &self.wire
     }
 }
 
-fn reserialize_shell_outputs(items: &mut [ResponseItem]) {
-    let mut shell_call_ids: HashSet<String> = HashSet::new();
+pub(crate) fn reasoning_effort_for_request(effort: ReasoningEffort) -> ReasoningEffort {
+    match effort {
+        ReasoningEffort::Ultra => ReasoningEffort::Max,
+        effort => effort,
+    }
+}
 
-    items.iter_mut().for_each(|item| match item {
-        ResponseItem::LocalShellCall { call_id, id, .. } => {
-            if let Some(identifier) = call_id.clone().or_else(|| id.clone()) {
-                shell_call_ids.insert(identifier);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SampledReasoning {
+    Disabled,
+    Enabled(Option<ReasoningEffort>),
+}
+
+impl SampledReasoning {
+    pub(crate) fn for_request(model: &ModelInfo, effort: Option<ReasoningEffort>) -> Self {
+        if model.supports_reasoning_summaries {
+            Self::Enabled(
+                effort
+                    .or(model.default_reasoning_level)
+                    .map(reasoning_effort_for_request),
+            )
+        } else {
+            Self::Disabled
+        }
+    }
+
+    pub(crate) fn restore(self, model: &mut ModelInfo) {
+        model.supports_reasoning_summaries = matches!(self, Self::Enabled(_));
+        if let Self::Enabled(effort) = self {
+            model.default_reasoning_level = effort;
+        }
+    }
+}
+
+impl Prompt {
+    pub(crate) fn with_tools(mut self, tools: ToolSurface) -> Self {
+        self.tools = tools;
+        self.format_tool_results();
+        self
+    }
+
+    pub(crate) fn format_tool_results(&mut self) {
+        if self.tools.structured_outputs {
+            let mut formatter = ShellOutputFormatter::default();
+            for item in &mut self.input {
+                if let Some(formatted) = formatter.project(item) {
+                    *item = formatted;
+                }
             }
         }
-        ResponseItem::CustomToolCall {
-            id: _,
-            status: _,
-            call_id,
-            name,
-            input: _,
-            ..
-        } => {
-            if name == "apply_patch" {
-                shell_call_ids.insert(call_id.clone());
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ShellOutputFormatter {
+    pending: HashSet<String>,
+}
+
+impl ShellOutputFormatter {
+    pub(crate) fn forget(&mut self, id: &str) {
+        self.pending.remove(id);
+    }
+
+    pub(crate) fn project(&mut self, item: &ResponseItem) -> Option<ResponseItem> {
+        match item {
+            ResponseItem::LocalShellCall { call_id, id, .. } => {
+                if let Some(identifier) = call_id.as_ref().or(id.as_ref()) {
+                    self.pending.insert(identifier.clone());
+                }
             }
-        }
-        ResponseItem::CustomToolCallOutput { call_id, output } => {
-            if shell_call_ids.remove(call_id)
-                && let Some(structured) = parse_structured_shell_output(output)
+            ResponseItem::CustomToolCall { call_id, name, .. } if name == "apply_patch" => {
+                self.pending.insert(call_id.clone());
+            }
+            ResponseItem::CustomToolCallOutput { call_id, output } => {
+                if self.pending.remove(call_id)
+                    && let Some(structured) = parse_structured_shell_output(output)
+                {
+                    return Some(ResponseItem::CustomToolCallOutput {
+                        call_id: call_id.clone(),
+                        output: structured,
+                    });
+                }
+            }
+            ResponseItem::FunctionCall { name, call_id, .. }
+                if is_shell_tool_name(name) || name == "apply_patch" =>
             {
-                *output = structured
+                self.pending.insert(call_id.clone());
             }
-        }
-        ResponseItem::FunctionCall { name, call_id, .. }
-            if is_shell_tool_name(name) || name == "apply_patch" =>
-        {
-            shell_call_ids.insert(call_id.clone());
-        }
-        ResponseItem::FunctionCallOutput { call_id, output } => {
-            if shell_call_ids.remove(call_id)
-                && let Some(structured) = output
-                    .text_content()
-                    .and_then(parse_structured_shell_output)
-            {
-                output.body = FunctionCallOutputBody::Text(structured);
+            ResponseItem::FunctionCallOutput { call_id, output } => {
+                if self.pending.remove(call_id)
+                    && let Some(structured) = output
+                        .text_content()
+                        .and_then(parse_structured_shell_output)
+                {
+                    return Some(ResponseItem::FunctionCallOutput {
+                        call_id: call_id.clone(),
+                        output: codex_protocol::models::FunctionCallOutputPayload {
+                            body: FunctionCallOutputBody::Text(structured),
+                            success: output.success,
+                        },
+                    });
+                }
             }
+            _ => {}
         }
-        _ => {}
-    })
+        None
+    }
 }
 
 fn is_shell_tool_name(name: &str) -> bool {

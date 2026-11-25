@@ -49,7 +49,8 @@ async fn compaction_notes_preserve_multipart_text_and_source_model_after_replay(
         capture_end: 3,
         source_model: Some(source_model.into()),
         notes: Some(notes.into()),
-        attempts: 1,
+        legacy_attempts: 1,
+        missing_rejections: vec![],
     };
     let (session, _) = make_session_and_context().await;
     let rollout: Vec<_> = items
@@ -66,11 +67,12 @@ async fn compaction_notes_preserve_multipart_text_and_source_model_after_replay(
         .await;
     assert_eq!(session.clone_history().await.raw_items(), items);
     assert_eq!(
-        compact::pending_work_notes(session.clone_history().await.raw_items()).unwrap(),
+        compact::pending_work_notes(session.clone_history().await.raw_items(), None).unwrap(),
         Some(expected)
     );
     let prepared =
-        compact::prepare_history_for_compaction(session.clone_history().await, None, None).unwrap();
+        compact::prepare_history_for_compaction(session.clone_history().await, None, None, None)
+            .unwrap();
     assert_eq!(prepared.source_history.raw_items(), &[user_message("task")]);
     assert_eq!(prepared.preserved_work_notes, Some(notes.into()));
 }
@@ -85,18 +87,18 @@ fn compaction_notes_reject_malformed_explicit_source_models() {
         ))
         .into();
         assert!(matches!(
-            compact::pending_work_notes(&[request]),
+            compact::pending_work_notes(&[request], None),
             Err(CodexErr::Fatal(_))
         ));
     }
 }
 
-#[test]
-fn compaction_notes_accept_only_matching_rejected_capture_outputs() {
+#[test_case::test_case(compact::WORK_NOTES_TOOL_REJECT_REASON; "capture denial")]
+#[test_case::test_case(crate::tools::parallel::INCOMPLETE_TOOL_BATCH_REASON; "legacy stream failure")]
+fn compaction_notes_accept_only_matching_rejected_capture_outputs(reason: &str) {
     let notes = "<AUTO_COMPACT_WORK_NOTES>\nexact notes";
     let request: ResponseItem =
         DeveloperInstructions::new(compact::AUTO_COMPACT_WORK_NOTES_REQUEST_TAG).into();
-    let reason = compact::WORK_NOTES_TOOL_REJECT_REASON;
     for (call, output) in [
         (
             ResponseItem::FunctionCall {
@@ -155,15 +157,180 @@ fn compaction_notes_accept_only_matching_rejected_capture_outputs() {
             items.extend(tail);
             let mut history = ContextManager::new();
             history.replace(items.clone());
-            let prepared = compact::prepare_history_for_compaction(history, None, None).unwrap();
+            let prepared =
+                compact::prepare_history_for_compaction(history, None, None, None).unwrap();
             assert_eq!(prepared.source_history.raw_items(), &[user_message("task")]);
             assert_eq!(prepared.preserved_work_notes, Some(notes.into()));
             // The same rejection without its matching capture call is
             // unrecognized work and must not be silently discarded.
             items.remove(2);
-            assert!(compact::pending_work_notes(&items).is_err());
+            assert!(compact::pending_work_notes(&items, None).is_err());
         }
     }
+}
+
+#[test]
+fn journaled_notes_count_responses_without_widening_legacy_capture_boundaries() {
+    let notes = "<AUTO_COMPACT_WORK_NOTES>\nexact";
+    let items = [
+        DeveloperInstructions::new(compact::AUTO_COMPACT_WORK_NOTES_REQUEST_TAG).into(),
+        assistant_message("commentary"),
+        assistant_message("final without a tag"),
+        assistant_message(notes),
+    ];
+    assert!(compact::pending_work_notes(&items, None).is_err());
+    assert_eq!(
+        compact::pending_work_notes(
+            &items,
+            Some(&crate::completion_review::CaptureJournal {
+                notes_remaining: Some(0),
+                ..Default::default()
+            })
+        )
+        .unwrap()
+        .unwrap()
+        .notes
+        .as_deref(),
+        Some(notes)
+    );
+}
+
+#[tokio::test]
+async fn another_accepted_prompt_does_not_reopen_completed_owed_work() {
+    let (_, ctx) = make_session_and_context().await;
+    let settings = RegularTaskSettings::from_turn(&ctx);
+    let mut sampled = settings.clone();
+    sampled.recorded_base = Some(ThreadId::new());
+    let input = |s: &str| {
+        vec![UserInput::Text {
+            text: s.into(),
+            text_elements: vec![],
+        }]
+    };
+    for actual in [None, Some(&sampled)] {
+        let mut review = crate::completion_review::CompletionReviewState {
+            owed_settings: Some(settings.clone()),
+            recovery_settings: Some(settings.clone()),
+            ..Default::default()
+        };
+        review.accept_input(false, input("older steer"), None);
+        review.release_owed_response(actual);
+        review.accept_input(true, input("next task"), None);
+        assert_eq!(
+            (review.owed_settings, review.completed_owed_source),
+            (None, Some(actual.unwrap_or(&settings).clone()))
+        );
+    }
+}
+
+#[tokio::test]
+async fn live_continuation_discounts_discarded_sampled_calls_only_for_helper_fit() {
+    let (session, context) = make_session_and_context().await;
+    let call = |id: &str, n| ResponseItem::FunctionCall {
+        encrypted_content: None,
+        status: None,
+        id: None,
+        name: "read_file".into(),
+        call_id: id.into(),
+        arguments: " ".repeat(n),
+    };
+    let a = call("A", 16);
+    let user = user_message("work");
+    session
+        .record_conversation_items(
+            &context,
+            &[
+                user.clone(),
+                a.clone(),
+                call("B", 12_000),
+                call("C", 12_000),
+            ],
+        )
+        .await;
+    let receipt = TokenUsage {
+        input_tokens: 26_000,
+        output_tokens: 5_600,
+        total_tokens: 31_600,
+        ..Default::default()
+    };
+    session
+        .update_token_usage_info_with_request_context(
+            &context,
+            Some(&receipt),
+            0,
+            true,
+            1,
+            &crate::Prompt::default(),
+        )
+        .await;
+    let result = ResponseItem::FunctionCallOutput {
+        call_id: "A".into(),
+        output: codex_protocol::models::FunctionCallOutputPayload::from_text("x".repeat(8_000)),
+    };
+    session
+        .record_conversation_items(&context, std::slice::from_ref(&result))
+        .await;
+    session.prepare_history_for_continuation(false).await;
+    let state = session.state.lock().await;
+    assert_eq!(state.history.raw_items(), &[user, a, result.clone()]);
+    assert_eq!(state.token_info().unwrap().last_token_usage, receipt);
+    let new_result = crate::context_manager::estimate_item_token_count(&result);
+    assert_eq!(
+        state.helper_tokens_from_usage(
+            &context.model_info.slug,
+            crate::context_manager::HelperProjection::plain(true)
+        ),
+        Some(receipt.input_tokens + new_result)
+    );
+    assert_eq!(
+        state.history.work_usage_without_frames(true),
+        receipt.total_tokens + new_result
+    );
+}
+
+#[test]
+fn a_tagged_capture_claim_cannot_discard_a_different_call_at_the_same_position() {
+    use crate::completion_review::CaptureJournal;
+    let call = |value: &str| ResponseItem::CustomToolCall {
+        encrypted_content: None,
+        status: None,
+        id: None,
+        call_id: "same-id".into(),
+        name: "capture".into(),
+        input: value.into(),
+    };
+    let mut journal = CaptureJournal {
+        notes_remaining: Some(1),
+        ..Default::default()
+    };
+    journal
+        .tagged_calls
+        .push(crate::completion_review::TaggedCaptureCall::from_item(1, &call("owned")).unwrap());
+    let mut items = vec![
+        DeveloperInstructions::new(compact::AUTO_COMPACT_WORK_NOTES_REQUEST_TAG).into(),
+        assistant_message("<AUTO_COMPACT_WORK_NOTES>\nexact"),
+        call("owned"),
+    ];
+    let pending = compact::pending_work_notes(&items, Some(&journal))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        pending.missing_rejections,
+        vec![ResponseItem::CustomToolCallOutput {
+            call_id: "same-id".into(),
+            output: compact::WORK_NOTES_TOOL_REJECT_REASON.into()
+        }]
+    );
+    items[2] = call("unrelated");
+    assert!(compact::pending_work_notes(&items, Some(&journal)).is_err());
+    items.insert(2, user_message("new work"));
+    assert_eq!(
+        compact::pending_work_notes(&items, Some(&journal))
+            .unwrap()
+            .unwrap()
+            .capture_end,
+        2
+    );
 }
 
 #[tokio::test]
@@ -227,7 +394,10 @@ async fn continuation_cleanup_preserves_notes_before_rejected_outputs_are_record
         let remaining = tokio::fs::read_to_string(&path).await.unwrap();
         assert_eq!(remaining, format!("{}\n", lines[..items.len()].join("\n")));
         assert_eq!(
-            compact::pending_work_notes(&items).unwrap().unwrap().notes,
+            compact::pending_work_notes(&items, None)
+                .unwrap()
+                .unwrap()
+                .notes,
             Some("<AUTO_COMPACT_WORK_NOTES>\nexact notes".into())
         );
     }
@@ -247,6 +417,7 @@ async fn compaction_usage_counts_preserved_notes_once_after_installation_and_res
             5_000,
             false,
             0,
+            &crate::Prompt::default(),
         )
         .await;
     let notes = compact::preserved_work_notes_message(&"long exact notes\n".repeat(2_000));
@@ -293,6 +464,10 @@ async fn compaction_usage_counts_preserved_notes_once_after_installation_and_res
                     request_context_tokens: 0,
                     server_reasoning_included: true,
                     last_usage_item_count: Some(replacement.len()),
+                    measured_item_tokens: None,
+                    measured_format_delta: None,
+                    measured_base_tokens: None,
+                    measured_tool_tokens: None,
                 },
                 RolloutItem::EventMsg(EventMsg::TokenCount(TokenCountEvent {
                     info: Some(info),
@@ -342,6 +517,10 @@ async fn continued_work_measurement_is_not_owned_by_the_previous_user_turn() {
                 request_context_tokens: 50,
                 server_reasoning_included: false,
                 last_usage_item_count: Some(2),
+                measured_item_tokens: None,
+                measured_format_delta: None,
+                measured_base_tokens: None,
+                measured_tool_tokens: None,
             },
             RolloutItem::ResponseItem(
                 DeveloperInstructions::new(compact::AUTO_COMPACT_WORK_NOTES_REQUEST_TAG).into(),
@@ -356,13 +535,22 @@ async fn continued_work_measurement_is_not_owned_by_the_previous_user_turn() {
             .await;
         let state = session.state.lock().await;
         assert_eq!(state.work_source_model(), Some(owner.unwrap_or(&a.model)));
-        assert_eq!(state.helper_tokens_from_usage(&a.model), None);
+        assert_eq!(
+            state.helper_tokens_from_usage(
+                &a.model,
+                crate::context_manager::HelperProjection::plain(true)
+            ),
+            None
+        );
         assert_eq!(state.history.work_notes_baseline_at(2, &a.model), None);
         assert_eq!(
             state
                 .history
                 .work_notes_baseline_at(2, &b.model)
-                .map(|s| s.work_tokens),
+                .map(|s| s.work_tokens(
+                    &BaseInstructions::default(),
+                    crate::context_manager::HelperProjection::plain(true)
+                )),
             owner.map(|_| 550)
         );
     }
@@ -563,7 +751,9 @@ async fn completed_work_notes_with_response_tail_remain_pending_work_after_resta
         .await;
     assert_eq!(reconstructed.history, history);
     assert!(reconstructed.pending_continuation.is_some());
-    let pending = compact::pending_work_notes(&history).unwrap().unwrap();
+    let pending = compact::pending_work_notes(&history, None)
+        .unwrap()
+        .unwrap();
     assert_eq!(
         pending,
         compact::PendingWorkNotes {
@@ -571,12 +761,13 @@ async fn completed_work_notes_with_response_tail_remain_pending_work_after_resta
             capture_end: history.len(),
             source_model: None,
             notes: Some(notes.into()),
-            attempts: 1
+            legacy_attempts: 1,
+            missing_rejections: vec![],
         }
     );
     let mut source = ContextManager::new();
     source.replace(history.clone());
-    let prepared = compact::prepare_history_for_compaction(source, None, None).unwrap();
+    let prepared = compact::prepare_history_for_compaction(source, None, None, None).unwrap();
     assert_eq!(prepared.source_history.raw_items(), &history[..1]);
     assert_eq!(prepared.preserved_work_notes, Some(notes.into()));
     let mut abandoned = history.clone();
@@ -588,7 +779,7 @@ async fn completed_work_notes_with_response_tail_remain_pending_work_after_resta
         crate::completion_review::ReviewPromptFrame::new("work frame".into(), 1, None),
     ]);
     let prepared =
-        compact::prepare_history_for_compaction(source.clone(), None, Some(&frame)).unwrap();
+        compact::prepare_history_for_compaction(source.clone(), None, Some(&frame), None).unwrap();
     assert_eq!(
         prepared.source_history.raw_items(),
         &[
@@ -637,7 +828,23 @@ async fn completed_work_notes_with_response_tail_remain_pending_work_after_resta
         let mut items = history.clone();
         items.push(later_work);
         ambiguous.replace(items.clone());
-        assert!(compact::prepare_history_for_compaction(ambiguous.clone(), None, None).is_err());
+        for journal in [
+            None,
+            Some(crate::completion_review::CaptureJournal {
+                notes_remaining: Some(1),
+                ..Default::default()
+            }),
+        ] {
+            assert!(
+                compact::prepare_history_for_compaction(
+                    ambiguous.clone(),
+                    None,
+                    None,
+                    journal.as_ref()
+                )
+                .is_err()
+            );
+        }
         assert_eq!(ambiguous.raw_items(), items);
     }
 }
@@ -667,7 +874,7 @@ async fn interrupted_notes_replay_and_preparation_preserve_the_known_abort_marke
         assert_eq!(reconstructed.history, history);
         let mut source = ContextManager::new();
         source.replace(history);
-        let prepared = compact::prepare_history_for_compaction(source, None, None).unwrap();
+        let prepared = compact::prepare_history_for_compaction(source, None, None, None).unwrap();
         assert_eq!(
             prepared.source_history.raw_items(),
             &[user_message("original task"), marker.clone()]
@@ -705,7 +912,7 @@ async fn ambiguous_compaction_notes_remain_recoverable_after_standalone_replay()
         .await;
     assert_eq!(reconstructed.history, history);
     assert!(reconstructed.pending_continuation.is_some());
-    assert!(compact::pending_work_notes(&reconstructed.history).is_err());
+    assert!(compact::pending_work_notes(&reconstructed.history, None).is_err());
 }
 
 #[tokio::test]
@@ -831,6 +1038,45 @@ fn continuation_trims_dangling_work_after_encrypted_compaction_and_keeps_undo() 
     ];
     assert!(trim_incomplete_continuation_tail(&mut history));
     assert_eq!(history, vec![summary, snapshot]);
+}
+
+#[test]
+fn continuation_keeps_completed_pairs_on_either_side_of_an_unmatched_ordinary_call() {
+    use serde_json::json;
+    let item = |v| serde_json::from_value::<ResponseItem>(v).unwrap();
+    let user = user_message("run the batch");
+    let first = item(json!({"type":"function_call","name":"a","call_id":"first","arguments":"{}"}));
+    let dangling =
+        item(json!({"type":"function_call","name":"b","call_id":"shared","arguments":"{}"}));
+    let custom =
+        item(json!({"type":"custom_tool_call","name":"c","call_id":"shared","input":"test"}));
+    let shell = item(
+        json!({"type":"local_shell_call","call_id":"local","status":"completed","action":{"type":"exec","command":["pwd"]}}),
+    );
+    let result = |id: &str, text: &str| {
+        item(json!({"type":"function_call_output","call_id":id,"output":text}))
+    };
+    let custom_out = item(
+        json!({"type":"custom_tool_call_output","call_id":"shared","output":"actual custom result"}),
+    );
+    let shell_out = result("local", "actual directory");
+    let first_out = result("first", "actual first result");
+    let mut history = vec![
+        user.clone(),
+        first.clone(),
+        dangling,
+        custom.clone(),
+        shell.clone(),
+        custom_out.clone(),
+        shell_out.clone(),
+        first_out.clone(),
+    ];
+    assert!(trim_incomplete_continuation_tail(&mut history));
+    assert_eq!(
+        history,
+        vec![user, first, custom, shell, custom_out, shell_out, first_out]
+    );
+    assert!(!trim_incomplete_continuation_tail(&mut history));
 }
 
 #[tokio::test]

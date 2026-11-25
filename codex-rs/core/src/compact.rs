@@ -1,11 +1,12 @@
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::Prompt;
 use crate::client::ModelClientSession;
 use crate::client_common::ResponseEvent;
+use crate::completion_review::CaptureJournal;
 use crate::completion_review::ReviewPromptFrames;
 use crate::context_manager::ContextManager;
+use crate::context_manager::ToolCallId;
 use crate::error::CodexErr;
 use crate::error::Result as CodexResult;
 use crate::preserved_work_notes::PRESERVED_WORK_NOTES_MESSAGE_PREFIX;
@@ -25,11 +26,14 @@ use crate::util::backoff;
 use codex_protocol::items::ContextCompactionItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::FunctionCallOutputBody;
+use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::user_input::UserInput;
 use futures::prelude::*;
+use indexmap::IndexSet;
 use tracing::error;
 
 pub const SUMMARIZATION_PROMPT: &str = include_str!("../templates/compact/prompt.md");
@@ -50,11 +54,30 @@ pub(crate) enum InitialContextInjection {
     BeforeLastUserMessage,
 }
 
+/// Calibration of the transcript, excluding the advertised tools on both sides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SourceFit {
+    Local,
+    Measured { transcript_adjustment: i64 },
+}
+
+impl SourceFit {
+    pub(crate) fn adjustment(self, tools: &crate::client_common::ToolSurface) -> i64 {
+        let transcript = match self {
+            Self::Local => 0,
+            Self::Measured {
+                transcript_adjustment,
+            } => transcript_adjustment,
+        };
+        transcript.saturating_add(tools.tokens())
+    }
+}
+
 pub(crate) struct CompactionContext<'a> {
     pub(crate) request: &'a Arc<TurnContext>,
     pub(crate) replacement: &'a Arc<TurnContext>,
-    /// Difference between ledger and byte estimates of the same pre-capture transcript.
-    pub(crate) source_token_adjustment: i64,
+    pub(crate) source_fit: SourceFit,
     /// Freeze the work frame across capture, retries and the subsequent compact request.
     pub(crate) review_frames: ReviewPromptFrames,
 }
@@ -64,7 +87,7 @@ impl<'a> CompactionContext<'a> {
         Self {
             request: context,
             replacement: context,
-            source_token_adjustment: 0,
+            source_fit: SourceFit::Local,
             review_frames: ReviewPromptFrames::default(),
         }
     }
@@ -161,11 +184,9 @@ async fn run_compact_task_inner(
     let PreparedCompactionInput {
         source_history,
         preserved_work_notes,
-    } = prepare_history_for_compaction(
-        sess.clone_history().await,
-        preserved_work_notes,
-        Some(&context.review_frames),
-    )?;
+    } = sess
+        .prepare_history_for_compaction(preserved_work_notes, &context.review_frames)
+        .await?;
     let mut history = source_history;
     history.record_items(
         &[initial_input_for_turn.into()],
@@ -498,18 +519,17 @@ pub(crate) fn prepare_history_for_compaction(
     mut history: ContextManager,
     preserved_work_notes: Option<String>,
     review_frames: Option<&ReviewPromptFrames>,
+    journal: Option<&CaptureJournal>,
 ) -> CodexResult<PreparedCompactionInput> {
     let mut items = history.raw_items().to_vec();
 
     // Remove only the identified capture segment. Input acknowledged after a
     // failed attempt belongs to the next attempt's source, not to notes capture.
-    let pending_notes = pending_work_notes(&items)?;
+    let pending_notes = pending_work_notes(&items, journal)?;
     if let Some(pending) = &pending_notes {
         let controls = items[pending.request_index..pending.capture_end]
             .iter()
-            .filter(|item| {
-                matches!(item, ResponseItem::GhostSnapshot { .. }) || is_turn_aborted_marker(item)
-            })
+            .filter(|item| is_capture_control(item))
             .cloned()
             .collect::<Vec<_>>();
         items.splice(pending.request_index..pending.capture_end, controls);
@@ -537,16 +557,55 @@ pub(crate) const WORK_NOTES_CAPTURE_MAX_ATTEMPTS: u8 = 2;
 pub(crate) const WORK_NOTES_TOOL_REJECT_REASON: &str =
     "tool use disabled during auto-compact work-notes capture";
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub(crate) struct PendingWorkNotes {
     pub(crate) request_index: usize,
     pub(crate) capture_end: usize,
     pub(crate) source_model: Option<String>,
     pub(crate) notes: Option<String>,
-    pub(crate) attempts: u8,
+    pub(crate) legacy_attempts: u8,
+    pub(crate) missing_rejections: Vec<ResponseItem>,
 }
 
-pub(crate) fn pending_work_notes(items: &[ResponseItem]) -> CodexResult<Option<PendingWorkNotes>> {
+pub(crate) fn tagged_work_notes(item: &ResponseItem) -> Option<String> {
+    last_assistant_message_from_item(item, false)
+        .filter(|text| text.trim_start().starts_with(AUTO_COMPACT_WORK_NOTES_TAG))
+}
+
+fn is_capture_control(item: &ResponseItem) -> bool {
+    matches!(item, ResponseItem::GhostSnapshot { .. }) || is_turn_aborted_marker(item)
+}
+
+pub(crate) fn next_capture_offset(items: &[ResponseItem]) -> Option<usize> {
+    let start = items.iter().rposition(is_work_notes_request_item)?;
+    Some(
+        items[start + 1..]
+            .iter()
+            .filter(|i| !is_capture_control(i))
+            .count(),
+    )
+}
+
+fn capture_rejection(call: ToolCallId<'_>) -> ResponseItem {
+    match call {
+        ToolCallId::Function(id) => ResponseItem::FunctionCallOutput {
+            call_id: id.to_owned(),
+            output: FunctionCallOutputPayload {
+                body: FunctionCallOutputBody::Text(WORK_NOTES_TOOL_REJECT_REASON.to_owned()),
+                success: Some(false),
+            },
+        },
+        ToolCallId::Custom(id) => ResponseItem::CustomToolCallOutput {
+            call_id: id.to_owned(),
+            output: WORK_NOTES_TOOL_REJECT_REASON.to_owned(),
+        },
+    }
+}
+
+pub(crate) fn pending_work_notes(
+    items: &[ResponseItem],
+    journal: Option<&CaptureJournal>,
+) -> CodexResult<Option<PendingWorkNotes>> {
     let Some(request_index) = items.iter().rposition(is_work_notes_request_item) else {
         return Ok(None);
     };
@@ -555,43 +614,64 @@ pub(crate) fn pending_work_notes(items: &[ResponseItem]) -> CodexResult<Option<P
         capture_end: items.len(),
         source_model: work_notes_source_model(&items[request_index])?,
         notes: None,
-        attempts: 0,
+        legacy_attempts: 0,
+        missing_rejections: Vec::new(),
     };
-    let mut function_calls = HashSet::new();
-    let mut custom_calls = HashSet::new();
-    let mcp_rejection = format!("err: {WORK_NOTES_TOOL_REJECT_REASON:?}");
-    for (index, item) in items.iter().enumerate().skip(request_index + 1) {
-        if matches!(item, ResponseItem::GhostSnapshot { .. }) || is_turn_aborted_marker(item) {
-            continue;
-        }
+    let mut calls = IndexSet::new();
+    // Older clients used the ordinary failed-batch reason on interrupted notes streams
+    // and wrapped rejections for calls their router recognized as MCP.
+    let reasons = [
+        WORK_NOTES_TOOL_REJECT_REASON,
+        crate::tools::parallel::INCOMPLETE_TOOL_BATCH_REASON,
+    ];
+    let mcp_reasons = reasons.map(|reason| format!("err: {reason:?}"));
+    let notes_remaining = journal.and_then(|journal| journal.notes_remaining);
+    for (offset, (index, item)) in items
+        .iter()
+        .enumerate()
+        .skip(request_index + 1)
+        .filter(|(_, item)| !is_capture_control(item))
+        .enumerate()
+    {
         if crate::context_manager::is_user_turn_boundary(item) {
             pending.capture_end = index;
             break;
         }
-        // Tool futures are drained after assistant notes are recorded. Only
-        // accept exact rejections for calls in this capture, in either order.
+        // Output items precede the batch's rejections. Never discard unrelated tool activity.
         let rejected_capture_output = match item {
             ResponseItem::FunctionCallOutput {
                 call_id, output, ..
             } => {
-                output.text_content().is_some_and(|text| {
-                    text == WORK_NOTES_TOOL_REJECT_REASON || text == mcp_rejection
-                }) && function_calls.remove(call_id)
+                output.success != Some(true)
+                    && output.text_content().is_some_and(|text| {
+                        reasons.contains(&text) || mcp_reasons.iter().any(|r| r == text)
+                    })
+                    && calls.shift_remove(&ToolCallId::Function(call_id))
             }
             ResponseItem::CustomToolCallOutput {
                 call_id, output, ..
-            } => output == WORK_NOTES_TOOL_REJECT_REASON && custom_calls.remove(call_id),
+            } => {
+                reasons.contains(&output.as_str())
+                    && calls.shift_remove(&ToolCallId::Custom(call_id))
+            }
             _ => false,
         };
         if rejected_capture_output {
             continue;
         }
         if pending.notes.is_some() {
+            if let Some(id) = ToolCallId::from_call(item)
+                && journal.is_some_and(|journal| journal.owns_call(offset, item))
+                && calls.insert(id)
+            {
+                continue;
+            }
             // A response can finish with reasoning and an empty final message
             // after emitting notes in commentary. These are still capture
             // output, not subsequent work.
             let is_capture_tail = match item {
                 ResponseItem::Reasoning { .. } => true,
+                ResponseItem::WebSearchCall { .. } => notes_remaining.is_some(),
                 ResponseItem::Message { role, content, .. } if role == "assistant" => {
                     content.iter().all(|part| {
                         matches!(part, ContentItem::OutputText { text, .. } if text.trim().is_empty())
@@ -608,20 +688,19 @@ pub(crate) fn pending_work_notes(items: &[ResponseItem]) -> CodexResult<Option<P
         }
         let is_capture_item = match item {
             ResponseItem::Message { role, .. } if role == "assistant" => {
-                pending.attempts = pending.attempts.saturating_add(1);
-                pending.notes = last_assistant_message_from_item(item, false)
-                    .filter(|text| text.trim_start().starts_with(AUTO_COMPACT_WORK_NOTES_TAG));
-                pending.attempts <= WORK_NOTES_CAPTURE_MAX_ATTEMPTS
-            }
-            ResponseItem::FunctionCall { call_id, .. } => function_calls.insert(call_id),
-            ResponseItem::CustomToolCall { call_id, .. } => custom_calls.insert(call_id),
-            ResponseItem::LocalShellCall { id, call_id, .. } => {
-                if let Some(call_id) = call_id.as_ref().or(id.as_ref()) {
-                    function_calls.insert(call_id);
+                pending.notes = tagged_work_notes(item);
+                if notes_remaining.is_none() {
+                    pending.legacy_attempts = pending.legacy_attempts.saturating_add(1);
                 }
-                true
+                pending.legacy_attempts <= WORK_NOTES_CAPTURE_MAX_ATTEMPTS
             }
-            ResponseItem::Reasoning { .. } => true,
+            ResponseItem::FunctionCall { .. }
+            | ResponseItem::CustomToolCall { .. }
+            | ResponseItem::LocalShellCall { .. } => {
+                ToolCallId::from_call(item).is_some_and(|id| calls.insert(id))
+            }
+            // Hosted search is service-produced output, not a local call awaiting a result.
+            ResponseItem::Reasoning { .. } | ResponseItem::WebSearchCall { .. } => true,
             _ => false,
         };
         if !is_capture_item {
@@ -630,6 +709,7 @@ pub(crate) fn pending_work_notes(items: &[ResponseItem]) -> CodexResult<Option<P
             ));
         }
     }
+    pending.missing_rejections = calls.into_iter().map(capture_rejection).collect();
     Ok(Some(pending))
 }
 
@@ -745,6 +825,7 @@ async fn drain_to_completed(
                     frame_tokens,
                     server_reasoning_included,
                     0,
+                    prompt,
                 )
                 .await;
                 return Ok(output);
@@ -1111,7 +1192,7 @@ mod tests {
         ]);
 
         let work = history.raw_items()[..2].to_vec();
-        let prepared = prepare_history_for_compaction(history, None, None).unwrap();
+        let prepared = prepare_history_for_compaction(history, None, None, None).unwrap();
 
         assert_eq!(
             prepared.preserved_work_notes,

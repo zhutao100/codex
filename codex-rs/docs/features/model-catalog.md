@@ -8,6 +8,10 @@ An overlay-selected provider owns discovery from the first turn. Only a turn ser
 
 A global overlay patch also applies to bundled models that have no per-model entry, including when the default provider is not OpenAI. A text-only global modality setting therefore disables image input consistently in both picker paths and in turns.
 
+Persist the model and personality opt-out state with catalog-rendered base instructions. Reuse the saved bytes for the same selection; an actual change selects the appropriate catalog text. Explicit configuration and final-instruction overrides retain precedence. Historical text without catalog provenance stays pinned; matching text alone is not proof of origin.
+
+An unset user reasoning effort follows the catalog for new work. A [checkpoint](session-work-notes.md#fit-and-prefix-reuse) of already-sampled work instead restores its effective wire effort, including omission, without making it a user override on the destination.
+
 - Thread naming selects the dedicated model in [thread naming](../../core/src/thread_name.rs), with low reasoning effort and title-only instructions. If that model is unavailable or hidden, it falls back through configured/default model selection and then the current model.
 - [Explorer selection](../../core/src/agent/role.rs) and [rate-limit switching](../../tui/src/chatwidget/rate_limits.rs) have their own selectors. Keep them compatible with the catalog when updating models; do not assume they share naming's fallback logic.
 - Removing a bundled entry changes discovery/pickers, not the ability to configure a custom provider's explicit model identifier. Retain valid tests of custom identifiers.

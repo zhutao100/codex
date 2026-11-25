@@ -68,7 +68,6 @@ use http::HeaderMap as ApiHeaderMap;
 use http::HeaderValue;
 use http::StatusCode as HttpStatusCode;
 use reqwest::StatusCode;
-use serde_json::Value;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -82,6 +81,9 @@ use crate::auth::RefreshTokenError;
 use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
 use crate::client_common::ResponseStream;
+use crate::client_common::SampledReasoning;
+use crate::client_common::ToolSurface;
+use crate::client_common::reasoning_effort_for_request;
 use crate::default_client::build_reqwest_client;
 use crate::default_client::default_headers;
 use crate::error::CodexErr;
@@ -89,7 +91,6 @@ use crate::error::Result;
 use crate::flags::CODEX_RS_SSE_FIXTURE;
 use crate::model_provider_info::ModelProviderInfo;
 use crate::model_provider_info::WireApi;
-use crate::tools::spec::create_tools_json_for_responses_api;
 
 mod cache_trace;
 pub(crate) use cache_trace::CacheOperation;
@@ -168,7 +169,7 @@ pub struct ModelClientSession {
     websocket_last_request: Option<ResponseCreateWsRequest>,
     websocket_last_response_rx: Option<oneshot::Receiver<LastResponse>>,
     /// Actual sampling tools, captured before opening the stream for inline compaction.
-    pub(crate) sampling_tools: Option<(String, Vec<crate::client_common::tools::ToolSpec>)>,
+    pub(crate) sampling_tools: Option<(String, ToolSurface)>,
     /// Turn state for sticky routing.
     ///
     /// This is an `OnceLock` that stores the turn state value received from the server
@@ -206,13 +207,6 @@ impl std::fmt::Debug for CachedWebsocketConnection {
 enum WebsocketStreamOutcome {
     Stream(ResponseStream),
     FallbackToHttp,
-}
-
-fn reasoning_effort_for_request(effort: ReasoningEffortConfig) -> ReasoningEffortConfig {
-    match effort {
-        ReasoningEffortConfig::Ultra => ReasoningEffortConfig::Max,
-        effort => effort,
-    }
 }
 
 impl ModelClient {
@@ -558,7 +552,7 @@ impl ModelClientSession {
             && (*CODEX_RS_SSE_FIXTURE).is_none()
     }
 
-    fn build_responses_request(&self, prompt: &Prompt) -> Result<ApiPrompt> {
+    fn build_responses_request(&self, prompt: &Prompt) -> ApiPrompt {
         let instructions = &prompt.base_instructions.text;
         let base = (!instructions.is_empty()).then(|| {
             // Match upstream's thread- and content-scoped identity, including after resume.
@@ -569,17 +563,19 @@ impl ModelClientSession {
             let id = uuid::Uuid::new_v5(&thread, instructions.as_bytes());
             BaseInstructionsMessage::new(format!("msg_{id}"), instructions)
         });
-        let tools_json: Vec<Value> = create_tools_json_for_responses_api(&prompt.tools)?;
-        Ok(ApiPrompt {
+        ApiPrompt {
             input: ResponsesInput {
                 base,
-                items: project_provider_input(prompt.get_formatted_input().into(), &self.provider)
-                    .into_owned(),
+                items: project_provider_input(
+                    std::borrow::Cow::Borrowed(&prompt.input),
+                    &self.provider,
+                )
+                .into_owned(),
             },
-            tools: tools_json,
+            tools: prompt.tools.wire().to_vec(),
             parallel_tool_calls: prompt.parallel_tool_calls,
             output_schema: prompt.output_schema.clone(),
-        })
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -596,20 +592,16 @@ impl ModelClientSession {
         let turn_metadata_header =
             turn_metadata_header.and_then(|value| HeaderValue::from_str(value).ok());
 
-        let default_reasoning_effort = model_info.default_reasoning_level;
-        let reasoning = if model_info.supports_reasoning_summaries {
-            Some(Reasoning {
-                effort: effort
-                    .or(default_reasoning_effort)
-                    .map(reasoning_effort_for_request),
+        let reasoning = match SampledReasoning::for_request(model_info, effort) {
+            SampledReasoning::Enabled(effort) => Some(Reasoning {
+                effort,
                 summary: if summary == ReasoningSummaryConfig::None {
                     None
                 } else {
                     Some(summary)
                 },
-            })
-        } else {
-            None
+            }),
+            SampledReasoning::Disabled => None,
         };
 
         let mut include = if reasoning.is_some() {
@@ -868,7 +860,7 @@ impl ModelClientSession {
         }
 
         let auth_manager = self.client.state.auth_manager.clone();
-        let api_prompt = self.build_responses_request(prompt)?;
+        let api_prompt = self.build_responses_request(prompt);
 
         // One outer stream attempt may have several wire sends, including auth recovery.
         let telemetry = Arc::new(ApiTelemetry::new(otel_manager.clone()));
@@ -954,7 +946,7 @@ impl ModelClientSession {
         turn_metadata_header: Option<&str>,
     ) -> Result<WebsocketStreamOutcome> {
         let auth_manager = self.client.state.auth_manager.clone();
-        let api_prompt = self.build_responses_request(prompt)?;
+        let api_prompt = self.build_responses_request(prompt);
 
         let mut auth_recovery = None;
         loop {

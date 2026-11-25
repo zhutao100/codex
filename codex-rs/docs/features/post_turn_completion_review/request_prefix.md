@@ -17,7 +17,9 @@ The advisory is ordinary developer history. Exact request/candidate frames are r
 
 Moving the frame to the growing transcript tail changes the previous input instead of extending it. Prepending it to all ordinary history also changes the established prefix. Keep mandatory snapshots and the client's prefix validation intact.
 
-A checkpoint can precede advisory admission: reconciling an already delivered job can find the owner over budget without appending anything. Do not insert a new candidate at the last older developer message. Keep the outgoing frames and defer the candidate unless its own admitted advisory is the tail of the outgoing work.
+To diagnose a handoff, compare the preceding work including its output and each existing frame's bytes and anchor. A larger frame-token total can mean that a new frame was appended after an unchanged prefix; it does not prove replacement or explain a low cache receipt.
+
+A checkpoint can precede advisory admission: reconciling an already delivered job can find the owner over budget without appending anything. Select the outgoing ordinary settings before the review guard, even on the same model: a changed personality, base or tier belongs to the incoming follow-up, not its helpers. Do not insert a new candidate at the last older developer message. Keep the outgoing frames and defer the candidate unless its own admitted advisory is the tail of the outgoing work.
 
 The [client](../../../core/src/client.rs) uses `previous_response_id` only when input extends the previous input and output with compatible request settings. A new task or the notes/compact branch can require a full send even when the logical work prefix matches.
 

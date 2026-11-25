@@ -5,6 +5,16 @@ use pretty_assertions::assert_eq;
 #[path = "compact_remote_v2_capture_phase.rs"]
 mod capture_phase;
 
+#[path = "compact_remote_v2_projection.rs"]
+mod projection;
+
+fn text_reply(id: &str, text: &str, usage: i64) -> String {
+    responses::sse(vec![
+        responses::ev_assistant_message(id, text),
+        responses::ev_completed_with_tokens(id, usage),
+    ])
+}
+
 pub(super) fn configure_providers(
     config: &mut codex_core::config::Config,
     previous_base: String,
@@ -62,6 +72,164 @@ fn model_override(model: &str) -> Op {
         personality: None,
         service_tier: None,
     }
+}
+
+#[test_case::test_case(false, false; "fresh acceptance")]
+#[test_case::test_case(true, false; "ordinary continuation before the decision")]
+#[test_case::test_case(true, true; "absent sampled default stays absent")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn second_model_checkpoint_reuses_archived_work_after_catalog_refresh(
+    plain: bool,
+    absent_default: bool,
+) -> Result<()> {
+    skip_if_no_network_unless_localhost!(Ok(()));
+    const A: &str = "previous-provider-model";
+    const B: &str = "destination-provider-model";
+    const SAMPLED: &str = "Instructions sampled on B.";
+    const REFRESHED: &str = "B instructions after catalog refresh.";
+    const NEW: &str = "Now admit a fresh task.";
+    let cwd = tempfile::tempdir()?;
+    let build = |server: &wiremock::MockServer, text: &'static str| {
+        let base = server.uri();
+        let cwd = cwd.path().to_owned();
+        test_codex().with_model(A).with_config(move |cfg| {
+            configure_providers(cfg, base.clone(), base, false);
+            cfg.cwd = cwd;
+            cfg.model_reasoning_effort = None;
+            let patch = &mut cfg.model_overlay.as_mut().unwrap().models[1].patch;
+            patch.base_instructions = Some(text.into());
+            patch.supports_reasoning_summaries = Some(true);
+            use codex_protocol::openai_models::ReasoningEffort;
+            patch.default_reasoning_level = Some(if text == REFRESHED {
+                Some(ReasoningEffort::High)
+            } else {
+                (!absent_default).then_some(ReasoningEffort::Low)
+            });
+        })
+    };
+    let replies = [
+        text_reply("a", "Finished A.", 3_000),
+        text_reply("b1", "Worked on B.", 4_000),
+        if plain {
+            responses::sse(vec![
+                responses::ev_function_call(
+                    "before-decision",
+                    "update_plan",
+                    r#"{"plan":[{"step":"Check","status":"completed"}]}"#,
+                ),
+                responses::ev_completed_with_tokens("b2", 42_000),
+            ])
+        } else {
+            text_reply("b2", "Finished B.", 42_000)
+        },
+        text_reply("notes", NOTES, 30_000),
+        compact_response("archived-work"),
+        text_reply("done", "Fresh task done.", 4_000),
+    ];
+    let server = responses::start_mock_server().await;
+    let live = responses::mount_sse_sequence(&server, replies.to_vec()).await;
+    let original = build(&server, SAMPLED).build(&server).await?;
+    for (index, text) in ["Start on A.", "Work on B.", "Finish on B.", NEW]
+        .into_iter()
+        .take(if plain { 3 } else { 4 })
+        .enumerate()
+    {
+        if index == 1 {
+            original.codex.submit(model_override(B)).await?;
+        }
+        original.codex.submit(user_input(text)).await?;
+        complete(&original.codex).await;
+    }
+    shutdown(&original.codex).await?;
+    let sent = live.requests();
+    assert_eq!(sent.len(), replies.len());
+    assert_ne!(sent[0].instructions_text(), SAMPLED);
+    for req in &sent[1..] {
+        assert_eq!(req.instructions_text(), SAMPLED);
+        assert_eq!(
+            req.body_json()["reasoning"]["effort"],
+            if absent_default {
+                Value::Null
+            } else {
+                json!("low")
+            }
+        );
+    }
+    assert!(sent[3].input().starts_with(&sent[2].input()));
+    assert!(sent[4].input().starts_with(&sent[2].input()));
+    let path = original.codex.rollout_path().unwrap();
+    let raw = std::fs::read_to_string(&path)?;
+    let mut archived = 0;
+    let mut archive_id = Value::Null;
+    let mut cuts = Vec::new();
+    let mut offset = 0;
+    for line in raw.split_inclusive('\n') {
+        offset += line.len();
+        let v: Value = serde_json::from_str(line)?;
+        let p = &v["payload"];
+        if v["type"] == "sampled_instructions" && p["text"] == SAMPLED {
+            archived += 1;
+            archive_id = p["id"].clone();
+        }
+        if v["type"] == "post_turn_completion_review_state" {
+            for settings in [&p["last_work_settings"], &p["pending_compaction"]["source"]] {
+                if settings["mode"]["settings"]["model"] == B {
+                    assert!(!archive_id.is_null());
+                    assert_eq!(settings["recorded_base"], archive_id);
+                    assert!(!settings.to_string().contains(SAMPLED));
+                }
+            }
+            if !plain && cuts.is_empty() && p["pending_inputs"][0]["content"][0]["text"] == NEW {
+                cuts.push((offset, 3));
+            }
+        }
+        if plain && p["type"] == "function_call_output" && p["call_id"] == "before-decision" {
+            assert!(!raw[..offset].contains("\"pending_compaction\":{"));
+            cuts.push((offset, 3));
+        }
+        if v["type"] == "response_item" && p["content"][0]["text"] == NOTES {
+            cuts.push((offset, 4));
+        }
+    }
+    assert_eq!((archived, cuts.len()), (1, 2));
+    for (cut, next) in cuts {
+        std::fs::write(&path, &raw[..cut])?;
+        let server = responses::start_mock_server().await;
+        let traffic = responses::mount_sse_sequence(&server, replies[next..].to_vec()).await;
+        let active = build(&server, REFRESHED)
+            .resume(&server, original.home.clone(), path.clone())
+            .await?;
+        if plain {
+            let mut changed = model_override(B);
+            if let Op::OverrideTurnContext { service_tier, .. } = &mut changed {
+                *service_tier = Some("priority".into());
+            }
+            active.codex.submit(changed).await?;
+        }
+        active.codex.submit(Op::Continue).await?;
+        complete(&active.codex).await;
+        shutdown(&active.codex).await?;
+        let restarted = traffic.requests();
+        assert_eq!(restarted.len(), replies.len() - next);
+        for (a, b) in restarted[..restarted.len() - 1].iter().zip(&sent[next..]) {
+            assert!(
+                a.body_json() == b.body_json(),
+                "B's helper changed after a catalog refresh"
+            );
+        }
+        assert_eq!(restarted.last().unwrap().instructions_text(), REFRESHED);
+        assert_eq!(
+            restarted.last().unwrap().body_json()["reasoning"]["effort"],
+            "high"
+        );
+        if plain {
+            assert_eq!(
+                restarted.last().unwrap().body_json()["service_tier"],
+                "priority"
+            );
+        }
+    }
+    Ok(())
 }
 
 fn without_compaction_decision(raw: &str) -> Result<String> {
@@ -395,8 +563,12 @@ async fn fresh_preturn_replays_the_same_requests_at_every_installation_cut(
     let cwd = tempfile::tempdir()?;
     let builder = |server: &wiremock::MockServer| {
         let url = format!("{}/v1", server.uri());
+        let catalog = server.uri();
         let cwd = cwd.path().to_owned();
-        test_codex().with_model(SOURCE).with_config(move |cfg| {
+        test_codex()
+            .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+            .with_model(SOURCE)
+            .with_config(move |cfg| {
             configure_providers(cfg, url.clone(), url, true);
             cfg.cwd = cwd;
             cfg.user_instructions = Some("Use the canonical project instructions.".into());
@@ -404,6 +576,17 @@ async fn fresh_preturn_replays_the_same_requests_at_every_installation_cut(
                 // A replacement reestimated against startup would exceed the 40k destination trigger.
                 cfg.model_overlay.as_mut().unwrap().models[0].final_instruction_override =
                     Some("source-only instructions ".repeat(9_000));
+            } else {
+                cfg.features.enable(codex_core::features::Feature::Apps);
+                cfg.chatgpt_base_url = catalog;
+                let model = &mut cfg.model_overlay.as_mut().unwrap().models[0];
+                model.patch.supports_reasoning_summaries = Some(true);
+                model.patch.default_reasoning_level = Some(Some(codex_protocol::openai_models::ReasoningEffort::Low));
+                model.final_instruction_override = None;
+                model.patch.model_messages = Some(codex_core::models_manager::overlay::ModelMessagesPatch {
+                    instructions_template: Some("Shared instructions.\n# Personality\nOutgoing style.\n# Task\nKeep working.".into()),
+                    ..Default::default()
+                });
             }
         })
     };
@@ -427,11 +610,14 @@ async fn fresh_preturn_replays_the_same_requests_at_every_installation_cut(
     ]));
     let last = replies.len() - 1;
     let server = responses::start_mock_server().await;
+    if !downshift {
+        responses::mount_app_catalog(&server, &["Calendar"]).await;
+    }
     let original_posts = responses::mount_sse_sequence(&server, replies.clone()).await;
     let original = builder(&server).build(&server).await?;
     original
         .codex
-        .submit(user_input("Complete the original task."))
+        .submit(user_input("Use $calendar to complete the original task."))
         .await?;
     complete(&original.codex).await;
     let Op::UserInput { items, .. } = user_input(FRESH) else {
@@ -439,11 +625,19 @@ async fn fresh_preturn_replays_the_same_requests_at_every_installation_cut(
     };
     let next_cwd = cwd.path().join("new-task");
     std::fs::create_dir(&next_cwd)?;
+    if !downshift {
+        let skill = next_cwd.join(".agents/skills/calendar");
+        std::fs::create_dir_all(&skill)?;
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: calendar\ndescription: Incoming task skill.\n---\nUse this skill.\n",
+        )?;
+    }
     let mode = codex_protocol::config_types::CollaborationMode {
         mode: codex_protocol::config_types::ModeKind::Plan,
         settings: codex_protocol::config_types::Settings {
             model: dest.into(),
-            reasoning_effort: None,
+            reasoning_effort: Some(codex_protocol::openai_models::ReasoningEffort::High),
             developer_instructions: Some("Make a plan for the accepted task.".into()),
         },
     };
@@ -459,7 +653,7 @@ async fn fresh_preturn_replays_the_same_requests_at_every_installation_cut(
             summary: original.config.model_reasoning_summary,
             effort: None,
             service_tier: Some("priority".into()),
-            personality: None,
+            personality: Some(codex_protocol::config_types::Personality::None),
             final_output_json_schema: schema.clone(),
         })
         .await?;
@@ -478,9 +672,37 @@ async fn fresh_preturn_replays_the_same_requests_at_every_installation_cut(
         assert_eq!(input.len(), work.len() + 2);
         assert_eq!(input[work.len()]["content"][0]["text"], "Old task done.");
         assert_eq!(helper["model"], SOURCE);
+        assert_eq!(
+            base_instructions_text(helper),
+            base_instructions_text(&expected[0])
+        );
+        for key in [
+            "tools",
+            "tool_choice",
+            "parallel_tool_calls",
+            "reasoning",
+            "text",
+            "service_tier",
+            "include",
+        ] {
+            assert_eq!(helper[key], expected[0][key], "source projection: {key}");
+        }
     }
     assert_compact_request(&expected[last - 1]);
     assert_eq!(expected[last]["model"], dest);
+    if !downshift {
+        assert!(base_instructions_text(&expected[0]).contains("Outgoing style."));
+        assert_eq!(expected[0]["reasoning"]["effort"], "low");
+        assert_eq!(expected[last]["reasoning"]["effort"], "high");
+        assert!(!base_instructions_text(&expected[last]).contains("Outgoing style."));
+        assert!(expected[0]["tools"].to_string().contains("probe_Calendar"));
+        assert!(
+            !expected[last]["tools"]
+                .to_string()
+                .contains("probe_Calendar")
+        );
+    }
+    assert_ne!(expected[0]["service_tier"], expected[last]["service_tier"]);
     let input = expected[last]["input"].to_string();
     assert!(input.contains("Make a plan for the accepted task."));
     assert!(input.contains(next_cwd.to_str().unwrap()));
@@ -495,8 +717,20 @@ async fn fresh_preturn_replays_the_same_requests_at_every_installation_cut(
     for &(label, cut, start) in &cuts {
         std::fs::write(&path, &raw[..cut])?;
         let server = responses::start_mock_server().await;
+        if !downshift {
+            responses::mount_app_catalog(&server, &["Calendar"]).await;
+        }
         let posts = responses::mount_sse_sequence(&server, replies[start..].to_vec()).await;
-        let resumed = builder(&server)
+        let mut replay = builder(&server);
+        if !downshift && matches!(label, "accepted before capture" | "notes answer") {
+            // The archived outgoing text must not be re-rendered from a refreshed template.
+            // The destination opted out of that section and is unaffected.
+            replay = replay.with_config(|cfg| {
+                cfg.model_overlay.as_mut().unwrap().models[0].patch.model_messages.as_mut().unwrap().instructions_template =
+                    Some("Shared instructions.\n# Personality\nRefreshed catalog style.\n# Task\nKeep working.".into());
+            });
+        }
+        let resumed = replay
             .resume(&server, original.home.clone(), path.clone())
             .await?;
         resumed.codex.submit(Op::Continue).await?;
@@ -506,6 +740,17 @@ async fn fresh_preturn_replays_the_same_requests_at_every_installation_cut(
         assert_eq!(requests.len(), expected.len() - start, "{label}");
         for (req, original) in requests.iter().zip(&expected[start..]) {
             let body = req.body_json();
+            let (actual_base, expected_base) = (
+                base_instructions_text(&body),
+                base_instructions_text(original),
+            );
+            assert!(
+                actual_base == expected_base,
+                "{label} at {cut}, model {}: base {:?} != {:?}",
+                body["model"],
+                actual_base.chars().take(90).collect::<String>(),
+                expected_base.chars().take(90).collect::<String>()
+            );
             assert_same_input(
                 body["input"].as_array().unwrap(),
                 original["input"].as_array().unwrap(),

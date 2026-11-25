@@ -20,6 +20,7 @@ Do not substitute one representation for another. `record_conversation_items` ad
 - Contextual user/developer messages, including preserved work notes, are excluded by the shared `is_user_turn_boundary` predicate. Use that predicate for rollback, continuation, and replay instead of checking only `role == "user"`.
 - Ordinary sampling appends completed response/tool items and accepted steering. Each request is rebuilt from current history, then projected; it is not reconstructed from TUI display text.
 - Prompt projection supplies missing tool outputs as `aborted`, removes orphan outputs, replaces unsupported images with placeholders, and excludes ghost snapshots. These changes normally affect a clone, not stored history.
+- Decode a legacy local-shell item ID as the pairing `call_id` only when the explicit call ID is absent. Transport, disk and prompt projection must all retain that same key. A record already missing both IDs cannot recover a pairing.
 - Local compaction intentionally summarizes detailed assistant/reasoning/tool history. Remote compaction installs a returned replacement. Both preserve required work notes and persist exact `replacement_history` for new compactions. Older rollouts can contain host-only ghost snapshots; new turns do not create them.
 - Compaction can clear the reference-context baseline while retaining previous-turn settings. Re-inject canonical context at the documented replacement boundary, without rewriting older context messages merely to reflect new settings.
 
@@ -29,6 +30,8 @@ Do not substitute one representation for another. `record_conversation_items` ad
 
 An exact compaction replacement starts a new replay epoch. `Compacted.checkpoint` commits the destination-local token estimate, lifetime totals, and optional already-injected reference with the replacement itself. The estimate covers exactly the replacement and is not a model measurement. Preserve previous-turn settings; do not reestimate a new marker against startup instructions or hydrate a fresh pre-turn reference from them. Older markers can use the adjacent injected reference and separately recorded usage where available.
 
+Restore sampled base instructions by reference to immutable rollout data, not by re-rendering a refreshed catalog. Reuse matching header or `SampledInstructions` bytes; flush a new entry before publishing the first settings checkpoint that names it. Repeated ordinary responses reference the same entry. The dictionary is host metadata, not an extra developer message.
+
 Legacy compaction records without `replacement_history` are rebuilt from surviving user messages and their summary with an empty initial-context prefix. Injecting resume-time initial context at a historical compaction point changes history and is incorrect.
 
 Rollback uses the same real-user boundaries for history and metadata checkpoints. Context-only tasks do not consume rollback slots. When rollback reaches beyond known checkpoints into an opaque compaction base, clear uncertain metadata instead of attributing it to guessed historical turns. Retain the surviving history prefix according to `ContextManager::drop_last_n_user_turns`.
@@ -37,7 +40,7 @@ Rollback uses the same real-user boundaries for history and metadata checkpoints
 
 Ordinary recovery infers unfinished work from a real user boundary followed by incomplete/tool/reasoning output; transient start/complete/pause/continue events are not persisted. Standalone or pre-turn compaction alone must not infer a regular continuation. Mid-turn encrypted compaction can preserve unfinished work even when no visible user item survives.
 
-Pending work-notes capture is recovered before ordinary sampling. Its source model is resolved separately from the destination model chosen for resumed work. Host-owned completion-review records restore accepted input, current request provenance, reviewer/main ownership, and prepared/started handoffs; unsupported or missing provenance must remain unavailable. Never recover those guarantees by searching assistant text for a plausible request.
+Recover pending work notes before ordinary sampling. A fork that copies an unfinished capture also copies its source, attempts, call ownership and explicit app selections. A typed app mention is not recoverable from Responses input alone. The fork uses those tools to finish the capture, not as defaults for its next fresh task; it does not inherit the parent's pending review or frame anchors. A fork without the marker must not start that capture.
 
 Token accounting also has host-owned state: preserve the reported usage baseline, its `last_usage_item_count`, reasoning-inclusion semantics, and request-only context credit. Do not reset the covered-history boundary to the replay tail, infer it from the last displayed answer, or infer request-frame credit from prompt text. See the [budget contract](post_turn_completion_review/budget_accounting.md) before changing this ledger.
 

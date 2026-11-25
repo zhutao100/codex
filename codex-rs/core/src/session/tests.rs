@@ -104,6 +104,10 @@ async fn request_context_usage_replays_atomic_prefixes_and_duplicate_token_event
             request_context_tokens,
             server_reasoning_included,
             last_usage_item_count: 0,
+            measured_item_tokens: None,
+            measured_format_delta: None,
+            measured_base_tokens: None,
+            measured_tool_tokens: None,
             work_notes_baseline: None,
         })
     };
@@ -129,6 +133,10 @@ async fn request_context_usage_replays_atomic_prefixes_and_duplicate_token_event
             request_context_tokens: 5_000,
             server_reasoning_included: true,
             last_usage_item_count: None,
+            measured_item_tokens: None,
+            measured_format_delta: None,
+            measured_base_tokens: None,
+            measured_tool_tokens: None,
         },
         event.clone(),
         event.clone(),
@@ -138,6 +146,10 @@ async fn request_context_usage_replays_atomic_prefixes_and_duplicate_token_event
             request_context_tokens: 0,
             server_reasoning_included: false,
             last_usage_item_count: None,
+            measured_item_tokens: None,
+            measured_format_delta: None,
+            measured_base_tokens: None,
+            measured_tool_tokens: None,
         },
         event,
     ];
@@ -204,6 +216,10 @@ async fn request_context_usage_replays_atomic_prefixes_and_duplicate_token_event
             request_context_tokens: 5_000,
             server_reasoning_included: true,
             last_usage_item_count: None,
+            measured_item_tokens: None,
+            measured_format_delta: None,
+            measured_base_tokens: None,
+            measured_tool_tokens: None,
         },
         RolloutItem::EventMsg(EventMsg::TokenCount(TokenCountEvent {
             info: Some(changed.clone()),
@@ -243,6 +259,7 @@ async fn reasoning_accounting_changes_only_with_a_completed_usage_baseline() {
                 frame_tokens,
                 reasoning_included,
                 0,
+                &crate::Prompt::default(),
             )
             .await;
         let state = session.state.lock().await;
@@ -302,6 +319,10 @@ async fn usage_boundary_replays_unreported_output(context_record: bool, explicit
             request_context_tokens: 10,
             server_reasoning_included: true,
             last_usage_item_count: explicit_boundary.then_some(3),
+            measured_item_tokens: None,
+            measured_format_delta: None,
+            measured_base_tokens: None,
+            measured_tool_tokens: None,
         });
     }
     records.push(event.clone());
@@ -319,6 +340,10 @@ async fn usage_boundary_replays_unreported_output(context_record: bool, explicit
             request_context_tokens: if context_record { 10 } else { 0 },
             server_reasoning_included: context_record,
             last_usage_item_count: covered_item_count,
+            measured_item_tokens: None,
+            measured_format_delta: None,
+            measured_base_tokens: None,
+            measured_tool_tokens: None,
             work_notes_baseline: None,
         })
     );
@@ -441,6 +466,47 @@ fn session_base_instructions_use_overlay_final_before_history() {
     );
 
     assert_eq!(resolved, ("overlay final instructions".to_owned(), false));
+}
+
+#[test]
+fn saved_catalog_base_is_reused_only_for_its_recorded_selection() {
+    let mut config = test_config();
+    config.base_instructions = None;
+    config.personality = Some(Personality::None);
+    let model = ModelsManager::construct_model_info_offline("gpt-5.4", &config);
+    let catalog_text = model.get_model_instructions(config.personality);
+    let origin =
+        |model: &str, personality_disabled| codex_protocol::protocol::CatalogInstructionsSource {
+            model: model.into(),
+            personality_disabled,
+        };
+    for (source, text, catalog) in [
+        (None, "archived base", false),
+        (Some(origin(&model.slug, true)), "archived base", true),
+        (
+            Some(origin(&model.slug, false)),
+            catalog_text.as_str(),
+            true,
+        ),
+        (Some(origin("other", true)), catalog_text.as_str(), true),
+    ] {
+        let history = InitialHistory::Forked(vec![RolloutItem::SessionMeta(
+            codex_protocol::protocol::SessionMetaLine {
+                meta: codex_protocol::protocol::SessionMeta {
+                    base_instructions: Some(BaseInstructions {
+                        text: "archived base".into(),
+                    }),
+                    catalog_instructions_source: source,
+                    ..Default::default()
+                },
+                git: None,
+            },
+        )]);
+        assert_eq!(
+            resolve_session_base_instructions(&config, &model, &history, None),
+            (text.to_owned(), catalog)
+        );
+    }
 }
 
 #[test]
