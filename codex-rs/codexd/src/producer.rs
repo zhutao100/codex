@@ -1,3 +1,4 @@
+use crate::SchedulerWork;
 use crate::daemon::RuntimeState;
 use crate::daemon::apply_notification_to_runtime;
 use crate::protocol::HubNotification;
@@ -10,7 +11,6 @@ use crate::protocol::RuntimeUpdateMetadataParams;
 use crate::protocol::WorkActivity;
 use codex_app_server_protocol::ServerNotification;
 use serde_json::Value as JsonValue;
-use std::collections::BTreeMap;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -68,7 +68,7 @@ enum Publication {
 struct Outbox {
     id: String,
     state: RuntimeState,
-    work: watch::Receiver<BTreeMap<String, Option<String>>>,
+    work: watch::Receiver<SchedulerWork>,
     generation: String,
     revision: u64,
     pending: Vec<Publication>,
@@ -155,7 +155,7 @@ impl CodexdProducerClient {
     pub fn spawn(
         codex_home: &Path,
         metadata: RuntimeMetadata,
-        work: watch::Receiver<BTreeMap<String, Option<String>>>,
+        work: watch::Receiver<SchedulerWork>,
     ) -> Self {
         let socket_path = super::default_socket_path(codex_home);
         Self::spawn_with_socket_path(socket_path, metadata, work)
@@ -164,7 +164,7 @@ impl CodexdProducerClient {
     pub fn spawn_with_socket_path(
         socket_path: PathBuf,
         metadata: RuntimeMetadata,
-        work: watch::Receiver<BTreeMap<String, Option<String>>>,
+        work: watch::Receiver<SchedulerWork>,
     ) -> Self {
         let (wake, receiver) = watch::channel(());
         let outbox = Arc::new(Mutex::new(Outbox {
@@ -230,7 +230,7 @@ async fn run_producer_task(
     socket_path: PathBuf,
     outbox: Arc<Mutex<Outbox>>,
     mut wake: watch::Receiver<()>,
-    mut work: watch::Receiver<BTreeMap<String, Option<String>>>,
+    mut work: watch::Receiver<SchedulerWork>,
 ) {
     if socket_path_too_long(socket_path.as_path()) {
         warn!(
@@ -333,6 +333,7 @@ fn max_unix_socket_path_len() -> usize {
 mod tests {
     use super::*;
     use serde_json::Value as JsonValue;
+    use std::collections::BTreeMap;
     use std::time::SystemTime;
     use std::time::UNIX_EPOCH;
     use tokio::io::AsyncBufReadExt;

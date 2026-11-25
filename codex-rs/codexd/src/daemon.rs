@@ -120,6 +120,15 @@ impl WorkActivity {
     }
 
     fn validate(&self) -> Result<(), String> {
+        if self.items.iter().any(String::is_empty)
+            || self
+                .running_turn_keys
+                .iter()
+                .flatten()
+                .any(String::is_empty)
+        {
+            return Err("workActivity contains an empty owner or turn key".into());
+        }
         if self.items.is_empty()
             && self
                 .running_turn_keys
@@ -136,7 +145,7 @@ impl WorkActivity {
 struct ProducerSlot {
     connection: u64,
     observed: Option<(String, u64)>,
-    requested_state: bool,
+    requested_state: Option<RequestState>,
 }
 
 #[derive(Default)]
@@ -601,19 +610,25 @@ async fn handle_subscribe_method(
 impl DaemonState {
     fn request_replacement(&mut self, connection: u64, id: String) -> Option<RequestState> {
         let slot = self.runtime_connections.get_mut(&id)?;
-        if slot.connection != connection || slot.requested_state {
+        if slot.connection != connection
+            || slot
+                .requested_state
+                .as_ref()
+                .is_some_and(|sent| sent.producer_generation.is_some() || slot.observed.is_none())
+        {
             return None;
         }
-        slot.requested_state = true;
         let (producer_generation, minimum_revision) = slot
             .observed
             .as_ref()
             .map_or((None, 0), |(g, revision)| (Some(g.clone()), *revision));
-        Some(RequestState {
+        let request = RequestState {
             runtime_id: id,
             producer_generation,
             minimum_revision,
-        })
+        };
+        slot.requested_state = Some(request.clone());
+        Some(request)
     }
 
     fn producer_message(
@@ -638,13 +653,14 @@ impl DaemonState {
         let work = params.as_ref().and_then(|p| p.get("workActivity"));
         let generation = work
             .and_then(|w| w.get("producerGeneration"))
-            .and_then(JsonValue::as_str);
+            .and_then(JsonValue::as_str)
+            .filter(|g| !g.is_empty() && *g == g.trim());
         // Remember the cursor even when the very first publication is unusable, without
         // exposing it as an empty runtime. Closing a superseded socket must not remove it.
         let slot = self.runtime_connections.entry(id.clone()).or_default();
         if owner != Some(connection) {
             slot.connection = connection;
-            slot.requested_state = false;
+            slot.requested_state = None;
             if slot
                 .observed
                 .as_ref()
@@ -654,15 +670,37 @@ impl DaemonState {
             }
         }
         owned.insert(id.clone());
-        if let (Some(work), Some(generation)) = (work, generation)
+        if let Some(work) = work.filter(|w| !w.is_null())
             && matches!(method, RUNTIME_UPDATE_STATE_METHOD | RUNTIME_EVENT_METHOD)
-            && let Some(revision) = work.get("revision").and_then(JsonValue::as_u64)
         {
+            let generation = generation.ok_or("invalid workActivity producerGeneration")?;
+            let revision = work
+                .get("revision")
+                .and_then(JsonValue::as_u64)
+                .filter(|r| i64::try_from(*r).is_ok())
+                .ok_or("invalid workActivity revision")?;
             if let Some((prior, highest)) = &slot.observed {
                 if generation != prior {
                     return Err("producer generation changed on a live connection".into());
                 }
                 if revision < *highest {
+                    if method == RUNTIME_EVENT_METHOD
+                        && self.runtimes.contains_key(&id)
+                        && let Some(notification) = archive_detail(params.as_ref())
+                    {
+                        self.broadcast_event(CodexdEventPayload::RuntimeArchiveDetail {
+                            runtime_id: id,
+                            notification,
+                        });
+                    } else if method == RUNTIME_UPDATE_STATE_METHOD
+                        && slot
+                            .requested_state
+                            .as_ref()
+                            .is_some_and(|request| request.minimum_revision < *highest)
+                    {
+                        slot.requested_state = None;
+                        return Err("replacement predates the observed revision".into());
+                    }
                     return Ok(serde_json::json!({}));
                 }
             }
@@ -715,7 +753,7 @@ impl DaemonState {
                 {
                     self.runtimes.remove(&id);
                 }
-                slot.requested_state = false;
+                slot.requested_state = None;
                 self.update_runtime_state(state);
             }
             RUNTIME_EVENT_METHOD => {
@@ -723,7 +761,7 @@ impl DaemonState {
                 if let Some(work) = &event.work_activity {
                     work.validate()?;
                 }
-                if slot.requested_state {
+                if slot.requested_state.is_some() {
                     if !self.runtimes.contains_key(&id)
                         || event.notification.method == "turn/started"
                     {
@@ -745,6 +783,25 @@ impl DaemonState {
         }
         Ok(serde_json::json!({}))
     }
+}
+
+fn archive_detail(params: Option<&JsonValue>) -> Option<HubNotification> {
+    let notification: HubNotification =
+        serde_json::from_value(params?.get("notification")?.clone()).ok()?;
+    if !matches!(
+        notification.method.as_str(),
+        "item/started" | "item/completed" | "turn/progressTrace"
+    ) {
+        return None;
+    }
+    let fields = notification.params.as_ref()?;
+    let named = |field| {
+        fields
+            .get(field)
+            .and_then(JsonValue::as_str)
+            .is_some_and(|s| !s.trim().is_empty())
+    };
+    (named("turnKey") || (named("threadId") && named("turnId"))).then_some(notification)
 }
 
 pub(crate) fn apply_notification_to_runtime(
@@ -1224,6 +1281,28 @@ mod tests {
         assert!(initial.get("id").is_none());
         let barrier = json!({"id":17,"method":"codexd/snapshot"});
         let mut good = initial;
+        for invalid in ["", " \n"] {
+            let mut queued = good.clone();
+            queued["params"]["workActivity"]["producerGeneration"] = invalid.into();
+            queued["params"]["workActivity"]["revision"] = 999.into();
+            write(&mut d_tx, &queued).await;
+        }
+        write(&mut d_tx, &barrier).await;
+        let unbound = read(&mut d_rx).await;
+        assert_eq!(unbound["method"], "codexd/runtime/requestState");
+        assert!(unbound["params"]["producerGeneration"].is_null());
+        assert_eq!(unbound["params"]["minimumRevision"], 0);
+        assert_eq!(read(&mut d_rx).await["result"]["runtimes"], json!([]));
+        write(&mut p_tx, &unbound).await;
+        good = read(&mut p_rx).await;
+        assert!(
+            !good["params"]["workActivity"]["producerGeneration"]
+                .as_str()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(good["params"]["workActivity"]["revision"].as_u64().unwrap() < 999);
+        // The producer answered. Now damage the reply before forwarding it.
         for first in [true, false] {
             let before = state.lock().await.snapshot();
             let floor = good["params"]["workActivity"]["revision"].as_u64().unwrap() + 7;
@@ -1255,19 +1334,37 @@ mod tests {
             if !first {
                 let mut detail = stale.clone();
                 detail["method"] = RUNTIME_EVENT_METHOD.into();
-                detail["params"]["workActivity"]["revision"] = floor.into();
-                detail["params"]["notification"] =
-                    json!({"method":"item/completed","params":{"turnKey":"A:1"}});
-                write(&mut d_tx, &detail).await;
+                for (revision, kind) in [
+                    (floor - 1, "commandExecution"),
+                    (floor - 1, "fileChange"),
+                    (floor, "commandExecution"),
+                ] {
+                    detail["params"]["workActivity"]["revision"] = revision.into();
+                    detail["params"]["notification"] = json!({"method":"item/completed","params":{
+                        "turnId":"1","turnKey":"A:1","item":{"type":kind}}});
+                    write(&mut d_tx, &detail).await;
+                }
                 write(&mut d_tx, &barrier).await;
                 let while_waiting = read(&mut d_rx).await;
                 assert_eq!(while_waiting["result"]["runtimes"], json!(before.runtimes));
                 let daemon = state.lock().await;
-                let (_, last) = daemon.recent_events.back().unwrap();
-                let last: JsonValue = serde_json::from_str(last).unwrap();
+                let detail: Vec<_> = daemon
+                    .recent_events
+                    .iter()
+                    .filter(|(seq, _)| *seq > before.seq)
+                    .map(|(_, line)| {
+                        let msg: JsonValue = serde_json::from_str(line).unwrap();
+                        let evt = &msg["params"]["event"];
+                        json!([evt["type"], evt["notification"]["params"]["item"]["type"]])
+                    })
+                    .collect();
                 assert_eq!(
-                    last["params"]["event"]["notification"]["method"],
-                    "item/completed"
+                    detail,
+                    [
+                        json!(["runtimeArchiveDetail", "commandExecution"]),
+                        json!(["runtimeArchiveDetail", "fileChange"]),
+                        json!(["runtimeNotification", "commandExecution"])
+                    ]
                 );
             }
             write(&mut p_tx, &repair).await;
@@ -1282,7 +1379,10 @@ mod tests {
                 after["result"]["runtimes"][0]["workActivity"]["items"],
                 json!(["owner"])
             );
-            assert_eq!(after["result"]["seq"], before.seq + 1 + u64::from(!first));
+            assert_eq!(
+                after["result"]["seq"],
+                before.seq + 1 + 3 * u64::from(!first)
+            );
         }
         client.shutdown().await;
         drop(d_tx);

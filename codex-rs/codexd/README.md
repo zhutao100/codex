@@ -154,6 +154,10 @@ For notification-only producers, a rejected state or event causes a reverse `cod
 
 Do not forward `turn/started` if the scheduler projection excludes that task, including when a sibling is still working. Valid terminal and item details still reach history; during repair they do not establish new power state.
 
+An empty or whitespace-only generation cannot establish a revision floor or enter the daemon snapshot. A repair request for an unidentified producer uses a null generation and minimum revision zero; a valid generation can establish authority on the same socket. Work revisions must fit a signed 64-bit integer and work IDs must be nonempty.
+
+An older revision cannot change current work or live turns. Its explicitly keyed item or progress detail may still describe an existing archive: `runtimeArchiveDetail` carries only that notification and runtime ID. Consumers apply it to a matching completed run, never to create or modify live work. Old consumers ignore this additional event type.
+
 TUI and app-server use one `CodexdProducerClient` projection per producing runtime. `updateState` is its first publication on every socket; there is no preliminary empty registration. On ordinary updates the notification and corresponding work revision are applied together, with `runtimeUpsert` preceding forwarded detail. A newer connection supersedes older writes and cleanup for the same runtime ID.
 
 Publish lifecycle notifications in order (`try_publish_hub_notification` on synchronous paths). The bounded outbox retains current state independently of pending detail. Overflow and reconnect discard superseded deltas in favor of a complete replacement; offline progress/history detail is not a durable replay service. Socket EOF triggers reconnect even when a running task produces no output.

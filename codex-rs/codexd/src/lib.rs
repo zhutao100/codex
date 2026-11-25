@@ -5,6 +5,9 @@ use std::path::PathBuf;
 
 pub mod protocol;
 
+/// Work guard IDs mapped to a running task's turn key, or `None` for queued work.
+pub type SchedulerWork = std::collections::BTreeMap<String, Option<String>>;
+
 #[cfg(unix)]
 pub mod daemon;
 #[cfg(unix)]
@@ -44,7 +47,7 @@ pub mod producer {
         pub fn spawn(
             _codex_home: &Path,
             _metadata: RuntimeMetadata,
-            _work: tokio::sync::watch::Receiver<std::collections::BTreeSet<String>>,
+            _work: tokio::sync::watch::Receiver<crate::SchedulerWork>,
         ) -> Self {
             Self
         }
@@ -52,7 +55,7 @@ pub mod producer {
         pub fn spawn_with_socket_path(
             _socket_path: PathBuf,
             _metadata: RuntimeMetadata,
-            _work: tokio::sync::watch::Receiver<std::collections::BTreeSet<String>>,
+            _work: tokio::sync::watch::Receiver<crate::SchedulerWork>,
         ) -> Self {
             Self
         }

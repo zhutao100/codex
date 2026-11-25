@@ -79,9 +79,11 @@ pub struct WorkActivity {
     pub running_turn_keys: Option<BTreeSet<String>>,
 }
 
+#[cfg(unix)]
 pub(crate) const REQUEST_STATE_METHOD: &str = "codexd/runtime/requestState";
 
-#[derive(Serialize, Deserialize)]
+#[cfg(unix)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RequestState {
     pub runtime_id: String,
@@ -196,6 +198,11 @@ pub enum CodexdEventPayload {
         runtime_id: String,
     },
     RuntimeNotification {
+        runtime_id: String,
+        notification: HubNotification,
+    },
+    /// Keyed detail accompanying superseded ownership; never a new live turn.
+    RuntimeArchiveDetail {
         runtime_id: String,
         notification: HubNotification,
     },
