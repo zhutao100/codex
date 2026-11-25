@@ -94,7 +94,7 @@ async fn run_remote_compact_task_inner_impl(
     } = prepare_history_for_compaction(
         sess.clone_history().await,
         preserved_work_notes,
-        context.review_frame.as_ref(),
+        Some(&context.review_frames),
     )?;
     let (rewritten_outputs, estimated_deleted_tokens) =
         trim_function_call_history_to_fit_context_window(
@@ -143,11 +143,7 @@ async fn run_remote_compact_task_inner_impl(
 
     // Unlike V2, the unary endpoint supplies the replacement list and can echo its input.
     new_history.retain(|item| {
-        !is_preserved_work_notes_item(item)
-            && !context
-                .review_frame
-                .as_ref()
-                .is_some_and(|frame| frame.matches_message(item))
+        !is_preserved_work_notes_item(item) && !context.review_frames.matches_message(item)
     });
     let reference_context_item = match initial_context_injection {
         InitialContextInjection::DoNotInject => None,

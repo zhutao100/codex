@@ -288,6 +288,7 @@ async fn compaction_usage_counts_preserved_notes_once_after_installation_and_res
                 RolloutItem::TurnContext(reference),
                 RolloutItem::TokenUsageContext {
                     info: info.clone(),
+                    source_model: None,
                     request_context_tokens: 0,
                     server_reasoning_included: true,
                     last_usage_item_count: Some(replacement.len()),
@@ -482,7 +483,9 @@ async fn completed_work_notes_with_response_tail_remain_pending_work_after_resta
     abandoned.push(later.clone());
     let mut source = ContextManager::new();
     source.replace(abandoned.clone());
-    let frame = crate::completion_review::ReviewPromptFrame::new("work frame".into());
+    let frame = crate::completion_review::ReviewPromptFrames(vec![
+        crate::completion_review::ReviewPromptFrame::new("work frame".into(), 1, None),
+    ]);
     let prepared =
         compact::prepare_history_for_compaction(source.clone(), None, Some(&frame)).unwrap();
     assert_eq!(

@@ -14,6 +14,16 @@ use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Error;
 use tokio_tungstenite::tungstenite::Message;
 
+pub const PROMPT_CACHE_TRACE_ENV: &str = "CODEX_TRACE_PROMPT_CACHE";
+
+/// A passive TRACE subscriber (e.g. TUI feedback) must not opt a session into hashing long inputs.
+pub fn prompt_cache_trace_enabled() -> bool {
+    static OPTED_IN: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os(PROMPT_CACHE_TRACE_ENV).as_deref() == Some(std::ffi::OsStr::new("1"))
+    });
+    *OPTED_IN && tracing::enabled!(target: "codex_core::cache_trace", tracing::Level::DEBUG)
+}
+
 /// Generic telemetry.
 pub trait SseTelemetry: Send + Sync {
     fn on_sse_poll(

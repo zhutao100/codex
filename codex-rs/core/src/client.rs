@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
 use crate::api_bridge::CoreAuthProvider;
@@ -91,6 +91,9 @@ use crate::model_provider_info::ModelProviderInfo;
 use crate::model_provider_info::WireApi;
 use crate::tools::spec::create_tools_json_for_responses_api;
 
+mod cache_trace;
+pub(crate) use cache_trace::CacheOperation;
+
 pub const X_CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
 pub const X_CODEX_TURN_METADATA_HEADER: &str = "x-codex-turn-metadata";
 pub const X_CODEX_PARENT_THREAD_ID_HEADER: &str = "x-codex-parent-thread-id";
@@ -117,8 +120,9 @@ struct ModelClientState {
     include_timing_metrics: bool,
     output_token_replay_enabled: bool,
     beta_features_header: Option<String>,
-    disable_websockets: AtomicBool,
+    http_fallback_cause: OnceLock<&'static str>,
     cached_websocket_connection: StdMutex<Option<CachedWebsocketConnection>>,
+    cache_trace: Arc<cache_trace::CacheTrace>,
 }
 
 /// A session-scoped client for model-provider API calls.
@@ -155,6 +159,8 @@ pub struct ModelClient {
 /// contract and can cause routing bugs.
 pub struct ModelClientSession {
     client: ModelClient,
+    pub(crate) cache_operation: CacheOperation,
+    pub(crate) cache_attempt: usize,
     provider: ModelProviderInfo,
     connection: Option<ApiWebSocketConnection>,
     request_auth: Option<SocketAuth>,
@@ -240,8 +246,9 @@ impl ModelClient {
                 include_timing_metrics,
                 output_token_replay_enabled,
                 beta_features_header,
-                disable_websockets: AtomicBool::new(false),
+                http_fallback_cause: OnceLock::new(),
                 cached_websocket_connection: StdMutex::new(None),
+                cache_trace: Default::default(),
             }),
         }
     }
@@ -259,9 +266,15 @@ impl ModelClient {
         self.new_session_with_provider(self.state.provider.clone())
     }
 
+    pub(crate) fn mark_cache_trace_compaction(&self) {
+        self.state.cache_trace.installed();
+    }
+
     pub fn new_session_with_provider(&self, provider: ModelProviderInfo) -> ModelClientSession {
         ModelClientSession {
             client: self.clone(),
+            cache_operation: CacheOperation::Other,
+            cache_attempt: 1,
             provider,
             connection: None,
             request_auth: None,
@@ -535,16 +548,7 @@ impl ModelClientSession {
     }
 
     fn disable_websockets(&self) -> bool {
-        self.client.state.disable_websockets.load(Ordering::Relaxed)
-    }
-
-    fn activate_http_fallback(&self, websocket_enabled: bool) -> bool {
-        websocket_enabled
-            && !self
-                .client
-                .state
-                .disable_websockets
-                .swap(true, Ordering::Relaxed)
+        self.client.state.http_fallback_cause.get().is_some()
     }
 
     fn responses_websocket_enabled(&self) -> bool {
@@ -852,18 +856,22 @@ impl ModelClientSession {
         summary: ReasoningSummaryConfig,
         service_tier: Option<String>,
         turn_metadata_header: Option<&str>,
+        http_reason: &'static str,
     ) -> Result<ResponseStream> {
         if let Some(path) = &*CODEX_RS_SSE_FIXTURE {
             warn!(path, "Streaming from fixture");
             let stream = codex_api::stream_from_fixture(path, self.provider.stream_idle_timeout())
                 .map_err(map_api_error)?;
-            let (stream, _last_response_rx) = map_response_stream(stream, otel_manager.clone());
+            let (stream, _last_response_rx) =
+                map_response_stream(stream, otel_manager.clone(), None);
             return Ok(stream);
         }
 
         let auth_manager = self.client.state.auth_manager.clone();
         let api_prompt = self.build_responses_request(prompt)?;
 
+        // One outer stream attempt may have several wire sends, including auth recovery.
+        let telemetry = Arc::new(ApiTelemetry::new(otel_manager.clone()));
         let mut auth_recovery = None;
         loop {
             let auth = match auth_manager.as_ref() {
@@ -880,11 +888,7 @@ impl ModelClientSession {
             let api_auth = request_auth.provider;
             self.bind_request_auth(api_auth.socket_auth(request_auth.auth_mode));
             let transport = ReqwestTransport::new(build_reqwest_client());
-            let (request_telemetry, sse_telemetry) = Self::build_streaming_telemetry(otel_manager);
             let compression = self.responses_request_compression(request_auth.auth_mode);
-
-            let client = ApiResponsesClient::new(transport, api_provider, api_auth)
-                .with_telemetry(Some(request_telemetry), Some(sse_telemetry));
 
             let options = self.build_responses_options(
                 prompt,
@@ -895,6 +899,17 @@ impl ModelClientSession {
                 turn_metadata_header,
                 compression,
             );
+            let mut trace = self.trace_cache_request(
+                &api_provider.base_url,
+                &model_info.slug,
+                &api_prompt,
+                &options,
+                "http",
+                http_reason,
+                None,
+            );
+            let client = ApiResponsesClient::new(transport, api_provider, api_auth)
+                .with_telemetry(Some(telemetry.clone()), Some(telemetry.clone()));
 
             let stream_result = client
                 .stream_prompt(&model_info.slug, &api_prompt, options)
@@ -902,8 +917,16 @@ impl ModelClientSession {
 
             match stream_result {
                 Ok(stream) => {
+                    if let Some(trace) = &mut trace {
+                        trace.http_retries = Some(
+                            telemetry
+                                .http_sends
+                                .load(Ordering::Relaxed)
+                                .saturating_sub(1),
+                        );
+                    }
                     let (stream, _last_response_rx) =
-                        map_response_stream(stream, otel_manager.clone());
+                        map_response_stream(stream, otel_manager.clone(), trace);
                     return Ok(stream);
                 }
                 Err(ApiError::Transport(
@@ -1008,27 +1031,27 @@ impl ModelClientSession {
                 }
             };
             otel_manager.record_websocket_continuation(mode, reason, previous, current);
+            let ResponsesWsRequest::ResponseCreate(create) = &request;
+            let trace = self.trace_cache_request(
+                &api_provider.base_url,
+                &model_info.slug,
+                &api_prompt,
+                &options,
+                mode,
+                reason,
+                create.previous_response_id.as_deref(),
+            );
             let stream_result = connection
                 .stream_request(request, Some(Arc::clone(&self.turn_state)))
                 .await
                 .map_err(map_api_error)?;
             self.websocket_last_request = Some(last_request);
             let (stream, last_response_rx) =
-                map_response_stream(stream_result, otel_manager.clone());
+                map_response_stream(stream_result, otel_manager.clone(), trace);
             self.websocket_last_response_rx = Some(last_response_rx);
 
             return Ok(WebsocketStreamOutcome::Stream(stream));
         }
-    }
-
-    /// Builds request and SSE telemetry for streaming API calls.
-    fn build_streaming_telemetry(
-        otel_manager: &OtelManager,
-    ) -> (Arc<dyn RequestTelemetry>, Arc<dyn SseTelemetry>) {
-        let telemetry = Arc::new(ApiTelemetry::new(otel_manager.clone()));
-        let request_telemetry: Arc<dyn RequestTelemetry> = telemetry.clone();
-        let sse_telemetry: Arc<dyn SseTelemetry> = telemetry;
-        (request_telemetry, sse_telemetry)
     }
 
     /// Builds telemetry for the Responses API WebSocket transport.
@@ -1058,10 +1081,14 @@ impl ModelClientSession {
         let wire_api = self.provider.wire_api;
         match wire_api {
             WireApi::Responses => {
-                let websocket_enabled =
-                    self.responses_websocket_enabled() && !self.disable_websockets();
-
-                if websocket_enabled {
+                let supports_websocket = self.responses_websocket_enabled();
+                let fallback_active = self.disable_websockets();
+                let mut http_reason = if supports_websocket && fallback_active {
+                    "sticky_websocket_fallback"
+                } else {
+                    "full"
+                };
+                if supports_websocket && !fallback_active {
                     match self
                         .stream_responses_websocket(
                             prompt,
@@ -1076,7 +1103,8 @@ impl ModelClientSession {
                     {
                         WebsocketStreamOutcome::Stream(stream) => return Ok(stream),
                         WebsocketStreamOutcome::FallbackToHttp => {
-                            self.try_switch_fallback_transport(otel_manager);
+                            self.switch_to_http(otel_manager, "upgrade_required");
+                            http_reason = "websocket_upgrade_required";
                         }
                     }
                 }
@@ -1089,6 +1117,7 @@ impl ModelClientSession {
                     summary,
                     service_tier.clone(),
                     turn_metadata_header,
+                    http_reason,
                 )
                 .await
             }
@@ -1101,8 +1130,13 @@ impl ModelClientSession {
     /// the HTTP transport. Returns `true` if this call activated fallback, or `false` if fallback
     /// was already active.
     pub(crate) fn try_switch_fallback_transport(&mut self, otel_manager: &OtelManager) -> bool {
+        self.switch_to_http(otel_manager, "stream_retries_exhausted")
+    }
+
+    fn switch_to_http(&mut self, otel_manager: &OtelManager, cause: &'static str) -> bool {
         let websocket_enabled = self.responses_websocket_enabled();
-        let activated = self.activate_http_fallback(websocket_enabled);
+        let activated =
+            websocket_enabled && self.client.state.http_fallback_cause.set(cause).is_ok();
         if activated {
             warn!("falling back to HTTP");
             otel_manager.counter(
@@ -1357,6 +1391,7 @@ fn service_tier_for_wire(
 fn map_response_stream<S>(
     api_stream: S,
     otel_manager: OtelManager,
+    cache_trace: Option<cache_trace::Pending>,
 ) -> (ResponseStream, oneshot::Receiver<LastResponse>)
 where
     S: futures::Stream<Item = std::result::Result<ResponseEvent, ApiError>>
@@ -1371,6 +1406,7 @@ where
 
     tokio::spawn(async move {
         let mut tx_last_response = Some(tx_last_response);
+        let mut cache_trace = cache_trace;
         let mut items_added = Vec::new();
         let mut logged_error = false;
         let mut api_stream = api_stream;
@@ -1399,6 +1435,9 @@ where
                     end_turn,
                     reasoning_removals,
                 }) => {
+                    if let Some(trace) = cache_trace.take() {
+                        trace.complete(&response_id, token_usage.as_ref(), &items_added);
+                    }
                     if let Some(usage) = &token_usage {
                         otel_manager.sse_event_completed(
                             usage.input_tokens,
@@ -1478,11 +1517,15 @@ async fn handle_unauthorized(
 
 struct ApiTelemetry {
     otel_manager: OtelManager,
+    http_sends: AtomicU64,
 }
 
 impl ApiTelemetry {
     fn new(otel_manager: OtelManager) -> Self {
-        Self { otel_manager }
+        Self {
+            otel_manager,
+            http_sends: AtomicU64::new(0),
+        }
     }
 }
 
@@ -1494,6 +1537,7 @@ impl RequestTelemetry for ApiTelemetry {
         error: Option<&TransportError>,
         duration: Duration,
     ) {
+        self.http_sends.fetch_add(1, Ordering::Relaxed);
         let error_message = error.map(std::string::ToString::to_string);
         self.otel_manager.record_api_request(
             attempt,
@@ -1621,6 +1665,7 @@ mod tests {
                 dropped: Some(dropped_tx),
             },
             test_otel_manager(),
+            None,
         );
 
         drop(stream);
@@ -1641,7 +1686,8 @@ mod tests {
                 end_turn: Some(true),
             }),
         ]);
-        let (mut stream, last_response_rx) = map_response_stream(api_stream, test_otel_manager());
+        let (mut stream, last_response_rx) =
+            map_response_stream(api_stream, test_otel_manager(), None);
 
         while let Some(event) = stream.next().await {
             if matches!(event, Ok(ResponseEvent::Completed { .. })) {

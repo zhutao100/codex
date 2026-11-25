@@ -114,7 +114,7 @@ async fn run_compact(
     let prepared = prepare_history_for_compaction(
         sess.clone_history().await,
         notes,
-        context.review_frame.as_ref(),
+        Some(&context.review_frames),
     )?;
     let mut source = prepared.source_history;
     let base_instructions = sess.get_base_instructions_for_turn(turn_context).await;
@@ -348,9 +348,12 @@ async fn request_compaction(
     token: &CancellationToken,
 ) -> CodexResult<CompactionOutput> {
     let context = source.request;
+    client.cache_operation = crate::client::CacheOperation::Compact;
+    client.cache_attempt = 0;
     let max_retries = context.provider.stream_max_retries().min(2);
     let mut retries = 0;
     loop {
+        client.cache_attempt += 1;
         let attempt = async {
             let stream = client
                 .stream(
@@ -421,7 +424,12 @@ async fn collect_compaction_output(
     let mut count = 0;
     let mut server_reasoning_included = false;
     while let Some(event) = stream.next().await {
-        match event? {
+        let event = event?;
+        if matches!(&event, ResponseEvent::Completed { .. }) {
+            let span = tracing::trace_span!("compact_response", otel.name = tracing::field::Empty);
+            context.otel_manager.record_responses(&span, &event);
+        }
+        match event {
             ResponseEvent::OutputItemDone(item @ ResponseItem::Compaction { .. }) => {
                 count += 1;
                 if candidate.is_none() {

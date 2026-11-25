@@ -17,9 +17,11 @@ pub(crate) struct ReconstructedRollout {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ReconstructedTokenUsage {
     pub(crate) info: TokenUsageInfo,
+    pub(crate) source_model: Option<String>,
     pub(crate) request_context_tokens: i64,
     pub(crate) server_reasoning_included: bool,
     pub(crate) last_usage_item_count: usize,
+    pub(crate) work_notes_baseline: Option<crate::context_manager::WorkNotesBaseline>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -108,6 +110,8 @@ impl Session {
         rollout_items: &[RolloutItem],
     ) -> ReconstructedRollout {
         let mut history = ContextManager::new();
+        let base = self.get_base_instructions().await;
+        let mut superseded_usage = None;
         let mut server_reasoning_included = false;
         let mut current_metadata = ReplayMetadata::default();
         let mut current_epoch = ReplayEpoch::default();
@@ -124,9 +128,14 @@ impl Session {
                     let input_installed = completion_review
                         .as_mut()
                         .is_some_and(|review| review.observe_input_installation(response_item));
-                    history.record_items(
-                        std::iter::once(response_item),
+                    history.record_session_item(
+                        response_item,
                         turn_context.truncation_policy,
+                        server_reasoning_included,
+                        current_metadata
+                            .previous_turn_settings
+                            .as_ref()
+                            .map(|p| p.model.as_str()),
                     );
                     if is_user_turn_boundary_response_item(response_item) {
                         if turn::is_review_rollout_user_message(response_item) {
@@ -137,7 +146,7 @@ impl Session {
                                 // A known amendment invalidates eligibility, not
                                 // the prior candidate's continuation directory.
                                 if !input_installed {
-                                    review.request_frame.exact = false;
+                                    review.invalidate_request_provenance();
                                     review.episode = None;
                                 }
                                 review.clear_operations();
@@ -148,6 +157,10 @@ impl Session {
                     }
                 }
                 RolloutItem::Compacted(compacted) => {
+                    superseded_usage = history.token_info();
+                    if let Some(review) = completion_review.as_mut() {
+                        review.clear_prompt_frames();
+                    }
                     let has_exact_replacement = compacted.replacement_history.is_some();
                     if let Some(replacement) = &compacted.replacement_history {
                         history.replace(replacement.clone());
@@ -159,6 +172,12 @@ impl Session {
                             &compacted.message,
                         );
                         history.replace(rebuilt);
+                    }
+                    // The marker commits the new history even if the process never writes the
+                    // following usage checkpoint. An unmeasured legacy history stays unmeasured.
+                    if superseded_usage.is_some() {
+                        history.reestimate_usage(&base, turn_context.model_context_window());
+                        server_reasoning_included = true;
                     }
                     current_metadata.reference_context_item = None;
                     pending_context = None;
@@ -217,6 +236,7 @@ impl Session {
                 }
                 RolloutItem::TokenUsageContext {
                     info,
+                    source_model,
                     request_context_tokens,
                     server_reasoning_included: included,
                     last_usage_item_count,
@@ -231,7 +251,11 @@ impl Session {
                     } else {
                         history.set_token_info(Some(info.clone()));
                     }
-                    history.set_request_context_tokens((*request_context_tokens).max(0));
+                    history.set_measured_context(
+                        (*request_context_tokens).max(0),
+                        source_model.clone(),
+                    );
+                    superseded_usage = None;
                     server_reasoning_included = *included;
                 }
                 RolloutItem::EventMsg(EventMsg::TokenCount(TokenCountEvent {
@@ -240,8 +264,11 @@ impl Session {
                 })) => {
                     awaiting_adjacent_post_compaction_context = false;
                     // Repeated UI events must not cover later, unreported output.
-                    if history.token_info().as_ref() != Some(info) {
+                    if history.token_info().as_ref() != Some(info)
+                        && superseded_usage.as_ref() != Some(info)
+                    {
                         history.set_token_info(Some(info.clone()));
+                        superseded_usage = None;
                         server_reasoning_included = false;
                     }
                 }
@@ -253,9 +280,11 @@ impl Session {
 
         let token_usage = history.token_info().map(|info| ReconstructedTokenUsage {
             info,
+            source_model: history.usage_source_model().map(str::to_owned),
             request_context_tokens: history.request_context_tokens(),
             server_reasoning_included,
             last_usage_item_count: history.last_usage_item_count(),
+            work_notes_baseline: history.work_notes_baseline.clone(),
         });
         let history = history.raw_items().to_vec();
         let pending_notes = !matches!(compact::pending_work_notes(&history), Ok(None));

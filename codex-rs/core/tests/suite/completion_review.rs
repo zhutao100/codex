@@ -37,12 +37,16 @@ fn configure_recovery_models(config: &mut Config) {
 }
 
 fn configure_recovery_models_with_limit(config: &mut Config, auto_compact_limit: i64) {
+    configure_recovery_windows(config, auto_compact_limit, 24_000);
+}
+
+fn configure_recovery_windows(config: &mut Config, auto_compact_limit: i64, main_window: i64) {
     config.model = Some("completion-recovery-small".into());
     config.review_model = Some("completion-recovery-large".into());
     config.compaction_mode = codex_core::config::types::CompactionMode::Auto;
     config.model_overlay = Some(ModelOverlay {
         models: [
-            ("completion-recovery-small", 24_000),
+            ("completion-recovery-small", main_window),
             ("completion-recovery-large", 128_000),
         ]
         .into_iter()
@@ -66,12 +70,16 @@ const REVIEW_WORK_NOTES: &str =
     "<AUTO_COMPACT_WORK_NOTES>\nFinish verifying the review.\n</AUTO_COMPACT_WORK_NOTES>";
 
 fn compacted_answer_with(summary: &str) -> String {
+    compacted_answer_with_completion(summary, ev_completed("compact"))
+}
+
+fn compacted_answer_with_completion(summary: &str, completion: serde_json::Value) -> String {
     sse(vec![
         serde_json::json!({
             "type": "response.output_item.done",
             "item": {"type": "compaction", "encrypted_content": summary},
         }),
-        ev_completed("compact"),
+        completion,
     ])
 }
 
@@ -126,7 +134,7 @@ fn followup_frame(request: &ResponsesRequest) -> Option<String> {
         .iter()
         .filter(|item| item["role"] == "developer")
         .filter_map(|item| item["content"][0]["text"].as_str())
-        .find(|text| text.contains("<completed_turn_review_context>"))
+        .rfind(|text| text.contains("<completed_turn_review_context>"))
         .map(str::to_owned)
 }
 
@@ -299,6 +307,11 @@ async fn automatic_review_continues_past_three_with_only_initial_and_latest_answ
         assert!(input.contains("self-contained final answer"));
         assert!(input.contains("when you reject every finding or make no file changes"));
         assert!(input.contains("U1: implement X and explain Y"));
+        assert!(
+            requests[index]
+                .input()
+                .starts_with(&requests[index - 2].input())
+        );
     }
     let rollout = read_rollout_lines(&codex.rollout_path().unwrap());
     let state = rollout
@@ -646,15 +659,30 @@ async fn invalid_reviewer_output_exits_without_a_clean_verdict_or_continuation()
     server.verify().await;
 }
 
-#[test_case::test_case(false; "initial task")]
-#[test_case::test_case(true; "review followup")]
+enum ClarificationCase {
+    Initial,
+    Review,
+    Steered,
+    SteeredThenCompact,
+}
+
+#[test_case::test_case(ClarificationCase::Initial; "initial task")]
+#[test_case::test_case(ClarificationCase::Review; "review followup")]
+#[test_case::test_case(ClarificationCase::Steered; "steered review with a pinned consumed-scope frame")]
+#[test_case::test_case(ClarificationCase::SteeredThenCompact; "clarification immediately before notes and compact")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn human_clarification_prevents_an_incomplete_request_from_being_declared_reviewed(
-    review_followup: bool,
+    case: ClarificationCase,
 ) -> anyhow::Result<()> {
     skip_if_no_network_unless_localhost!(Ok(()));
     let server = MockServer::start().await;
     let call_id = "scope-clarification";
+    let review_followup = !matches!(case, ClarificationCase::Initial);
+    let steered = matches!(
+        case,
+        ClarificationCase::Steered | ClarificationCase::SteeredThenCompact
+    );
+    let compact = matches!(case, ClarificationCase::SteeredThenCompact);
     let questions = serde_json::json!({
         "questions": [{
             "id": "target",
@@ -673,17 +701,42 @@ async fn human_clarification_prevents_an_incomplete_request_from_being_declared_
             verdict("Clarify the interface before completing the change.", true),
         ]);
     }
-    responses.extend([
-        sse(vec![
-            ev_response_created("clarification"),
-            ev_function_call(call_id, "request_user_input", &questions.to_string()),
-            ev_completed("clarification"),
-        ]),
-        answer("Complete result for the selected CLI-only scope."),
-    ]);
-    let requests = mount_sse_sequence(&server, responses).await;
+    responses.push(sse(vec![
+        ev_response_created("clarification"),
+        ev_function_call(call_id, "request_user_input", &questions.to_string()),
+        if compact {
+            ev_completed_with_tokens("clarification", 28_000)
+        } else {
+            ev_completed("clarification")
+        },
+    ]));
+    if compact {
+        responses.extend([answer(REVIEW_WORK_NOTES), compacted_answer()]);
+    }
+    responses.push(answer("Complete result for the selected CLI-only scope."));
+    let mut replies: Vec<_> = responses.into_iter().map(sse_response).collect();
+    if steered {
+        replies.insert(
+            2,
+            sse_response(sse(vec![
+                ev_function_call(
+                    "plan",
+                    "update_plan",
+                    r#"{"plan":[{"step":"Check","status":"completed"}]}"#,
+                ),
+                ev_completed("before-steering"),
+            ]))
+            .set_delay(std::time::Duration::from_secs(1)),
+        );
+    }
+    let requests = mount_response_sequence(&server, replies).await;
     let home = Arc::new(TempDir::new()?);
-    let mut builder = test_codex().with_home(home).with_config(|_config| {});
+    let mut builder = test_codex().with_home(home).with_config(move |config| {
+        if compact {
+            config.model_context_window = Some(32_000);
+            config.model_auto_compact_token_limit = Some(27_000);
+        }
+    });
     let test = builder.build(&server).await?;
     let codex = Arc::clone(&test.codex);
     codex
@@ -711,6 +764,24 @@ async fn human_clarification_prevents_an_incomplete_request_from_being_declared_
     if review_followup {
         wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
         codex.submit(Op::ReviewCompletedTurn).await?;
+    }
+    let amendment = "Include the CLI verification.";
+    if steered {
+        wait_for_captured_requests(&requests, 3).await;
+        let started = completion_state(&codex.rollout_path().context("expected rollout")?)?;
+        codex
+            .submit(Op::SteerInput {
+                expected_turn_id: started["main_task_id"]
+                    .as_str()
+                    .context("expected main owner")?
+                    .into(),
+                items: vec![UserInput::Text {
+                    text: amendment.into(),
+                    text_elements: vec![],
+                }],
+                client_user_message_id: Some("before-clarification".into()),
+            })
+            .await?;
     }
     let event = wait_for_event(&codex, |event| {
         matches!(event, EventMsg::RequestUserInput(_))
@@ -745,10 +816,50 @@ async fn human_clarification_prevents_an_incomplete_request_from_being_declared_
     })
     .await;
     let captured = requests.requests();
-    assert_eq!(captured.len(), if review_followup { 4 } else { 2 });
+    assert_eq!(
+        captured.len(),
+        if review_followup {
+            4 + usize::from(steered) + 2 * usize::from(compact)
+        } else {
+            2
+        }
+    );
+    let consumed_scope = |request: &ResponsesRequest| -> anyhow::Result<Vec<serde_json::Value>> {
+        request
+            .input()
+            .iter()
+            .filter(|item| item["role"] == "developer")
+            .filter_map(|item| {
+                item["content"][0]["text"]
+                    .as_str()?
+                    .split_once("Consumed user request context (host snapshot):\n")
+                    .map(|(_, snapshot)| snapshot)
+            })
+            .map(|s| Ok(serde_json::from_str(s)?))
+            .collect()
+    };
+    let after_clarification = captured.len() - 1 - 2 * usize::from(compact);
+    if review_followup {
+        for after in &captured[after_clarification..] {
+            let frames = consumed_scope(after)?;
+            assert_eq!(frames.len(), 1);
+            assert_eq!(frames[0]["exact"], false);
+            assert!(followup_frame(after).is_none());
+            if steered {
+                let before = consumed_scope(&captured[after_clarification - 1])?;
+                assert_eq!(before.len(), 1);
+                assert_eq!(before[0]["exact"], true);
+                assert!(before[0].to_string().contains(amendment));
+                assert_eq!(
+                    frames[0]["current_user_messages"],
+                    before[0]["current_user_messages"]
+                );
+            }
+        }
+    }
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(
-            &captured[captured.len() - 1]
+            &captured[after_clarification]
                 .function_call_output_content_and_success(call_id)
                 .context("expected clarification output")?
                 .0
@@ -1052,7 +1163,7 @@ async fn compaction_replays_the_sampled_optional_reference_choice(
         verdict("Revise the initial answer.", true),
         sse(vec![
             ev_assistant_message("candidate", candidate),
-            ev_completed_with_tokens("candidate", if omitted { 14_600 } else { 4_000 }),
+            ev_completed_with_tokens("candidate", if omitted { 13_350 } else { 4_000 }),
         ]),
         verdict("Verify the replacement.", true),
         sse(vec![
@@ -1061,13 +1172,25 @@ async fn compaction_replays_the_sampled_optional_reference_choice(
                 "update_plan",
                 r#"{"plan":[{"step":"Verify","status":"completed"}]}"#,
             ),
-            ev_completed_with_tokens("near-limit", 20_500),
-        ]),
-        sse(vec![
-            ev_assistant_message("notes", REVIEW_WORK_NOTES),
-            ev_completed_with_tokens("notes", 21_000),
+            // A sampled full frame crosses the guard, although its mandatory subset would fit.
+            ev_completed_with_tokens("near-limit", if omitted { 6_000 } else { 14_700 }),
         ]),
     ];
+    if omitted {
+        // There is room for the full reference again. Do not put it back in the earlier prefix.
+        replies.push(sse(vec![
+            ev_function_call(
+                "plan-again",
+                "update_plan",
+                r#"{"plan":[{"step":"Verify","status":"completed"}]}"#,
+            ),
+            ev_completed_with_tokens("above-limit", 20_500),
+        ]));
+    }
+    replies.push(sse(vec![
+        ev_assistant_message("notes", REVIEW_WORK_NOTES),
+        ev_completed_with_tokens("notes", 21_000),
+    ]));
     if !omitted {
         // No completed compaction item. Resume after the failed installation, not from a live frame.
         replies.push(sse(vec![ev_completed_with_tokens(
@@ -1113,12 +1236,13 @@ async fn compaction_replays_the_sampled_optional_reference_choice(
     })
     .await;
     let captured = requests.requests();
-    assert_eq!(captured.len(), if omitted { 8 } else { 9 });
+    assert_eq!(captured.len(), 9);
     let frame = followup_frame(&captured[4]).context("missing replacement frame")?;
     assert_eq!(frame.contains("omitted_for_budget"), omitted);
     assert_eq!(frame.contains(&initial), !omitted);
     assert!(frame.contains(candidate));
     assert!(frame.contains("Keep the exact user request."));
+    assert!(captured[4].input().starts_with(&captured[2].input()));
     let hot = captured[4].input();
     for request in &captured[5..captured.len() - 1] {
         assert!(request.input().starts_with(&hot));
@@ -1126,6 +1250,208 @@ async fn compaction_replays_the_sampled_optional_reference_choice(
     }
     if !omitted {
         assert_eq!(captured[6].input(), captured[7].input());
+    }
+    server.verify().await;
+    Ok(())
+}
+
+#[test_case::test_case(false; "small handoff fits both helpers")]
+#[test_case::test_case(true; "oversized unsampled handoff deferred across failed installation and restart")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn new_review_compacts_the_previous_sampled_work_across_restart(
+    defer: bool,
+) -> anyhow::Result<()> {
+    skip_if_no_network_unless_localhost!(Ok(()));
+    let server = MockServer::start().await;
+    let advice = "Verify the outstanding evidence.";
+    let candidate =
+        "Second candidate, sampled under the first review.".repeat(if defer { 820 } else { 1 });
+    let candidate = candidate.as_str();
+    let mut replies = vec![
+        answer("First candidate."),
+        verdict(advice, true),
+        sse(vec![
+            ev_assistant_message("candidate", candidate),
+            ev_completed_with_tokens("candidate", 14_600),
+        ]),
+        verdict(advice, true),
+        answer(REVIEW_WORK_NOTES),
+    ];
+    if defer {
+        replies.push(sse(vec![ev_completed_with_tokens(
+            "missing-compact-output",
+            23_000,
+        )]));
+    }
+    let installed = compacted_answer_with_completion(
+        "installed review summary",
+        ev_completed_with_tokens("compact", 23_900),
+    );
+    replies.extend([installed.clone(), answer("Verified replacement.")]);
+    if defer {
+        // Replay three prefixes of the same real recorder output below.
+        replies.extend([
+            answer(REVIEW_WORK_NOTES),
+            installed,
+            answer("Resumed."),
+            answer("Resumed."),
+            answer("Resumed."),
+        ]);
+    }
+    let requests = mount_sse_sequence(&server, replies).await;
+    let home = Arc::new(TempDir::new()?);
+    let codex = new_conversation_for_server(&server, home.clone(), configure_recovery_models).await;
+    submit_request(&codex, "Verify both results.").await;
+    wait_for_event(&codex, |e| matches!(e, EventMsg::TurnComplete(_))).await;
+    codex.submit(Op::ReviewCompletedTurn).await?;
+    wait_for_event(&codex, |e| matches!(e, EventMsg::TurnComplete(t) if t.last_agent_message.as_deref() == Some(candidate))).await;
+    let path = codex.rollout_path().context("expected rollout")?;
+    codex.submit(Op::Shutdown).await?;
+    wait_for_event(&codex, |e| matches!(e, EventMsg::ShutdownComplete)).await;
+    let resumed = resume_conversation_for_server(
+        &server,
+        home.clone(),
+        path.clone(),
+        configure_recovery_models,
+    )
+    .await;
+    resumed.submit(Op::ReviewCompletedTurn).await?;
+    let resumed = if defer {
+        wait_for_event(&resumed, |e| matches!(e, EventMsg::Error(e) if e.message.contains("exactly one compaction output"))).await;
+        resumed.submit(Op::Shutdown).await?;
+        wait_for_event(&resumed, |e| matches!(e, EventMsg::ShutdownComplete)).await;
+        // The deferred choice belongs to this capture, not to the new process's headroom.
+        let active =
+            resume_conversation_for_server(&server, home.clone(), path.clone(), |config| {
+                configure_recovery_windows(config, 200_000, 64_000);
+            })
+            .await;
+        active.submit(Op::Continue).await?;
+        active
+    } else {
+        resumed
+    };
+    wait_for_event(&resumed, |e| match e {
+        EventMsg::Error(e) => panic!("handoff failed: {}", e.message),
+        EventMsg::TurnComplete(t) => {
+            t.last_agent_message.as_deref() == Some("Verified replacement.")
+        }
+        _ => false,
+    })
+    .await;
+    let captured = requests.requests();
+    assert_eq!(captured.len(), 7 + usize::from(defer));
+    if defer {
+        assert_eq!(captured[5].input(), captured[6].input());
+    }
+    let last = captured.last().context("replacement")?;
+    let cycle = [captured[4].clone(), captured[5].clone(), last.clone()];
+    assert_review_compaction_cycle(&cycle);
+    let hot = captured[2].input();
+    for helper in &captured[4..6] {
+        let input = helper.input();
+        assert!(input.starts_with(&hot));
+        assert_eq!(input[hot.len()]["content"][0]["text"], candidate);
+        let source_frame = followup_frame(helper).context("outgoing frame")?;
+        assert_eq!(source_frame.contains(candidate), !defer);
+        if defer {
+            assert_eq!(Some(source_frame), followup_frame(&captured[2]));
+        }
+    }
+    let replacement = last.input();
+    assert_eq!(
+        replacement
+            .iter()
+            .filter(|item| item["role"] == "developer"
+                && item["content"][0]["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("<completed_turn_review_context>")))
+            .count(),
+        1
+    );
+    assert!(
+        followup_frame(last)
+            .is_some_and(|frame| frame.contains(candidate) && frame.contains(advice))
+    );
+    if defer {
+        resumed.submit(Op::Shutdown).await?;
+        wait_for_event(&resumed, |e| matches!(e, EventMsg::ShutdownComplete)).await;
+        let original = std::fs::read_to_string(&path)?;
+        let mut end = 0;
+        let mut selection = None;
+        let mut replacement = None;
+        let mut adjacent = None;
+        let mut last_usage = 0;
+        for line in original.split_inclusive('\n') {
+            let start = end;
+            end += line.len();
+            match serde_json::from_str::<codex_protocol::protocol::RolloutLine>(line)?.item {
+                RolloutItem::PostTurnCompletionReviewState(s)
+                    if selection.is_none() && s["defer_new_prompt_frame"] == true =>
+                {
+                    selection = Some(end)
+                }
+                RolloutItem::TokenUsageContext { info, .. } => {
+                    last_usage = info.last_token_usage.total_tokens
+                }
+                RolloutItem::Compacted(_) => {
+                    assert_eq!(last_usage, 23_900);
+                    replacement = Some(end);
+                }
+                RolloutItem::TurnContext(_) if replacement == Some(start) => adjacent = Some(end),
+                _ => {}
+            }
+        }
+        let mut sent = captured.len();
+        for (cut, before_marker) in [
+            (selection.context("deferral before marker")?, true),
+            (replacement.context("durable installation")?, false),
+            (adjacent.context("adjacent turn context")?, false),
+        ] {
+            // Only truncate the disposable fixture, with its writer shut down.
+            std::fs::write(&path, &original.as_bytes()[..cut])?;
+            let active =
+                resume_conversation_for_server(&server, home.clone(), path.clone(), move |cfg| {
+                    configure_recovery_windows(
+                        cfg,
+                        200_000,
+                        if before_marker { 64_000 } else { 24_000 },
+                    );
+                })
+                .await;
+            if before_marker {
+                active
+                    .submit(context_override(None, Some("completion-recovery-large")))
+                    .await?;
+            }
+            active.submit(Op::Continue).await?;
+            wait_for_event(&active, |e| match e {
+                EventMsg::Error(e) => panic!("resume at {cut} failed: {}", e.message),
+                EventMsg::TurnComplete(t) => t.last_agent_message.as_deref() == Some("Resumed."),
+                _ => false,
+            })
+            .await;
+            let all = requests.requests();
+            let new = &all[sent..];
+            assert_eq!(new.len(), if before_marker { 3 } else { 1 });
+            if before_marker {
+                assert_review_compaction_cycle(new);
+                assert_eq!(new[0].input(), captured[4].input());
+                assert_eq!(new[1].input(), captured[5].input());
+                assert_eq!(new[0].body_json()["model"], "completion-recovery-small");
+                assert_eq!(new[1].body_json()["model"], "completion-recovery-small");
+                assert_eq!(new[2].body_json()["model"], "completion-recovery-large");
+            }
+            let ordinary = new.last().context("ordinary replacement")?;
+            assert!(ordinary.input().iter().any(|i| i["type"] == "compaction"));
+            assert!(
+                followup_frame(ordinary)
+                    .is_some_and(|frame| frame.contains(candidate) && frame.contains(advice))
+            );
+            sent = all.len();
+            active.submit(Op::Shutdown).await?;
+            wait_for_event(&active, |e| matches!(e, EventMsg::ShutdownComplete)).await;
+        }
     }
     server.verify().await;
     Ok(())

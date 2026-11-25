@@ -994,7 +994,8 @@ impl Session {
                 .set_token_info_with_boundary(Some(usage.info), usage.last_usage_item_count);
             state
                 .history
-                .set_request_context_tokens(usage.request_context_tokens);
+                .set_measured_context(usage.request_context_tokens, usage.source_model);
+            state.history.work_notes_baseline = usage.work_notes_baseline;
             state.set_server_reasoning_included(usage.server_reasoning_included);
         } else {
             state.history.set_token_info_with_boundary(None, 0);
@@ -1756,9 +1757,17 @@ impl Session {
         reference_context_item: Option<TurnContextItem>,
         compacted_item: CompactedItem,
     ) {
+        // Order the new epoch's marker with snapshots that carry old frame anchors.
+        let review_installation = self.completion_review_installation.lock().await;
+        let base = self.get_base_instructions().await;
         {
             let mut state = self.state.lock().await;
             state.replace_history(items);
+            state
+                .history
+                .reestimate_usage(&base, turn_context.model_context_window());
+            state.set_server_reasoning_included(true);
+            state.completion_review.clear_prompt_frames();
             state
                 .history
                 .set_reference_context_item(reference_context_item.clone());
@@ -1770,7 +1779,10 @@ impl Session {
             rollout_items.push(RolloutItem::TurnContext(reference_context_item));
         }
         self.persist_rollout_items(&rollout_items).await;
-        self.recompute_token_usage(turn_context).await;
+        drop(review_installation);
+        self.services.model_client.mark_cache_trace_compaction();
+        self.persist_token_usage_context().await;
+        self.send_token_count_event(turn_context).await;
     }
 
     pub(crate) async fn reference_context_item(&self) -> Option<TurnContextItem> {
@@ -1975,9 +1987,10 @@ impl Session {
                     turn_context.model_context_window(),
                     input_item_count,
                 );
-                state
-                    .history
-                    .set_request_context_tokens(request_context_tokens);
+                state.history.set_measured_context(
+                    request_context_tokens,
+                    Some(turn_context.model_info.slug.clone()),
+                );
                 state.set_server_reasoning_included(server_reasoning_included);
                 true
             } else {
@@ -2011,6 +2024,7 @@ impl Session {
                 .token_info()
                 .map(|info| RolloutItem::TokenUsageContext {
                     info,
+                    source_model: state.history.usage_source_model().map(str::to_owned),
                     request_context_tokens: state.history.request_context_tokens(),
                     server_reasoning_included: state.server_reasoning_included(),
                     last_usage_item_count: Some(state.history.last_usage_item_count()),
@@ -2025,34 +2039,9 @@ impl Session {
         let base_instructions = self.get_base_instructions().await;
         {
             let mut state = self.state.lock().await;
-            let Some(estimated_total_tokens) = state
-                .history
-                .estimate_token_count_with_base_instructions(&base_instructions)
-            else {
-                return;
-            };
-            let mut info = state.token_info().unwrap_or(TokenUsageInfo {
-                total_token_usage: TokenUsage::default(),
-                last_token_usage: TokenUsage::default(),
-                model_context_window: None,
-            });
-
-            info.last_token_usage = TokenUsage {
-                input_tokens: 0,
-                cached_input_tokens: 0,
-                output_tokens: 0,
-                reasoning_output_tokens: 0,
-                total_tokens: estimated_total_tokens.max(0),
-            };
-
-            if info.model_context_window.is_none() {
-                info.model_context_window = turn_context.model_context_window();
-            }
-
-            let covered_item_count = state.history.raw_items().len();
             state
                 .history
-                .set_token_info_with_boundary(Some(info), covered_item_count);
+                .reestimate_usage(&base_instructions, turn_context.model_context_window());
             state.set_server_reasoning_included(true);
         }
         self.persist_token_usage_context().await;

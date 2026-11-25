@@ -176,6 +176,29 @@ async fn completion_review_snapshot_deduplication_preserves_state_transitions(
 }
 
 #[tokio::test]
+async fn equal_review_snapshots_on_either_side_of_compaction_are_distinct() -> Result<()> {
+    let file = tempfile::NamedTempFile::new()?;
+    let recorder = writable_recorder(file.path()).await?;
+    let state = RolloutItem::PostTurnCompletionReviewState(
+        serde_json::json!({"frame":"same bytes, new epoch"}),
+    );
+    let compact = RolloutItem::Compacted(codex_protocol::protocol::CompactedItem {
+        message: String::new(),
+        replacement_history: Some(vec![]),
+    });
+    let expected = vec![state.clone(), compact, state];
+    recorder.record_items(&expected).await?;
+    recorder.flush().await?;
+    let (items, _, errors) = RolloutRecorder::load_rollout_items(file.path()).await?;
+    assert_eq!(errors, 0);
+    assert_eq!(
+        serde_json::to_value(items)?,
+        serde_json::to_value(expected)?
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn unchanged_completion_review_snapshot_still_flushes_transcript() -> Result<()> {
     let file = tempfile::NamedTempFile::new()?;
     let recorder = writable_recorder(file.path()).await?;
@@ -410,6 +433,7 @@ async fn clean_for_continue_removes_abort_custom_and_dangling_records() -> Resul
         crate::completion_review::CompletionReviewState::default(),
     )?);
     let usage_context = RolloutItem::TokenUsageContext {
+        source_model: None,
         info: codex_protocol::protocol::TokenUsageInfo::new_or_append(
             &None,
             &Some(codex_protocol::protocol::TokenUsage {
