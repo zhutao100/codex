@@ -100,9 +100,11 @@ async fn request_context_usage_replays_atomic_prefixes_and_duplicate_token_event
     let expected = |info, request_context_tokens, server_reasoning_included| {
         Some(rollout_reconstruction::ReconstructedTokenUsage {
             info,
+            source_model: None,
             request_context_tokens,
             server_reasoning_included,
             last_usage_item_count: 0,
+            work_notes_baseline: None,
         })
     };
     let info = TokenUsageInfo::new_or_append(
@@ -123,6 +125,7 @@ async fn request_context_usage_replays_atomic_prefixes_and_duplicate_token_event
         event.clone(),
         RolloutItem::TokenUsageContext {
             info: info.clone(),
+            source_model: None,
             request_context_tokens: 5_000,
             server_reasoning_included: true,
             last_usage_item_count: None,
@@ -131,6 +134,7 @@ async fn request_context_usage_replays_atomic_prefixes_and_duplicate_token_event
         event.clone(),
         RolloutItem::TokenUsageContext {
             info: info.clone(),
+            source_model: None,
             request_context_tokens: 0,
             server_reasoning_included: false,
             last_usage_item_count: None,
@@ -173,19 +177,29 @@ async fn request_context_usage_replays_atomic_prefixes_and_duplicate_token_event
             message: String::new(),
             replacement_history: Some(Vec::new()),
         }),
+        records[0].clone(),
     ];
+    let mut local = info.clone();
+    local.last_token_usage = TokenUsage {
+        total_tokens: ContextManager::new()
+            .estimate_token_count_with_base_instructions(&session.get_base_instructions().await)
+            .unwrap(),
+        ..Default::default()
+    };
+    local.model_context_window = context.model_context_window();
     assert_eq!(
         session
             .reconstruct_history_from_rollout(&context, &records)
             .await
             .token_usage,
-        expected(info.clone(), 0, true)
+        expected(local, 0, true)
     );
     let mut changed = info.clone();
     changed.last_token_usage.total_tokens += 1;
     let records = [
         RolloutItem::TokenUsageContext {
             info,
+            source_model: None,
             request_context_tokens: 5_000,
             server_reasoning_included: true,
             last_usage_item_count: None,
@@ -282,6 +296,7 @@ async fn usage_boundary_replays_unreported_output(context_record: bool, explicit
         .collect::<Vec<_>>();
     if context_record {
         records.push(RolloutItem::TokenUsageContext {
+            source_model: None,
             info: info.clone(),
             request_context_tokens: 10,
             server_reasoning_included: true,
@@ -299,9 +314,11 @@ async fn usage_boundary_replays_unreported_output(context_record: bool, explicit
         reconstructed.token_usage,
         Some(rollout_reconstruction::ReconstructedTokenUsage {
             info,
+            source_model: None,
             request_context_tokens: if context_record { 10 } else { 0 },
             server_reasoning_included: context_record,
             last_usage_item_count: covered_item_count,
+            work_notes_baseline: None,
         })
     );
     session

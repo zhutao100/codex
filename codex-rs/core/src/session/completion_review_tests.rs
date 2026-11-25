@@ -4,6 +4,7 @@ use crate::completion_review::CompletionReviewState;
 use crate::completion_review::ReviewHandoffDisposition;
 use crate::completion_review::ReviewInputInstallation;
 use crate::completion_review::ReviewPromptFrame;
+use crate::completion_review::ReviewPromptFrames;
 use crate::completion_review::ReviewRequestFrame;
 use codex_protocol::models::ResponseInputItem;
 use pretty_assertions::assert_eq;
@@ -43,9 +44,13 @@ fn completion_review_request_frame_keeps_a_stable_prefix(
     mut history: Vec<ResponseItem>,
     expected_index: usize,
 ) {
-    let frame = ReviewPromptFrame::new("exact review frame".into());
+    let frames = ReviewPromptFrames(vec![ReviewPromptFrame::new(
+        "exact review frame".into(),
+        ReviewPromptFrame::anchor(&history),
+        None,
+    )]);
     let mut request = history.clone();
-    frame.insert(&mut request, None);
+    frames.insert(&mut request, None).unwrap();
     let mut expected = history[..expected_index].to_vec();
     expected.push(DeveloperInstructions::new("exact review frame").into());
     expected.extend_from_slice(&history[expected_index..]);
@@ -53,7 +58,7 @@ fn completion_review_request_frame_keeps_a_stable_prefix(
 
     let output = assistant_message("new follow-up output");
     history.push(output.clone());
-    frame.insert(&mut history, None);
+    frames.insert(&mut history, None).unwrap();
     expected.push(output);
     assert_eq!(history, expected);
 }

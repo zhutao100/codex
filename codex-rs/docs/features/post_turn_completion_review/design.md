@@ -47,7 +47,7 @@ Flush and shutdown acknowledgements carry the writer's I/O result. A failed rese
 
 Suppress unchanged review snapshots only inside the recorder writer. Compare against pending state before the flushed baseline, preserving `A -> B -> A` within one flush. Advance the acknowledged baseline only after a successful flush and reset it when replacing the writer. Never suppress transcript writes, flush/error delivery or newly assigned ownership because review metadata is unchanged.
 
-Continuation cleanup shares the installation boundary and preserves host metadata and acknowledged input. `ResponseItem::Message.id` is not serialized; advisory recovery compares the exact durable developer item, not an assumed persistent message ID. Reinsert advice only when compaction removed it, while always restoring the replacement contract and exact request/candidate frame.
+Continuation cleanup shares the installation boundary and preserves host metadata and acknowledged input. `ResponseItem::Message.id` is not serialized. When a handoff write was interrupted before its recorded flag, match the exact developer item at the tail; an identical verdict earlier than intervening work does not count as this handoff's advisory. Restore the active contract and candidate even after compaction removes the separate advisory.
 
 ## Recovery transitions
 

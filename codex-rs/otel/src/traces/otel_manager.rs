@@ -90,7 +90,9 @@ impl OtelManager {
         handle_responses_span.record("otel.name", OtelManager::responses_type(event));
 
         if let ResponseEvent::Completed {
-            reasoning_removals, ..
+            response_id,
+            reasoning_removals,
+            ..
         } = event
         {
             use codex_api::ReasoningRemovalReason;
@@ -102,7 +104,7 @@ impl OtelManager {
                 }
                 Some(_) => "removals_reported",
             };
-            tracing::debug!(parent: handle_responses_span, report, ?reasoning_removals, "reasoning replay report");
+            tracing::debug!(target: "codex_core::cache_trace", parent: handle_responses_span, response_id, report, ?reasoning_removals, "reasoning replay report");
             self.counter(
                 crate::metrics::names::REASONING_REPLAY_COUNT_METRIC,
                 1,

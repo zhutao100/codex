@@ -1988,6 +1988,10 @@ pub enum RolloutItem {
     /// Host-owned usage baseline accounting, not conversation input or a UI event.
     TokenUsageContext {
         info: TokenUsageInfo,
+        /// Request model that produced the measured usage; absent for estimates and legacy records.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        source_model: Option<String>,
         #[ts(type = "number")]
         request_context_tokens: i64,
         #[serde(default)]

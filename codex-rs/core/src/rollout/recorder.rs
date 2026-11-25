@@ -828,8 +828,17 @@ impl JsonlWriter {
             item: rollout_item,
         };
         self.write_line(&line).await?;
-        if let RolloutItem::PostTurnCompletionReviewState(state) = rollout_item {
-            self.pending_completion_review_state = Some(state.clone());
+        match rollout_item {
+            RolloutItem::PostTurnCompletionReviewState(state) => {
+                self.pending_completion_review_state = Some(state.clone());
+            }
+            RolloutItem::Compacted(_) | RolloutItem::EventMsg(EventMsg::ThreadRolledBack(_)) => {
+                // Replay invalidates frame anchors here. The first snapshot of the new history
+                // is a new checkpoint even if its JSON equals the one before the marker.
+                self.pending_completion_review_state = None;
+                self.last_flushed_completion_review_state = None;
+            }
+            _ => {}
         }
         Ok(())
     }

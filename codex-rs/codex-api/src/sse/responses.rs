@@ -328,6 +328,33 @@ fn reasoning_removals(response: &Value) -> Option<BTreeMap<ReasoningRemovalReaso
 pub fn process_responses_event(
     event: ResponsesStreamEvent,
 ) -> std::result::Result<Option<ResponseEvent>, ResponsesEventError> {
+    if matches!(event.kind.as_str(), "response.completed" | "response.done")
+        && crate::telemetry::prompt_cache_trace_enabled()
+        && let Some(response) = &event.response
+    {
+        // TokenUsage defaults absent cache detail to zero for accounting. Preserve the actual
+        // receipt separately so a diagnosis never mistakes a missing field for a measured miss.
+        let cached = response
+            .pointer("/usage/input_tokens_details/cached_tokens")
+            .and_then(Value::as_i64);
+        let response_id = response.get("id").and_then(Value::as_str);
+        let model = response.get("model").and_then(Value::as_str);
+        let service_tier = response.get("service_tier").and_then(Value::as_str);
+        let comparison = response.get("prompt_cache_diagnostics");
+        let reported = |field: &str, allowed: &[&str]| {
+            comparison?
+                .get(field)?
+                .as_str()
+                .map(|v| if allowed.contains(&v) { v } else { "other" })
+        };
+        tracing::debug!(target: "codex_core::cache_trace",
+            response_id, model, service_tier,
+            comparison = reported("type", &["cache_hit","cache_miss","comparison_response_not_found","unavailable"]),
+            comparison_reason = reported("reason", &["model_changed","prompt_cache_key_changed","service_tier_changed","tools_changed","text_format_changed","reasoning_effort_changed","verbosity_changed","context_compacted","input_changed"]),
+            comparison_reusable_tokens = comparison.and_then(|d| d.get("comparison_reusable_tokens")?.as_u64()),
+            cache_missed_tokens = comparison.and_then(|d| d.get("cache_missed_tokens")?.as_u64()),
+            cached_tokens_reported = cached.is_some(), cached_tokens = cached, "provider cache receipt");
+    }
     match event.kind.as_str() {
         "response.output_item.done" => {
             if let Some(item_val) = event.item {

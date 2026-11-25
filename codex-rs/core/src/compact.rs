@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crate::Prompt;
 use crate::client::ModelClientSession;
 use crate::client_common::ResponseEvent;
-use crate::completion_review::ReviewPromptFrame;
+use crate::completion_review::ReviewPromptFrames;
 use crate::context_manager::ContextManager;
 use crate::error::CodexErr;
 use crate::error::Result as CodexResult;
@@ -57,7 +57,7 @@ pub(crate) struct CompactionContext<'a> {
     /// Difference between ledger and byte estimates of the same pre-capture transcript.
     pub(crate) source_token_adjustment: i64,
     /// Freeze the work frame across capture, retries and the subsequent compact request.
-    pub(crate) review_frame: Option<ReviewPromptFrame>,
+    pub(crate) review_frames: ReviewPromptFrames,
 }
 
 impl<'a> CompactionContext<'a> {
@@ -66,12 +66,12 @@ impl<'a> CompactionContext<'a> {
             request: context,
             replacement: context,
             source_token_adjustment: 0,
-            review_frame: None,
+            review_frames: ReviewPromptFrames::default(),
         }
     }
 
     pub(crate) fn review_frame_tokens(&self) -> i64 {
-        self.review_frame.as_ref().map_or(0, |frame| frame.tokens)
+        self.review_frames.tokens()
     }
 }
 
@@ -165,7 +165,7 @@ async fn run_compact_task_inner(
     } = prepare_history_for_compaction(
         sess.clone_history().await,
         preserved_work_notes,
-        context.review_frame.as_ref(),
+        Some(&context.review_frames),
     )?;
     let mut history = source_history;
     history.record_items(
@@ -194,11 +194,7 @@ async fn run_compact_task_inner(
             .clone()
             .for_prompt_with_modalities(&turn_context.model_info.input_modalities);
         let turn_input_len = turn_input.len();
-        let frame_tokens = context
-            .review_frame
-            .as_ref()
-            .filter(|frame| turn_input.iter().any(|item| frame.matches_message(item)))
-            .map_or(0, |frame| frame.tokens);
+        let frame_tokens = context.review_frames.retained_tokens(&turn_input);
         let prompt = Prompt {
             input: turn_input,
             base_instructions: sess.get_base_instructions_for_turn(turn_context).await,
@@ -507,7 +503,7 @@ fn build_compacted_history_with_limit(
 pub(crate) fn prepare_history_for_compaction(
     mut history: ContextManager,
     preserved_work_notes: Option<String>,
-    review_frame: Option<&ReviewPromptFrame>,
+    review_frames: Option<&ReviewPromptFrames>,
 ) -> CodexResult<PreparedCompactionInput> {
     let mut items = history.raw_items().to_vec();
 
@@ -525,11 +521,11 @@ pub(crate) fn prepare_history_for_compaction(
         items.splice(pending.request_index..pending.capture_end, controls);
     }
 
-    if let Some(frame) = review_frame {
-        frame.insert(
+    if let Some(frames) = review_frames {
+        frames.insert(
             &mut items,
             pending_notes.as_ref().map(|pending| pending.request_index),
-        );
+        )?;
     }
     let preserved_work_notes = preserved_work_notes
         .and_then(|notes| (!notes.trim().is_empty()).then_some(notes))
@@ -665,12 +661,16 @@ pub(crate) fn is_work_notes_request_item(item: &ResponseItem) -> bool {
         return false;
     }
 
-    let Some(text) = content_items_to_text(content) else {
-        return false;
-    };
-
-    text.trim_start()
-        .starts_with(AUTO_COMPACT_WORK_NOTES_REQUEST_TAG)
+    content
+        .iter()
+        .filter_map(|part| match part {
+            ContentItem::InputText { text } | ContentItem::OutputText { text, .. } => {
+                Some(text.trim_start())
+            }
+            ContentItem::InputImage { .. } => None,
+        })
+        .find(|text| !text.is_empty())
+        .is_some_and(|text| text.starts_with(AUTO_COMPACT_WORK_NOTES_REQUEST_TAG))
 }
 
 pub(crate) fn is_preserved_work_notes_item(item: &ResponseItem) -> bool {

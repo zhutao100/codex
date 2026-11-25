@@ -6,6 +6,8 @@ use crate::completion_review::ReviewHandoff;
 use crate::completion_review::ReviewHandoffDisposition;
 use crate::completion_review::ReviewInputInstallation;
 use crate::completion_review::ReviewPromptFrame;
+use crate::completion_review::ReviewPromptFrames;
+use crate::completion_review::ReviewSampling;
 use crate::completion_review::ReviewTicket;
 
 impl Session {
@@ -59,8 +61,7 @@ impl Session {
                 .lock()
                 .await
                 .completion_review
-                .request_frame
-                .exact = false;
+                .invalidate_request_provenance();
             warn!("failed to persist completion review state: {error}");
             self.send_event_raw(Event {
                 id: self.next_internal_sub_id_with_prefix("completion-review-unavailable"),
@@ -450,7 +451,7 @@ impl Session {
         if review.main_task_id.as_deref() != Some(turn_id) {
             return;
         }
-        review.request_frame.exact = false;
+        review.invalidate_request_provenance();
         review.clear_operations();
         drop(state);
         self.persist_completion_review_locked().await;
@@ -688,25 +689,189 @@ impl Session {
         Self::render_review_instructions(&state, include_reference)
     }
 
-    /// Across a new task or restart, recover the reference choice from the existing usage credit
-    /// when it identifies the full frame. Never add an unverified optional reference to the source.
-    pub(crate) async fn compaction_review_frame(&self) -> CodexResult<Option<ReviewPromptFrame>> {
+    pub(crate) async fn compaction_review_frames(
+        self: &Arc<Self>,
+        context: &Arc<TurnContext>,
+    ) -> CodexResult<ReviewPromptFrames> {
+        let context = Arc::clone(context);
+        self.completion_review_transaction(move |session| async move {
+            session.compaction_review_frames_locked(&context).await
+        })
+        .await
+        .map_err(|e| CodexErr::Fatal(e.to_string()))?
+    }
+
+    async fn compaction_review_frames_locked(
+        &self,
+        context: &TurnContext,
+    ) -> CodexResult<ReviewPromptFrames> {
+        let base = self.get_base_instructions_for_turn(context).await;
         let state = self.state.lock().await;
-        let Some(mandatory) = Self::render_review_instructions(&state, false)? else {
+        let mut frames = state.completion_review.prompt_frames.clone();
+        if state.completion_review.defer_new_prompt_frame {
+            return Ok(frames);
+        }
+        let attempt = Self::active_review_attempt(&state)?;
+        if state.completion_review.replacement_answer_required
+            && state.completion_review.input_revision
+                == state.completion_review.consumed_input_revision
+            && frames.0.last().is_none_or(|f| f.attempt != attempt)
+            && let Some(text) = Self::render_review_instructions(&state, false)?
+        {
+            let items = state.history.raw_items();
+            let marker = items
+                .iter()
+                .rposition(crate::compact::is_work_notes_request_item);
+            let work = &items[..marker.unwrap_or(items.len())];
+            let work_tokens = match marker {
+                Some(index) => state
+                    .history
+                    .work_notes_baseline_at(index, &context.model_info.slug)
+                    .map(|baseline| baseline.work_tokens),
+                None => state.history_tokens_from_usage(&context.model_info.slug),
+            }
+            .unwrap_or_else(|| super::turn::estimate_work_notes_prompt_tokens(work, &base));
+            let new = ReviewPromptFrame::new(text, ReviewPromptFrame::anchor(work), attempt);
+            if work_tokens
+                .saturating_add(frames.tokens())
+                .saturating_add(new.tokens)
+                > super::turn::unsampled_review_token_limit(context)
+            {
+                drop(state);
+                self.record_frame_selection_locked(&frames, Some(&context.model_info.slug))
+                    .await?;
+                return Ok(frames);
+            }
+            frames.0.push(new);
+            drop(state);
+            self.record_frame_selection_locked(&frames, None).await?;
+        }
+        Ok(frames)
+    }
+
+    async fn record_frame_selection_locked(
+        &self,
+        frames: &ReviewPromptFrames,
+        deferred_model: Option<&str>,
+    ) -> CodexResult<()> {
+        {
+            let mut state = self.state.lock().await;
+            state.completion_review.prompt_frames = frames.clone();
+            state.completion_review.defer_new_prompt_frame = deferred_model.is_some();
+            state.completion_review.deferred_capture_model = deferred_model.map(str::to_owned);
+        }
+        if !self.persist_completion_review_locked().await {
+            return Err(CodexErr::Fatal(
+                "Could not persist the selected review frame. No request was sent.".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn active_review_attempt(state: &SessionState) -> CodexResult<Option<String>> {
+        let review = &state.completion_review;
+        if !review.replacement_answer_required {
+            return Ok(None);
+        }
+        let Some(handoff) = &review.handoff else {
             return Ok(None);
         };
-        let mandatory = ReviewPromptFrame::new(mandatory);
-        let credit = state.history.request_context_tokens();
-        if credit > 0
-            && credit != mandatory.tokens
-            && let Some(full) = Self::render_review_instructions(&state, true)?
+        if !matches!(
+            handoff.disposition,
+            ReviewHandoffDisposition::Started { .. }
+        ) || !review.ticket_is_current(&handoff.ticket)
         {
-            let full = ReviewPromptFrame::new(full);
-            if full.tokens == credit {
-                return Ok(Some(full));
+            return Err(CodexErr::Fatal(
+                "Review follow-up snapshots are unavailable. Repair persistence and resume from the last durable rollout, or supply a new complete request. No incomplete follow-up request was sent.".into()
+            ));
+        }
+        Ok(Some(handoff.ticket.attempt_id.clone()))
+    }
+
+    pub(super) async fn review_sampling(
+        self: &Arc<Self>,
+        context: &TurnContext,
+        input: &[ResponseItem],
+        allow_compact: bool,
+    ) -> CodexResult<ReviewSampling> {
+        let target = context
+            .model_context_window()
+            .unwrap_or_default()
+            .saturating_sub(8_192);
+        {
+            let state = self.state.lock().await;
+            if !state.completion_review.replacement_answer_required {
+                return Ok(ReviewSampling::Ready(ReviewPromptFrames::default()));
+            }
+            // Already-admitted tool rounds only read the projection. Avoid spawning a durable
+            // installation transaction or scanning the history for a new anchor on the hot path.
+            let frames = &state.completion_review.prompt_frames;
+            if let Some(frame) = frames.0.last()
+                && frame.attempt == Self::active_review_attempt(&state)?
+                && state
+                    .history_tokens_from_usage(&context.model_info.slug)
+                    .is_some_and(|tokens| tokens.saturating_add(frames.tokens()) <= target)
+            {
+                return Ok(ReviewSampling::Ready(frames.clone()));
             }
         }
-        Ok(Some(mandatory))
+        let anchor = ReviewPromptFrame::anchor(input);
+        let base = self.get_base_instructions_for_turn(context).await;
+        let helper_limit = super::turn::unsampled_review_token_limit(context);
+        let source_model = context.model_info.slug.clone();
+        self.completion_review_transaction(move |session| async move {
+            let state = session.state.lock().await;
+            let attempt = Self::active_review_attempt(&state)?;
+            if !state.completion_review.replacement_answer_required {
+                return Ok(ReviewSampling::Ready(ReviewPromptFrames::default()));
+            }
+            let mut frames = state.completion_review.prompt_frames.clone();
+            let history = state.history_tokens_from_usage(&source_model).unwrap_or_else(|| {
+                state.history.estimate_token_count_with_base_instructions(&base).unwrap_or_default()
+            });
+            let pinned = frames.0.last().is_some_and(|frame| frame.attempt == attempt);
+            let render = |full| -> CodexResult<ReviewPromptFrame> {
+                let text = Self::render_review_instructions(&state, full)?
+                    .ok_or_else(|| CodexErr::Fatal("Missing active review frame.".into()))?;
+                Ok(ReviewPromptFrame::new(text, anchor, attempt.clone()))
+            };
+            if !pinned {
+                let full = render(true)?;
+                let cost = history.saturating_add(frames.tokens()).saturating_add(full.tokens);
+                frames.0.push(if cost <= target { full } else { render(false)? });
+            }
+            let prompt_tokens = history.saturating_add(frames.tokens());
+            if prompt_tokens > target {
+                // Even if omitting the optional reference would now fit, changing a frame that
+                // has governed work would rewrite the hot input. Compact that work unchanged.
+                let mandatory = render(false)?.tokens;
+                if mandatory <= target && allow_compact {
+                    tracing::info!(prompt_tokens, target, pinned, "compacting history to fit review follow-up");
+                    if !pinned && prompt_tokens > helper_limit {
+                        // The started handoff owns the new scope durably. It has governed no
+                        // ordinary work yet. Install it after compacting the outgoing prefix.
+                        let outgoing = state.completion_review.prompt_frames.clone();
+                        drop(state);
+                        session.record_frame_selection_locked(&outgoing, Some(&source_model)).await?;
+                        return Ok(ReviewSampling::Compact);
+                    }
+                } else {
+                    let recovery = if mandatory > target {
+                        "The mandatory review frame alone does not fit. Select a larger context window, then /continue."
+                    } else {
+                        "Compaction did not free enough space. Run /compact or select a larger context window, then /continue."
+                    };
+                    return Err(CodexErr::Fatal(format!(
+                        "Review follow-up context exceeds the main model's payload budget ({prompt_tokens} estimated tokens, {target} available). {recovery} No truncated follow-up request was sent."
+                    )));
+                }
+            }
+            if !pinned {
+                drop(state);
+                session.record_frame_selection_locked(&frames, None).await?;
+            }
+            Ok(if prompt_tokens > target { ReviewSampling::Compact } else { ReviewSampling::Ready(frames) })
+        }).await.map_err(|e| CodexErr::Fatal(e.to_string()))?
     }
 
     fn render_review_instructions(
@@ -728,16 +893,7 @@ impl Session {
                 })?
             )));
         };
-        if !matches!(
-            handoff.disposition,
-            ReviewHandoffDisposition::Started { .. }
-        ) || !review.ticket_is_current(&handoff.ticket)
-        {
-            return Err(CodexErr::Fatal(
-                "Review follow-up snapshots are unavailable. Repair persistence and resume from the last durable rollout, or supply a new complete request. No incomplete follow-up request was sent."
-                    .into(),
-            ));
-        }
+        Self::active_review_attempt(state)?;
         let episode = review
             .eligible_episode()
             .ok_or_else(|| CodexErr::Fatal("Review follow-up candidate is unavailable.".into()))?;
@@ -747,9 +903,15 @@ impl Session {
         } else {
             &handoff.advisory
         };
+        let precedence = if review.prompt_frames.0.first().is_some_and(|frame| {
+            frame.attempt.as_deref() != Some(handoff.ticket.attempt_id.as_str())
+        }) {
+            "\nEarlier review frames describe earlier work. Use the current scope and candidate below; earlier verdicts are not additional user requirements."
+        } else {
+            ""
+        };
         Ok(Some(format!(
-            "{}\n{}",
-            instructions,
+            "{instructions}{precedence}\n{}",
             crate::tasks::post_turn_completion_review::render_completed_turn_context(
                 episode,
                 include_reference
@@ -782,10 +944,10 @@ impl Session {
         }) else {
             return;
         };
-        // ResponseItem IDs are not serialized. Compare the exact host-owned
-        // developer item when recovering a write made before its state flag.
+        // A crash can leave this handoff's advisory at the tail without its state flag.
+        // The same advice *before* intervening work belongs to an earlier review.
         let item: ResponseItem = DeveloperInstructions::new(handoff.advisory).into();
-        let exists = self.clone_history().await.raw_items().contains(&item);
+        let exists = self.state.lock().await.history.raw_items().last() == Some(&item);
         if !exists {
             self.record_conversation_items(context, &[item]).await;
         }

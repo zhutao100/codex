@@ -47,6 +47,29 @@ fn completed_state() -> CompletionReviewState {
 }
 
 #[test]
+fn frame_anchors_survive_pending_input_but_not_consumption_or_fork() {
+    let mut state = completed_state();
+    let frames = ReviewPromptFrames(vec![ReviewPromptFrame::new(
+        "outgoing frame".into(),
+        1,
+        Some("review-1".into()),
+    )]);
+    state.prompt_frames = frames.clone();
+    let revision = state.accept_input(false, text_input("new scope"), None);
+    assert_eq!(state.prompt_frames, frames);
+    let mut forked = state.clone();
+    forked.rebranch();
+    assert!(forked.prompt_frames.is_empty());
+    consume(&mut state, revision);
+    assert!(state.prompt_frames.is_empty());
+
+    let marker =
+        DeveloperInstructions::new(crate::compact::AUTO_COMPACT_WORK_NOTES_REQUEST_TAG).into();
+    let mut orphan = vec![marker];
+    assert!(frames.insert(&mut orphan, Some(0)).is_err());
+}
+
+#[test]
 fn ten_followups_keep_frozen_request_and_initial_reference() {
     let mut state = completed_state();
     let original = state.episode.clone().unwrap();

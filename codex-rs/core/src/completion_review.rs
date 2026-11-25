@@ -11,39 +11,103 @@ use serde::Deserialize;
 use serde::Serialize;
 use uuid::Uuid;
 
-/// The exact request-only frame selected for ordinary work, including its optional-reference choice.
+/// Host-only selections for one consumed user scope, up to the next history replacement.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub(crate) struct ReviewPromptFrames(pub(crate) Vec<ReviewPromptFrame>);
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ReviewPromptFrame {
     item: ResponseItem,
     pub(crate) tokens: i64,
+    after_boundaries: usize,
+    pub(crate) attempt: Option<String>,
 }
 
 impl ReviewPromptFrame {
-    pub(crate) fn new(instructions: String) -> Self {
+    pub(crate) fn anchor(work: &[ResponseItem]) -> usize {
+        work.iter().filter(|item| is_frame_boundary(item)).count()
+    }
+
+    pub(crate) fn new(
+        instructions: String,
+        after_boundaries: usize,
+        attempt: Option<String>,
+    ) -> Self {
         let item = DeveloperInstructions::new(instructions).into();
         Self {
             tokens: estimate_item_token_count(&item),
             item,
+            after_boundaries,
+            attempt,
         }
     }
 
-    pub(crate) fn insert(&self, input: &mut Vec<ResponseItem>, capture_start: Option<usize>) {
-        // A capture marker, its retries and any later acknowledged input are not anchors for
-        // the work frame. Ordinary sampling and compact requests otherwise use the same boundary.
-        let work = &input[..capture_start.unwrap_or(input.len())];
-        let index = work.iter().rposition(|item| {
-            matches!(item, ResponseItem::Message { role, .. }
-                if matches!(role.as_str(), "system" | "developer" | "user"))
-                || matches!(item, ResponseItem::Compaction { .. })
-        });
-        input.insert(index.map_or(0, |i| i + 1), self.item.clone());
-    }
-
-    pub(crate) fn matches_message(&self, item: &ResponseItem) -> bool {
+    fn matches_message(&self, item: &ResponseItem) -> bool {
         // A unary compact response may echo the message with a server-assigned id/status.
         matches!((&self.item, item),
             (ResponseItem::Message { content: expected, .. }, ResponseItem::Message { role, content, .. })
                 if role == "developer" && content == expected)
     }
+}
+
+fn is_frame_boundary(item: &ResponseItem) -> bool {
+    matches!(item, ResponseItem::Message { role, .. } if matches!(role.as_str(), "system" | "developer" | "user"))
+        || matches!(item, ResponseItem::Compaction { .. })
+}
+
+impl ReviewPromptFrames {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub(crate) fn tokens(&self) -> i64 {
+        self.0.iter().map(|frame| frame.tokens).sum()
+    }
+
+    pub(crate) fn insert(
+        &self,
+        input: &mut Vec<ResponseItem>,
+        work_end: Option<usize>,
+    ) -> crate::error::Result<()> {
+        if self.is_empty() {
+            return Ok(());
+        }
+        // Raw history may also contain ghost snapshots or unpaired tool items that normalization
+        // removes. Boundary ordinals, unlike raw/projected offsets, agree in both representations.
+        let anchors: Vec<_> = std::iter::once(0)
+            .chain(
+                input[..work_end.unwrap_or(input.len())]
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, item)| is_frame_boundary(item).then_some(i + 1)),
+            )
+            .collect();
+        for frame in self.0.iter().rev() {
+            let index = anchors.get(frame.after_boundaries).ok_or_else(|| crate::error::CodexErr::Fatal(
+                "The sampled review frame's history boundary is unavailable. No incomplete request was sent.".into()
+            ))?;
+            input.insert(*index, frame.item.clone());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn matches_message(&self, item: &ResponseItem) -> bool {
+        self.0.iter().any(|frame| frame.matches_message(item))
+    }
+
+    pub(crate) fn retained_tokens(&self, input: &[ResponseItem]) -> i64 {
+        input
+            .iter()
+            .filter_map(|item| self.0.iter().find(|frame| frame.matches_message(item)))
+            .map(|frame| frame.tokens)
+            .sum()
+    }
+}
+
+pub(crate) enum ReviewSampling {
+    Ready(ReviewPromptFrames),
+    Compact,
 }
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -159,6 +223,13 @@ pub(crate) struct CompletionReviewState {
     pub(crate) episode: Option<CompletedTurnForReview>,
     pub(crate) attempt: Option<ReviewTicket>,
     pub(crate) handoff: Option<ReviewHandoff>,
+    #[serde(default, skip_serializing_if = "ReviewPromptFrames::is_empty")]
+    pub(crate) prompt_frames: ReviewPromptFrames,
+    /// A checkpoint must finish with the outgoing frames, even if resumed with more headroom.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) defer_new_prompt_frame: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) deferred_capture_model: Option<String>,
 }
 
 impl Default for CompletionReviewState {
@@ -180,14 +251,28 @@ impl Default for CompletionReviewState {
             episode: None,
             attempt: None,
             handoff: None,
+            prompt_frames: ReviewPromptFrames::default(),
+            defer_new_prompt_frame: false,
+            deferred_capture_model: None,
         }
     }
 }
 
 impl CompletionReviewState {
+    pub(crate) fn clear_prompt_frames(&mut self) {
+        self.prompt_frames = ReviewPromptFrames::default();
+        self.defer_new_prompt_frame = false;
+        self.deferred_capture_model = None;
+    }
+
+    pub(crate) fn invalidate_request_provenance(&mut self) {
+        self.request_frame.exact = false;
+        self.clear_prompt_frames();
+    }
+
     pub(crate) fn for_unknown_history() -> Self {
         let mut state = Self::default();
-        state.request_frame.exact = false;
+        state.invalidate_request_provenance();
         state
     }
 
@@ -290,6 +375,7 @@ impl CompletionReviewState {
             self.request_frame.current_user_messages.push(message);
         }
         self.consumed_input_revision = self.consumed_input_revision.max(revision);
+        self.clear_prompt_frames();
     }
 
     pub(crate) fn observe_input_installation(&mut self, item: &ResponseItem) -> bool {
@@ -358,6 +444,7 @@ impl CompletionReviewState {
     }
 
     pub(crate) fn rebranch(&mut self) {
+        self.clear_prompt_frames();
         self.history_generation = Uuid::new_v4().to_string();
         if let Some(episode) = self.episode.as_mut() {
             episode.history_generation = self.history_generation.clone();

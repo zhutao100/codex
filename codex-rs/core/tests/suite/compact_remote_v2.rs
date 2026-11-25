@@ -686,37 +686,128 @@ async fn pause_during_compact_recovers_completed_notes_on_a_fresh_socket() -> Re
 async fn restart_after_compact_failure_recovers_notes_before_sampling() -> Result<()> {
     skip_if_no_network_unless_localhost!(Ok(()));
     let server = responses::start_mock_server().await;
+    let configure = |config: &mut codex_core::config::Config| {
+        config.model = Some("calibration-a".into());
+        config.model_provider.request_max_retries = Some(0);
+        config.model_provider.stream_max_retries = Some(0);
+        config.model_context_window = Some(32_000);
+        config.model_auto_compact_token_limit = Some(27_000);
+        config
+            .model_overlay
+            .get_or_insert_with(Default::default)
+            .cross_model
+            .experimental_supported_tools = Some(vec!["read_file".into()]);
+    };
+    let test = test_codex().with_config(configure).build(&server).await?;
+    let warm = responses::mount_response_sequence(
+        &server,
+        vec![
+            responses::sse_response(responses::sse(vec![
+                responses::ev_function_call(
+                    "plan",
+                    "update_plan",
+                    r#"{"plan":[{"step":"Read evidence","status":"pending"}]}"#,
+                ),
+                responses::ev_completed_with_tokens("a", 4_000),
+            ])),
+            responses::sse_response(responses::sse(vec![responses::ev_completed("unused")]))
+                .set_delay(Duration::from_secs(10)),
+        ],
+    )
+    .await;
+    test.codex.submit(user_input("unfinished task")).await?;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while warm.requests().len() < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await?;
+    assert_eq!(warm.requests()[1].body_json()["model"], "calibration-a");
+    test.codex.submit(Op::Pause).await?;
+    wait_for_event(&test.codex, |e| matches!(e, EventMsg::TurnPaused(_))).await;
+    test.codex
+        .submit(Op::OverrideTurnContext {
+            model: Some("calibration-b".into()),
+            cwd: None,
+            approval_policy: None,
+            sandbox_policy: None,
+            windows_sandbox_level: None,
+            effort: None,
+            summary: None,
+            collaboration_mode: None,
+            personality: None,
+            service_tier: None,
+        })
+        .await?;
+    let path = test.workspace_path("evidence.txt");
+    std::fs::write(&path, "unmodified trailing evidence\n".repeat(150))?;
+    let mut reasoning = responses::ev_reasoning_item("reasoning", &[], &[]);
+    reasoning["item"]["encrypted_content"] = json!("A".repeat(240_000));
     let initial = responses::mount_sse_sequence(
         &server,
         vec![
             responses::sse(vec![
-                responses::ev_shell_command_call("work", "printf work"),
-                responses::ev_completed_with_tokens("work", 1_000_000),
+                reasoning,
+                responses::ev_function_call(
+                    "work",
+                    "read_file",
+                    &json!({"file_path":path}).to_string(),
+                ),
+                responses::ev_completed_with_tokens("work", 27_100),
             ]),
             responses::sse(vec![
                 responses::ev_assistant_message("notes", NOTES),
-                responses::ev_completed("notes"),
+                responses::ev_completed_with_tokens("notes", 31_900),
             ]),
             responses::sse(vec![ev_compaction("discarded")]),
         ],
     )
     .await;
-    let test = test_codex()
-        .with_config(|config| {
-            config.model_provider.request_max_retries = Some(0);
-            config.model_provider.stream_max_retries = Some(0);
-        })
-        .build(&server)
-        .await?;
-    test.codex.submit(user_input("unfinished task")).await?;
+    test.codex.submit(Op::Continue).await?;
     wait_for_event(&test.codex, |event| matches!(event, EventMsg::Error(_))).await;
     complete(&test.codex).await;
-    assert_eq!(initial.requests().len(), 3);
+    let sent = initial.requests();
+    assert_eq!(sent.len(), 3);
+    assert!(
+        sent.iter()
+            .all(|r| r.body_json()["model"] == "calibration-b")
+    );
+    let before_restart = sent[2].input();
+    assert!(before_restart.iter().any(|item| {
+        item["type"] == "function_call_output"
+            && item["output"]
+                .to_string()
+                .contains("unmodified trailing evidence")
+    }));
+    let notes_input = sent[1].input();
+    assert_eq!(
+        &notes_input[..notes_input.len() - 1],
+        &before_restart[..before_restart.len() - 1]
+    );
     test.codex.submit(Op::Shutdown).await?;
     wait_for_event(&test.codex, |event| {
         matches!(event, EventMsg::ShutdownComplete)
     })
     .await;
+    let rollout = test.session_configured.rollout_path.as_ref().unwrap();
+    let mut measured = Vec::new();
+    for line in std::fs::read_to_string(rollout)?.lines() {
+        if let RolloutItem::TokenUsageContext {
+            source_model, info, ..
+        } = serde_json::from_str::<RolloutLine>(line)?.item
+            && info.last_token_usage.input_tokens > 0
+        {
+            measured.push((source_model, info.last_token_usage.input_tokens));
+        }
+    }
+    assert_eq!(
+        measured,
+        vec![
+            (Some("calibration-a".into()), 4_000),
+            (Some("calibration-b".into()), 27_100),
+            (Some("calibration-b".into()), 31_900)
+        ]
+    );
     let followup = responses::mount_sse_sequence(
         &server,
         vec![
@@ -729,20 +820,15 @@ async fn restart_after_compact_failure_recovers_notes_before_sampling() -> Resul
     )
     .await;
     let resumed = test_codex()
-        .resume(
-            &server,
-            test.home.clone(),
-            test.session_configured
-                .rollout_path
-                .as_ref()
-                .unwrap()
-                .clone(),
-        )
+        .with_config(configure)
+        .resume(&server, test.home.clone(), rollout.clone())
         .await?;
     resumed.codex.submit(Op::Continue).await?;
     complete(&resumed.codex).await;
     let requests = followup.requests();
     assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].body_json()["model"], "calibration-b");
+    assert_eq!(requests[0].input(), before_restart);
     assert_compact_request(&requests[0].body_json());
     assert!(
         !requests[0]

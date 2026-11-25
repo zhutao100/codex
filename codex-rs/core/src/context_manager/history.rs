@@ -19,6 +19,23 @@ use codex_protocol::protocol::TokenUsageInfo;
 use codex_protocol::protocol::TurnContextItem;
 use std::ops::Deref;
 
+/// Frozen immediately before recording a capture marker, both live and during rollout replay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorkNotesBaseline {
+    index: usize,
+    model: Option<String>,
+    pub(crate) work_tokens: i64,
+    item_tokens: i64,
+}
+
+impl WorkNotesBaseline {
+    pub(crate) fn adjustment(&self, base: &BaseInstructions) -> i64 {
+        self.work_tokens
+            .saturating_sub(self.item_tokens)
+            .saturating_sub(i64::try_from(approx_token_count(&base.text)).unwrap_or(i64::MAX))
+    }
+}
+
 /// Transcript of thread history
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ContextManager {
@@ -27,9 +44,11 @@ pub(crate) struct ContextManager {
     item_token_estimates: Vec<i64>,
     total_item_tokens: i64,
     token_info: Option<TokenUsageInfo>,
+    source_model: Option<String>,
     /// Items at this index and later are not covered by the stored usage baseline.
     last_usage_item_count: usize,
     request_context_tokens: i64,
+    pub(crate) work_notes_baseline: Option<WorkNotesBaseline>,
     reference_context_item: Option<TurnContextItem>,
 }
 
@@ -40,8 +59,10 @@ impl ContextManager {
             item_token_estimates: Vec::new(),
             total_item_tokens: 0,
             token_info: TokenUsageInfo::new_or_append(&None, &None, None),
+            source_model: None,
             last_usage_item_count: 0,
             request_context_tokens: 0,
+            work_notes_baseline: None,
             reference_context_item: None,
         }
     }
@@ -68,6 +89,7 @@ impl ContextManager {
         covered_item_count: usize,
     ) {
         self.token_info = info;
+        self.source_model = None;
         self.last_usage_item_count = covered_item_count;
         self.request_context_tokens = 0;
     }
@@ -80,8 +102,54 @@ impl ContextManager {
         self.request_context_tokens
     }
 
-    pub(crate) fn set_request_context_tokens(&mut self, tokens: i64) {
+    pub(crate) fn usage_source_model(&self) -> Option<&str> {
+        self.source_model.as_deref()
+    }
+
+    pub(crate) fn set_measured_context(&mut self, tokens: i64, source_model: Option<String>) {
         self.request_context_tokens = tokens;
+        self.source_model = source_model;
+    }
+
+    pub(crate) fn work_usage_without_frames(&self, reasoning_included: bool) -> i64 {
+        self.get_total_token_usage(reasoning_included)
+            .saturating_sub(self.request_context_tokens)
+            .max(0)
+    }
+
+    pub(crate) fn work_notes_baseline_at(
+        &self,
+        index: usize,
+        model: &str,
+    ) -> Option<&WorkNotesBaseline> {
+        self.work_notes_baseline.as_ref().filter(|b| {
+            b.index == index && b.model.as_deref().is_none_or(|measured| measured == model)
+        })
+    }
+
+    pub(crate) fn record_session_item(
+        &mut self,
+        item: &ResponseItem,
+        policy: TruncationPolicy,
+        reasoning_included: bool,
+        legacy_user_model: Option<&str>,
+    ) {
+        if crate::compact::is_work_notes_request_item(item) {
+            self.work_notes_baseline = self
+                .token_info
+                .as_ref()
+                .filter(|info| info.last_token_usage.input_tokens > 0)
+                .map(|_| WorkNotesBaseline {
+                    index: self.items.len(),
+                    model: self
+                        .usage_source_model()
+                        .or(legacy_user_model)
+                        .map(str::to_owned),
+                    work_tokens: self.work_usage_without_frames(reasoning_included),
+                    item_tokens: self.total_item_tokens,
+                });
+        }
+        self.record_items([item], policy);
     }
 
     pub(crate) fn reference_context_item(&self) -> Option<TurnContextItem> {
@@ -93,6 +161,7 @@ impl ContextManager {
     }
 
     pub(crate) fn set_token_usage_full(&mut self, context_window: i64) {
+        self.source_model = None;
         self.last_usage_item_count = self.items.len();
         self.request_context_tokens = 0;
         match &mut self.token_info {
@@ -182,6 +251,24 @@ impl ContextManager {
         Some(base_tokens.saturating_add(self.total_item_tokens))
     }
 
+    /// Start coverage at the installed history, preserving lifetime usage, not the last request.
+    pub(crate) fn reestimate_usage(&mut self, base: &BaseInstructions, window: Option<i64>) {
+        let Some(estimated) = self.estimate_token_count_with_base_instructions(base) else {
+            return;
+        };
+        let mut info = self.token_info.take().unwrap_or(TokenUsageInfo {
+            total_token_usage: TokenUsage::default(),
+            last_token_usage: TokenUsage::default(),
+            model_context_window: None,
+        });
+        info.last_token_usage = TokenUsage {
+            total_tokens: estimated.max(0),
+            ..Default::default()
+        };
+        info.model_context_window = window.or(info.model_context_window);
+        self.set_token_info_with_boundary(Some(info), self.items.len());
+    }
+
     pub(crate) fn remove_first_item(&mut self) {
         if !self.items.is_empty() {
             // Remove the oldest item (front of the list). Items are ordered from
@@ -205,6 +292,7 @@ impl ContextManager {
     }
 
     pub(crate) fn replace(&mut self, items: Vec<ResponseItem>) {
+        self.work_notes_baseline = None;
         self.replace_items(items);
         self.set_token_info(self.token_info.clone());
     }
@@ -217,6 +305,7 @@ impl ContextManager {
             .take_while(|(old, new)| old == new)
             .count();
         self.last_usage_item_count = self.last_usage_item_count.min(unchanged_prefix);
+        self.invalidate_work_notes_from(unchanged_prefix);
         self.replace_items(items);
     }
 
@@ -402,6 +491,7 @@ impl ContextManager {
     }
 
     fn remove_item_at(&mut self, index: usize) -> ResponseItem {
+        self.invalidate_work_notes_from(index);
         let token_estimate = self.item_token_estimates.remove(index);
         let item = self.items.remove(index);
         self.total_item_tokens = self.total_item_tokens.saturating_sub(token_estimate);
@@ -423,6 +513,7 @@ impl ContextManager {
     }
 
     fn truncate_items(&mut self, len: usize) {
+        self.invalidate_work_notes_from(len);
         self.items.truncate(len);
         self.item_token_estimates.truncate(len);
         self.last_usage_item_count = self.last_usage_item_count.min(self.items.len());
@@ -433,7 +524,18 @@ impl ContextManager {
             .fold(0i64, |acc, estimate| acc.saturating_add(*estimate));
     }
 
+    fn invalidate_work_notes_from(&mut self, index: usize) {
+        if self
+            .work_notes_baseline
+            .as_ref()
+            .is_some_and(|b| b.index >= index)
+        {
+            self.work_notes_baseline = None;
+        }
+    }
+
     fn update_item_token_estimate(&mut self, index: usize) {
+        self.invalidate_work_notes_from(index);
         let previous = self.item_token_estimates[index];
         let updated = estimate_item_token_count(&self.items[index]);
         self.item_token_estimates[index] = updated;

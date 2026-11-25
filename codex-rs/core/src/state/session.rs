@@ -93,7 +93,15 @@ impl SessionState {
         I: IntoIterator,
         I::Item: std::ops::Deref<Target = ResponseItem>,
     {
-        self.history.record_items(items, policy);
+        let reasoning = self.server_reasoning_included();
+        let previous_model = self
+            .previous_turn_settings
+            .as_ref()
+            .map(|p| p.model.as_str());
+        for item in items {
+            self.history
+                .record_session_item(&item, policy, reasoning, previous_model);
+        }
     }
 
     pub(crate) fn clone_history(&self) -> ContextManager {
@@ -142,13 +150,24 @@ impl SessionState {
     }
 
     /// Cost of the work transcript, without the previous request-only review frame.
-    pub(crate) fn history_tokens_from_usage(&self) -> Option<i64> {
+    pub(crate) fn history_tokens_from_usage(&self, model: &str) -> Option<i64> {
         self.token_info()
-            .filter(|info| info.last_token_usage.total_tokens > 0)
+            .filter(|info| {
+                info.last_token_usage.total_tokens > 0
+                    && (info.last_token_usage.input_tokens == 0
+                        || self
+                            .history
+                            .usage_source_model()
+                            .or_else(|| {
+                                self.previous_turn_settings
+                                    .as_ref()
+                                    .map(|p| p.model.as_str())
+                            })
+                            .is_none_or(|measured| measured == model))
+            })
             .map(|_| {
-                self.get_total_token_usage(self.server_reasoning_included())
-                    .saturating_sub(self.history.request_context_tokens())
-                    .max(0)
+                self.history
+                    .work_usage_without_frames(self.server_reasoning_included())
             })
     }
 
