@@ -148,12 +148,12 @@ impl From<ResponseCompletedUsage> for TokenUsage {
             input_tokens: val.input_tokens,
             cached_input_tokens: val
                 .input_tokens_details
-                .map(|d| d.cached_tokens)
+                .and_then(|d| d.cached_tokens)
                 .unwrap_or(0),
             output_tokens: val.output_tokens,
             reasoning_output_tokens: val
                 .output_tokens_details
-                .map(|d| d.reasoning_tokens)
+                .and_then(|d| d.reasoning_tokens)
                 .unwrap_or(0),
             total_tokens: val.total_tokens,
         }
@@ -162,12 +162,12 @@ impl From<ResponseCompletedUsage> for TokenUsage {
 
 #[derive(Debug, Deserialize)]
 struct ResponseCompletedInputTokensDetails {
-    cached_tokens: i64,
+    cached_tokens: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ResponseCompletedOutputTokensDetails {
-    reasoning_tokens: i64,
+    reasoning_tokens: Option<i64>,
 }
 
 #[derive(Deserialize, Debug)]

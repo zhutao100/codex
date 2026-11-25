@@ -400,6 +400,198 @@ async fn completion_review_late_input_remains_unreviewed_until_consumed() {
     assert_eq!(episode.final_agent_message, "answer including amendment");
 }
 
+#[test_case::test_case(0, None; "unmeasured exact advice")]
+#[test_case::test_case(1, None; "unmeasured advice one over")]
+#[test_case::test_case(0, Some(true); "schemas shrink to exact fit")]
+#[test_case::test_case(1, Some(false); "schemas grow one over")]
+#[tokio::test]
+async fn review_admission_charges_resolved_tool_schemas(overflow: i64, shrink: Option<bool>) {
+    let (session, mut context) = completed_session().await;
+    let ctx = Arc::get_mut(&mut context).unwrap();
+    ctx.model_info.context_window = Some(40_000);
+    ctx.model_info.effective_context_window_percent = 100;
+    ctx.dynamic_tools.push(DynamicToolSpec {
+        name: "schema_probe".into(),
+        description: String::new(),
+        input_schema: serde_json::json!({"type":"object","properties":{}}),
+    });
+    let ticket = session.begin_completion_review(false).await.unwrap();
+    assert!(
+        session
+            .prepare_completion_review_handoff(
+                &ticket,
+                "Verify the answer.".into(),
+                ctx.model_info.slug.clone()
+            )
+            .await
+    );
+    session
+        .claim_completion_review_handoff(&ticket.attempt_id, "main", false)
+        .await
+        .unwrap();
+    let cancel = CancellationToken::new();
+    let items = session.prompt_history(ctx).await;
+    let specs = super::turn::compaction_tool_specs(&session, ctx, &items, &cancel)
+        .await
+        .unwrap();
+    assert!(specs.wire().iter().any(|t| t["name"] == "schema_probe"));
+    let fixed = specs.tokens();
+    let state = session.state.lock().await;
+    let base = state.base_instructions_for_turn(ctx);
+    let work = state
+        .history
+        .projected_tokens(&base, ctx.helper_projection());
+    let advice = state
+        .completion_review
+        .handoff
+        .as_ref()
+        .unwrap()
+        .advisory_item();
+    drop(state);
+    let extra = super::turn::unsampled_review_token_limit(ctx)
+        - work
+        - fixed
+        - crate::context_manager::estimate_item_token_count(&advice)
+        + overflow;
+    assert!(extra > 1_000);
+    if let Some(shrink) = shrink {
+        if shrink {
+            ctx.dynamic_tools.last_mut().unwrap().description =
+                "a".repeat(4 * (extra as usize + 2000));
+        }
+        let tools = super::turn::compaction_tool_specs(&session, ctx, &items, &cancel)
+            .await
+            .unwrap();
+        let total = work + tools.tokens();
+        let prompt = Prompt {
+            base_instructions: base,
+            tools,
+            ..Default::default()
+        };
+        session
+            .update_token_usage_info_with_request_context(
+                ctx,
+                Some(&TokenUsage {
+                    input_tokens: total,
+                    total_tokens: total,
+                    ..Default::default()
+                }),
+                0,
+                true,
+                items.len(),
+                &prompt,
+            )
+            .await;
+    }
+    ctx.dynamic_tools.last_mut().unwrap().description = "a".repeat(4 * extra as usize);
+    assert_eq!(
+        session
+            .admit_completion_review_advisory(&context, &context, true, &cancel)
+            .await
+            .unwrap(),
+        overflow == 0
+    );
+    if overflow == 0 {
+        let input = session.prompt_history(&context).await;
+        assert_eq!(input.last(), Some(&advice));
+        assert!(matches!(
+            session
+                .review_sampling(&context, &context, &input, fixed + extra, true, &cancel)
+                .await
+                .unwrap(),
+            crate::completion_review::ReviewSampling::Compact
+        ));
+    } else {
+        assert!(!session.prompt_history(&context).await.contains(&advice));
+    }
+    let state = session.state.lock().await;
+    assert!(state.completion_review.prompt_frames.is_empty());
+    assert!(state.completion_review.defer_new_prompt_frame);
+}
+
+#[test_case::test_case(true; "growing base cannot use pinned fast path")]
+#[test_case::test_case(false; "shrinking base avoids compaction")]
+#[tokio::test]
+async fn pinned_review_accounts_for_only_the_instruction_delta(grow: bool) {
+    let (session, mut context) = completed_session().await;
+    let ctx = Arc::get_mut(&mut context).unwrap();
+    ctx.model_info.context_window = Some(40_000);
+    ctx.model_info.effective_context_window_percent = 100;
+    let base = |long| {
+        if long {
+            "Sampled style. ".repeat(300)
+        } else {
+            "Default.".into()
+        }
+    };
+    Arc::make_mut(&mut ctx.config).base_instructions = Some(base(!grow));
+    let ticket = session.begin_completion_review(false).await.unwrap();
+    assert!(
+        session
+            .prepare_completion_review_handoff(
+                &ticket,
+                "Verify the answer.".into(),
+                ctx.model_info.slug.clone()
+            )
+            .await
+    );
+    session
+        .claim_completion_review_handoff(&ticket.attempt_id, "main", false)
+        .await
+        .unwrap();
+    let cancel = CancellationToken::new();
+    assert!(
+        session
+            .admit_completion_review_advisory(&context, &context, false, &cancel)
+            .await
+            .unwrap()
+    );
+    let input = session.prompt_history(&context).await;
+    let tools = super::turn::compaction_tool_specs(&session, &context, &input, &cancel)
+        .await
+        .unwrap();
+    let crate::completion_review::ReviewSampling::Ready(frames) = session
+        .review_sampling(&context, &context, &input, tools.tokens(), true, &cancel)
+        .await
+        .unwrap()
+    else {
+        panic!("expected admitted frame")
+    };
+    let tokens = 40_000 - 8_192 + if grow { -1 } else { 1 };
+    let prompt = Prompt {
+        base_instructions: session.get_base_instructions_for_turn(&context).await,
+        tools: tools.clone(),
+        ..Default::default()
+    };
+    session
+        .update_token_usage_info_with_request_context(
+            &context,
+            Some(&TokenUsage {
+                input_tokens: tokens,
+                total_tokens: tokens,
+                ..Default::default()
+            }),
+            frames.tokens(),
+            true,
+            input.len(),
+            &prompt,
+        )
+        .await;
+    Arc::make_mut(&mut Arc::get_mut(&mut context).unwrap().config).base_instructions =
+        Some(base(grow));
+    match session
+        .review_sampling(&context, &context, &input, tools.tokens(), true, &cancel)
+        .await
+        .unwrap()
+    {
+        crate::completion_review::ReviewSampling::Ready(ready) => {
+            assert!(!grow);
+            assert_eq!(ready, frames);
+        }
+        crate::completion_review::ReviewSampling::Compact => assert!(grow),
+    }
+}
+
 #[tokio::test]
 async fn completion_review_handoff_is_claimed_once_and_survives_compaction() {
     let (session, context) = completed_session().await;
@@ -456,13 +648,13 @@ async fn completion_review_handoff_is_claimed_once_and_survives_compaction() {
     assert!(prompt.contains("advisory plus replacement contract"));
     assert!(
         session
-            .admit_completion_review_advisory(&context, &context, false)
+            .admit_completion_review_advisory(&context, &context, false, &CancellationToken::new())
             .await
             .expect("admit advice")
     );
     assert!(
         session
-            .admit_completion_review_advisory(&context, &context, false)
+            .admit_completion_review_advisory(&context, &context, false, &CancellationToken::new())
             .await
             .expect("admit advice")
     );
@@ -1364,7 +1556,12 @@ impl SessionTask for ReviewInstallationTask {
         if self.main {
             assert!(
                 session
-                    .admit_completion_review_advisory(&context, &context, false)
+                    .admit_completion_review_advisory(
+                        &context,
+                        &context,
+                        false,
+                        &CancellationToken::new()
+                    )
                     .await
                     .expect("admit advice")
             );

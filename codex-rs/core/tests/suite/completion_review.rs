@@ -14,6 +14,9 @@ use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_reasoning_item;
 use pretty_assertions::assert_eq;
 
+#[path = "completion_review_wire_budget.rs"]
+mod wire_budget;
+
 fn answer(text: &str) -> String {
     sse(vec![
         ev_response_created(&Uuid::new_v4().to_string()),
@@ -1357,6 +1360,96 @@ async fn claimed_review_restores_the_uninterrupted_wire_settings() -> anyhow::Re
     Ok(())
 }
 
+#[test_case::test_case(true; "longer destination needs compaction")]
+#[test_case::test_case(false; "shorter destination fits without compaction")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_budget_prices_the_destination_base_after_restart(grow: bool) -> anyhow::Result<()> {
+    skip_if_no_network_unless_localhost!(Ok(()));
+    use codex_protocol::config_types::Personality;
+    let config = |cfg: &mut Config| {
+        cfg.base_instructions = None;
+        let overlay = configure_recovery_windows(cfg, 200_000, 40_000);
+        overlay.cross_model.effective_context_window_percent = Some(100);
+        overlay.models[0].patch.model_messages =
+            Some(codex_core::models_manager::overlay::ModelMessagesPatch {
+                instructions_template: Some(format!(
+                    "Original.\n# Personality\n{}\n# Work\nAnswer.",
+                    "Personality evidence. ".repeat(1_200)
+                )),
+                ..Default::default()
+            });
+    };
+    let personality = |full| {
+        let mut op = context_override(None, None);
+        if let Op::OverrideTurnContext { personality, .. } = &mut op {
+            *personality = Some(if full {
+                Personality::Pragmatic
+            } else {
+                Personality::None
+            });
+        }
+        op
+    };
+    let receipt = if grow { 30_000 } else { 33_000 };
+    let server = MockServer::start().await;
+    let mut replies = vec![
+        sse(vec![
+            ev_assistant_message("candidate", "Initial answer."),
+            ev_completed_with_tokens("candidate", receipt),
+        ]),
+        verdict("Check the answer.", true),
+    ];
+    if grow {
+        replies.extend([
+            answer(REVIEW_WORK_NOTES),
+            compacted_answer_with("base-delta"),
+        ]);
+    }
+    replies.push(answer("Replacement."));
+    let traffic = mount_sse_sequence(&server, replies).await;
+    let home = Arc::new(TempDir::new()?);
+    let codex = new_conversation_for_server(&server, home.clone(), config).await;
+    codex.submit(personality(!grow)).await?;
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "Examine this answer.".into(),
+                text_elements: vec![],
+            }],
+            final_output_json_schema: None,
+        })
+        .await?;
+    wait_for_event(&codex, |e| matches!(e, EventMsg::TurnComplete(_))).await;
+    let path = codex.rollout_path().context("rollout")?;
+    codex.submit(Op::Shutdown).await?;
+    wait_for_event(&codex, |e| matches!(e, EventMsg::ShutdownComplete)).await;
+    let active = resume_conversation_for_server(&server, home, path, config).await;
+    active.submit(personality(grow)).await?;
+    active.submit(Op::ReviewCompletedTurn).await?;
+    wait_for_event(&active, |e| match e {
+        EventMsg::Error(error) => panic!("review admission: {}", error.message),
+        EventMsg::TurnComplete(t) => t.last_agent_message.as_deref() == Some("Replacement."),
+        _ => false,
+    })
+    .await;
+    active.submit(Op::Shutdown).await?;
+    wait_for_event(&active, |e| matches!(e, EventMsg::ShutdownComplete)).await;
+    let requests = traffic.requests();
+    assert_eq!(requests.len(), if grow { 5 } else { 3 });
+    let source = requests[0].instructions_text();
+    let destination = requests.last().context("replacement")?.instructions_text();
+    assert_eq!(source.contains("Personality evidence."), !grow);
+    assert_eq!(destination.contains("Personality evidence."), grow);
+    assert!(source.len().abs_diff(destination.len()) / 4 > 6_000);
+    if grow {
+        assert_review_compaction_cycle(&requests[2..]);
+        for helper in &requests[2..4] {
+            assert_eq!(helper.instructions_text(), source);
+        }
+    }
+    Ok(())
+}
+
 #[test_case::test_case(false, false; "small handoff fits both helpers")]
 #[test_case::test_case(true, false; "oversized unsampled frame")]
 #[test_case::test_case(false, true; "oversized unadmitted advisory")]
@@ -1366,6 +1459,19 @@ async fn new_review_compacts_the_previous_sampled_work_across_restart(
     large_advice: bool,
 ) -> anyhow::Result<()> {
     skip_if_no_network_unless_localhost!(Ok(()));
+    let review_config = |window| {
+        move |cfg: &mut Config| {
+            cfg.base_instructions = None;
+            let overlay = configure_recovery_windows(cfg, 200_000, window);
+            overlay.cross_model.supports_reasoning_summaries = Some(true);
+            let instructions = "Review instructions.\n# Personality\nOriginal style.\n# Work\nAnswer the question.";
+            overlay.models[0].patch.model_messages =
+                Some(codex_core::models_manager::overlay::ModelMessagesPatch {
+                    instructions_template: Some(instructions.into()),
+                    ..Default::default()
+                });
+        }
+    };
     let server = MockServer::start().await;
     let advice = "Verify the outstanding evidence.";
     let incoming = if large_advice {
@@ -1421,8 +1527,7 @@ async fn new_review_compacts_the_previous_sampled_work_across_restart(
     }
     let requests = mount_sse_sequence(&server, replies).await;
     let home = Arc::new(TempDir::new()?);
-    let codex =
-        new_conversation_for_server(&server, home.clone(), recovery_with_effort(24_000)).await;
+    let codex = new_conversation_for_server(&server, home.clone(), review_config(24_000)).await;
     submit_request(&codex, "Verify both results.").await;
     wait_for_event(&codex, |e| matches!(e, EventMsg::TurnComplete(_))).await;
     codex.submit(Op::ReviewCompletedTurn).await?;
@@ -1430,13 +1535,23 @@ async fn new_review_compacts_the_previous_sampled_work_across_restart(
     let path = codex.rollout_path().context("expected rollout")?;
     codex.submit(Op::Shutdown).await?;
     wait_for_event(&codex, |e| matches!(e, EventMsg::ShutdownComplete)).await;
-    let resumed = resume_conversation_for_server(
-        &server,
-        home.clone(),
-        path.clone(),
-        recovery_with_effort(24_000),
-    )
-    .await;
+    let resumed =
+        resume_conversation_for_server(&server, home.clone(), path.clone(), review_config(24_000))
+            .await;
+    if large_advice {
+        let mut change = context_override(None, None);
+        let Op::OverrideTurnContext {
+            personality,
+            service_tier,
+            ..
+        } = &mut change
+        else {
+            unreachable!()
+        };
+        *personality = Some(codex_protocol::config_types::Personality::None);
+        *service_tier = Some("priority".into());
+        resumed.submit(change).await?;
+    }
     resumed.submit(Op::ReviewCompletedTurn).await?;
     let resumed = if defer {
         wait_for_event(&resumed, |e| matches!(e, EventMsg::Error(e) if e.message.contains("exactly one compaction output"))).await;
@@ -1447,7 +1562,7 @@ async fn new_review_compacts_the_previous_sampled_work_across_restart(
             &server,
             home.clone(),
             path.clone(),
-            recovery_with_effort(64_000),
+            review_config(64_000),
         )
         .await;
         active.submit(Op::Continue).await?;
@@ -1472,6 +1587,18 @@ async fn new_review_compacts_the_previous_sampled_work_across_restart(
     let cycle = [captured[4].clone(), captured[5].clone(), last.clone()];
     assert_review_compaction_cycle(&cycle);
     let hot = captured[2].input();
+    if large_advice {
+        assert!(captured[2].instructions_text().contains("Original style."));
+        assert!(!last.instructions_text().contains("Original style."));
+        assert_eq!(last.body_json()["service_tier"], "priority");
+        for helper in &captured[4..captured.len() - 1] {
+            assert_eq!(helper.instructions_text(), captured[2].instructions_text());
+            assert_eq!(
+                helper.body_json()["service_tier"],
+                captured[2].body_json()["service_tier"]
+            );
+        }
+    }
     assert!(
         hot.iter()
             .any(|i| i["call_id"] == "hot-tool" && i["type"] == "function_call_output")
@@ -1560,7 +1687,7 @@ async fn new_review_compacts_the_previous_sampled_work_across_restart(
                 &server,
                 home.clone(),
                 path.clone(),
-                recovery_with_effort(if before_marker { 64_000 } else { 24_000 }),
+                review_config(if before_marker { 64_000 } else { 24_000 }),
             )
             .await;
             if before_marker {

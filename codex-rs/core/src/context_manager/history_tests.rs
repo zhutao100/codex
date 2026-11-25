@@ -143,8 +143,24 @@ fn assert_token_cache_matches(history: &ContextManager) {
         .iter()
         .fold(0i64, |acc, estimate| acc.saturating_add(*estimate));
 
-    assert_eq!(history.item_token_estimates, expected_estimates);
-    assert_eq!(history.total_item_tokens, expected_total);
+    assert_eq!(
+        history
+            .item_token_estimates
+            .iter()
+            .map(|cost| cost.raw)
+            .collect::<Vec<_>>(),
+        expected_estimates
+    );
+    assert_eq!(history.total_item_tokens.raw, expected_total);
+    let mut text_items = history.raw_items().to_vec();
+    super::normalize::strip_images_when_unsupported(&[InputModality::Text], &mut text_items);
+    assert_eq!(
+        history.total_item_tokens.text,
+        text_items
+            .iter()
+            .map(estimate_item_token_count)
+            .sum::<i64>()
+    );
 }
 
 #[test]
@@ -215,6 +231,30 @@ fn filters_non_api_messages() {
             }
         ]
     );
+}
+
+#[test]
+fn projected_legacy_shell_keeps_its_real_successful_result_before_and_after_replay() {
+    let call: ResponseItem = serde_json::from_value(serde_json::json!({
+        "type":"local_shell_call","id":"legacy","status":"completed","encrypted_content":"opaque",
+        "action":{"type":"exec","command":["pwd"]}
+    }))
+    .unwrap();
+    let output = ResponseItem::FunctionCallOutput {
+        call_id: "legacy".into(),
+        output: FunctionCallOutputPayload {
+            body: FunctionCallOutputBody::Text("/work".into()),
+            success: Some(true),
+        },
+    };
+    let admitted = vec![call, output];
+    let wire = serde_json::to_value(&admitted).unwrap();
+    assert_eq!(wire[0]["call_id"], "legacy");
+    let restored = serde_json::from_value(wire.clone()).unwrap();
+    for items in [admitted, restored] {
+        let prompt = ContextManager::prepare_items_for_prompt(items);
+        assert_eq!(serde_json::to_value(&prompt).unwrap(), wire);
+    }
 }
 
 #[test]
@@ -308,7 +348,14 @@ fn helper_fit_uses_measured_work_only_for_a_known_unchanged_user_boundary() {
     let reserve = estimate_item_token_count(&reasoning);
     let mut history =
         create_history_with_items(vec![user_msg("first"), reasoning, user_msg("second")]);
-    assert_eq!(history.helper_tokens_from_usage("source", false), None);
+    assert_eq!(
+        history.helper_tokens_from_usage(
+            "source",
+            false,
+            crate::context_manager::HelperProjection::plain(true)
+        ),
+        None
+    );
     history.update_token_info(
         &TokenUsage {
             input_tokens: 700,
@@ -324,7 +371,14 @@ fn helper_fit_uses_measured_work_only_for_a_known_unchanged_user_boundary() {
     let policy = TruncationPolicy::Tokens(10_000);
     history.record_items([&tool], policy);
     let work = 800 - 40 + estimate_item_token_count(&tool);
-    assert_eq!(history.helper_tokens_from_usage("source", false), None);
+    assert_eq!(
+        history.helper_tokens_from_usage(
+            "source",
+            false,
+            crate::context_manager::HelperProjection::plain(true)
+        ),
+        None
+    );
     assert_eq!(history.work_usage_without_frames(false), work + reserve);
 
     let marker: ResponseItem = codex_protocol::models::DeveloperInstructions::new(
@@ -339,7 +393,10 @@ fn helper_fit_uses_measured_work_only_for_a_known_unchanged_user_boundary() {
         assert_eq!(
             captured
                 .work_notes_baseline_at(start, "source")
-                .map(|b| b.work_tokens),
+                .map(|b| b.work_tokens(
+                    &BaseInstructions::default(),
+                    crate::context_manager::HelperProjection::plain(true)
+                )),
             expected
         );
         assert!(captured.work_notes_baseline_at(start, "other").is_none());
@@ -348,7 +405,11 @@ fn helper_fit_uses_measured_work_only_for_a_known_unchanged_user_boundary() {
     history.record_items([&user_msg("not yet measured")], policy);
     let conservative = history.work_usage_without_frames(false);
     assert_eq!(
-        history.helper_tokens_from_usage("source", false),
+        history.helper_tokens_from_usage(
+            "source",
+            false,
+            crate::context_manager::HelperProjection::plain(true)
+        ),
         Some(conservative)
     );
     let start = history.raw_items().len();
@@ -356,7 +417,10 @@ fn helper_fit_uses_measured_work_only_for_a_known_unchanged_user_boundary() {
     assert_eq!(
         history
             .work_notes_baseline_at(start, "source")
-            .map(|b| b.work_tokens),
+            .map(|b| b.work_tokens(
+                &BaseInstructions::default(),
+                crate::context_manager::HelperProjection::plain(true)
+            )),
         Some(conservative)
     );
 }

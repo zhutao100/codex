@@ -72,6 +72,7 @@ async fn collector_accepts_only_completed_compaction_and_never_records_extra_out
             completed(),
         ]),
         17,
+        &Prompt::default(),
     )
     .await
     .unwrap();
@@ -105,7 +106,8 @@ async fn collector_rejects_invalid_completed_cardinality_but_accounts_for_usage(
             .collect();
         events.push(completed());
         assert!(matches!(
-            collect_compaction_output(&session, &context, stream(events), 0).await,
+            collect_compaction_output(&session, &context, stream(events), 0, &Prompt::default())
+                .await,
             Err(CodexErr::Fatal(_))
         ));
         assert_eq!(session.clone_history().await.raw_items(), &[]);
@@ -131,7 +133,8 @@ async fn collector_discards_partial_summary_on_eof_or_failure() {
             events.push(Err(error));
         }
         assert!(matches!(
-            collect_compaction_output(&session, &context, stream(events), 0).await,
+            collect_compaction_output(&session, &context, stream(events), 0, &Prompt::default())
+                .await,
             Err(CodexErr::Stream(..))
         ));
         assert_eq!(session.clone_history().await.raw_items(), &[]);
@@ -144,6 +147,7 @@ async fn collector_discards_partial_summary_on_eof_or_failure() {
             completed(),
         ]),
         0,
+        &Prompt::default(),
     )
     .await
     .unwrap();
@@ -225,17 +229,23 @@ async fn tail_rewrite_preserves_calls_status_and_live_source() {
     let mut history = ContextManager::new();
     history.replace(vec![call.clone(), output]);
     let source = history.raw_items().to_vec();
-    let mut working = history.clone();
+    let mut working = history
+        .clone()
+        .for_prompt_with_modalities(&context.model_info.input_modalities);
     let base = codex_protocol::models::BaseInstructions {
         text: String::new(),
     };
-    let (count, savings) =
-        trim_function_call_history_to_fit_context_window(&mut working, &context, &base, 0);
+    let (count, savings) = trim_function_call_history_to_fit_context_window(
+        &mut working,
+        source_token_limit(&context),
+        &base,
+        0,
+    );
     assert_eq!(count, 1);
     assert!(savings > 1000);
     assert_eq!(history.raw_items(), source);
     assert_eq!(
-        working.raw_items(),
+        working.as_slice(),
         &[
             call,
             ResponseItem::FunctionCallOutput {
@@ -315,6 +325,7 @@ async fn installation_persists_before_task_stop_and_replays_exactly(pause: bool)
             source: context.session_source.clone(),
             model_provider_id: context.model_provider_id.clone(),
             base_instructions: session.get_base_instructions().await,
+            catalog_instructions_source: None,
             dynamic_tools: vec![],
         },
         None,
@@ -504,7 +515,9 @@ fn work_notes_preparation_keeps_snapshots_that_arrive_during_capture() {
     .into();
     let mut history = ContextManager::new();
     history.replace(vec![request, snapshot.clone()]);
-    let prepared = prepare_history_for_compaction(history, Some("notes".into()), None).unwrap();
+    let prepared =
+        crate::compact::prepare_history_for_compaction(history, Some("notes".into()), None, None)
+            .unwrap();
     assert_eq!(prepared.source_history.raw_items(), &[snapshot]);
     assert_eq!(prepared.source_history.for_prompt(), vec![]);
     assert_eq!(prepared.preserved_work_notes, Some("notes".into()));

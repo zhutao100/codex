@@ -13,6 +13,7 @@ pub(crate) fn is_persisted_response_item(item: &RolloutItem) -> bool {
         | RolloutItem::TurnContext(_)
         | RolloutItem::SessionMeta(_)
         | RolloutItem::ToolOutputPolicy { .. }
+        | RolloutItem::SampledInstructions { .. }
         | RolloutItem::TokenUsageContext { .. }
         | RolloutItem::PostTurnCompletionReviewState(_) => true,
     }

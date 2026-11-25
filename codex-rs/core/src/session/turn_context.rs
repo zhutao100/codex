@@ -43,6 +43,26 @@ pub(crate) struct TurnContext {
     pub(crate) exec_capture_locators: Mutex<HashMap<String, String>>,
 }
 impl TurnContext {
+    pub(crate) fn sampled_reasoning(&self) -> SampledReasoning {
+        SampledReasoning::for_request(&self.model_info, self.reasoning_effort)
+    }
+
+    pub(crate) fn helper_projection(&self) -> crate::context_manager::HelperProjection {
+        crate::context_manager::HelperProjection {
+            images: self.supports_image_inputs(),
+            structured_outputs: matches!(
+                self.tools_config.apply_patch_tool_type,
+                Some(codex_protocol::openai_models::ApplyPatchToolType::Freeform)
+            ),
+        }
+    }
+
+    pub(crate) fn supports_image_inputs(&self) -> bool {
+        self.model_info
+            .input_modalities
+            .contains(&codex_protocol::openai_models::InputModality::Image)
+    }
+
     pub(crate) fn to_turn_context_item(&self) -> TurnContextItem {
         TurnContextItem {
             cwd: self.cwd.clone(),
@@ -252,7 +272,13 @@ impl Session {
         };
 
         Ok(self
-            .new_turn_from_configuration(sub_id, session_configuration, final_output_json_schema)
+            .new_turn_from_configuration(
+                sub_id,
+                session_configuration,
+                final_output_json_schema,
+                None,
+                None,
+            )
             .await)
     }
 
@@ -261,10 +287,15 @@ impl Session {
         sub_id: String,
         session_configuration: SessionConfiguration,
         final_output_json_schema: Option<Option<Value>>,
+        sampled_base: Option<String>,
+        sampled_reasoning: Option<SampledReasoning>,
     ) -> Arc<TurnContext> {
-        let per_turn_config = Self::build_per_turn_config(&session_configuration);
+        let mut per_turn_config = Self::build_per_turn_config(&session_configuration);
+        if let Some(base) = sampled_base {
+            per_turn_config.base_instructions = Some(base);
+        }
 
-        let model_info = self
+        let mut model_info = self
             .services
             .models_manager
             .get_model_info(
@@ -272,6 +303,9 @@ impl Session {
                 &per_turn_config,
             )
             .await;
+        if let Some(reasoning) = sampled_reasoning {
+            reasoning.restore(&mut model_info);
+        }
         let final_instruction_override = self
             .services
             .models_manager
@@ -309,7 +343,7 @@ impl Session {
             let state = self.state.lock().await;
             state.session_configuration.clone()
         };
-        self.new_turn_from_configuration(sub_id, session_configuration, None)
+        self.new_turn_from_configuration(sub_id, session_configuration, None, None, None)
             .await
     }
 
@@ -320,13 +354,27 @@ impl Session {
         settings: &RegularTaskSettings,
     ) -> CodexResult<Arc<TurnContext>> {
         let updates = settings.updates(None);
-        let mut configuration = self
-            .state
-            .lock()
-            .await
-            .session_configuration
-            .apply(&updates)
-            .map_err(|err| CodexErr::Fatal(err.to_string()))?;
+        let (mut configuration, base) = {
+            let state = self.state.lock().await;
+            let base = if let Some(owner) = settings.recorded_base {
+                let Some((_, text)) = state.recorded_bases.iter().find(|(id, _)| *id == owner)
+                else {
+                    return Err(CodexErr::Fatal(
+                        "Cannot restore checkpoint instructions: the referenced base is missing from the rollout".into(),
+                    ));
+                };
+                Some(text.clone())
+            } else {
+                None
+            };
+            (
+                state
+                    .session_configuration
+                    .apply(&updates)
+                    .map_err(|err| CodexErr::Fatal(err.to_string()))?,
+                base,
+            )
+        };
         (configuration.provider_id, configuration.provider) = configuration
             .original_config_do_not_use
             .resolve_model_provider_for_model(settings.mode.model())?;
@@ -335,6 +383,8 @@ impl Session {
                 source.sub_id.clone(),
                 configuration,
                 updates.final_output_json_schema,
+                base,
+                settings.sampled_reasoning,
             )
             .await)
     }

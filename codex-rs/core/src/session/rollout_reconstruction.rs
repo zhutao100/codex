@@ -21,6 +21,10 @@ pub(crate) struct ReconstructedTokenUsage {
     pub(crate) request_context_tokens: i64,
     pub(crate) server_reasoning_included: bool,
     pub(crate) last_usage_item_count: usize,
+    pub(crate) measured_item_tokens: Option<i64>,
+    pub(crate) measured_format_delta: Option<i64>,
+    pub(crate) measured_base_tokens: Option<i64>,
+    pub(crate) measured_tool_tokens: Option<i64>,
     pub(crate) work_notes_baseline: Option<crate::context_manager::WorkNotesBaseline>,
 }
 
@@ -172,15 +176,14 @@ impl Session {
                         checkpoint_after_latest_compaction = true;
                     }
                 }
-                RolloutItem::ToolOutputPolicy { .. } => {}
+                RolloutItem::ToolOutputPolicy { .. } | RolloutItem::SampledInstructions { .. } => {}
                 RolloutItem::Compacted(compacted) => {
                     // The marker alone commits a fresh history. A steer can still arrive
                     // before its first ordinary continuation, even if none was queued at install.
                     awaiting_compact_followup = true;
                     superseded_usage = history.token_info();
                     if let Some(review) = completion_review.as_mut() {
-                        review.pending_compaction = None;
-                        review.clear_prompt_frames();
+                        review.forget_compaction_source();
                     }
                     let has_exact_replacement = compacted.replacement_history.is_some();
                     if let Some(replacement) = &compacted.replacement_history {
@@ -310,7 +313,7 @@ impl Session {
                         && let Some(review) = &mut completion_review
                     {
                         // A positive ordinary receipt can precede the owner's release snapshot.
-                        review.owed_settings = None;
+                        review.release_owed_response(None);
                     }
                     if value["episode"]["automatic_reviews_started"].as_u64() == Some(3)
                         && let Some(review) = completion_review.as_mut()
@@ -330,12 +333,16 @@ impl Session {
                     request_context_tokens,
                     server_reasoning_included: included,
                     last_usage_item_count,
+                    measured_item_tokens,
+                    measured_format_delta,
+                    measured_base_tokens,
+                    measured_tool_tokens,
                 } => {
                     awaiting_adjacent_post_compaction_context = false;
                     if awaiting_compact_followup && info.last_token_usage.input_tokens > 0 {
                         awaiting_compact_followup = false;
                         if let Some(review) = &mut completion_review {
-                            review.owed_settings = None;
+                            review.release_owed_response(None);
                         }
                     }
                     if let Some(covered_item_count) = last_usage_item_count {
@@ -351,6 +358,10 @@ impl Session {
                         (*request_context_tokens).max(0),
                         source_model.clone(),
                     );
+                    history.measured_item_tokens = measured_item_tokens.filter(|cost| *cost >= 0);
+                    history.measured_format_delta = *measured_format_delta;
+                    history.measured_base_tokens = measured_base_tokens.filter(|&cost| cost >= 0);
+                    history.measured_tool_tokens = measured_tool_tokens.filter(|&cost| cost >= 0);
                     superseded_usage = None;
                     server_reasoning_included = *included;
                 }
@@ -383,10 +394,17 @@ impl Session {
             request_context_tokens: history.request_context_tokens(),
             server_reasoning_included,
             last_usage_item_count: history.last_usage_item_count(),
+            measured_item_tokens: history.measured_item_tokens,
+            measured_format_delta: history.measured_format_delta,
+            measured_base_tokens: history.measured_base_tokens,
+            measured_tool_tokens: history.measured_tool_tokens,
             work_notes_baseline: history.work_notes_baseline.clone(),
         });
         let history = history.raw_items().to_vec();
-        let pending_notes = !matches!(compact::pending_work_notes(&history), Ok(None));
+        let pending_notes = history
+            .iter()
+            .rev()
+            .any(compact::is_work_notes_request_item);
         let suppress_compaction_continuation = latest_compaction_tail_kind
             == CompactionTailKind::StandaloneOrPreTurn
             && !checkpoint_after_latest_compaction

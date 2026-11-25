@@ -12,6 +12,7 @@ use codex_protocol::protocol::TurnContextItem;
 use codex_protocol::user_input::UserInput;
 use serde::Deserialize;
 use serde::Serialize;
+use sha2::Digest;
 use uuid::Uuid;
 
 /// Host-only selections for one consumed user scope, up to the next history replacement.
@@ -254,10 +255,50 @@ impl AcceptedReviewInput {
 pub(crate) struct AutoCompactionDecision {
     pub(crate) source: RegularTaskSettings,
     pub(crate) placement: InitialContextInjection,
-    pub(crate) source_token_adjustment: i64,
+    #[serde(default)]
+    pub(crate) source_fit: Option<crate::compact::SourceFit>,
+    #[serde(flatten)]
+    pub(crate) capture: CaptureJournal,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub(crate) struct CaptureJournal {
     /// Zero commits the compact phase. Older records lack per-response capture progress.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) notes_remaining: Option<u8>,
+    /// Relative to the marker, excluding local controls that continuation can remove.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) tagged_calls: Vec<TaggedCaptureCall>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct TaggedCaptureCall {
+    offset: usize,
+    digest: String,
+}
+
+impl TaggedCaptureCall {
+    pub(crate) fn from_item(offset: usize, item: &ResponseItem) -> serde_json::Result<Self> {
+        let mut hash = sha2::Sha256::new();
+        let mut value = serde_json::to_value(item)?;
+        value.sort_all_objects();
+        serde_json::to_writer(&mut hash, &value)?;
+        Ok(Self {
+            offset,
+            digest: format!("{:x}", hash.finalize()),
+        })
+    }
+}
+
+impl CaptureJournal {
+    pub(crate) fn owns_call(&self, offset: usize, item: &ResponseItem) -> bool {
+        self.tagged_calls
+            .iter()
+            .find(|claim| claim.offset == offset)
+            .is_some_and(|claim| {
+                TaggedCaptureCall::from_item(offset, item).is_ok_and(|actual| *claim == actual)
+            })
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -290,6 +331,12 @@ pub(crate) struct CompletionReviewState {
     pub(crate) unsampled_fresh_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) owed_settings: Option<RegularTaskSettings>,
+    /// Still owns a possible checkpoint after the owed response, not another ordinary sample.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) completed_owed_source: Option<RegularTaskSettings>,
+    /// Actual last ordinary request on this work history, not the accepted next task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) last_work_settings: Option<RegularTaskSettings>,
     /// Typed app mentions have no representation in a Responses user message.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) explicit_app_paths: Vec<String>,
@@ -332,6 +379,8 @@ impl Default for CompletionReviewState {
             pending_compaction: None,
             unsampled_fresh_model: None,
             owed_settings: None,
+            completed_owed_source: None,
+            last_work_settings: None,
             explicit_app_paths: Vec::new(),
             unsampled_app_paths: Vec::new(),
             replacement_answer_required: false,
@@ -355,6 +404,20 @@ impl Default for CompletionReviewState {
 }
 
 impl CompletionReviewState {
+    pub(crate) fn release_owed_response(&mut self, sampled: Option<&RegularTaskSettings>) {
+        if let Some(admitted) = self.owed_settings.take() {
+            self.completed_owed_source = Some(sampled.cloned().unwrap_or(admitted));
+        }
+    }
+
+    pub(crate) fn notes_remaining(&self) -> Option<u8> {
+        self.capture_journal()?.notes_remaining
+    }
+
+    pub(crate) fn capture_journal(&self) -> Option<&CaptureJournal> {
+        Some(&self.pending_compaction.as_ref()?.capture)
+    }
+
     pub(crate) fn recovery_capture_source(
         &self,
         fallback_model: &str,
@@ -375,6 +438,13 @@ impl CompletionReviewState {
         self.prompt_frames = ReviewPromptFrames::default();
         self.defer_new_prompt_frame = false;
         self.deferred_capture_source = None;
+    }
+
+    pub(crate) fn forget_compaction_source(&mut self) {
+        self.clear_prompt_frames();
+        self.pending_compaction = None;
+        self.completed_owed_source = None;
+        self.last_work_settings = None;
     }
 
     pub(crate) fn invalidate_request_provenance(&mut self) {
@@ -438,6 +508,7 @@ impl CompletionReviewState {
     ) -> u64 {
         if new_task {
             if self.owed_settings.is_none()
+                && self.completed_owed_source.is_none()
                 && self
                     .pending_inputs
                     .iter()
@@ -486,6 +557,7 @@ impl CompletionReviewState {
             return;
         };
         let input = self.pending_inputs.remove(index);
+        self.completed_owed_source = None;
         if input.new_task {
             self.owed_settings = None;
             self.explicit_app_paths
@@ -633,9 +705,8 @@ impl CompletionReviewState {
     }
 
     pub(crate) fn rebranch(&mut self) {
-        self.clear_prompt_frames();
+        self.forget_compaction_source();
         self.awaiting_compact_followup = false;
-        self.pending_compaction = None;
         self.unsampled_fresh_model = None;
         self.owed_settings = None;
         self.recovery_settings = None;

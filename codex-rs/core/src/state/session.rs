@@ -39,6 +39,8 @@ pub(crate) struct PreviousTurnSettings {
 /// Persistent, session-scoped state previously stored directly on `Session`.
 pub(crate) struct SessionState {
     pub(crate) session_configuration: SessionConfiguration,
+    /// Immutable bases from rollout headers and later sampled instruction records.
+    pub(crate) recorded_bases: Vec<(codex_protocol::ThreadId, String)>,
     pub(crate) history: ContextManager,
     pub(crate) latest_rate_limits: Option<RateLimitSnapshot>,
     /// Whether the stored usage baseline already includes earlier reasoning.
@@ -73,6 +75,7 @@ impl SessionState {
         let history = ContextManager::new();
         Self {
             session_configuration,
+            recorded_bases: Vec::new(),
             history,
             latest_rate_limits: None,
             server_reasoning_included: false,
@@ -153,25 +156,13 @@ impl SessionState {
         })
     }
 
-    /// Cost of the work transcript, without the previous request-only review frame.
-    pub(crate) fn history_tokens_from_usage(&self, model: &str) -> Option<i64> {
-        self.token_info()
-            .filter(|info| {
-                info.last_token_usage.total_tokens > 0
-                    && (info.last_token_usage.input_tokens == 0
-                        || self
-                            .work_source_model()
-                            .is_none_or(|measured| measured == model))
-            })
-            .map(|_| {
-                self.history
-                    .work_usage_without_frames(self.server_reasoning_included())
-            })
-    }
-
-    pub(crate) fn helper_tokens_from_usage(&self, model: &str) -> Option<i64> {
+    pub(crate) fn helper_tokens_from_usage(
+        &self,
+        model: &str,
+        projection: crate::context_manager::HelperProjection,
+    ) -> Option<i64> {
         self.history
-            .helper_tokens_from_usage(model, self.server_reasoning_included())
+            .helper_tokens_from_usage(model, self.server_reasoning_included(), projection)
     }
 
     pub(crate) fn set_server_reasoning_included(&mut self, included: bool) {

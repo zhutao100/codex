@@ -168,6 +168,11 @@ pub(crate) struct RegularTaskSettings {
     personality: Option<Personality>,
     service_tier: Option<String>,
     schema: Option<Value>,
+    /// Refer to the exact sampled bytes without copying instructions into every host checkpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) recorded_base: Option<ThreadId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) sampled_reasoning: Option<SampledReasoning>,
 }
 
 impl RegularTaskSettings {
@@ -185,6 +190,8 @@ impl RegularTaskSettings {
             personality: config.personality,
             service_tier: config.service_tier.clone(),
             schema: None,
+            recorded_base: None,
+            sampled_reasoning: None,
         }
     }
 
@@ -203,6 +210,8 @@ impl RegularTaskSettings {
             personality: ctx.personality,
             service_tier: ctx.service_tier.clone(),
             schema: ctx.final_output_json_schema.clone(),
+            recorded_base: None,
+            sampled_reasoning: None,
         }
     }
 
@@ -278,16 +287,23 @@ impl Session {
                 let conversation_id = ThreadId::default();
                 (
                     conversation_id,
-                    RolloutRecorderParams::new(
+                    RolloutRecorderParams::Create {
                         conversation_id,
                         forked_from_id,
-                        session_source,
-                        session_configuration.provider_id.clone(),
-                        BaseInstructions {
+                        source: session_source,
+                        model_provider_id: session_configuration.provider_id.clone(),
+                        base_instructions: BaseInstructions {
                             text: session_configuration.base_instructions.clone(),
                         },
-                        session_configuration.dynamic_tools.clone(),
-                    ),
+                        catalog_instructions_source: session_configuration
+                            .uses_catalog_base_instructions
+                            .then(|| codex_protocol::protocol::CatalogInstructionsSource {
+                                model: session_configuration.collaboration_mode.model().into(),
+                                personality_disabled: session_configuration.personality
+                                    == Some(Personality::None),
+                            }),
+                        dynamic_tools: session_configuration.dynamic_tools.clone(),
+                    },
                 )
             }
             InitialHistory::Resumed(resumed_history) => (

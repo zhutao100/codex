@@ -54,6 +54,11 @@ async fn compare_completed_work_and_sibling_compact_on_http_and_websocket() -> R
         cold["response"]["input_transformations"] = json!([]);
         cold["response"]["prompt_cache_diagnostics"] =
             json!({"type":"cache_miss","reason":"model_changed","cache_missed_tokens":27_000});
+        let mut missing = responses::ev_completed_with_tokens("work", 28_000);
+        missing["response"]["usage"]["input_tokens_details"] = json!({});
+        let mut unavailable = responses::ev_completed_with_tokens("notes-first", 28_010);
+        unavailable["response"]["usage"]["input_tokens_details"] = json!({"cached_tokens":null});
+        unavailable["response"]["usage"]["output_tokens_details"] = json!({});
         let streams = vec![
             vec![
                 responses::ev_function_call(
@@ -61,11 +66,11 @@ async fn compare_completed_work_and_sibling_compact_on_http_and_websocket() -> R
                     "read_file",
                     &json!({"file_path":private_path}).to_string(),
                 ),
-                responses::ev_completed_with_tokens("work", 28_000),
+                missing,
             ],
             vec![
                 responses::ev_assistant_message("notes-first", "Not a valid checkpoint."),
-                responses::ev_completed_with_tokens("notes-first", 28_010),
+                unavailable,
             ],
             vec![
                 responses::ev_assistant_message(
@@ -191,9 +196,12 @@ async fn compare_completed_work_and_sibling_compact_on_http_and_websocket() -> R
                 .any(|l| l.contains("comparison_reason=\"model_changed\"")
                     && l.contains("cache_missed_tokens=27000"))
         );
-        assert!(lines.lines().any(|l| l.contains("provider cache receipt")
-            && l.contains("response_id=\"work\"")
-            && l.contains("cached_tokens_reported=false")));
+        for (id, input) in [("work", 28_000), ("notes-first", 28_010)] {
+            assert!(lines.lines().any(|l| l.contains("provider cache receipt")
+                && l.contains(&format!("response_id=\"{id}\""))
+                && l.contains("cached_tokens_reported=false")));
+            assert!(comparison(id, "previous")?.contains(&format!("input_tokens={input}")));
+        }
         assert!(lines.lines().any(|l| l.contains("reasoning replay report")
             && l.contains("response_id=\"compact\"")
             && l.contains("no_removals_reported")));

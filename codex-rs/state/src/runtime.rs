@@ -903,6 +903,7 @@ fn extract_dynamic_tools(items: &[RolloutItem]) -> Option<Option<Vec<DynamicTool
         | RolloutItem::Compacted(_)
         | RolloutItem::TurnContext(_)
         | RolloutItem::ToolOutputPolicy { .. }
+        | RolloutItem::SampledInstructions { .. }
         | RolloutItem::TokenUsageContext { .. }
         | RolloutItem::PostTurnCompletionReviewState(_)
         | RolloutItem::EventMsg(_) => None,

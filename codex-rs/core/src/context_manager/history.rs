@@ -1,3 +1,4 @@
+use crate::client_common::ShellOutputFormatter;
 use crate::context_manager::normalize;
 use crate::event_mapping::is_contextual_user_message_content;
 use crate::event_mapping::is_pre_turn_dev_message_content;
@@ -19,21 +20,132 @@ use codex_protocol::protocol::TokenUsageInfo;
 use codex_protocol::protocol::TurnContextItem;
 use std::ops::Deref;
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HelperProjection {
+    pub(crate) images: bool,
+    pub(crate) structured_outputs: bool,
+}
+
+impl HelperProjection {
+    pub(crate) fn plain(images: bool) -> Self {
+        Self {
+            images,
+            structured_outputs: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WorkBudget {
+    Helper,
+    Review,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ProjectionCost {
+    raw: i64,
+    text: i64,
+    structured_delta: i64,
+}
+
+impl ProjectionCost {
+    fn of(item: &ResponseItem, formatter: &mut ShellOutputFormatter) -> Self {
+        let raw = estimate_item_token_count(item);
+        let has_image = match item {
+            ResponseItem::Message { content, .. } => content
+                .iter()
+                .any(|p| matches!(p, ContentItem::InputImage { .. })),
+            ResponseItem::FunctionCallOutput { output, .. } => {
+                output.content_items().is_some_and(|parts| {
+                    parts
+                        .iter()
+                        .any(|p| matches!(p, FunctionCallOutputContentItem::InputImage { .. }))
+                })
+            }
+            _ => false,
+        };
+        let text = if has_image {
+            let mut projected = item.clone();
+            normalize::strip_images_when_unsupported(
+                &[InputModality::Text],
+                std::slice::from_mut(&mut projected),
+            );
+            estimate_item_token_count(&projected)
+        } else {
+            raw
+        };
+        let structured_delta = formatter
+            .project(item)
+            .map_or(0, |wire| estimate_item_token_count(&wire) - raw);
+        Self {
+            raw,
+            text,
+            structured_delta,
+        }
+    }
+
+    fn get(self, projection: HelperProjection) -> i64 {
+        let cost = if projection.images {
+            self.raw
+        } else {
+            self.text
+        };
+        cost + if projection.structured_outputs {
+            self.structured_delta
+        } else {
+            0
+        }
+    }
+    fn add(self, rhs: Self) -> Self {
+        Self {
+            raw: self.raw.saturating_add(rhs.raw),
+            text: self.text.saturating_add(rhs.text),
+            structured_delta: self.structured_delta.saturating_add(rhs.structured_delta),
+        }
+    }
+    fn sub(self, rhs: Self) -> Self {
+        Self {
+            raw: self.raw.saturating_sub(rhs.raw),
+            text: self.text.saturating_sub(rhs.text),
+            structured_delta: self.structured_delta.saturating_sub(rhs.structured_delta),
+        }
+    }
+}
+
 /// Frozen immediately before recording a capture marker, both live and during rollout replay.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WorkNotesBaseline {
     index: usize,
     model: String,
-    pub(crate) work_tokens: i64,
-    item_tokens: i64,
+    // [images][structured shell outputs]. Each mode respects the receipt's input floor.
+    work: [[i64; 2]; 2],
+    items: ProjectionCost,
+    measured_base_tokens: Option<i64>,
+    pub(crate) measured_tool_tokens: Option<i64>,
 }
 
 impl WorkNotesBaseline {
-    pub(crate) fn adjustment(&self, base: &BaseInstructions) -> i64 {
-        self.work_tokens
-            .saturating_sub(self.item_tokens)
-            .saturating_sub(i64::try_from(approx_token_count(&base.text)).unwrap_or(i64::MAX))
+    pub(crate) fn work_tokens(&self, base: &BaseInstructions, projection: HelperProjection) -> i64 {
+        self.work[usize::from(projection.images)][usize::from(projection.structured_outputs)]
+            .saturating_add(instruction_delta(base, self.measured_base_tokens))
+            .max(0)
     }
+
+    pub(crate) fn projected_tokens(
+        &self,
+        base: &BaseInstructions,
+        projection: HelperProjection,
+    ) -> i64 {
+        self.items
+            .get(projection)
+            .saturating_add(approx_token_count(&base.text) as i64)
+    }
+}
+
+fn instruction_delta(base: &BaseInstructions, measured: Option<i64>) -> i64 {
+    measured.map_or(0, |cost| {
+        (approx_token_count(&base.text) as i64).saturating_sub(cost)
+    })
 }
 
 /// Transcript of thread history
@@ -41,8 +153,16 @@ impl WorkNotesBaseline {
 pub(crate) struct ContextManager {
     /// The oldest items are at the beginning of the vector.
     items: Vec<ResponseItem>,
-    item_token_estimates: Vec<i64>,
-    total_item_tokens: i64,
+    item_token_estimates: Vec<ProjectionCost>,
+    output_formatter: ShellOutputFormatter,
+    total_item_tokens: ProjectionCost,
+    original_covered_cost: ProjectionCost,
+    /// Model-projected local cost of the prefix covered by a positive provider receipt.
+    /// Unlike the current coverage boundary, it is not reduced by continuation cleanup.
+    pub(crate) measured_item_tokens: Option<i64>,
+    pub(crate) measured_format_delta: Option<i64>,
+    pub(crate) measured_base_tokens: Option<i64>,
+    pub(crate) measured_tool_tokens: Option<i64>,
     token_info: Option<TokenUsageInfo>,
     source_model: Option<String>,
     /// Items at this index and later are not covered by the stored usage baseline.
@@ -57,7 +177,13 @@ impl ContextManager {
         Self {
             items: Vec::new(),
             item_token_estimates: Vec::new(),
-            total_item_tokens: 0,
+            output_formatter: ShellOutputFormatter::default(),
+            total_item_tokens: ProjectionCost::default(),
+            original_covered_cost: ProjectionCost::default(),
+            measured_item_tokens: None,
+            measured_format_delta: None,
+            measured_base_tokens: None,
+            measured_tool_tokens: None,
             token_info: TokenUsageInfo::new_or_append(&None, &None, None),
             source_model: None,
             last_usage_item_count: 0,
@@ -90,7 +216,16 @@ impl ContextManager {
     ) {
         self.token_info = info;
         self.source_model = None;
-        self.last_usage_item_count = covered_item_count;
+        self.last_usage_item_count = covered_item_count.min(self.items.len());
+        self.original_covered_cost = if self.last_usage_item_count == 0 {
+            ProjectionCost::default()
+        } else {
+            self.total_item_tokens.sub(self.uncovered_cost())
+        };
+        self.measured_item_tokens = None;
+        self.measured_format_delta = None;
+        self.measured_base_tokens = None;
+        self.measured_tool_tokens = None;
         self.request_context_tokens = 0;
     }
 
@@ -100,6 +235,18 @@ impl ContextManager {
 
     pub(crate) fn request_context_tokens(&self) -> i64 {
         self.request_context_tokens
+    }
+
+    pub(crate) fn mark_measured_projection(&mut self, projection: HelperProjection) {
+        let plain = self
+            .original_covered_cost
+            .get(HelperProjection::plain(projection.images));
+        self.measured_item_tokens = Some(plain);
+        self.measured_format_delta = Some(self.original_covered_cost.get(projection) - plain);
+    }
+
+    pub(crate) fn base_delta(&self, base: &BaseInstructions) -> i64 {
+        instruction_delta(base, self.measured_base_tokens)
     }
 
     pub(crate) fn usage_source_model(&self) -> Option<&str> {
@@ -124,6 +271,33 @@ impl ContextManager {
         &self,
         model: &str,
         reasoning_included: bool,
+        projection: HelperProjection,
+    ) -> Option<i64> {
+        self.projected_work_usage(model, reasoning_included, projection, WorkBudget::Helper)
+    }
+
+    pub(crate) fn review_transcript_tokens(
+        &self,
+        model: &str,
+        base: &BaseInstructions,
+        reasoning_included: bool,
+        projection: HelperProjection,
+    ) -> Option<i64> {
+        self.measured_base_tokens?;
+        let tools = self.measured_tool_tokens?;
+        Some(
+            self.projected_work_usage(model, reasoning_included, projection, WorkBudget::Review)?
+                .saturating_add(self.base_delta(base))
+                .saturating_sub(tools),
+        )
+    }
+
+    fn projected_work_usage(
+        &self,
+        model: &str,
+        reasoning_included: bool,
+        projection: HelperProjection,
+        budget: WorkBudget,
     ) -> Option<i64> {
         let usage = &self.token_info.as_ref()?.last_token_usage;
         if usage.total_tokens <= 0 {
@@ -131,24 +305,52 @@ impl ContextManager {
         }
         if usage.input_tokens == 0 {
             // Local replacement estimate, not a measurement of the old history.
-            return self
-                .usage_source_model()
-                .is_none()
-                .then(|| self.work_usage_without_frames(reasoning_included));
+            return self.usage_source_model().is_none().then(|| {
+                self.work_usage_without_frames(reasoning_included)
+                    .saturating_add(
+                        self.total_item_tokens.get(projection) - self.total_item_tokens.raw,
+                    )
+                    .max(0)
+            });
         }
         if self.usage_source_model() != Some(model) {
             return None;
         }
-        if self.items[self.last_usage_item_count..]
-            .iter()
-            .any(is_user_turn_boundary)
+        let tail = self.uncovered_cost().get(projection);
+        let retained = self.total_item_tokens.get(projection).saturating_sub(tail);
+        let measured = self
+            .measured_item_tokens
+            .unwrap_or(
+                self.original_covered_cost
+                    .get(HelperProjection::plain(projection.images)),
+            )
+            .saturating_add(self.measured_format_delta.unwrap_or(
+                if projection.structured_outputs {
+                    self.original_covered_cost.structured_delta
+                } else {
+                    0
+                },
+            ));
+        // Cleanup can discard covered sampled output, never the already-billed input.
+        let change = retained
+            .saturating_sub(measured)
+            .max(-usage.output_tokens.max(0));
+        let reserve = if !reasoning_included
+            && (budget == WorkBudget::Review
+                || self.items[self.last_usage_item_count..]
+                    .iter()
+                    .any(is_user_turn_boundary))
         {
-            return Some(self.work_usage_without_frames(reasoning_included));
-        }
+            self.get_non_last_reasoning_items_tokens()
+        } else {
+            0
+        };
         Some(
             usage
                 .total_tokens
-                .saturating_add(self.uncovered_item_tokens())
+                .saturating_add(change)
+                .saturating_add(tail)
+                .saturating_add(reserve)
                 .saturating_sub(self.request_context_tokens)
                 .max(0),
         )
@@ -172,11 +374,26 @@ impl ContextManager {
     ) {
         if crate::compact::is_work_notes_request_item(item) {
             self.work_notes_baseline = self.usage_source_model().and_then(|model| {
+                let work = |images, structured_outputs| {
+                    self.helper_tokens_from_usage(
+                        model,
+                        reasoning_included,
+                        HelperProjection {
+                            images,
+                            structured_outputs,
+                        },
+                    )
+                };
                 Some(WorkNotesBaseline {
                     index: self.items.len(),
                     model: model.to_owned(),
-                    work_tokens: self.helper_tokens_from_usage(model, reasoning_included)?,
-                    item_tokens: self.total_item_tokens,
+                    work: [
+                        [work(false, false)?, work(false, true)?],
+                        [work(true, false)?, work(true, true)?],
+                    ],
+                    items: self.total_item_tokens,
+                    measured_base_tokens: self.measured_base_tokens,
+                    measured_tool_tokens: self.measured_tool_tokens,
                 })
             });
         }
@@ -193,6 +410,10 @@ impl ContextManager {
 
     pub(crate) fn set_token_usage_full(&mut self, context_window: i64) {
         self.source_model = None;
+        self.measured_item_tokens = None;
+        self.measured_format_delta = None;
+        self.measured_base_tokens = None;
+        self.measured_tool_tokens = None;
         self.last_usage_item_count = self.items.len();
         self.request_context_tokens = 0;
         match &mut self.token_info {
@@ -279,7 +500,24 @@ impl ContextManager {
         let base_tokens =
             i64::try_from(approx_token_count(&base_instructions.text)).unwrap_or(i64::MAX);
 
-        Some(base_tokens.saturating_add(self.total_item_tokens))
+        Some(base_tokens.saturating_add(self.total_item_tokens.raw))
+    }
+
+    pub(crate) fn projected_tokens(
+        &self,
+        base: &BaseInstructions,
+        projection: HelperProjection,
+    ) -> i64 {
+        self.projected_prefix_tokens(self.items.len(), projection)
+            .saturating_add(i64::try_from(approx_token_count(&base.text)).unwrap_or(i64::MAX))
+    }
+
+    pub(crate) fn projected_prefix_tokens(&self, end: usize, projection: HelperProjection) -> i64 {
+        self.total_item_tokens.get(projection).saturating_sub(
+            self.item_token_estimates[end..]
+                .iter()
+                .fold(0i64, |sum, cost| sum.saturating_add(cost.get(projection))),
+        )
     }
 
     /// Start coverage at the installed history, preserving lifetime usage, not the last request.
@@ -335,7 +573,15 @@ impl ContextManager {
             .zip(&items)
             .take_while(|(old, new)| old == new)
             .count();
-        self.last_usage_item_count = self.last_usage_item_count.min(unchanged_prefix);
+        // Continuation only removes items. Keep all surviving members of the measured
+        // prefix covered, including the completed sibling of an earlier unmatched call.
+        let mut covered = self.last_usage_item_count.min(unchanged_prefix);
+        for original in &self.items[covered..self.last_usage_item_count] {
+            if items.get(covered) == Some(original) {
+                covered += 1;
+            }
+        }
+        self.last_usage_item_count = covered;
         self.invalidate_work_notes_from(unchanged_prefix);
         self.replace_items(items);
     }
@@ -441,7 +687,7 @@ impl ContextManager {
                     }
                 )
             })
-            .fold(0i64, |acc, (_, estimate)| acc.saturating_add(*estimate))
+            .fold(0i64, |acc, (_, estimate)| acc.saturating_add(estimate.raw))
     }
 
     fn last_model_item_count(&self) -> Option<usize> {
@@ -463,9 +709,14 @@ impl ContextManager {
     }
 
     fn uncovered_item_tokens(&self) -> i64 {
+        self.uncovered_cost().raw
+    }
+
+    fn uncovered_cost(&self) -> ProjectionCost {
         self.item_token_estimates[self.last_usage_item_count..]
             .iter()
-            .fold(0i64, |acc, estimate| acc.saturating_add(*estimate))
+            .copied()
+            .fold(ProjectionCost::default(), ProjectionCost::add)
     }
 
     pub(crate) fn get_unreported_token_usage(&self, server_reasoning_included: bool) -> i64 {
@@ -513,8 +764,8 @@ impl ContextManager {
     }
 
     fn push_item(&mut self, item: ResponseItem) {
-        let token_estimate = estimate_item_token_count(&item);
-        self.total_item_tokens = self.total_item_tokens.saturating_add(token_estimate);
+        let token_estimate = ProjectionCost::of(&item, &mut self.output_formatter);
+        self.total_item_tokens = self.total_item_tokens.add(token_estimate);
         self.item_token_estimates.push(token_estimate);
         self.items.push(item);
     }
@@ -529,7 +780,11 @@ impl ContextManager {
         self.invalidate_work_notes_from(index);
         let token_estimate = self.item_token_estimates.remove(index);
         let item = self.items.remove(index);
-        self.total_item_tokens = self.total_item_tokens.saturating_sub(token_estimate);
+        if let Some(call) = super::ToolCallId::from_call(&item) {
+            let (super::ToolCallId::Function(id) | super::ToolCallId::Custom(id)) = call;
+            self.output_formatter.forget(id);
+        }
+        self.total_item_tokens = self.total_item_tokens.sub(token_estimate);
         if index < self.last_usage_item_count {
             self.last_usage_item_count -= 1;
         }
@@ -550,13 +805,9 @@ impl ContextManager {
     fn truncate_items(&mut self, len: usize) {
         self.invalidate_work_notes_from(len);
         self.items.truncate(len);
-        self.item_token_estimates.truncate(len);
         self.last_usage_item_count = self.last_usage_item_count.min(self.items.len());
         self.request_context_tokens = 0;
-        self.total_item_tokens = self
-            .item_token_estimates
-            .iter()
-            .fold(0i64, |acc, estimate| acc.saturating_add(*estimate));
+        self.rebuild_token_estimates();
     }
 
     fn invalidate_work_notes_from(&mut self, index: usize) {
@@ -572,20 +823,24 @@ impl ContextManager {
     fn update_item_token_estimate(&mut self, index: usize) {
         self.invalidate_work_notes_from(index);
         let previous = self.item_token_estimates[index];
-        let updated = estimate_item_token_count(&self.items[index]);
+        // Image substitution changes a multipart result; it is not a shell text envelope.
+        let updated = ProjectionCost::of(&self.items[index], &mut ShellOutputFormatter::default());
         self.item_token_estimates[index] = updated;
-        self.total_item_tokens = self
-            .total_item_tokens
-            .saturating_sub(previous)
-            .saturating_add(updated);
+        self.total_item_tokens = self.total_item_tokens.sub(previous).add(updated);
     }
 
     fn rebuild_token_estimates(&mut self) {
-        self.item_token_estimates = self.items.iter().map(estimate_item_token_count).collect();
+        self.output_formatter = ShellOutputFormatter::default();
+        self.item_token_estimates = self
+            .items
+            .iter()
+            .map(|item| ProjectionCost::of(item, &mut self.output_formatter))
+            .collect();
         self.total_item_tokens = self
             .item_token_estimates
             .iter()
-            .fold(0i64, |acc, estimate| acc.saturating_add(*estimate));
+            .copied()
+            .fold(ProjectionCost::default(), ProjectionCost::add);
     }
 
     fn process_item(&self, item: &ResponseItem, policy: TruncationPolicy) -> ResponseItem {

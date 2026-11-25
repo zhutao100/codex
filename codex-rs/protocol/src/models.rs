@@ -126,6 +126,7 @@ pub enum ResponseItem {
         content: Option<Vec<ReasoningItemContent>>,
         encrypted_content: Option<String>,
     },
+    #[serde(deserialize_with = "deserialize_shell_call")]
     LocalShellCall {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
@@ -221,6 +222,38 @@ pub enum ResponseItem {
 }
 
 pub const BASE_INSTRUCTIONS_DEFAULT: &str = include_str!("prompts/base_instructions/default.md");
+
+// Older streams use the item ID for pairing. Admit that ID as a call ID before
+// transport continuation, history normalization or rollout serialization sees it.
+type ShellCallFields = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    LocalShellStatus,
+    LocalShellAction,
+);
+
+fn deserialize_shell_call<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<ShellCallFields, D::Error> {
+    #[derive(Deserialize)]
+    struct Wire {
+        encrypted_content: Option<String>,
+        id: Option<String>,
+        call_id: Option<String>,
+        status: LocalShellStatus,
+        action: LocalShellAction,
+    }
+    let Wire {
+        encrypted_content,
+        id,
+        call_id,
+        status,
+        action,
+    } = Wire::deserialize(deserializer)?;
+    let call_id = call_id.or_else(|| id.clone());
+    Ok((encrypted_content, id, call_id, status, action))
+}
 
 impl ResponseItem {
     pub fn item_type(&self) -> &'static str {
@@ -1155,6 +1188,26 @@ mod tests {
     use pretty_assertions::assert_eq;
     use std::path::PathBuf;
     use tempfile::tempdir;
+
+    #[test]
+    fn shell_pairing_id_survives_admission_and_replay() {
+        for (id, call, expected) in [
+            (Some("item"), None, Some("item")),
+            (Some("item"), Some("call"), Some("call")),
+            (None, None, None),
+        ] {
+            let action = serde_json::json!({"type":"exec","command":["pwd"],"timeout_ms":null,"working_directory":null,"env":null,"user":null});
+            let wire = serde_json::json!({"type":"local_shell_call","encrypted_content":"sampled","id":id,"call_id":call,"status":"completed","action":action});
+            let admitted: ResponseItem = serde_json::from_value(wire).unwrap();
+            let durable = serde_json::to_value(admitted).unwrap();
+            assert_eq!(
+                durable,
+                serde_json::json!({"type":"local_shell_call","encrypted_content":"sampled","call_id":expected,"status":"completed","action":action})
+            );
+            let restored: ResponseItem = serde_json::from_value(durable.clone()).unwrap();
+            assert_eq!(serde_json::to_value(restored).unwrap(), durable);
+        }
+    }
 
     #[test]
     fn convert_mcp_content_to_items_preserves_data_urls() {

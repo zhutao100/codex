@@ -30,9 +30,11 @@ impl SessionTask for CompactTask {
     ) -> Option<String> {
         let session = session.clone_session();
         let mut context = CompactionContext::new(&ctx);
-        context.source_token_adjustment =
-            crate::session::turn::compaction_source_token_adjustment(&session, &ctx).await;
-        context.review_frames = match session.compaction_review_frames(&ctx).await {
+        context.source_fit = crate::session::turn::compaction_source_fit(&session, &ctx).await;
+        context.review_frames = match session
+            .compaction_review_frames(&ctx, &cancellation_token)
+            .await
+        {
             Ok(frame) => frame,
             Err(error) => {
                 session

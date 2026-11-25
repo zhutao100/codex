@@ -331,6 +331,7 @@ async fn load_rollout_items_ignores_custom_pause_continue_events() -> Result<()>
                 source: SessionSource::Cli,
                 model_provider: Some(TEST_PROVIDER.to_string()),
                 base_instructions: None,
+                catalog_instructions_source: None,
                 dynamic_tools: None,
             },
             git: None,
@@ -449,6 +450,10 @@ async fn clean_for_continue_removes_abort_custom_and_dangling_records() -> Resul
         request_context_tokens: 5_000,
         server_reasoning_included: true,
         last_usage_item_count: None,
+        measured_item_tokens: None,
+        measured_format_delta: None,
+        measured_base_tokens: None,
+        measured_tool_tokens: None,
     };
     let lines = [
         rollout_json_line(RolloutItem::SessionMeta(SessionMetaLine {
@@ -462,6 +467,7 @@ async fn clean_for_continue_removes_abort_custom_and_dangling_records() -> Resul
                 source: SessionSource::Cli,
                 model_provider: Some(TEST_PROVIDER.to_string()),
                 base_instructions: None,
+                catalog_instructions_source: None,
                 dynamic_tools: None,
             },
             git: None,
@@ -1633,6 +1639,7 @@ async fn test_updated_at_uses_file_mtime() -> Result<()> {
                 source: SessionSource::VSCode,
                 model_provider: Some("test-provider".into()),
                 base_instructions: None,
+                catalog_instructions_source: None,
                 dynamic_tools: None,
             },
             git: None,

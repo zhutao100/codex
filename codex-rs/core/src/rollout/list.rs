@@ -588,6 +588,7 @@ async fn read_head_summary(path: &Path, head_limit: usize) -> io::Result<HeadTai
             }
             RolloutItem::TurnContext(_)
             | RolloutItem::ToolOutputPolicy { .. }
+            | RolloutItem::SampledInstructions { .. }
             | RolloutItem::TokenUsageContext { .. }
             | RolloutItem::PostTurnCompletionReviewState(_) => {
                 // Not included in `head`; skip.
@@ -650,6 +651,7 @@ async fn read_head_records(path: &Path, limit: usize) -> io::Result<Vec<serde_js
                 RolloutItem::Compacted(_)
                 | RolloutItem::TurnContext(_)
                 | RolloutItem::ToolOutputPolicy { .. }
+                | RolloutItem::SampledInstructions { .. }
                 | RolloutItem::TokenUsageContext { .. }
                 | RolloutItem::PostTurnCompletionReviewState(_)
                 | RolloutItem::EventMsg(_) => {}

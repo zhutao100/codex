@@ -1,5 +1,6 @@
 use super::*;
 use crate::completion_review::AutoCompactionDecision;
+use crate::completion_review::CaptureJournal;
 use crate::completion_review::CompletionReviewReservationError;
 use crate::completion_review::CompletionReviewState;
 use crate::completion_review::DeferredCaptureSource;
@@ -12,6 +13,7 @@ use crate::completion_review::ReviewPromptFrame;
 use crate::completion_review::ReviewPromptFrames;
 use crate::completion_review::ReviewSampling;
 use crate::completion_review::ReviewTicket;
+use crate::completion_review::TaggedCaptureCall;
 use crate::completion_review::WorkNotesCheckpoint;
 
 fn review_input_budget(context: &TurnContext) -> i64 {
@@ -21,23 +23,93 @@ fn review_input_budget(context: &TurnContext) -> i64 {
         .saturating_sub(8_192)
 }
 
-fn review_work_tokens(state: &SessionState, context: &TurnContext) -> i64 {
-    state
-        .history_tokens_from_usage(&context.model_info.slug)
-        .unwrap_or_else(|| local_work_tokens(state, context))
+struct ReviewWorkEstimate {
+    transcript: i64,
+    routing_input: Vec<ResponseItem>,
 }
 
-fn local_work_tokens(state: &SessionState, context: &TurnContext) -> i64 {
+impl ReviewWorkEstimate {
+    async fn resolve_source(
+        self,
+        session: &Session,
+        context: &TurnContext,
+        active: &TurnContext,
+        active_tools: i64,
+        cancel: &CancellationToken,
+    ) -> CodexResult<i64> {
+        if std::ptr::eq(context, active) {
+            Ok(self.transcript.saturating_add(active_tools).max(0))
+        } else {
+            self.resolve(session, context, active, cancel)
+                .await
+                .map(|(tokens, _)| tokens)
+        }
+    }
+
+    fn new(state: &SessionState, end: usize, transcript: i64) -> Self {
+        // Only user messages and the separately journaled app selections choose connector tools.
+        let routing_input = state.history.raw_items()[..end]
+            .iter()
+            .filter(|item| matches!(item, ResponseItem::Message { role, .. } if role == "user"))
+            .cloned()
+            .collect();
+        Self {
+            transcript,
+            routing_input,
+        }
+    }
+
+    async fn resolve(
+        self,
+        session: &Session,
+        context: &TurnContext,
+        active: &TurnContext,
+        cancel: &CancellationToken,
+    ) -> CodexResult<(i64, ToolSurface)> {
+        let tools =
+            super::turn::compaction_tool_specs(session, context, &self.routing_input, cancel).await;
+        if !std::ptr::eq(active, context) {
+            session.activate_mcp_context(active).await;
+        }
+        let tools = tools?;
+        Ok((self.transcript.saturating_add(tools.tokens()).max(0), tools))
+    }
+}
+
+fn review_transcript_tokens(state: &SessionState, context: &TurnContext) -> i64 {
+    let base = state.base_instructions_for_turn(context);
     state
         .history
-        .estimate_token_count_with_base_instructions(&state.base_instructions_for_turn(context))
-        .unwrap_or_default()
+        .review_transcript_tokens(
+            &context.model_info.slug,
+            &base,
+            state.server_reasoning_included(),
+            context.helper_projection(),
+        )
+        .unwrap_or_else(|| {
+            state
+                .history
+                .projected_tokens(&base, context.helper_projection())
+        })
 }
 
-fn helper_work_tokens(state: &SessionState, source: &TurnContext) -> i64 {
-    state
-        .helper_tokens_from_usage(&source.model_info.slug)
-        .unwrap_or_else(|| local_work_tokens(state, source))
+fn helper_work_tokens(
+    state: &SessionState,
+    source: &TurnContext,
+    marker: Option<usize>,
+) -> ReviewWorkEstimate {
+    let base = state.base_instructions_for_turn(source);
+    let end = marker.unwrap_or(state.history.raw_items().len());
+    let transcript = super::turn::measured_helper_work(state, source, &base, marker).map_or_else(
+        || {
+            state
+                .history
+                .projected_prefix_tokens(end, source.helper_projection())
+                .saturating_add(crate::truncate::approx_token_count(&base.text) as i64)
+        },
+        |(work, _)| work,
+    );
+    ReviewWorkEstimate::new(state, end, transcript)
 }
 
 impl Session {
@@ -150,30 +222,40 @@ impl Session {
         &self,
         source: &TurnContext,
         placement: crate::compact::InitialContextInjection,
-        source_token_adjustment: i64,
+        source_fit: crate::compact::SourceFit,
         legacy_attempts: u8,
+        allow_new_capture: bool,
     ) -> CodexResult<AutoCompactionDecision> {
         let _guard = self.completion_review_installation.lock().await;
         let (decision, previous) = {
             let mut state = self.state.lock().await;
-            let slot = &mut state.completion_review.pending_compaction;
-            if let Some(saved) = slot.as_ref()
-                && saved.notes_remaining.is_some()
+            let slot = &state.completion_review.pending_compaction;
+            if let Some(saved) = slot
+                && saved.capture.notes_remaining.is_some()
+                && saved.source_fit.is_some()
             {
                 return Ok(saved.clone());
             }
             let mut decision = slot.clone().unwrap_or_else(|| AutoCompactionDecision {
-                source: RegularTaskSettings::from_turn(source),
+                source: state.sampled_settings(source, &state.base_instructions_for_turn(source)),
                 placement,
-                source_token_adjustment,
-                notes_remaining: None,
+                source_fit: Some(source_fit),
+                capture: CaptureJournal::default(),
             });
-            decision.notes_remaining = Some(if decision.source.captures_notes() {
-                crate::compact::WORK_NOTES_CAPTURE_MAX_ATTEMPTS.saturating_sub(legacy_attempts)
-            } else {
-                0
+            // Older offsets included an unidentified tool surface. Upgrade from attributable
+            // pre-capture work if available, otherwise use the current local projection.
+            decision.source_fit.get_or_insert(source_fit);
+            decision.capture.notes_remaining.get_or_insert_with(|| {
+                if decision.source.captures_notes() && (slot.is_some() || allow_new_capture) {
+                    crate::compact::WORK_NOTES_CAPTURE_MAX_ATTEMPTS.saturating_sub(legacy_attempts)
+                } else {
+                    0
+                }
             });
-            let previous = slot.replace(decision.clone());
+            let previous = state
+                .completion_review
+                .pending_compaction
+                .replace(decision.clone());
             (decision, previous)
         };
         if !self.persist_completion_review_locked().await {
@@ -183,6 +265,40 @@ impl Session {
             ));
         }
         Ok(decision)
+    }
+
+    pub(super) async fn claim_tagged_capture_call(&self, item: &ResponseItem) -> CodexResult<()> {
+        let _guard = self.completion_review_installation.lock().await;
+        {
+            let mut state = self.state.lock().await;
+            let offset = crate::compact::next_capture_offset(state.history.raw_items())
+                .ok_or_else(|| {
+                    CodexErr::Fatal("Missing work-notes request for a capture call".into())
+                })?;
+            let decision = state
+                .completion_review
+                .pending_compaction
+                .as_mut()
+                .ok_or_else(|| {
+                    CodexErr::Fatal("Missing work-notes decision for a capture call".into())
+                })?;
+            decision.capture.tagged_calls.push(
+                TaggedCaptureCall::from_item(offset, item).map_err(|err| {
+                    CodexErr::Fatal(format!("Could not identify the tagged capture call: {err}"))
+                })?,
+            );
+        }
+        if !self.persist_completion_review_locked().await {
+            if let Some(decision) =
+                &mut self.state.lock().await.completion_review.pending_compaction
+            {
+                decision.capture.tagged_calls.pop();
+            }
+            return Err(CodexErr::Fatal(
+                "Could not persist ownership of a tagged capture call".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub(super) async fn advance_work_notes(
@@ -195,10 +311,10 @@ impl Session {
             let Some(decision) = &mut state.completion_review.pending_compaction else {
                 return Ok(());
             };
-            let Some(remaining) = decision.notes_remaining.filter(|n| *n > 0) else {
+            let Some(remaining) = decision.capture.notes_remaining.filter(|n| *n > 0) else {
                 return Ok(());
             };
-            decision.notes_remaining = Some(match checkpoint {
+            decision.capture.notes_remaining = Some(match checkpoint {
                 WorkNotesCheckpoint::CompletedResponse => remaining - 1,
                 WorkNotesCheckpoint::BeforeCompact => 0,
             });
@@ -208,7 +324,7 @@ impl Session {
             if let Some(decision) =
                 &mut self.state.lock().await.completion_review.pending_compaction
             {
-                decision.notes_remaining = Some(previous);
+                decision.capture.notes_remaining = Some(previous);
             }
             return Err(CodexErr::Fatal(
                 "Could not persist progress of the work-notes capture".into(),
@@ -524,22 +640,74 @@ impl Session {
             .collect()
     }
 
-    pub(super) async fn finish_ordinary_input(self: &Arc<Self>) -> bool {
-        {
+    // Called under the review installation guard. Flush new bytes before publishing their ID.
+    async fn archive_sampled_base(&self, text: String) -> Option<ThreadId> {
+        let tracked = {
             let state = self.state.lock().await;
+            if let Some(id) = state.recorded_base_id(&text) {
+                return Some(id);
+            }
+            state.session_configuration.tracks_completion_review()
+        };
+        let id = ThreadId::new();
+        if tracked {
+            let recorder = self.services.rollout.lock().await.clone();
+            if let Some(recorder) = recorder {
+                let result = async {
+                    recorder
+                        .record_items(&[RolloutItem::SampledInstructions {
+                            id,
+                            text: text.clone(),
+                        }])
+                        .await?;
+                    recorder.flush().await
+                }
+                .await;
+                if !self.check_completion_review_persistence(result).await {
+                    return None;
+                }
+            }
+        }
+        self.state.lock().await.recorded_bases.push((id, text));
+        Some(id)
+    }
+
+    pub(super) async fn finish_ordinary_input(
+        self: &Arc<Self>,
+        context: &TurnContext,
+        base: &BaseInstructions,
+    ) -> bool {
+        let settings = {
+            let state = self.state.lock().await;
+            let settings = state.sampled_settings(context, base);
             let review = &state.completion_review;
-            if !review.awaiting_compact_followup
+            if settings.recorded_base.is_some()
+                && !review.awaiting_compact_followup
+                && review.owed_settings.is_none()
                 && review.unsampled_app_paths.is_empty()
                 && review.unsampled_fresh_model.is_none()
+                && review.last_work_settings.as_ref() == Some(&settings)
             {
                 return true;
             }
-        }
-        self.completion_review_transaction(|session| async move {
+            settings
+        };
+        let unarchived = settings.recorded_base.is_none().then(|| base.text.clone());
+        self.completion_review_transaction(move |session| async move {
+            let mut settings = settings;
+            if let Some(text) = unarchived {
+                let Some(id) = session.archive_sampled_base(text).await else {
+                    return false;
+                };
+                settings.recorded_base = Some(id);
+            }
             let mut state = session.state.lock().await;
+            state
+                .completion_review
+                .release_owed_response(Some(&settings));
+            state.completion_review.last_work_settings = Some(settings);
             state.completion_review.awaiting_compact_followup = false;
             state.completion_review.unsampled_fresh_model = None;
-            state.completion_review.owed_settings = None;
             state.completion_review.unsampled_app_paths.clear();
             drop(state);
             session.persist_completion_review_locked().await
@@ -926,10 +1094,14 @@ impl Session {
     pub(crate) async fn compaction_review_frames(
         self: &Arc<Self>,
         context: &Arc<TurnContext>,
+        cancel: &CancellationToken,
     ) -> CodexResult<ReviewPromptFrames> {
         let context = Arc::clone(context);
+        let cancel = cancel.clone();
         self.completion_review_transaction(move |session| async move {
-            session.compaction_review_frames_locked(&context).await
+            session
+                .compaction_review_frames_locked(&context, &cancel)
+                .await
         })
         .await
         .map_err(|e| CodexErr::Fatal(e.to_string()))?
@@ -938,8 +1110,8 @@ impl Session {
     async fn compaction_review_frames_locked(
         &self,
         context: &TurnContext,
+        cancel: &CancellationToken,
     ) -> CodexResult<ReviewPromptFrames> {
-        let base = self.get_base_instructions_for_turn(context).await;
         let state = self.state.lock().await;
         let mut frames = state.completion_review.prompt_frames.clone();
         if state.completion_review.defer_new_prompt_frame {
@@ -974,27 +1146,22 @@ impl Session {
             let Some(text) = Self::render_review_instructions(&state, false)? else {
                 return Ok(frames);
             };
-            let work_tokens = match marker {
-                Some(index) => state
-                    .history
-                    .work_notes_baseline_at(index, &context.model_info.slug)
-                    .map(|baseline| baseline.work_tokens),
-                None => state.helper_tokens_from_usage(&context.model_info.slug),
-            }
-            .unwrap_or_else(|| super::turn::estimate_work_notes_prompt_tokens(work, &base));
+            let work_tokens = helper_work_tokens(&state, context, marker);
             let new = ReviewPromptFrame::new(text, ReviewPromptFrame::anchor(work), attempt);
+            drop(state);
             if work_tokens
+                .resolve(self, context, context, cancel)
+                .await?
+                .0
                 .saturating_add(frames.tokens())
                 .saturating_add(new.tokens)
                 > super::turn::unsampled_review_token_limit(context)
             {
-                drop(state);
                 self.record_frame_selection_locked(&frames, Some(context))
                     .await?;
                 return Ok(frames);
             }
             frames.0.push(new);
-            drop(state);
             self.record_frame_selection_locked(&frames, None).await?;
         }
         Ok(frames)
@@ -1010,7 +1177,9 @@ impl Session {
             state.completion_review.prompt_frames = frames.clone();
             state.completion_review.defer_new_prompt_frame = deferred_source.is_some();
             state.completion_review.deferred_capture_source = deferred_source.map(|ctx| {
-                DeferredCaptureSource::Settings(Box::new(RegularTaskSettings::from_turn(ctx)))
+                DeferredCaptureSource::Settings(Box::new(
+                    state.sampled_settings(ctx, &state.base_instructions_for_turn(ctx)),
+                ))
             });
         }
         if !self.persist_completion_review_locked().await {
@@ -1046,7 +1215,9 @@ impl Session {
         context: &Arc<TurnContext>,
         capture_source: &Arc<TurnContext>,
         input: &[ResponseItem],
+        tool_tokens: i64,
         allow_compact: bool,
+        cancel: &CancellationToken,
     ) -> CodexResult<ReviewSampling> {
         let target = review_input_budget(context);
         {
@@ -1059,9 +1230,11 @@ impl Session {
             let frames = &state.completion_review.prompt_frames;
             if let Some(frame) = frames.0.last()
                 && frame.attempt == Self::active_review_attempt(&state)?
-                && state
-                    .history_tokens_from_usage(&context.model_info.slug)
-                    .is_some_and(|tokens| tokens.saturating_add(frames.tokens()) <= target)
+                && review_transcript_tokens(&state, context)
+                    .saturating_add(tool_tokens)
+                    .max(0)
+                    .saturating_add(frames.tokens())
+                    <= target
             {
                 return Ok(ReviewSampling::Ready(frames.clone()));
             }
@@ -1070,6 +1243,7 @@ impl Session {
         let helper_limit = super::turn::unsampled_review_token_limit(capture_source);
         let context = Arc::clone(context);
         let capture_source = Arc::clone(capture_source);
+        let cancel = cancel.clone();
         self.completion_review_transaction(move |session| async move {
             let state = session.state.lock().await;
             let attempt = Self::active_review_attempt(&state)?;
@@ -1077,36 +1251,41 @@ impl Session {
                 return Ok(ReviewSampling::Ready(ReviewPromptFrames::default()));
             }
             let mut frames = state.completion_review.prompt_frames.clone();
-            let history = review_work_tokens(&state, &context);
+            let history = review_transcript_tokens(&state, &context).saturating_add(tool_tokens).max(0);
             let pinned = frames.0.last().is_some_and(|frame| frame.attempt == attempt);
             let render = |full| -> CodexResult<ReviewPromptFrame> {
                 let text = Self::render_review_instructions(&state, full)?
                     .ok_or_else(|| CodexErr::Fatal("Missing active review frame.".into()))?;
                 Ok(ReviewPromptFrame::new(text, anchor, attempt.clone()))
             };
-            if !pinned {
-                let full = render(true)?;
+            let mandatory = render(false)?;
+            let full = (!pinned).then(|| render(true)).transpose()?;
+            drop(state);
+            if let Some(full) = full {
                 let cost = history.saturating_add(frames.tokens()).saturating_add(full.tokens);
-                frames.0.push(if cost <= target { full } else { render(false)? });
+                frames.0.push(if cost <= target { full } else { mandatory.clone() });
             }
             let prompt_tokens = history.saturating_add(frames.tokens());
             if prompt_tokens > target {
                 // Even if omitting the optional reference would now fit, changing a frame that
                 // has governed work would rewrite the hot input. Compact that work unchanged.
-                let mandatory = render(false)?.tokens;
-                if mandatory <= target && allow_compact {
+                if mandatory.tokens <= target && allow_compact {
                     tracing::info!(prompt_tokens, target, pinned, "compacting history to fit review follow-up");
-                    if !pinned && helper_work_tokens(&state, &capture_source)
-                        .saturating_add(frames.tokens()) > helper_limit {
-                        // The started handoff owns the new scope durably. It has governed no
-                        // ordinary work yet. Install it after compacting the outgoing prefix.
-                        let outgoing = state.completion_review.prompt_frames.clone();
-                        drop(state);
-                        session.record_frame_selection_locked(&outgoing, Some(&capture_source)).await?;
-                        return Ok(ReviewSampling::Compact);
+                    if !pinned {
+                        let estimate = {
+                            let state = session.state.lock().await;
+                            helper_work_tokens(&state, &capture_source, None)
+                        };
+                        if estimate.resolve_source(&session, &capture_source, &context, tool_tokens, &cancel).await?
+                            .saturating_add(frames.tokens()) > helper_limit {
+                            // The handoff owns the unsampled frame. Keep only the outgoing prefix.
+                            frames.0.pop();
+                            session.record_frame_selection_locked(&frames, Some(&capture_source)).await?;
+                            return Ok(ReviewSampling::Compact);
+                        }
                     }
                 } else {
-                    let recovery = if mandatory > target {
+                    let recovery = if mandatory.tokens > target {
                         "The mandatory review frame alone does not fit. Select a larger context window, then /continue."
                     } else {
                         "Compaction did not free enough space. Run /compact or select a larger context window, then /continue."
@@ -1117,7 +1296,6 @@ impl Session {
                 }
             }
             if !pinned {
-                drop(state);
                 session.record_frame_selection_locked(&frames, None).await?;
             }
             Ok(if prompt_tokens > target { ReviewSampling::Compact } else { ReviewSampling::Ready(frames) })
@@ -1175,13 +1353,20 @@ impl Session {
         context: &Arc<TurnContext>,
         capture_source: &Arc<TurnContext>,
         allow_compact: bool,
+        cancel: &CancellationToken,
     ) -> CodexResult<bool> {
         // Enter the installation transaction before reading state; pause joins this owner.
         let context = Arc::clone(context);
         let capture_source = Arc::clone(capture_source);
+        let cancel = cancel.clone();
         self.completion_review_transaction(move |session| async move {
             session
-                .admit_completion_review_advisory_locked(&context, &capture_source, allow_compact)
+                .admit_completion_review_advisory_locked(
+                    &context,
+                    &capture_source,
+                    allow_compact,
+                    &cancel,
+                )
                 .await
         })
         .await
@@ -1193,6 +1378,7 @@ impl Session {
         context: &TurnContext,
         capture_source: &TurnContext,
         allow_compact: bool,
+        cancel: &CancellationToken,
     ) -> CodexResult<bool> {
         let state = self.state.lock().await;
         let handoff = state.completion_review.handoff.as_ref();
@@ -1210,10 +1396,17 @@ impl Session {
         let item = handoff.advisory_item();
         let exists = state.history.raw_items().last() == Some(&item);
         if !exists {
-            let work = review_work_tokens(&state, context);
-            let outgoing = &state.completion_review.prompt_frames;
+            let work = ReviewWorkEstimate::new(
+                &state,
+                state.history.raw_items().len(),
+                review_transcript_tokens(&state, context),
+            );
+            let outgoing = state.completion_review.prompt_frames.clone();
+            let helper = allow_compact.then(|| helper_work_tokens(&state, capture_source, None));
+            drop(state);
             let advice_tokens = crate::context_manager::estimate_item_token_count(&item);
-            let prompt_tokens = work
+            let (work_tokens, tools) = work.resolve(self, context, context, cancel).await?;
+            let prompt_tokens = work_tokens
                 .saturating_add(outgoing.tokens())
                 .saturating_add(advice_tokens);
             let target = review_input_budget(context);
@@ -1222,22 +1415,21 @@ impl Session {
                     "Review advice exceeds the main model's payload budget ({prompt_tokens} estimated tokens, {target} available). Select a larger context window, then /continue. No truncated follow-up request was sent."
                 )));
             }
-            if allow_compact
-                && helper_work_tokens(&state, capture_source)
+            if let Some(helper) = helper
+                && helper
+                    .resolve_source(self, capture_source, context, tools.tokens(), cancel)
+                    .await?
                     .saturating_add(outgoing.tokens())
                     .saturating_add(advice_tokens)
                     > super::turn::unsampled_review_token_limit(capture_source)
             {
-                let outgoing = outgoing.clone();
-                drop(state);
                 self.record_frame_selection_locked(&outgoing, Some(capture_source))
                     .await?;
                 return Ok(false);
             }
-        }
-        drop(state);
-        if !exists {
             self.record_conversation_items(context, &[item]).await;
+        } else {
+            drop(state);
         }
         if let Some(handoff) = self.state.lock().await.completion_review.handoff.as_mut() {
             handoff.advisory_recorded = true;

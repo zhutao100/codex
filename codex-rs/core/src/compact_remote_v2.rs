@@ -10,9 +10,9 @@ use crate::client_common::ResponseStream;
 use crate::compact::CompactionContext;
 use crate::compact::InitialContextInjection;
 use crate::compact::insert_initial_context_before_last_real_user_message;
-use crate::compact::prepare_history_for_compaction;
 use crate::compact::preserved_work_notes_message;
 use crate::compact_remote::trim_function_call_history_to_fit_context_window;
+use crate::context_manager::estimate_item_token_count;
 use crate::error::CodexErr;
 use crate::error::Result as CodexResult;
 use crate::protocol::EventMsg;
@@ -39,6 +39,14 @@ pub(crate) enum CompactionReason {
     UserRequested,
     TokenLimit,
     ModelDownshift,
+}
+
+pub(crate) fn source_token_limit(context: &TurnContext) -> Option<i64> {
+    context.model_context_window().map(|window| {
+        window.saturating_sub(estimate_item_token_count(
+            &ResponseItem::CompactionTrigger {},
+        ))
+    })
 }
 
 pub(crate) async fn run_remote_compact_task(
@@ -110,34 +118,35 @@ async fn run_compact(
     let lifecycle_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
     sess.emit_turn_item_started(turn_context, &lifecycle_item)
         .await;
-    let prepared = prepare_history_for_compaction(
-        sess.clone_history().await,
-        notes,
-        Some(&context.review_frames),
-    )?;
-    let mut source = prepared.source_history;
+    let prepared = sess
+        .prepare_history_for_compaction(notes, &context.review_frames)
+        .await?;
+    let input = prepared
+        .source_history
+        .for_prompt_with_modalities(&turn_context.model_info.input_modalities);
     let base_instructions = sess.get_base_instructions_for_turn(turn_context).await;
-    let (rewritten_outputs, estimated_deleted_tokens) =
-        trim_function_call_history_to_fit_context_window(
-            &mut source,
-            turn_context,
-            &base_instructions,
-            context.source_token_adjustment,
-        );
-    let mut input = source.for_prompt_with_modalities(&turn_context.model_info.input_modalities);
     let tools = match &client_session.sampling_tools {
         Some((model, tools)) if model == &turn_context.model_info.slug => tools.clone(),
         _ => compaction_tool_specs(sess, turn_context, &input, cancellation_token).await?,
     };
-    input.push(ResponseItem::CompactionTrigger {});
     let mut prompt = Prompt {
         input,
-        tools,
         parallel_tool_calls: turn_context.model_info.supports_parallel_tool_calls,
         base_instructions,
         personality: turn_context.personality,
         output_schema: None,
-    };
+        ..Default::default()
+    }
+    .with_tools(tools);
+    let adjustment = context.source_fit.adjustment(&prompt.tools);
+    let (rewritten_outputs, estimated_deleted_tokens) =
+        trim_function_call_history_to_fit_context_window(
+            &mut prompt.input,
+            source_token_limit(turn_context),
+            &prompt.base_instructions,
+            adjustment,
+        );
+    prompt.input.push(ResponseItem::CompactionTrigger {});
     let metadata = compaction_metadata(
         turn_context.resolve_turn_metadata_header().await.as_deref(),
         reason,
@@ -178,9 +187,7 @@ async fn run_compact(
         .map(history::retained_tokens)
         .sum::<usize>()
         .saturating_add(approx_token_count(&replacement_instructions.text))
-        .saturating_add(approx_token_count(&serde_json::to_string(
-            &replacement_tools,
-        )?));
+        .saturating_add(replacement_tools.tokens() as usize);
     let budget = retention_budget(
         fixed_tokens,
         replacement_context.model_context_window(),
@@ -361,7 +368,8 @@ async fn request_compaction(
                     Some(metadata),
                 )
                 .await?;
-            collect_compaction_output(sess, context, stream, source.review_frame_tokens()).await
+            collect_compaction_output(sess, context, stream, source.review_frame_tokens(), prompt)
+                .await
         };
         let error = tokio::select! {
             biased;
@@ -414,6 +422,7 @@ async fn collect_compaction_output(
     context: &TurnContext,
     mut stream: ResponseStream,
     frame_tokens: i64,
+    prompt: &Prompt,
 ) -> CodexResult<CompactionOutput> {
     let mut candidate = None;
     let mut count = 0;
@@ -442,6 +451,7 @@ async fn collect_compaction_output(
                     frame_tokens,
                     server_reasoning_included,
                     0,
+                    prompt,
                 )
                 .await;
                 if count != 1 {
