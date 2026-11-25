@@ -16,7 +16,9 @@ Outer retries are capped at `min(provider.stream_max_retries(), 2)` per transpor
 
 Selected-model/personality requests retain session instructions, including resumed instructions. A temporary previous-model context resolves explicit config instructions, then the model's final override, then effective model instructions. Provider-resolution errors remain errors, not an excuse to use the destination's provider.
 
-The notes request stores `Compaction source model: "JSON-encoded-model"` on its second line. Recovery uses it independently of current usage and the resume-selected destination; malformed explicit metadata fails before mutation. Older captures can infer a larger previous model from prior-turn settings without trusting usage reported by the notes response. The capture request is excluded from compaction input.
+Prefer the source task settings recorded with the compaction decision or the preceding frame deferral. The notes marker also stores `Compaction source model: "JSON-encoded-model"` for older captures; malformed explicit metadata fails before mutation. Without either record, prior-turn settings may identify the larger model, but the notes response cannot measure its work. The capture request is excluded from compaction input.
+
+Activate the source working directory and sandbox policy on capable MCP servers before capture or source tool lookup. When the destination differs, switch to it after the source responds, before resolving replacement tools and sampling ordinary work. Compare task settings, not just model names: an outstanding response can cross the limit on the same model while the next task has a different schema, directory or tool policy.
 
 ## Retention and fitting
 
@@ -39,7 +41,7 @@ The separate [tool-output fitter](../../../core/src/compact_remote.rs) rewrites 
 - Request final-answer placement and both delimiters, but do not make that guidance a new parser prerequisite: existing prefix-only captures remain valid.
 - If incomplete capture has later input, use available notes or the no-notes path without requesting notes across that boundary. Propagate cancellation before considering a no-notes fallback.
 
-Failed compaction remains unfinished main work. Acknowledged steering retained during finalization becomes later source history rather than disappearing into the capture. Successful inline compaction defers queued input until its first follow-up.
+Failed automatic compaction remains unfinished main work. Its host checkpoint precedes the notes marker or schema-only compact and ends at `Compacted`, not `response.completed`. A stop at the notes marker may require resampling notes; a saved notes answer does not. A compact receipt without a persisted replacement requires another compact from the frozen source, not an ordinary request on the old history. Fresh pre-turn capture keeps `DoNotInject` through these cuts; inline capture keeps its original placement. An older marker without this checkpoint uses the available legacy evidence.
 
 Local summarization buffers output per attempt. EOF, failure and retries discard that buffer; only a completed attempt supplies the replacement summary. Appending uncommitted summarizer output to live history would make the preceding notes transaction ambiguous and block recovery.
 
@@ -55,7 +57,7 @@ Legacy worktree snapshots are readable from older rollouts but excluded from mod
 
 After successful installation, clear logical WebSocket continuation and retain only a healthy completed physical connection. Failed/cancelled requests must remain marked unfinished; a different local/unary request must not accidentally make an unfinished notes socket cacheable.
 
-Standalone/pre-turn replacement clears the reference baseline. Inline replacement retains the matching destination reference. Replay uses that inline provenance to infer unfinished work even with encrypted-only history, then respects subsequent completion and rollback. Pending captures keep the resume-selected destination while retaining their separate source. Standalone compaction must not consume the existing interrupted/paused main checkpoint.
+Standalone/pre-turn replacement clears the reference baseline. Inline replacement commits the matching destination reference with the replacement and its local usage ledger; the following context and usage records remain readable by older clients. Replay does not require either later write to determine inline provenance or to send the first ordinary request without a second compact. The marker is not measured work and cannot by itself create a standalone owner. See [history replay](../history-replay.md#replay-metadata-and-compaction-epochs) for legacy and rollback behavior.
 
 ## Scope
 

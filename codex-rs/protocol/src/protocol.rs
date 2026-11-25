@@ -1981,6 +1981,11 @@ pub struct SessionMetaLine {
 pub enum RolloutItem {
     SessionMeta(SessionMetaLine),
     ResponseItem(ResponseItem),
+    /// Admission limit for the immediately following raw tool result, not model input.
+    ToolOutputPolicy {
+        call_id: String,
+        policy: TruncationPolicy,
+    },
     Compacted(CompactedItem),
     TurnContext(TurnContextItem),
     /// Versioned host-owned completion-review metadata, not conversation input.
@@ -2009,6 +2014,20 @@ pub struct CompactedItem {
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replacement_history: Option<Vec<ResponseItem>>,
+    /// Host metadata committed with the replacement, before any adjacent records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub checkpoint: Option<Box<CompactionCheckpoint>>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, TS)]
+pub struct CompactionCheckpoint {
+    /// Destination-local estimate and lifetime totals, not measured inference usage.
+    pub usage: TokenUsageInfo,
+    /// Present only if canonical destination context is already in the replacement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub injected_context: Option<TurnContextItem>,
 }
 
 impl From<CompactedItem> for ResponseItem {

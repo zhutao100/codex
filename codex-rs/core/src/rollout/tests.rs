@@ -183,6 +183,7 @@ async fn equal_review_snapshots_on_either_side_of_compaction_are_distinct() -> R
         serde_json::json!({"frame":"same bytes, new epoch"}),
     );
     let compact = RolloutItem::Compacted(codex_protocol::protocol::CompactedItem {
+        checkpoint: None,
         message: String::new(),
         replacement_history: Some(vec![]),
     });
@@ -387,6 +388,7 @@ async fn clean_for_continue_uses_compaction_epoch_and_keeps_late_snapshots() -> 
     };
     let previous = call("superseded");
     let checkpoint = RolloutItem::Compacted(codex_protocol::protocol::CompactedItem {
+        checkpoint: None,
         message: String::new(),
         replacement_history: Some(vec![ResponseItem::Compaction {
             encrypted_content: "summary".into(),

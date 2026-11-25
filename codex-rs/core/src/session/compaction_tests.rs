@@ -258,6 +258,7 @@ async fn compaction_usage_counts_preserved_notes_once_after_installation_and_res
         notes,
     ];
     let compacted = CompactedItem {
+        checkpoint: None,
         message: String::new(),
         replacement_history: Some(replacement.clone()),
     };
@@ -267,7 +268,7 @@ async fn compaction_usage_counts_preserved_notes_once_after_installation_and_res
             &context,
             replacement.clone(),
             Some(reference.clone()),
-            compacted.clone(),
+            String::new(),
         )
         .await;
     let expected = session
@@ -315,6 +316,59 @@ async fn compaction_usage_counts_preserved_notes_once_after_installation_and_res
 }
 
 #[tokio::test]
+async fn continued_work_measurement_is_not_owned_by_the_previous_user_turn() {
+    for owner in [None, Some("model-b")] {
+        let (session, context) = make_session_and_context().await;
+        let a = context.to_turn_context_item();
+        let mut b = a.clone();
+        b.model = "model-b".into();
+        let usage = TokenUsage {
+            input_tokens: 600,
+            total_tokens: 600,
+            ..Default::default()
+        };
+        let history = vec![
+            RolloutItem::TurnContext(a.clone()),
+            RolloutItem::ResponseItem(user_message("start on A")),
+            RolloutItem::EventMsg(EventMsg::TurnContinued(TurnContinuedEvent {
+                continued_from_turn_id: Some("A".into()),
+                source: TurnContinuationSource::Paused,
+            })),
+            RolloutItem::TurnContext(b.clone()),
+            RolloutItem::ResponseItem(assistant_message("B continued the work")),
+            RolloutItem::TokenUsageContext {
+                info: TokenUsageInfo::new_or_append(&None, &Some(usage), None).unwrap(),
+                source_model: owner.map(str::to_owned),
+                request_context_tokens: 50,
+                server_reasoning_included: false,
+                last_usage_item_count: Some(2),
+            },
+            RolloutItem::ResponseItem(
+                DeveloperInstructions::new(compact::AUTO_COMPACT_WORK_NOTES_REQUEST_TAG).into(),
+            ),
+        ];
+        session
+            .record_initial_history(InitialHistory::Resumed(ResumedHistory {
+                conversation_id: ThreadId::default(),
+                rollout_path: PathBuf::from("continued-work.jsonl"),
+                history,
+            }))
+            .await;
+        let state = session.state.lock().await;
+        assert_eq!(state.work_source_model(), Some(owner.unwrap_or(&a.model)));
+        assert_eq!(state.helper_tokens_from_usage(&a.model), None);
+        assert_eq!(state.history.work_notes_baseline_at(2, &a.model), None);
+        assert_eq!(
+            state
+                .history
+                .work_notes_baseline_at(2, &b.model)
+                .map(|s| s.work_tokens),
+            owner.map(|_| 550)
+        );
+    }
+}
+
+#[tokio::test]
 async fn stable_compaction_feature_is_advertised_without_displacing_other_flags() {
     let home = tempfile::tempdir().unwrap();
     let mut config = build_test_config(home.path()).await;
@@ -329,6 +383,51 @@ async fn stable_compaction_feature_is_advertised_without_displacing_other_flags(
         Session::build_model_client_beta_features_header(&config),
         Some(header)
     );
+}
+
+#[tokio::test]
+async fn inline_destination_survives_ordinary_task_ownership_without_pending_input() {
+    let (session, context) = make_session_and_context().await;
+    let mut source = context.to_turn_context_item();
+    source.model = "larger-source-model".into();
+    let destination = context.to_turn_context_item();
+    for selected in [None, Some("explicit-recovery-model")] {
+        let mut owner = crate::completion_review::CompletionReviewState {
+            main_task_id: Some("original-task".into()),
+            recovery_model: selected.map(str::to_owned),
+            ..Default::default()
+        };
+        owner
+            .request_frame
+            .current_user_messages
+            .push("original task".into());
+        let rollout = [
+            RolloutItem::TurnContext(source.clone()),
+            RolloutItem::ResponseItem(user_message("original task")),
+            RolloutItem::PostTurnCompletionReviewState(serde_json::to_value(owner).unwrap()),
+            RolloutItem::Compacted(CompactedItem {
+                checkpoint: None,
+                message: String::new(),
+                replacement_history: Some(vec![ResponseItem::Compaction {
+                    encrypted_content: "installed".into(),
+                }]),
+            }),
+            RolloutItem::TurnContext(destination.clone()),
+        ];
+        assert_eq!(
+            session
+                .reconstruct_history_from_rollout(&context, &rollout)
+                .await
+                .pending_continuation,
+            Some(PendingContinuation {
+                source: TurnContinuationSource::Interrupted,
+                continued_from_turn_id: Some("original-task".into()),
+                model: Some(selected.unwrap_or(&destination.model).into()),
+                pause_reason: None,
+                target: PendingContinuationTarget::Regular,
+            })
+        );
+    }
 }
 
 #[tokio::test]
@@ -350,6 +449,7 @@ async fn encrypted_only_replay_uses_inline_provenance_and_completion_tail() {
                     RolloutItem::TurnContext(source.clone()),
                     RolloutItem::ResponseItem(user_message("original task")),
                     RolloutItem::Compacted(CompactedItem {
+                        checkpoint: None,
                         message: String::new(),
                         replacement_history: Some(history.clone()),
                     }),
@@ -395,6 +495,7 @@ async fn encrypted_only_replay_retains_incomplete_tool_rounds_and_respects_rollb
     let (session, context) = make_session_and_context().await;
     let mut rollout = vec![
         RolloutItem::Compacted(CompactedItem {
+            checkpoint: None,
             message: String::new(),
             replacement_history: Some(vec![ResponseItem::Compaction {
                 encrypted_content: "encrypted".into(),
@@ -591,6 +692,7 @@ async fn ambiguous_compaction_notes_remain_recoverable_after_standalone_replay()
     ];
     let rollout = vec![
         RolloutItem::Compacted(CompactedItem {
+            checkpoint: None,
             message: String::new(),
             replacement_history: Some(history[..1].to_vec()),
         }),

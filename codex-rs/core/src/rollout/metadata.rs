@@ -62,6 +62,7 @@ pub(crate) fn builder_from_items(
         RolloutItem::ResponseItem(_)
         | RolloutItem::Compacted(_)
         | RolloutItem::TurnContext(_)
+        | RolloutItem::ToolOutputPolicy { .. }
         | RolloutItem::TokenUsageContext { .. }
         | RolloutItem::PostTurnCompletionReviewState(_)
         | RolloutItem::EventMsg(_) => None,
@@ -504,6 +505,7 @@ mod tests {
             .path()
             .join(format!("rollout-2026-01-27T12-34-56-{uuid}.jsonl"));
         let items = vec![RolloutItem::Compacted(CompactedItem {
+            checkpoint: None,
             message: "noop".to_string(),
             replacement_history: None,
         })];

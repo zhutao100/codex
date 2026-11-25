@@ -11,7 +11,6 @@ use crate::compact::preserved_work_notes_message;
 use crate::context_manager::ContextManager;
 use crate::context_manager::estimate_item_token_count;
 use crate::error::Result as CodexResult;
-use crate::protocol::CompactedItem;
 use crate::protocol::EventMsg;
 use crate::protocol::TurnStartedEvent;
 use crate::session::session::Session;
@@ -159,15 +158,11 @@ async fn run_remote_compact_task_inner_impl(
     if !ghost_snapshots.is_empty() {
         new_history.extend(ghost_snapshots);
     }
-    let compacted_item = CompactedItem {
-        message: String::new(),
-        replacement_history: Some(new_history.clone()),
-    };
     sess.replace_compacted_history(
         context.replacement,
         new_history,
         reference_context_item,
-        compacted_item,
+        String::new(),
     )
     .await;
 

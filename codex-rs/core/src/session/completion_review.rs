@@ -1,6 +1,9 @@
 use super::*;
+use crate::completion_review::AutoCompactionDecision;
 use crate::completion_review::CompletionReviewReservationError;
 use crate::completion_review::CompletionReviewState;
+use crate::completion_review::DeferredCaptureSource;
+use crate::completion_review::InputContextProjection;
 use crate::completion_review::InternalReviewOperation;
 use crate::completion_review::ReviewHandoff;
 use crate::completion_review::ReviewHandoffDisposition;
@@ -9,6 +12,33 @@ use crate::completion_review::ReviewPromptFrame;
 use crate::completion_review::ReviewPromptFrames;
 use crate::completion_review::ReviewSampling;
 use crate::completion_review::ReviewTicket;
+use crate::completion_review::WorkNotesCheckpoint;
+
+fn review_input_budget(context: &TurnContext) -> i64 {
+    context
+        .model_context_window()
+        .unwrap_or_default()
+        .saturating_sub(8_192)
+}
+
+fn review_work_tokens(state: &SessionState, context: &TurnContext) -> i64 {
+    state
+        .history_tokens_from_usage(&context.model_info.slug)
+        .unwrap_or_else(|| local_work_tokens(state, context))
+}
+
+fn local_work_tokens(state: &SessionState, context: &TurnContext) -> i64 {
+    state
+        .history
+        .estimate_token_count_with_base_instructions(&state.base_instructions_for_turn(context))
+        .unwrap_or_default()
+}
+
+fn helper_work_tokens(state: &SessionState, source: &TurnContext) -> i64 {
+    state
+        .helper_tokens_from_usage(&source.model_info.slug)
+        .unwrap_or_else(|| local_work_tokens(state, source))
+}
 
 impl Session {
     pub(super) async fn completion_review_transaction<T, F, Fut>(
@@ -78,9 +108,9 @@ impl Session {
         &self,
         input: &[UserInput],
         new_task: bool,
-        main_task_id: Option<&str>,
+        main_task: Option<&TurnContext>,
     ) -> Option<u64> {
-        self.accept_completion_review_input_with_client_id(input, new_task, None, main_task_id)
+        self.accept_completion_review_input_with_client_id(input, new_task, None, main_task)
             .await
     }
 
@@ -89,7 +119,7 @@ impl Session {
         input: &[UserInput],
         new_task: bool,
         client_id: Option<String>,
-        main_task_id: Option<&str>,
+        main_task: Option<&TurnContext>,
     ) -> Option<u64> {
         let _guard = self.completion_review_installation.lock().await;
         let revision = {
@@ -101,13 +131,90 @@ impl Session {
                 state
                     .completion_review
                     .accept_input(new_task, input.to_vec(), client_id);
-            if let Some(main_task_id) = main_task_id {
-                state.completion_review.main_task_id = Some(main_task_id.to_string());
+            if let Some(context) = main_task {
+                state
+                    .completion_review
+                    .set_main_task(&context.sub_id, &context.model_info.slug);
+                state.completion_review.recovery_settings =
+                    Some(RegularTaskSettings::from_turn(context));
             }
             revision
         };
         self.persist_completion_review_locked().await;
         Some(revision)
+    }
+
+    /// Persist the choice before a helper receipt can replace the measured work
+    /// baseline. The installation marker, not a response or validation error, closes it.
+    pub(super) async fn checkpoint_auto_compaction(
+        &self,
+        source: &TurnContext,
+        placement: crate::compact::InitialContextInjection,
+        source_token_adjustment: i64,
+        legacy_attempts: u8,
+    ) -> CodexResult<AutoCompactionDecision> {
+        let _guard = self.completion_review_installation.lock().await;
+        let (decision, previous) = {
+            let mut state = self.state.lock().await;
+            let slot = &mut state.completion_review.pending_compaction;
+            if let Some(saved) = slot.as_ref()
+                && saved.notes_remaining.is_some()
+            {
+                return Ok(saved.clone());
+            }
+            let mut decision = slot.clone().unwrap_or_else(|| AutoCompactionDecision {
+                source: RegularTaskSettings::from_turn(source),
+                placement,
+                source_token_adjustment,
+                notes_remaining: None,
+            });
+            decision.notes_remaining = Some(if decision.source.captures_notes() {
+                crate::compact::WORK_NOTES_CAPTURE_MAX_ATTEMPTS.saturating_sub(legacy_attempts)
+            } else {
+                0
+            });
+            let previous = slot.replace(decision.clone());
+            (decision, previous)
+        };
+        if !self.persist_completion_review_locked().await {
+            self.state.lock().await.completion_review.pending_compaction = previous;
+            return Err(CodexErr::Fatal(
+                "Could not persist the automatic compaction decision".into(),
+            ));
+        }
+        Ok(decision)
+    }
+
+    pub(super) async fn advance_work_notes(
+        &self,
+        checkpoint: WorkNotesCheckpoint,
+    ) -> CodexResult<()> {
+        let _guard = self.completion_review_installation.lock().await;
+        let previous = {
+            let mut state = self.state.lock().await;
+            let Some(decision) = &mut state.completion_review.pending_compaction else {
+                return Ok(());
+            };
+            let Some(remaining) = decision.notes_remaining.filter(|n| *n > 0) else {
+                return Ok(());
+            };
+            decision.notes_remaining = Some(match checkpoint {
+                WorkNotesCheckpoint::CompletedResponse => remaining - 1,
+                WorkNotesCheckpoint::BeforeCompact => 0,
+            });
+            remaining
+        };
+        if !self.persist_completion_review_locked().await {
+            if let Some(decision) =
+                &mut self.state.lock().await.completion_review.pending_compaction
+            {
+                decision.notes_remaining = Some(previous);
+            }
+            return Err(CodexErr::Fatal(
+                "Could not persist progress of the work-notes capture".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) async fn install_completion_review_input(
@@ -116,36 +223,63 @@ impl Session {
         revision: u64,
         consume: bool,
     ) -> bool {
+        self.install_review_input_with_skills(context, revision, consume, None)
+            .await
+    }
+
+    pub(super) async fn install_review_input_with_skills(
+        self: &Arc<Self>,
+        context: &Arc<TurnContext>,
+        revision: u64,
+        consume: bool,
+        selected_skills: Option<Vec<ResponseItem>>,
+    ) -> bool {
         let context = Arc::clone(context);
         self.completion_review_transaction(move |session| async move {
-            let input = session
-                .state
-                .lock()
-                .await
+            let prepared_context = if selected_skills.is_some() {
+                Some(session.plan_input_context(&context).await)
+            } else {
+                None
+            };
+            let mut state = session.state.lock().await;
+            let Some(pending) = state
                 .completion_review
                 .pending_inputs
-                .iter()
+                .iter_mut()
                 .find(|input| input.revision == revision)
-                .cloned();
-            let Some(input) = input else {
+            else {
                 return true;
             };
-            let needs_installation = input.installation != ReviewInputInstallation::Recorded;
-            if needs_installation {
-                if let Some(input) = session
-                    .state
-                    .lock()
-                    .await
-                    .completion_review
-                    .pending_inputs
-                    .iter_mut()
-                    .find(|input| input.revision == revision)
-                {
-                    input.installation = ReviewInputInstallation::Installing;
+            let needs_installation = pending.installation != ReviewInputInstallation::Recorded;
+            let preparing_skills =
+                selected_skills.is_some() && pending.remaining_skill_items.is_none();
+            if preparing_skills {
+                pending.remaining_skill_items = selected_skills;
+                if needs_installation {
+                    pending.remaining_context = prepared_context;
                 }
-                // This marker disambiguates identical messages if the process
-                // stops after the body but before checkpointing installation.
-                if !session.persist_completion_review_locked().await {
+            }
+            if needs_installation {
+                pending.installation = ReviewInputInstallation::Installing;
+            }
+            let input = pending.clone();
+            if preparing_skills {
+                state.completion_review.unsampled_fresh_model =
+                    Some(context.model_info.slug.clone());
+            }
+            drop(state);
+            // Journal context, prompt and selected skills before the first conversation item.
+            if (needs_installation || preparing_skills)
+                && !session.persist_completion_review_locked().await
+            {
+                return false;
+            }
+            if needs_installation {
+                if input.remaining_skill_items.is_some()
+                    && !session
+                        .finish_fresh_input_context(&context, revision, input.remaining_context)
+                        .await
+                {
                     return false;
                 }
                 session
@@ -156,36 +290,36 @@ impl Session {
                         input.client_id,
                     )
                     .await;
-                if consume {
-                    let recorder = session.services.rollout.lock().await.clone();
-                    let result = match recorder {
-                        Some(recorder) => recorder.flush().await,
-                        None => Ok(()),
-                    };
-                    if !session.check_completion_review_persistence(result).await {
-                        return false;
-                    }
+            }
+            let skills = input.remaining_skill_items.unwrap_or_default();
+            if consume && !skills.is_empty() {
+                session.record_conversation_items(&context, &skills).await;
+            }
+            if consume && (needs_installation || !skills.is_empty()) {
+                let recorder = session.services.rollout.lock().await.clone();
+                let result = match recorder {
+                    Some(recorder) => recorder.flush().await,
+                    None => Ok(()),
+                };
+                if !session.check_completion_review_persistence(result).await {
+                    return false;
                 }
-                if let Some(input) = session
-                    .state
-                    .lock()
-                    .await
+            }
+            let mut state = session.state.lock().await;
+            if needs_installation
+                && let Some(input) = state
                     .completion_review
                     .pending_inputs
                     .iter_mut()
                     .find(|input| input.revision == revision)
-                {
-                    input.installation = ReviewInputInstallation::Recorded;
-                }
+            {
+                input.remaining_context = None;
+                input.installation = ReviewInputInstallation::Recorded;
             }
             if consume {
-                session
-                    .state
-                    .lock()
-                    .await
-                    .completion_review
-                    .consume_input(revision);
+                state.completion_review.consume_input(revision);
             }
+            drop(state);
             if needs_installation || consume {
                 session.persist_completion_review_locked().await
             } else {
@@ -196,21 +330,77 @@ impl Session {
         .unwrap_or(false)
     }
 
-    pub(crate) async fn start_completion_review_main_task(&self, turn_id: &str) -> bool {
+    /// Called under the installation lock, before the prompt body. Finish the frozen
+    /// prefix first; an explicit settings change on resume can then append its own delta.
+    async fn finish_fresh_input_context(
+        &self,
+        context: &TurnContext,
+        revision: u64,
+        saved: Option<InputContextProjection>,
+    ) -> bool {
+        if let Some(saved) = saved {
+            self.record_input_context(context, saved).await;
+        }
+        if let Some(mut installed) = self.state.lock().await.history.reference_context_item() {
+            let mut target = context.to_turn_context_item();
+            // Rediscovering AGENTS or a different skill catalog at startup is not a
+            // settings override for a prompt whose context was already selected.
+            installed.user_instructions = None;
+            target.user_instructions = None;
+            if installed == target {
+                return true;
+            }
+        }
+        let correction = self.plan_input_context(context).await;
+        {
+            let mut state = self.state.lock().await;
+            let Some(pending) = state
+                .completion_review
+                .pending_inputs
+                .iter_mut()
+                .find(|input| input.revision == revision)
+            else {
+                return false;
+            };
+            pending.remaining_context = Some(correction.clone());
+        }
+        if !self.persist_completion_review_locked().await {
+            return false;
+        }
+        self.record_input_context(context, correction).await;
+        true
+    }
+
+    pub(crate) async fn start_completion_review_main_task(
+        &self,
+        turn_id: &str,
+        context: &TurnContext,
+    ) -> bool {
         let _guard = self.completion_review_installation.lock().await;
         {
             let mut state = self.state.lock().await;
             if !state.session_configuration.tracks_completion_review() {
                 return true;
             }
-            state.completion_review.main_task_id = Some(turn_id.to_string());
+            state
+                .completion_review
+                .set_main_task(turn_id, &context.model_info.slug);
+            state.completion_review.recovery_settings =
+                Some(RegularTaskSettings::from_turn(context));
         }
         self.persist_completion_review_locked().await
     }
 
-    pub(crate) async fn retarget_pending_regular_continuation_model(&self, model: &str) {
+    pub(super) async fn update_pending_regular_settings(
+        &self,
+        updates: &SessionSettingsUpdate,
+        model: Option<String>,
+    ) {
         let _guard = self.completion_review_installation.lock().await;
         let mut state = self.state.lock().await;
+        if !state.regular_continuation_directory_matches() {
+            return;
+        }
         let Some(checkpoint) = state
             .pending_continuation
             .as_mut()
@@ -218,18 +408,31 @@ impl Session {
         else {
             return;
         };
-        checkpoint.model = Some(model.to_string());
-        if !state.completion_review.replacement_answer_required {
+        if model.is_some() {
+            checkpoint.model.clone_from(&model);
+        }
+        let review = &mut state.completion_review;
+        if !review.replacement_answer_required
+            && review.main_task_id.is_none()
+            && review.pending_inputs.is_empty()
+        {
             return;
         }
-        state.completion_review.recovery_model = Some(model.to_string());
-        if let Some(handoff) = state.completion_review.handoff.as_mut().filter(|handoff| {
-            matches!(
-                handoff.disposition,
-                ReviewHandoffDisposition::Started { .. }
-            )
-        }) {
-            model.clone_into(&mut handoff.model);
+        if let Some(saved) = &mut review.recovery_settings {
+            saved.apply_override(updates);
+        }
+        if model.is_some() {
+            review.recovery_model.clone_from(&model);
+        }
+        if let Some(model) = model
+            && let Some(handoff) = review.handoff.as_mut().filter(|handoff| {
+                matches!(
+                    handoff.disposition,
+                    ReviewHandoffDisposition::Started { .. }
+                )
+            })
+        {
+            handoff.model = model;
         }
         drop(state);
         self.persist_completion_review_locked().await;
@@ -319,6 +522,30 @@ impl Session {
             .filter(|input| !live_revisions.contains(&input.revision))
             .map(|input| input.revision)
             .collect()
+    }
+
+    pub(super) async fn finish_ordinary_input(self: &Arc<Self>) -> bool {
+        {
+            let state = self.state.lock().await;
+            let review = &state.completion_review;
+            if !review.awaiting_compact_followup
+                && review.unsampled_app_paths.is_empty()
+                && review.unsampled_fresh_model.is_none()
+            {
+                return true;
+            }
+        }
+        self.completion_review_transaction(|session| async move {
+            let mut state = session.state.lock().await;
+            state.completion_review.awaiting_compact_followup = false;
+            state.completion_review.unsampled_fresh_model = None;
+            state.completion_review.owed_settings = None;
+            state.completion_review.unsampled_app_paths.clear();
+            drop(state);
+            session.persist_completion_review_locked().await
+        })
+        .await
+        .unwrap_or(false)
     }
 
     pub(crate) async fn completed_turn_for_review(&self) -> Option<CompletedTurnForReview> {
@@ -540,8 +767,7 @@ impl Session {
             .completion_review
             .eligible_episode()
             .is_some_and(|episode| episode.cwd == state.session_configuration.cwd);
-        let review = &mut state.completion_review;
-        let handoff = review.unstarted_handoff()?;
+        let handoff = state.completion_review.unstarted_handoff()?;
         let expected = if confirmed {
             ReviewHandoffDisposition::Deferred
         } else {
@@ -553,6 +779,12 @@ impl Session {
         {
             return None;
         }
+        let mode =
+            state
+                .mode_for_continuation()
+                .with_updates(Some(handoff.model.clone()), None, None);
+        let settings = RegularTaskSettings::for_review_handoff(&state.session_configuration, mode);
+        let review = &mut state.completion_review;
         let handoff = review.handoff.as_mut()?;
         handoff.disposition = ReviewHandoffDisposition::Started {
             turn_id: turn_id.to_string(),
@@ -565,6 +797,8 @@ impl Session {
             target: PendingContinuationTarget::Regular,
         };
         review.recovery_model = checkpoint.model.clone();
+        review.recovery_output_schema = None;
+        review.recovery_settings = Some(settings);
         review.replacement_answer_required = true;
         drop(state);
         self.persist_completion_review_locked()
@@ -716,19 +950,36 @@ impl Session {
             && state.completion_review.input_revision
                 == state.completion_review.consumed_input_revision
             && frames.0.last().is_none_or(|f| f.attempt != attempt)
-            && let Some(text) = Self::render_review_instructions(&state, false)?
         {
             let items = state.history.raw_items();
             let marker = items
                 .iter()
                 .rposition(crate::compact::is_work_notes_request_item);
             let work = &items[..marker.unwrap_or(items.len())];
+            // A job checkpoint (and a manual compact) can run before new advice is
+            // admitted. Its candidate has no insertion point in already sampled work.
+            if state
+                .completion_review
+                .handoff
+                .as_ref()
+                .is_some_and(|handoff| {
+                    !handoff.advisory_recorded || work.last() != Some(&handoff.advisory_item())
+                })
+            {
+                drop(state);
+                self.record_frame_selection_locked(&frames, Some(context))
+                    .await?;
+                return Ok(frames);
+            }
+            let Some(text) = Self::render_review_instructions(&state, false)? else {
+                return Ok(frames);
+            };
             let work_tokens = match marker {
                 Some(index) => state
                     .history
                     .work_notes_baseline_at(index, &context.model_info.slug)
                     .map(|baseline| baseline.work_tokens),
-                None => state.history_tokens_from_usage(&context.model_info.slug),
+                None => state.helper_tokens_from_usage(&context.model_info.slug),
             }
             .unwrap_or_else(|| super::turn::estimate_work_notes_prompt_tokens(work, &base));
             let new = ReviewPromptFrame::new(text, ReviewPromptFrame::anchor(work), attempt);
@@ -738,7 +989,7 @@ impl Session {
                 > super::turn::unsampled_review_token_limit(context)
             {
                 drop(state);
-                self.record_frame_selection_locked(&frames, Some(&context.model_info.slug))
+                self.record_frame_selection_locked(&frames, Some(context))
                     .await?;
                 return Ok(frames);
             }
@@ -752,13 +1003,15 @@ impl Session {
     async fn record_frame_selection_locked(
         &self,
         frames: &ReviewPromptFrames,
-        deferred_model: Option<&str>,
+        deferred_source: Option<&TurnContext>,
     ) -> CodexResult<()> {
         {
             let mut state = self.state.lock().await;
             state.completion_review.prompt_frames = frames.clone();
-            state.completion_review.defer_new_prompt_frame = deferred_model.is_some();
-            state.completion_review.deferred_capture_model = deferred_model.map(str::to_owned);
+            state.completion_review.defer_new_prompt_frame = deferred_source.is_some();
+            state.completion_review.deferred_capture_source = deferred_source.map(|ctx| {
+                DeferredCaptureSource::Settings(Box::new(RegularTaskSettings::from_turn(ctx)))
+            });
         }
         if !self.persist_completion_review_locked().await {
             return Err(CodexErr::Fatal(
@@ -790,14 +1043,12 @@ impl Session {
 
     pub(super) async fn review_sampling(
         self: &Arc<Self>,
-        context: &TurnContext,
+        context: &Arc<TurnContext>,
+        capture_source: &Arc<TurnContext>,
         input: &[ResponseItem],
         allow_compact: bool,
     ) -> CodexResult<ReviewSampling> {
-        let target = context
-            .model_context_window()
-            .unwrap_or_default()
-            .saturating_sub(8_192);
+        let target = review_input_budget(context);
         {
             let state = self.state.lock().await;
             if !state.completion_review.replacement_answer_required {
@@ -816,9 +1067,9 @@ impl Session {
             }
         }
         let anchor = ReviewPromptFrame::anchor(input);
-        let base = self.get_base_instructions_for_turn(context).await;
-        let helper_limit = super::turn::unsampled_review_token_limit(context);
-        let source_model = context.model_info.slug.clone();
+        let helper_limit = super::turn::unsampled_review_token_limit(capture_source);
+        let context = Arc::clone(context);
+        let capture_source = Arc::clone(capture_source);
         self.completion_review_transaction(move |session| async move {
             let state = session.state.lock().await;
             let attempt = Self::active_review_attempt(&state)?;
@@ -826,9 +1077,7 @@ impl Session {
                 return Ok(ReviewSampling::Ready(ReviewPromptFrames::default()));
             }
             let mut frames = state.completion_review.prompt_frames.clone();
-            let history = state.history_tokens_from_usage(&source_model).unwrap_or_else(|| {
-                state.history.estimate_token_count_with_base_instructions(&base).unwrap_or_default()
-            });
+            let history = review_work_tokens(&state, &context);
             let pinned = frames.0.last().is_some_and(|frame| frame.attempt == attempt);
             let render = |full| -> CodexResult<ReviewPromptFrame> {
                 let text = Self::render_review_instructions(&state, full)?
@@ -847,12 +1096,13 @@ impl Session {
                 let mandatory = render(false)?.tokens;
                 if mandatory <= target && allow_compact {
                     tracing::info!(prompt_tokens, target, pinned, "compacting history to fit review follow-up");
-                    if !pinned && prompt_tokens > helper_limit {
+                    if !pinned && helper_work_tokens(&state, &capture_source)
+                        .saturating_add(frames.tokens()) > helper_limit {
                         // The started handoff owns the new scope durably. It has governed no
                         // ordinary work yet. Install it after compacting the outgoing prefix.
                         let outgoing = state.completion_review.prompt_frames.clone();
                         drop(state);
-                        session.record_frame_selection_locked(&outgoing, Some(&source_model)).await?;
+                        session.record_frame_selection_locked(&outgoing, Some(&capture_source)).await?;
                         return Ok(ReviewSampling::Compact);
                     }
                 } else {
@@ -897,7 +1147,7 @@ impl Session {
         let episode = review
             .eligible_episode()
             .ok_or_else(|| CodexErr::Fatal("Review follow-up candidate is unavailable.".into()))?;
-        let advisory: ResponseItem = DeveloperInstructions::new(handoff.advisory.clone()).into();
+        let advisory = handoff.advisory_item();
         let instructions = if state.history.raw_items().contains(&advisory) {
             crate::tasks::post_turn_completion_review::REPLACEMENT_ANSWER_CONTRACT
         } else {
@@ -919,22 +1169,33 @@ impl Session {
         )))
     }
 
-    pub(crate) async fn record_completion_review_advisory(
+    /// False means compact the outgoing work before writing this advisory to history.
+    pub(super) async fn admit_completion_review_advisory(
         self: &Arc<Self>,
         context: &Arc<TurnContext>,
-    ) {
+        capture_source: &Arc<TurnContext>,
+        allow_compact: bool,
+    ) -> CodexResult<bool> {
+        // Enter the installation transaction before reading state; pause joins this owner.
         let context = Arc::clone(context);
-        let _ = self
-            .completion_review_transaction(move |session| async move {
-                session
-                    .record_completion_review_advisory_locked(&context)
-                    .await;
-            })
-            .await;
+        let capture_source = Arc::clone(capture_source);
+        self.completion_review_transaction(move |session| async move {
+            session
+                .admit_completion_review_advisory_locked(&context, &capture_source, allow_compact)
+                .await
+        })
+        .await
+        .map_err(|e| CodexErr::Fatal(e.to_string()))?
     }
 
-    async fn record_completion_review_advisory_locked(&self, context: &TurnContext) {
-        let handoff = self.state.lock().await.completion_review.handoff.clone();
+    async fn admit_completion_review_advisory_locked(
+        &self,
+        context: &TurnContext,
+        capture_source: &TurnContext,
+        allow_compact: bool,
+    ) -> CodexResult<bool> {
+        let state = self.state.lock().await;
+        let handoff = state.completion_review.handoff.as_ref();
         let Some(handoff) = handoff.filter(|handoff| {
             !handoff.advisory_recorded
                 && matches!(
@@ -942,19 +1203,51 @@ impl Session {
                     ReviewHandoffDisposition::Started { .. }
                 )
         }) else {
-            return;
+            return Ok(true);
         };
         // A crash can leave this handoff's advisory at the tail without its state flag.
         // The same advice *before* intervening work belongs to an earlier review.
-        let item: ResponseItem = DeveloperInstructions::new(handoff.advisory).into();
-        let exists = self.state.lock().await.history.raw_items().last() == Some(&item);
+        let item = handoff.advisory_item();
+        let exists = state.history.raw_items().last() == Some(&item);
+        if !exists {
+            let work = review_work_tokens(&state, context);
+            let outgoing = &state.completion_review.prompt_frames;
+            let advice_tokens = crate::context_manager::estimate_item_token_count(&item);
+            let prompt_tokens = work
+                .saturating_add(outgoing.tokens())
+                .saturating_add(advice_tokens);
+            let target = review_input_budget(context);
+            if advice_tokens > target || (!allow_compact && prompt_tokens > target) {
+                return Err(CodexErr::Fatal(format!(
+                    "Review advice exceeds the main model's payload budget ({prompt_tokens} estimated tokens, {target} available). Select a larger context window, then /continue. No truncated follow-up request was sent."
+                )));
+            }
+            if allow_compact
+                && helper_work_tokens(&state, capture_source)
+                    .saturating_add(outgoing.tokens())
+                    .saturating_add(advice_tokens)
+                    > super::turn::unsampled_review_token_limit(capture_source)
+            {
+                let outgoing = outgoing.clone();
+                drop(state);
+                self.record_frame_selection_locked(&outgoing, Some(capture_source))
+                    .await?;
+                return Ok(false);
+            }
+        }
+        drop(state);
         if !exists {
             self.record_conversation_items(context, &[item]).await;
         }
         if let Some(handoff) = self.state.lock().await.completion_review.handoff.as_mut() {
             handoff.advisory_recorded = true;
         }
-        self.persist_completion_review_locked().await;
+        if !self.persist_completion_review_locked().await {
+            return Err(CodexErr::Fatal(
+                "Could not persist review advisory admission.".into(),
+            ));
+        }
+        Ok(true)
     }
 
     pub(crate) async fn stop_completion_review_operations(&self) {

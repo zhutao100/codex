@@ -40,6 +40,7 @@ pub use crate::provider::Provider;
 pub use crate::provider::is_azure_responses_wire_base_url;
 pub use crate::requests::ResponsesRequest;
 pub use crate::requests::ResponsesRequestBuilder;
+pub use crate::requests::responses::ResponsesStorage;
 pub use crate::sse::stream_from_fixture;
 pub use crate::telemetry::SseTelemetry;
 pub use crate::telemetry::WebsocketTelemetry;

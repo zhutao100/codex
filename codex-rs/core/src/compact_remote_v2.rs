@@ -15,7 +15,6 @@ use crate::compact::preserved_work_notes_message;
 use crate::compact_remote::trim_function_call_history_to_fit_context_window;
 use crate::error::CodexErr;
 use crate::error::Result as CodexResult;
-use crate::protocol::CompactedItem;
 use crate::protocol::EventMsg;
 use crate::protocol::TurnStartedEvent;
 use crate::session::session::Session;
@@ -253,12 +252,8 @@ async fn install_compacted_history(
     let install_context = Arc::clone(turn_context);
     let install = tokio::spawn(async move {
         let _guard = guard;
-        let compacted = CompactedItem {
-            message: String::new(),
-            replacement_history: Some(replacement.clone()),
-        };
         install_session
-            .replace_compacted_history(&install_context, replacement, reference, compacted)
+            .replace_compacted_history(&install_context, replacement, reference, String::new())
             .await;
         install_session
             .emit_turn_item_completed(&install_context, lifecycle_item)

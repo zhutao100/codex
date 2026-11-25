@@ -78,11 +78,15 @@ pub(super) async fn submission_loop(
                     collab_mode
                 } else {
                     let state = sess.state.lock().await;
-                    state.session_configuration.collaboration_mode.with_updates(
-                        model.clone(),
-                        effort,
-                        None,
-                    )
+                    let saved = state
+                        .pending_continuation
+                        .as_ref()
+                        .filter(|c| c.target == PendingContinuationTarget::Regular)
+                        .and(state.completion_review.recovery_settings.as_ref());
+                    saved
+                        .map(|s| &s.mode)
+                        .unwrap_or(&state.session_configuration.collaboration_mode)
+                        .with_updates(model.clone(), effort, None)
                 };
                 override_turn_context(
                     &sess,
@@ -94,8 +98,8 @@ pub(super) async fn submission_loop(
                         windows_sandbox_level,
                         collaboration_mode: Some(collaboration_mode),
                         reasoning_summary: summary,
-                        personality,
-                        service_tier,
+                        personality: personality.map(Some),
+                        service_tier: service_tier.map(Some),
                         ..Default::default()
                     },
                     model_selected,
@@ -394,34 +398,43 @@ async fn continue_with(sess: &Arc<Session>, sub_id: String, request: ContinueReq
         return;
     }
 
-    let turn_context =
-        if checkpoint.target == PendingContinuationTarget::Regular || checkpoint.model.is_some() {
-            let collaboration_mode = {
-                let state = sess.state.lock().await;
-                let mode = if checkpoint.target == PendingContinuationTarget::Regular {
-                    state.mode_for_continuation()
+    let turn_context = if checkpoint.target == PendingContinuationTarget::Regular
+        || checkpoint.model.is_some()
+    {
+        let updates = {
+            let state = sess.state.lock().await;
+            if checkpoint.target == PendingContinuationTarget::Regular
+                && let Some(settings) = &state.completion_review.recovery_settings
+            {
+                settings.updates(checkpoint.model.clone())
+            } else {
+                let (mode, schema) = if checkpoint.target == PendingContinuationTarget::Regular {
+                    (
+                        state.mode_for_continuation(),
+                        state.completion_review.recovery_output_schema.clone(),
+                    )
                 } else {
-                    state.session_configuration.collaboration_mode.clone()
+                    (state.session_configuration.collaboration_mode.clone(), None)
                 };
-                mode.with_updates(checkpoint.model.clone(), None, None)
-            };
-            let Ok(turn_context) = sess
-                .new_turn_with_sub_id(
-                    sub_id,
-                    SessionSettingsUpdate {
-                        collaboration_mode: Some(collaboration_mode),
-                        ..Default::default()
-                    },
-                )
-                .await
-            else {
-                sess.set_pending_continuation(Some(checkpoint)).await;
-                return;
-            };
-            turn_context
-        } else {
-            sess.new_default_turn_with_sub_id(sub_id).await
+                SessionSettingsUpdate {
+                    collaboration_mode: Some(mode.with_updates(
+                        checkpoint.model.clone(),
+                        None,
+                        None,
+                    )),
+                    final_output_json_schema: Some(schema),
+                    ..Default::default()
+                }
+            }
         };
+        let Ok(turn_context) = sess.new_turn_with_sub_id(sub_id, updates).await else {
+            sess.set_pending_continuation(Some(checkpoint)).await;
+            return;
+        };
+        turn_context
+    } else {
+        sess.new_default_turn_with_sub_id(sub_id).await
+    };
     match checkpoint.target {
         PendingContinuationTarget::Regular => {
             sess.spawn_task(
@@ -484,7 +497,7 @@ pub async fn override_turn_context(
         .as_ref()
         .filter(|_| model_selected)
         .map(|mode| mode.model().to_string());
-    if let Err(err) = sess.update_settings(updates).await {
+    if let Err(err) = sess.update_settings(updates.clone()).await {
         sess.send_event_raw(Event {
             id: sub_id,
             msg: EventMsg::Error(ErrorEvent {
@@ -496,10 +509,8 @@ pub async fn override_turn_context(
         .await;
         return;
     }
-    if let Some(model) = recovery_model {
-        sess.retarget_pending_regular_continuation_model(&model)
-            .await;
-    }
+    sess.update_pending_regular_settings(&updates, recovery_model)
+        .await;
 }
 
 pub async fn user_input_or_turn(sess: &Arc<Session>, sub_id: String, op: Op) {
@@ -535,8 +546,8 @@ pub async fn user_input_or_turn(sess: &Arc<Session>, sub_id: String, op: Op) {
                     collaboration_mode: Some(collaboration_mode),
                     reasoning_summary: Some(summary),
                     final_output_json_schema: Some(final_output_json_schema),
-                    personality,
-                    service_tier,
+                    personality: personality.map(Some),
+                    service_tier: service_tier.map(Some),
                 },
             )
         }
@@ -564,8 +575,6 @@ pub async fn user_input_or_turn(sess: &Arc<Session>, sub_id: String, op: Op) {
         Err(SteerInputError::NoActiveTurn(items)) => {
             current_context.otel_manager.user_prompt(&items);
             sess.clear_pending_continuation().await;
-            sess.refresh_mcp_servers_if_requested(&current_context)
-                .await;
             sess.spawn_task(Arc::clone(&current_context), items, RegularTask)
                 .await;
         }
@@ -584,8 +593,6 @@ pub async fn user_input_or_turn(sess: &Arc<Session>, sub_id: String, op: Op) {
             }) =>
         {
             current_context.otel_manager.user_prompt(&items);
-            sess.refresh_mcp_servers_if_requested(&current_context)
-                .await;
             sess.spawn_task(Arc::clone(&current_context), items, RegularTask)
                 .await;
         }

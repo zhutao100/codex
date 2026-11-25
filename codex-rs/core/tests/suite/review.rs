@@ -1929,6 +1929,7 @@ fn rollout_event_count(lines: &[RolloutLine], predicate: impl Fn(&EventMsg) -> b
             | RolloutItem::ResponseItem(_)
             | RolloutItem::Compacted(_)
             | RolloutItem::PostTurnCompletionReviewState(_)
+            | RolloutItem::ToolOutputPolicy { .. }
             | RolloutItem::TokenUsageContext { .. }
             | RolloutItem::TurnContext(_) => false,
         })

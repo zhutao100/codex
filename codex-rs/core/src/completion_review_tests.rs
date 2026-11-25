@@ -8,6 +8,20 @@ fn text_input(text: &str) -> Vec<UserInput> {
     }]
 }
 
+#[test]
+fn earlier_review_deferral_restores_only_its_recorded_model_hint() {
+    let mut saved = serde_json::to_value(CompletionReviewState::default()).unwrap();
+    saved["defer_new_prompt_frame"] = true.into();
+    saved["deferred_capture_model"] = "previous".into();
+    let mut state = CompletionReviewState::from_rollout(&saved).unwrap();
+    assert_eq!(
+        state.recovery_capture_source("destination"),
+        Some(DeferredCaptureSource::LegacyModel("previous".into()))
+    );
+    state.clear_prompt_frames();
+    assert_eq!(state.recovery_capture_source("destination"), None);
+}
+
 fn consume(state: &mut CompletionReviewState, revision: u64) {
     state
         .pending_inputs

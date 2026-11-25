@@ -121,10 +121,10 @@ impl SessionConfiguration {
         }
         if let Some(service_tier) = updates.service_tier.clone() {
             next_configuration.service_tier =
-                Some(ServiceTier::normalize_request_value(service_tier));
+                service_tier.map(ServiceTier::normalize_request_value);
         }
         if let Some(personality) = updates.personality {
-            next_configuration.personality = Some(personality);
+            next_configuration.personality = personality;
         }
         if let Some(approval_policy) = updates.approval_policy {
             next_configuration.approval_policy.set(approval_policy)?;
@@ -150,11 +150,97 @@ pub(crate) struct SessionSettingsUpdate {
     pub(crate) windows_sandbox_level: Option<WindowsSandboxLevel>,
     pub(crate) collaboration_mode: Option<CollaborationMode>,
     pub(crate) reasoning_summary: Option<ReasoningSummaryConfig>,
-    pub(crate) service_tier: Option<String>,
+    pub(crate) service_tier: Option<Option<String>>,
     pub(crate) final_output_json_schema: Option<Option<Value>>,
-    pub(crate) personality: Option<Personality>,
+    pub(crate) personality: Option<Option<Personality>>,
 }
 
+/// Effective, user-selectable settings for a regular invocation. No host handles,
+/// discovered instructions or connection state belong in a recovery checkpoint.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct RegularTaskSettings {
+    pub(super) mode: CollaborationMode,
+    cwd: PathBuf,
+    approval: AskForApproval,
+    sandbox: SandboxPolicy,
+    windows: WindowsSandboxLevel,
+    summary: ReasoningSummaryConfig,
+    personality: Option<Personality>,
+    service_tier: Option<String>,
+    schema: Option<Value>,
+}
+
+impl RegularTaskSettings {
+    pub(super) fn for_review_handoff(
+        config: &SessionConfiguration,
+        mode: CollaborationMode,
+    ) -> Self {
+        Self {
+            mode,
+            cwd: config.cwd.clone(),
+            approval: config.approval_policy.value(),
+            sandbox: config.sandbox_policy.get().clone(),
+            windows: config.windows_sandbox_level,
+            summary: config.model_reasoning_summary,
+            personality: config.personality,
+            service_tier: config.service_tier.clone(),
+            schema: None,
+        }
+    }
+
+    pub(super) fn captures_notes(&self) -> bool {
+        self.schema.is_none()
+    }
+
+    pub(super) fn from_turn(ctx: &TurnContext) -> Self {
+        Self {
+            mode: ctx.collaboration_mode.clone(),
+            cwd: ctx.cwd.clone(),
+            approval: ctx.approval_policy,
+            sandbox: ctx.sandbox_policy.clone(),
+            windows: ctx.windows_sandbox_level,
+            summary: ctx.reasoning_summary,
+            personality: ctx.personality,
+            service_tier: ctx.service_tier.clone(),
+            schema: ctx.final_output_json_schema.clone(),
+        }
+    }
+
+    pub(super) fn updates(&self, model: Option<String>) -> SessionSettingsUpdate {
+        SessionSettingsUpdate {
+            cwd: Some(self.cwd.clone()),
+            approval_policy: Some(self.approval),
+            sandbox_policy: Some(self.sandbox.clone()),
+            windows_sandbox_level: Some(self.windows),
+            collaboration_mode: Some(self.mode.with_updates(model, None, None)),
+            reasoning_summary: Some(self.summary),
+            personality: Some(self.personality),
+            service_tier: Some(self.service_tier.clone()),
+            final_output_json_schema: Some(self.schema.clone()),
+        }
+    }
+
+    pub(super) fn apply_override(&mut self, update: &SessionSettingsUpdate) {
+        if let Some(mode) = &update.collaboration_mode {
+            self.mode.clone_from(mode);
+        }
+        if let Some(cwd) = &update.cwd {
+            self.cwd.clone_from(cwd);
+        }
+        if let Some(sandbox) = &update.sandbox_policy {
+            self.sandbox.clone_from(sandbox);
+        }
+        self.approval = update.approval_policy.unwrap_or(self.approval);
+        self.windows = update.windows_sandbox_level.unwrap_or(self.windows);
+        self.summary = update.reasoning_summary.unwrap_or(self.summary);
+        if let Some(personality) = update.personality {
+            self.personality = personality;
+        }
+        if let Some(tier) = &update.service_tier {
+            self.service_tier = tier.clone().map(ServiceTier::normalize_request_value);
+        }
+    }
+}
 impl Session {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn new(

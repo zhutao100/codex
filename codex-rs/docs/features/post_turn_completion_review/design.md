@@ -32,7 +32,7 @@ Review delegates use `SubAgentSource::Review` and leave completion-review recove
 1. Persist accepted original input with its known initial task owner. Keep its original payload until installation is durable.
 2. Persist a revision-specific `Installing` marker before the model-facing body. Flush the body before consumption. Immediately consumed input needs no intermediate `Recorded` snapshot; retained unconsumed input does.
 3. Persist a completed candidate and any automatic-review reservation together. Scheduling uses that existing ticket; it cannot recreate a ticket invalidated by stop.
-4. Persist a `Prepared` handoff before enqueueing and its `Started` claim before main work. A full or closed operation queue leaves recoverable work rather than blocking the finalizer.
+4. Persist a `Prepared` handoff before enqueueing. At `Started`, commit the follow-up's effective regular settings (including reasoning effort and service tier, with no inherited output schema) in the same write as the claim. A restart before main-task startup must project the same request, not process defaults. A full or closed operation queue leaves recoverable work rather than blocking the finalizer.
 5. Persist every resumed main task's new owner before cleanup, context injection or sampling, including an already-Started handoff.
 
 Replay matches a body to its revision-specific installing marker using the exact host-owned message. It repairs both acknowledged-but-unwritten input and body-written/state-not-written gaps. It never deduplicates distinct identical amendments by searching for matching text elsewhere. Missing bodies are reinstalled after pending notes recovery and before ordinary sampling.

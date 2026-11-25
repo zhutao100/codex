@@ -1,5 +1,7 @@
 use super::*;
 use crate::context_manager::ContextManager;
+use crate::protocol::CompactedItem;
+use crate::protocol::CompactionCheckpoint;
 use crate::rollout::policy::should_persist_response_item;
 use crate::rollout::recorder::RolloutRecorder;
 use crate::rollout::recorder::RolloutRecorderParams;
@@ -370,6 +372,7 @@ async fn installation_persists_before_task_stop_and_replays_exactly(pause: bool)
     })
     .await
     .unwrap();
+    let installed_usage = session.clone_history().await.token_info().unwrap();
     let stop_session = Arc::clone(&session);
     let stopped = tokio::spawn(async move {
         if pause {
@@ -431,6 +434,10 @@ async fn installation_persists_before_task_stop_and_replays_exactly(pause: bool)
         serde_json::to_value(checkpoints).unwrap(),
         serde_json::to_value(vec![(
             CompactedItem {
+                checkpoint: Some(Box::new(CompactionCheckpoint {
+                    usage: installed_usage,
+                    injected_context: Some(reference.clone()),
+                })),
                 message: String::new(),
                 replacement_history: Some(expected.clone()),
             },

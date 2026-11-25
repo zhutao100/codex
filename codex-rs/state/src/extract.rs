@@ -19,6 +19,7 @@ pub fn apply_rollout_item(
         RolloutItem::EventMsg(event) => apply_event_msg(metadata, event),
         RolloutItem::ResponseItem(item) => apply_response_item(metadata, item),
         RolloutItem::Compacted(_)
+        | RolloutItem::ToolOutputPolicy { .. }
         | RolloutItem::TokenUsageContext { .. }
         | RolloutItem::PostTurnCompletionReviewState(_) => {}
     }

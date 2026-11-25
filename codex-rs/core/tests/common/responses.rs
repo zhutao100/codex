@@ -33,6 +33,39 @@ use wiremock::matchers::path_regex;
 
 use crate::test_codex::ApplyPatchModelOutput;
 
+/// Host a local connector catalog whose `probe_NAME` tools expose the selected apps on the wire.
+pub async fn mount_app_catalog(server: &MockServer, names: &[&str]) {
+    mount_app_catalog_with_capabilities(server, names, serde_json::json!({"tools":{}})).await;
+}
+
+pub async fn mount_app_catalog_with_capabilities(
+    server: &MockServer,
+    names: &[&str],
+    capabilities: Value,
+) {
+    let tools: Vec<_> = names
+        .iter()
+        .map(|name| {
+            serde_json::json!({
+                "name": format!("probe_{name}"), "inputSchema": {"type":"object","properties":{}},
+                "_meta": {"connector_id":name,"connector_name":name}
+            })
+        })
+        .collect();
+    Mock::given(method("POST")).and(wiremock::matchers::path("/api/codex/apps"))
+        .respond_with(move |request: &wiremock::Request| {
+            let msg: Value = request.body_json().unwrap();
+            let Some(id) = msg.get("id") else { return ResponseTemplate::new(202) };
+            let result = match msg["method"].as_str() {
+                Some("initialize") => serde_json::json!({"protocolVersion": msg["params"]["protocolVersion"], "capabilities":capabilities, "serverInfo":{"name":"apps","version":"1"}}),
+                Some("tools/list") => serde_json::json!({"tools":tools}),
+                Some("tools/call") => serde_json::json!({"content":[{"type":"text","text":"probe complete"}]}),
+                _ => serde_json::json!({}),
+            };
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"jsonrpc":"2.0","id":id,"result":result}))
+        }).mount(server).await;
+}
+
 #[derive(Debug, Clone)]
 pub struct ResponseMock {
     requests: Arc<Mutex<Vec<ResponsesRequest>>>,

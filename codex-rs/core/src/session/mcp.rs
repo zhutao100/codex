@@ -1,6 +1,24 @@
 use super::*;
 
+impl From<&TurnContext> for SandboxState {
+    fn from(context: &TurnContext) -> Self {
+        Self {
+            sandbox_policy: context.sandbox_policy.clone(),
+            sandbox_cwd: context.cwd.clone(),
+            codex_linux_sandbox_exe: context.codex_linux_sandbox_exe.clone(),
+        }
+    }
+}
+
 impl Session {
+    pub(super) async fn activate_mcp_context(&self, context: &TurnContext) {
+        self.refresh_mcp_servers_if_requested(context).await;
+        self.current_mcp_manager()
+            .await
+            .activate_sandbox(context.into())
+            .await;
+    }
+
     /// Keep workspace connections alive across login/logout, but never send a new request
     /// through a hosted connection established with different account credentials.
     pub(crate) async fn current_mcp_manager(&self) -> Arc<McpConnectionManager> {
@@ -25,15 +43,6 @@ impl Session {
             return guard.clone();
         }
         drop(guard);
-        let sandbox_state = {
-            let state = self.state.lock().await;
-            let session = &state.session_configuration;
-            SandboxState {
-                sandbox_policy: session.sandbox_policy.get().clone(),
-                sandbox_cwd: session.cwd.clone(),
-                codex_linux_sandbox_exe: config.codex_linux_sandbox_exe.clone(),
-            }
-        };
         let mut guard = clients.write().await;
         Arc::make_mut(&mut guard)
             .rebind_hosted_apps(
@@ -41,7 +50,6 @@ impl Session {
                 config.mcp_oauth_credentials_store_mode,
                 self.mcp_startup_cancellation_token().await,
                 self.get_tx_event(),
-                sandbox_state,
             )
             .await;
         guard.clone()
@@ -173,11 +181,6 @@ impl Session {
             config.as_ref(),
         );
         let auth_statuses = compute_auth_statuses(mcp_servers.iter(), store_mode).await;
-        let sandbox_state = SandboxState {
-            sandbox_policy: turn_context.sandbox_policy.clone(),
-            codex_linux_sandbox_exe: turn_context.codex_linux_sandbox_exe.clone(),
-            sandbox_cwd: turn_context.cwd.clone(),
-        };
         let cancel_token = self.reset_mcp_startup_cancellation_token().await;
 
         let mut refreshed_manager = McpConnectionManager::default();
@@ -188,7 +191,7 @@ impl Session {
                 auth_statuses,
                 self.get_tx_event(),
                 cancel_token,
-                sandbox_state,
+                turn_context.into(),
             )
             .await;
 

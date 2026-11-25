@@ -676,7 +676,7 @@ mod tests {
         );
         assert!(
             session
-                .start_completion_review_main_task(&context.sub_id)
+                .start_completion_review_main_task(&context.sub_id, &context)
                 .await
         );
         session
