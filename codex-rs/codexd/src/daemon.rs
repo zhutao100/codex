@@ -9,9 +9,9 @@ use crate::protocol::HubNotification;
 use crate::protocol::RuntimeEventParams;
 use crate::protocol::RuntimeRegisterParams;
 use crate::protocol::RuntimeSnapshot;
-use crate::protocol::RuntimeUnregisterParams;
 use crate::protocol::RuntimeUpdateMetadataParams;
 use crate::protocol::RuntimeUpdateStateParams;
+use crate::protocol::WorkActivity;
 use anyhow::Context;
 use serde::de::DeserializeOwned;
 use serde_json::Value as JsonValue;
@@ -45,29 +45,29 @@ const LAUNCHD_SOCKET_NAME: &str = "codexd";
 const MAX_RECENT_EVENTS: usize = 1024;
 const PROTOCOL_VERSION: u32 = 1;
 
-#[derive(Debug, Clone)]
-struct RuntimeState {
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RuntimeState {
     pid: Option<u32>,
     session_source: Option<String>,
     cwd: Option<String>,
     display_name: Option<String>,
-    active_turns: BTreeMap<String, ActiveTurnSnapshot>,
+    pub(crate) active_turns: BTreeMap<String, ActiveTurnSnapshot>,
+    pub(crate) work_activity: Option<WorkActivity>,
     thread_token_usage: BTreeMap<String, JsonValue>,
 }
 
 impl RuntimeState {
-    fn with_register(params: &RuntimeRegisterParams) -> Self {
+    pub(crate) fn with_register(params: &RuntimeRegisterParams) -> Self {
         Self {
             pid: params.pid,
             session_source: params.session_source.clone(),
             cwd: params.cwd.clone(),
             display_name: params.display_name.clone(),
-            active_turns: BTreeMap::new(),
-            thread_token_usage: BTreeMap::new(),
+            ..Self::default()
         }
     }
 
-    fn apply_metadata_update(&mut self, params: &RuntimeUpdateMetadataParams) {
+    pub(crate) fn apply_metadata_update(&mut self, params: &RuntimeUpdateMetadataParams) {
         self.pid = params.pid.or(self.pid);
         self.session_source = params
             .session_source
@@ -80,7 +80,7 @@ impl RuntimeState {
             .or_else(|| self.display_name.clone());
     }
 
-    fn as_snapshot(&self, runtime_id: String) -> RuntimeSnapshot {
+    pub(crate) fn as_snapshot(&self, runtime_id: String) -> RuntimeSnapshot {
         let active_turns = self.active_turns.values().cloned().collect();
 
         RuntimeSnapshot {
@@ -90,6 +90,8 @@ impl RuntimeState {
             cwd: self.cwd.clone(),
             display_name: self.display_name.clone(),
             active_turns,
+            work_activity_supported: self.work_activity.is_some(),
+            work_activity: self.work_activity.clone(),
         }
     }
 }
@@ -99,6 +101,7 @@ struct DaemonState {
     next_connection_id: u64,
     seq: u64,
     runtimes: BTreeMap<String, RuntimeState>,
+    runtime_connections: HashMap<String, u64>,
     subscribers: HashMap<u64, mpsc::UnboundedSender<String>>,
     recent_events: VecDeque<(u64, String)>,
 }
@@ -129,6 +132,7 @@ impl DaemonState {
                 "eventReplay".to_string(),
                 "runtimeState".to_string(),
                 "activeTurnContext".to_string(),
+                "workActivity".to_string(),
             ],
             seq: self.seq,
         }
@@ -192,17 +196,7 @@ impl DaemonState {
     fn update_runtime_metadata(&mut self, params: RuntimeUpdateMetadataParams) {
         let runtime_id = params.runtime_id.clone();
         let snapshot = {
-            let runtime = self
-                .runtimes
-                .entry(runtime_id.clone())
-                .or_insert_with(|| RuntimeState {
-                    pid: params.pid,
-                    session_source: params.session_source.clone(),
-                    cwd: params.cwd.clone(),
-                    display_name: params.display_name.clone(),
-                    active_turns: BTreeMap::new(),
-                    thread_token_usage: BTreeMap::new(),
-                });
+            let runtime = self.runtimes.entry(runtime_id.clone()).or_default();
             runtime.apply_metadata_update(&params);
             runtime.as_snapshot(runtime_id)
         };
@@ -213,18 +207,15 @@ impl DaemonState {
     fn update_runtime_state(&mut self, params: RuntimeUpdateStateParams) {
         let runtime_id = params.runtime_id.clone();
         let snapshot = {
-            let runtime = self
-                .runtimes
-                .entry(runtime_id.clone())
-                .or_insert_with(|| RuntimeState {
-                    pid: params.pid,
-                    session_source: params.session_source.clone(),
-                    cwd: params.cwd.clone(),
-                    display_name: params.display_name.clone(),
-                    active_turns: BTreeMap::new(),
-                    thread_token_usage: BTreeMap::new(),
-                });
+            let runtime = self.runtimes.entry(runtime_id.clone()).or_default();
 
+            if let (Some(old), Some(new)) = (&runtime.work_activity, &params.work_activity)
+                && old.producer_generation == new.producer_generation
+                && old.revision > new.revision
+            {
+                return;
+            }
+            runtime.work_activity = params.work_activity;
             runtime.pid = params.pid.or(runtime.pid);
             runtime.session_source = params
                 .session_source
@@ -244,7 +235,9 @@ impl DaemonState {
                         turn_key(turn.thread_id.as_str(), turn.turn_id.as_str())
                     });
                     turn.turn_key = Some(turn_key.clone());
-                    if turn.token_usage_baseline.is_none() {
+                    // A complete producer projection already owns the baseline.
+                    // Its current-turn usage must not become its own starting total.
+                    if runtime.work_activity.is_none() && turn.token_usage_baseline.is_none() {
                         turn.token_usage_baseline =
                             thread_token_usage.get(turn.thread_id.as_str()).cloned();
                     }
@@ -265,19 +258,19 @@ impl DaemonState {
         let runtime_id = params.runtime_id;
         let notification = params.notification;
         let updated_snapshot = {
-            let runtime = self
-                .runtimes
-                .entry(runtime_id.clone())
-                .or_insert_with(|| RuntimeState {
-                    pid: None,
-                    session_source: None,
-                    cwd: None,
-                    display_name: None,
-                    active_turns: BTreeMap::new(),
-                    thread_token_usage: BTreeMap::new(),
-                });
+            let runtime = self.runtimes.entry(runtime_id.clone()).or_default();
 
-            apply_notification_to_runtime(runtime, &notification)
+            let changed_work = params.work_activity.is_some();
+            if let Some(work) = params.work_activity {
+                if let Some(old) = &runtime.work_activity
+                    && (old.producer_generation != work.producer_generation
+                        || old.revision >= work.revision)
+                {
+                    return;
+                }
+                runtime.work_activity = Some(work);
+            }
+            (apply_notification_to_runtime(runtime, &notification) || changed_work)
                 .then(|| runtime.as_snapshot(runtime_id.clone()))
         };
 
@@ -409,7 +402,7 @@ async fn handle_connection(
     let mut owned_runtime_ids = HashSet::<String>::new();
     let mut subscribed = false;
 
-    while let Some(line) = lines.next_line().await? {
+    while let Ok(Some(line)) = lines.next_line().await {
         if line.trim().is_empty() {
             continue;
         }
@@ -446,34 +439,16 @@ async fn handle_connection(
                 )
                 .await
             }
-            RUNTIME_REGISTER_METHOD => {
-                handle_runtime_register_method(Arc::clone(&state), params, &mut owned_runtime_ids)
-                    .await
-            }
-            RUNTIME_UPDATE_METADATA_METHOD => {
-                handle_runtime_update_metadata_method(
-                    Arc::clone(&state),
-                    params,
-                    &mut owned_runtime_ids,
-                )
-                .await
-            }
-            RUNTIME_UPDATE_STATE_METHOD => {
-                handle_runtime_update_state_method(
-                    Arc::clone(&state),
-                    params,
-                    &mut owned_runtime_ids,
-                )
-                .await
-            }
-            RUNTIME_EVENT_METHOD => {
-                handle_runtime_event_method(Arc::clone(&state), params, &mut owned_runtime_ids)
-                    .await
-            }
-            RUNTIME_UNREGISTER_METHOD => {
-                handle_runtime_unregister_method(Arc::clone(&state), params, &mut owned_runtime_ids)
-                    .await
-            }
+            RUNTIME_REGISTER_METHOD
+            | RUNTIME_UPDATE_METADATA_METHOD
+            | RUNTIME_UPDATE_STATE_METHOD
+            | RUNTIME_EVENT_METHOD
+            | RUNTIME_UNREGISTER_METHOD => state.lock().await.producer_message(
+                connection_id,
+                &mut owned_runtime_ids,
+                &method,
+                params,
+            ),
             _ => Err(format!("unknown method `{method}`")),
         };
 
@@ -510,7 +485,10 @@ async fn cleanup_connection(
     }
 
     for runtime_id in owned_runtime_ids {
-        state.unregister_runtime(&runtime_id);
+        if state.runtime_connections.get(&runtime_id) == Some(&connection_id) {
+            state.runtime_connections.remove(&runtime_id);
+            state.unregister_runtime(&runtime_id);
+        }
     }
 }
 
@@ -540,77 +518,72 @@ async fn handle_subscribe_method(
     serde_json::to_value(response).map_err(|err| err.to_string())
 }
 
-async fn handle_runtime_register_method(
-    state: Arc<Mutex<DaemonState>>,
-    params: Option<JsonValue>,
-    owned_runtime_ids: &mut HashSet<String>,
-) -> Result<JsonValue, String> {
-    let params: RuntimeRegisterParams = deserialize_params(params)?;
-
-    owned_runtime_ids.insert(params.runtime_id.clone());
-
-    let mut state = state.lock().await;
-    state.upsert_runtime_from_register(params);
-    Ok(serde_json::json!({}))
+impl DaemonState {
+    fn producer_message(
+        &mut self,
+        connection: u64,
+        owned: &mut HashSet<String>,
+        method: &str,
+        params: Option<JsonValue>,
+    ) -> Result<JsonValue, String> {
+        let id = params
+            .as_ref()
+            .and_then(|p| p.get("runtimeId"))
+            .and_then(JsonValue::as_str)
+            .ok_or("missing runtimeId")?
+            .to_owned();
+        let owner = self.runtime_connections.get(&id).copied();
+        if owner.is_some_and(|n| n > connection)
+            || (owned.contains(&id) && owner != Some(connection))
+        {
+            return Err("superseded producer connection".into());
+        }
+        match method {
+            RUNTIME_REGISTER_METHOD => {
+                let registration = deserialize_params(params)?;
+                if owner != Some(connection) {
+                    self.runtimes.remove(&id);
+                }
+                self.upsert_runtime_from_register(registration);
+            }
+            RUNTIME_UPDATE_METADATA_METHOD => {
+                self.update_runtime_metadata(deserialize_params(params)?)
+            }
+            RUNTIME_UPDATE_STATE_METHOD => {
+                let state: RuntimeSnapshot = deserialize_params(params)?;
+                if state.work_activity_supported && state.work_activity.is_none() {
+                    return Err("missing negotiated workActivity".into());
+                }
+                if let Some(prior) = self
+                    .runtimes
+                    .get(&id)
+                    .and_then(|r| r.work_activity.as_ref())
+                    && state.work_activity.as_ref().map(|w| &w.producer_generation)
+                        != Some(&prior.producer_generation)
+                {
+                    if owner == Some(connection) {
+                        return Err("producer generation changed on a live connection".into());
+                    }
+                    self.runtimes.remove(&id);
+                }
+                self.update_runtime_state(state);
+            }
+            RUNTIME_EVENT_METHOD => self.apply_runtime_notification(deserialize_params(params)?),
+            RUNTIME_UNREGISTER_METHOD => {
+                self.unregister_runtime(&id);
+                self.runtime_connections.remove(&id);
+                owned.remove(&id);
+                return Ok(serde_json::json!({}));
+            }
+            _ => unreachable!(),
+        }
+        self.runtime_connections.insert(id.clone(), connection);
+        owned.insert(id);
+        Ok(serde_json::json!({}))
+    }
 }
 
-async fn handle_runtime_update_metadata_method(
-    state: Arc<Mutex<DaemonState>>,
-    params: Option<JsonValue>,
-    owned_runtime_ids: &mut HashSet<String>,
-) -> Result<JsonValue, String> {
-    let params: RuntimeUpdateMetadataParams = deserialize_params(params)?;
-
-    owned_runtime_ids.insert(params.runtime_id.clone());
-
-    let mut state = state.lock().await;
-    state.update_runtime_metadata(params);
-    Ok(serde_json::json!({}))
-}
-
-async fn handle_runtime_update_state_method(
-    state: Arc<Mutex<DaemonState>>,
-    params: Option<JsonValue>,
-    owned_runtime_ids: &mut HashSet<String>,
-) -> Result<JsonValue, String> {
-    let params: RuntimeUpdateStateParams = deserialize_params(params)?;
-
-    owned_runtime_ids.insert(params.runtime_id.clone());
-
-    let mut state = state.lock().await;
-    state.update_runtime_state(params);
-    Ok(serde_json::json!({}))
-}
-
-async fn handle_runtime_event_method(
-    state: Arc<Mutex<DaemonState>>,
-    params: Option<JsonValue>,
-    owned_runtime_ids: &mut HashSet<String>,
-) -> Result<JsonValue, String> {
-    let params: RuntimeEventParams = deserialize_params(params)?;
-
-    owned_runtime_ids.insert(params.runtime_id.clone());
-
-    let mut state = state.lock().await;
-    state.apply_runtime_notification(params);
-    Ok(serde_json::json!({}))
-}
-
-async fn handle_runtime_unregister_method(
-    state: Arc<Mutex<DaemonState>>,
-    params: Option<JsonValue>,
-    owned_runtime_ids: &mut HashSet<String>,
-) -> Result<JsonValue, String> {
-    let params: RuntimeUnregisterParams = deserialize_params(params)?;
-
-    owned_runtime_ids.remove(&params.runtime_id);
-
-    let mut state = state.lock().await;
-    state.unregister_runtime(&params.runtime_id);
-    Ok(serde_json::json!({}))
-}
-
-fn apply_notification_to_runtime(
+pub(crate) fn apply_notification_to_runtime(
     runtime: &mut RuntimeState,
     notification: &HubNotification,
 ) -> bool {
@@ -1080,6 +1053,7 @@ mod tests {
                     "eventReplay".to_string(),
                     "runtimeState".to_string(),
                     "activeTurnContext".to_string(),
+                    "workActivity".to_string(),
                 ],
                 seq: 1,
             }
@@ -1090,6 +1064,8 @@ mod tests {
     fn update_state_replaces_active_turn_summary() {
         let mut state = DaemonState::default();
         state.update_runtime_state(RuntimeUpdateStateParams {
+            work_activity_supported: false,
+            work_activity: None,
             runtime_id: "rt-1".to_string(),
             pid: Some(123),
             session_source: Some("cli".to_string()),
@@ -1107,6 +1083,8 @@ mod tests {
         });
 
         state.update_runtime_state(RuntimeUpdateStateParams {
+            work_activity_supported: false,
+            work_activity: None,
             runtime_id: "rt-1".to_string(),
             pid: None,
             session_source: None,
@@ -1127,6 +1105,8 @@ mod tests {
         assert_eq!(
             snapshot.runtimes,
             vec![RuntimeSnapshot {
+                work_activity_supported: false,
+                work_activity: None,
                 runtime_id: "rt-1".to_string(),
                 pid: Some(123),
                 session_source: Some("cli".to_string()),
@@ -1146,12 +1126,84 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn superseded_socket_and_older_revision_cannot_restore_or_remove_work() {
+        let mut state = DaemonState::default();
+        let mut a = HashSet::new();
+        let mut b = HashSet::new();
+        let params = |revision, items: Vec<&str>| {
+            Some(serde_json::json!({
+                "runtimeId": "rt", "activeTurns": [], "workActivitySupported": true,
+                "workActivity": {"producerGeneration": "g", "revision": revision, "items": items}
+            }))
+        };
+        state
+            .producer_message(
+                1,
+                &mut a,
+                RUNTIME_UPDATE_STATE_METHOD,
+                params(1, vec!["review"]),
+            )
+            .unwrap();
+        state
+            .producer_message(2, &mut b, RUNTIME_UPDATE_STATE_METHOD, params(3, vec![]))
+            .unwrap();
+        assert!(
+            state
+                .producer_message(
+                    1,
+                    &mut a,
+                    RUNTIME_UPDATE_STATE_METHOD,
+                    params(2, vec!["old"])
+                )
+                .is_err()
+        );
+        state
+            .producer_message(
+                2,
+                &mut b,
+                RUNTIME_UPDATE_STATE_METHOD,
+                params(2, vec!["old"]),
+            )
+            .unwrap();
+        let state = Arc::new(Mutex::new(state));
+        cleanup_connection(Arc::clone(&state), 1, a, false).await;
+        let work = state
+            .lock()
+            .await
+            .snapshot()
+            .runtimes
+            .remove(0)
+            .work_activity
+            .unwrap();
+        assert_eq!(work.revision, 3);
+        assert!(work.items.is_empty());
+    }
+
+    #[test]
+    fn repeating_a_complete_state_does_not_use_current_usage_as_its_own_baseline() {
+        let mut state = DaemonState::default();
+        let params: RuntimeSnapshot = serde_json::from_value(serde_json::json!({
+            "runtimeId": "rt", "workActivitySupported": true,
+            "workActivity": {"producerGeneration": "g", "revision": 1, "items": ["t:1"]},
+            "activeTurns": [{"threadId":"t","turnId":"1","tokenUsage":{"total":{"totalTokens":42}}}]
+        }))
+        .unwrap();
+        state.update_runtime_state(params.clone());
+        state.update_runtime_state(params);
+        assert_eq!(
+            state.snapshot().runtimes[0].active_turns[0].token_usage_baseline,
+            None
+        );
+    }
+
     #[test]
     fn runtime_notifications_key_active_turns_by_thread_and_turn() {
         let mut state = DaemonState::default();
 
         for thread_id in ["thread-a", "thread-b"] {
             state.apply_runtime_notification(RuntimeEventParams {
+                work_activity: None,
                 runtime_id: "rt-1".to_string(),
                 notification: HubNotification {
                     method: "turn/started".to_string(),
@@ -1191,6 +1243,7 @@ mod tests {
         );
 
         state.apply_runtime_notification(RuntimeEventParams {
+            work_activity: None,
             runtime_id: "rt-1".to_string(),
             notification: HubNotification {
                 method: "turn/completed".to_string(),
@@ -1221,6 +1274,7 @@ mod tests {
     fn stale_completion_key_does_not_remove_reused_child_turn_id() {
         let mut state = DaemonState::default();
         state.apply_runtime_notification(RuntimeEventParams {
+            work_activity: None,
             runtime_id: "rt-1".to_string(),
             notification: HubNotification {
                 method: "turn/started".to_string(),
@@ -1237,6 +1291,7 @@ mod tests {
         });
 
         state.apply_runtime_notification(RuntimeEventParams {
+            work_activity: None,
             runtime_id: "rt-1".to_string(),
             notification: HubNotification {
                 method: "turn/completed".to_string(),
@@ -1267,6 +1322,7 @@ mod tests {
     fn runtime_context_updates_active_turn_and_broadcasts_snapshot() {
         let mut state = DaemonState::default();
         state.apply_runtime_notification(RuntimeEventParams {
+            work_activity: None,
             runtime_id: "rt-1".to_string(),
             notification: HubNotification {
                 method: "turn/started".to_string(),
@@ -1296,6 +1352,7 @@ mod tests {
         let seq_before_update = state.seq;
 
         state.apply_runtime_notification(RuntimeEventParams {
+            work_activity: None,
             runtime_id: "rt-1".to_string(),
             notification: HubNotification {
                 method: "thread/tokenUsage/updated".to_string(),
@@ -1404,6 +1461,7 @@ mod tests {
         });
 
         state.apply_runtime_notification(RuntimeEventParams {
+            work_activity: None,
             runtime_id: "rt-1".to_string(),
             notification: HubNotification {
                 method: "thread/tokenUsage/updated".to_string(),
@@ -1416,6 +1474,7 @@ mod tests {
             },
         });
         state.apply_runtime_notification(RuntimeEventParams {
+            work_activity: None,
             runtime_id: "rt-1".to_string(),
             notification: HubNotification {
                 method: "turn/started".to_string(),
@@ -1430,6 +1489,7 @@ mod tests {
             },
         });
         state.apply_runtime_notification(RuntimeEventParams {
+            work_activity: None,
             runtime_id: "rt-1".to_string(),
             notification: HubNotification {
                 method: "thread/tokenUsage/updated".to_string(),

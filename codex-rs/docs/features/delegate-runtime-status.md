@@ -20,6 +20,8 @@ Runtime-context events are transient and excluded from rollout persistence. Revi
 
 ## `codexd` projection
 
+Visible turns and automatic work have different lifetimes. Delegate context can lack a turn ID during preparation; use [per-runtime work activity](../../codexd/README.md#work-activity) for continuity, not a synthetic turn in history.
+
 The TUI's `MenuBarBridge` publishes the snapshots into the existing process-level runtime. The daemon advertises `activeTurnContext` and retains optional fields so older clients can continue reading the base active-turn shape.
 
 |Notification|State change|

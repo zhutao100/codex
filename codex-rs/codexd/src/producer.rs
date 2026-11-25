@@ -1,21 +1,27 @@
+use crate::daemon::RuntimeState;
+use crate::daemon::apply_notification_to_runtime;
 use crate::protocol::HubNotification;
+use crate::protocol::RuntimeEventParams;
 use crate::protocol::RuntimeRegisterParams;
+use crate::protocol::RuntimeSnapshot;
 use crate::protocol::RuntimeUpdateMetadataParams;
+use crate::protocol::WorkActivity;
 use codex_app_server_protocol::ServerNotification;
 use serde_json::Value as JsonValue;
-use std::collections::VecDeque;
+use std::collections::BTreeSet;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::PoisonError;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
-use tokio::sync::mpsc;
-use tracing::debug;
+use tokio::sync::watch;
 use tracing::warn;
 
-const DEFAULT_CHANNEL_CAPACITY: usize = 2048;
-const MAX_PENDING_LINES: usize = 4096;
+const MAX_PENDING: usize = 2048;
 
 #[derive(Debug, Clone)]
 pub struct RuntimeMetadata {
@@ -48,71 +54,146 @@ impl RuntimeMetadata {
     }
 }
 
-#[derive(Debug)]
-enum ProducerCommand {
-    UpdateMetadata(RuntimeMetadata),
-    PublishNotification(HubNotification),
-    Shutdown,
+enum Publication {
+    State(RuntimeSnapshot),
+    Event(RuntimeEventParams),
+}
+
+// Projection and its outbound ordering barrier change under the same lock.
+// Losing buffered detail never loses the state required to resume a quiet turn.
+struct Outbox {
+    id: String,
+    state: RuntimeState,
+    work: watch::Receiver<BTreeSet<String>>,
+    generation: String,
+    revision: u64,
+    pending: Vec<Publication>,
+    replace: bool,
+    stopped: bool,
+}
+
+impl Outbox {
+    fn snapshot(&self) -> RuntimeSnapshot {
+        self.state.as_snapshot(self.id.clone())
+    }
+
+    fn update_work(&mut self) {
+        self.revision += 1;
+        let mut items = self.work.borrow_and_update().clone();
+        items.extend(self.state.active_turns.keys().cloned());
+        self.state.work_activity = Some(WorkActivity {
+            producer_generation: self.generation.clone(),
+            revision: self.revision,
+            items,
+        });
+    }
+
+    fn push(&mut self, update: Publication) {
+        if self.replace {
+            return;
+        }
+        if self.pending.len() == MAX_PENDING {
+            self.pending.clear();
+            self.replace = true;
+        } else {
+            self.pending.push(update);
+        }
+    }
+
+    fn publish(&mut self, notification: HubNotification) {
+        let changed = apply_notification_to_runtime(&mut self.state, &notification);
+        let work_activity = if changed || self.work.has_changed().unwrap_or(false) {
+            self.update_work();
+            self.state.work_activity.clone()
+        } else {
+            None
+        };
+        self.push(Publication::Event(RuntimeEventParams {
+            runtime_id: self.id.clone(),
+            notification,
+            work_activity,
+        }));
+    }
+
+    fn drain(&mut self, reconnect: bool) -> Vec<Publication> {
+        if reconnect || self.replace {
+            self.update_work();
+            self.pending.clear();
+            self.replace = false;
+            return vec![Publication::State(self.snapshot())];
+        }
+        if self.work.has_changed().unwrap_or(false) {
+            self.update_work();
+            self.pending.push(Publication::State(self.snapshot()));
+        }
+        std::mem::take(&mut self.pending)
+    }
 }
 
 #[derive(Clone)]
 pub struct CodexdProducerClient {
-    sender: mpsc::Sender<ProducerCommand>,
+    outbox: Arc<Mutex<Outbox>>,
+    wake: watch::Sender<()>,
 }
 
 impl CodexdProducerClient {
-    pub fn spawn(codex_home: &Path, metadata: RuntimeMetadata) -> Self {
+    pub fn spawn(
+        codex_home: &Path,
+        metadata: RuntimeMetadata,
+        work: watch::Receiver<BTreeSet<String>>,
+    ) -> Self {
         let socket_path = super::default_socket_path(codex_home);
-        Self::spawn_with_socket_path(socket_path, metadata)
+        Self::spawn_with_socket_path(socket_path, metadata, work)
     }
 
-    pub fn spawn_with_socket_path(socket_path: PathBuf, metadata: RuntimeMetadata) -> Self {
-        let (sender, receiver) = mpsc::channel(DEFAULT_CHANNEL_CAPACITY);
-
+    pub fn spawn_with_socket_path(
+        socket_path: PathBuf,
+        metadata: RuntimeMetadata,
+        work: watch::Receiver<BTreeSet<String>>,
+    ) -> Self {
+        let (wake, receiver) = watch::channel(());
+        let outbox = Arc::new(Mutex::new(Outbox {
+            state: RuntimeState::with_register(&metadata.to_register_params()),
+            id: metadata.runtime_id,
+            generation: uuid::Uuid::new_v4().to_string(),
+            revision: 0,
+            work: work.clone(),
+            pending: Vec::new(),
+            replace: true,
+            stopped: false,
+        }));
+        let writer = Arc::clone(&outbox);
         tokio::spawn(async move {
-            run_producer_task(socket_path, metadata, receiver).await;
+            run_producer_task(socket_path, writer, receiver, work).await;
         });
-
-        Self { sender }
+        Self { outbox, wake }
     }
 
     pub async fn update_metadata(&self, metadata: RuntimeMetadata) {
-        if self
-            .sender
-            .send(ProducerCommand::UpdateMetadata(metadata))
-            .await
-            .is_err()
-        {
-            debug!("codexd producer task stopped before metadata update could be queued");
-        }
+        let mut outbox = self.outbox.lock().unwrap_or_else(PoisonError::into_inner);
+        outbox
+            .state
+            .apply_metadata_update(&metadata.to_update_params());
+        outbox.update_work();
+        let snapshot = outbox.snapshot();
+        outbox.push(Publication::State(snapshot));
+        self.wake.send_replace(());
     }
 
     pub async fn publish_hub_notification(&self, notification: HubNotification) {
-        if self
-            .sender
-            .send(ProducerCommand::PublishNotification(notification))
-            .await
-            .is_err()
-        {
-            debug!("codexd producer task stopped before notification could be queued");
-        }
+        self.try_publish_hub_notification(notification);
     }
 
     pub fn try_publish_hub_notification(&self, notification: HubNotification) -> bool {
-        match self
-            .sender
-            .try_send(ProducerCommand::PublishNotification(notification))
-        {
-            Ok(()) => true,
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                warn!("codexd producer channel full; dropped notification");
-                false
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                debug!("codexd producer task stopped before notification could be queued");
-                false
-            }
+        if self.wake.is_closed() {
+            return false;
         }
+        self.outbox
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .publish(notification);
+        self.wake.send_replace(());
+        true
     }
 
     pub async fn publish_server_notification(&self, notification: &ServerNotification) {
@@ -122,7 +203,11 @@ impl CodexdProducerClient {
     }
 
     pub async fn shutdown(&self) {
-        let _ = self.sender.send(ProducerCommand::Shutdown).await;
+        self.outbox
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .stopped = true;
+        self.wake.send_replace(());
     }
 }
 
@@ -138,8 +223,9 @@ fn hub_notification_from_server_notification(
 
 async fn run_producer_task(
     socket_path: PathBuf,
-    mut metadata: RuntimeMetadata,
-    mut receiver: mpsc::Receiver<ProducerCommand>,
+    outbox: Arc<Mutex<Outbox>>,
+    mut wake: watch::Receiver<()>,
+    mut work: watch::Receiver<BTreeSet<String>>,
 ) {
     if socket_path_too_long(socket_path.as_path()) {
         warn!(
@@ -147,133 +233,59 @@ async fn run_producer_task(
             socket_path.display()
         );
 
-        while let Some(command) = receiver.recv().await {
-            if matches!(command, ProducerCommand::Shutdown) {
-                break;
-            }
-        }
-
         return;
     }
-
-    let mut connection: Option<UnixStream> = None;
-    let mut pending_lines = VecDeque::<String>::new();
-    let mut needs_register = true;
-    let mut flush_interval = tokio::time::interval(Duration::from_millis(500));
-
-    loop {
-        tokio::select! {
-            maybe_command = receiver.recv() => {
-                let Some(command) = maybe_command else {
-                    break;
+    'connect: while !outbox
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .stopped
+        && wake.has_changed().is_ok()
+    {
+        let Ok(mut stream) = UnixStream::connect(&socket_path).await else {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            continue;
+        };
+        let mut reconnect = true;
+        loop {
+            let batch = {
+                let mut outbox = outbox.lock().unwrap_or_else(PoisonError::into_inner);
+                if outbox.stopped {
+                    return;
+                }
+                wake.borrow_and_update();
+                work.borrow_and_update();
+                outbox.drain(reconnect)
+            };
+            reconnect = false;
+            for publication in batch {
+                let line = match publication {
+                    Publication::State(state) => {
+                        encode_notification("codexd/runtime/updateState", serde_json::json!(state))
+                    }
+                    Publication::Event(event) => {
+                        encode_notification("codexd/runtime/event", serde_json::json!(event))
+                    }
                 };
-
-                match command {
-                    ProducerCommand::UpdateMetadata(next_metadata) => {
-                        metadata = next_metadata;
-                        needs_register = true;
-                    }
-                    ProducerCommand::PublishNotification(notification) => {
-                        if let Some(line) = encode_notification(
-                            "codexd/runtime/event",
-                            serde_json::json!({
-                                "runtimeId": metadata.runtime_id,
-                                "notification": notification,
-                            }),
-                        ) {
-                            push_pending_line(&mut pending_lines, line);
-                        }
-                    }
-                    ProducerCommand::Shutdown => {
-                        break;
+                if let Some(line) = line
+                    && write_line(&mut stream, &line).await.is_err()
+                {
+                    continue 'connect;
+                }
+            }
+            tokio::select! {
+                signal = wake.changed() => if signal.is_err() { return; },
+                signal = work.changed() => if signal.is_err() { return; },
+                readable = stream.readable() => {
+                    // Notification-only producer connections receive no replies. EOF
+                    // is observable even if a long-running task emits no progress.
+                    match stream.try_read(&mut [0; 256]) {
+                        Err(err) if readable.is_ok() && err.kind() == std::io::ErrorKind::WouldBlock => (),
+                        Ok(n) if n > 0 => (),
+                        _ => continue 'connect,
                     }
                 }
             }
-            _ = flush_interval.tick() => {}
         }
-
-        flush_pending_lines(
-            socket_path.as_path(),
-            &metadata,
-            &mut connection,
-            &mut pending_lines,
-            &mut needs_register,
-        )
-        .await;
-    }
-}
-
-fn push_pending_line(pending_lines: &mut VecDeque<String>, line: String) {
-    pending_lines.push_back(line);
-
-    if pending_lines.len() <= MAX_PENDING_LINES {
-        return;
-    }
-
-    let overflow = pending_lines.len() - MAX_PENDING_LINES;
-    for _ in 0..overflow {
-        pending_lines.pop_front();
-    }
-
-    warn!("codexd producer queue overflowed; dropped {overflow} pending messages");
-}
-
-async fn flush_pending_lines(
-    socket_path: &Path,
-    metadata: &RuntimeMetadata,
-    connection: &mut Option<UnixStream>,
-    pending_lines: &mut VecDeque<String>,
-    needs_register: &mut bool,
-) {
-    if pending_lines.is_empty() && !*needs_register {
-        return;
-    }
-
-    if connection.is_none() {
-        match UnixStream::connect(socket_path).await {
-            Ok(stream) => {
-                debug!("connected codexd producer socket {}", socket_path.display());
-                *connection = Some(stream);
-                *needs_register = true;
-            }
-            Err(err) => {
-                debug!(
-                    "failed to connect codexd producer socket {}: {err}",
-                    socket_path.display()
-                );
-                return;
-            }
-        }
-    }
-
-    let Some(stream) = connection.as_mut() else {
-        return;
-    };
-
-    if *needs_register {
-        let register_line = encode_notification(
-            "codexd/runtime/register",
-            serde_json::to_value(metadata.to_register_params()).unwrap_or(JsonValue::Null),
-        );
-
-        if let Some(register_line) = register_line
-            && write_line(stream, &register_line).await.is_err()
-        {
-            *connection = None;
-            return;
-        }
-
-        *needs_register = false;
-    }
-
-    while let Some(line) = pending_lines.front() {
-        if write_line(stream, line).await.is_ok() {
-            pending_lines.pop_front();
-            continue;
-        }
-
-        *connection = None;
-        return;
     }
 }
 
@@ -318,6 +330,7 @@ mod tests {
         let socket_path = test_socket_path("ordered");
         let _ = tokio::fs::remove_file(&socket_path).await;
         let listener = UnixListener::bind(&socket_path).expect("bind test listener");
+        let (_work_tx, work) = watch::channel(BTreeSet::new());
         let client = CodexdProducerClient::spawn_with_socket_path(
             socket_path.clone(),
             RuntimeMetadata {
@@ -327,8 +340,16 @@ mod tests {
                 cwd: Some("/tmp".to_string()),
                 display_name: Some("test-producer".to_string()),
             },
+            work,
         );
 
+        let (stream, _) = timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut lines = BufReader::new(stream).lines();
+        let register = read_json_line(&mut lines).await;
+        assert_eq!(register["method"], "codexd/runtime/updateState");
         assert!(client.try_publish_hub_notification(HubNotification {
             method: "turn/started".to_string(),
             params: Some(serde_json::json!({ "index": 1 })),
@@ -337,15 +358,6 @@ mod tests {
             method: "turn/completed".to_string(),
             params: Some(serde_json::json!({ "index": 2 })),
         }));
-
-        let (stream, _) = timeout(Duration::from_secs(2), listener.accept())
-            .await
-            .expect("producer should connect")
-            .expect("accept producer connection");
-        let mut lines = BufReader::new(stream).lines();
-
-        let register = read_json_line(&mut lines).await;
-        assert_eq!(register["method"], "codexd/runtime/register");
 
         let first = read_json_line(&mut lines).await;
         let second = read_json_line(&mut lines).await;
@@ -369,6 +381,78 @@ mod tests {
             .expect("read line")
             .expect("line should be present");
         serde_json::from_str(&line).expect("line should be json")
+    }
+
+    #[tokio::test]
+    async fn quiet_work_recovers_on_a_new_listener_and_offline_completion_is_not_replayed() {
+        let path = test_socket_path("quiet");
+        let listener = UnixListener::bind(&path).unwrap();
+        let (work_tx, work) = watch::channel(BTreeSet::from(["episode".into()]));
+        let client = CodexdProducerClient::spawn_with_socket_path(
+            path.clone(),
+            RuntimeMetadata {
+                runtime_id: "rt".into(),
+                pid: None,
+                session_source: None,
+                cwd: None,
+                display_name: None,
+            },
+            work,
+        );
+        let accept = |listener: UnixListener| async move {
+            let (stream, _) = timeout(Duration::from_secs(4), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            BufReader::new(stream).lines()
+        };
+        let mut lines = accept(listener).await;
+        read_json_line(&mut lines).await;
+        let turn = |method: &str| HubNotification {
+            method: method.into(),
+            params: Some(serde_json::json!({"threadId":"t","turn":{"id":"1"}})),
+        };
+        client.try_publish_hub_notification(turn("turn/started"));
+        let started = read_json_line(&mut lines).await;
+        assert_eq!(
+            started["params"]["workActivity"]["items"],
+            serde_json::json!(["episode", "t:1"])
+        );
+        drop(lines);
+        tokio::fs::remove_file(&path).await.unwrap();
+        let mut lines = accept(UnixListener::bind(&path).unwrap()).await;
+        let restored = read_json_line(&mut lines).await;
+        assert_eq!(restored["method"], "codexd/runtime/updateState");
+        assert_eq!(restored["params"]["activeTurns"][0]["turnKey"], "t:1");
+        assert_eq!(
+            restored["params"]["workActivity"]["items"],
+            started["params"]["workActivity"]["items"]
+        );
+        drop(lines);
+        tokio::fs::remove_file(&path).await.unwrap();
+        client.try_publish_hub_notification(turn("turn/completed"));
+        work_tx.send_replace(BTreeSet::new());
+        let mut lines = accept(UnixListener::bind(&path).unwrap()).await;
+        let idle = read_json_line(&mut lines).await;
+        assert_eq!(idle["params"]["activeTurns"], serde_json::json!([]));
+        assert_eq!(
+            idle["params"]["workActivity"]["items"],
+            serde_json::json!([])
+        );
+
+        // Exercise ingress overflow deterministically with the writer excluded.
+        {
+            let mut outbox = client.outbox.lock().unwrap();
+            for _ in 0..=MAX_PENDING {
+                outbox.publish(turn("progress"));
+            }
+            outbox.publish(turn("turn/started"));
+            let batch = outbox.drain(false);
+            assert!(matches!(&batch[..], [Publication::State(state)]
+                if state.active_turns.len() == 1 && state.work_activity.as_ref().unwrap().items.contains("t:1")));
+        }
+        client.shutdown().await;
+        tokio::fs::remove_file(path).await.unwrap();
     }
 
     fn test_socket_path(label: &str) -> PathBuf {

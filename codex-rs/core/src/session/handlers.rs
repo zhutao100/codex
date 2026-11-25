@@ -13,7 +13,11 @@ pub(super) async fn submission_loop(
     // To break out of this loop, send Op::Shutdown.
     while let Ok(sub) = rx_sub.recv().await {
         debug!(?sub, "Submission");
-        if let Some(operation) = sess.take_completion_review_operation(&sub.id).await {
+        if let Some((operation, queued_work)) = sess.take_completion_review_operation(&sub.id).await
+        {
+            let Some(_queued_work) = queued_work else {
+                continue;
+            };
             use crate::completion_review::InternalReviewOperation;
             match operation {
                 InternalReviewOperation::Review(ticket) => {

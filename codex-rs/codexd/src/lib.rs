@@ -41,11 +41,19 @@ pub mod producer {
     pub struct CodexdProducerClient;
 
     impl CodexdProducerClient {
-        pub fn spawn(_codex_home: &Path, _metadata: RuntimeMetadata) -> Self {
+        pub fn spawn(
+            _codex_home: &Path,
+            _metadata: RuntimeMetadata,
+            _work: tokio::sync::watch::Receiver<std::collections::BTreeSet<String>>,
+        ) -> Self {
             Self
         }
 
-        pub fn spawn_with_socket_path(_socket_path: PathBuf, _metadata: RuntimeMetadata) -> Self {
+        pub fn spawn_with_socket_path(
+            _socket_path: PathBuf,
+            _metadata: RuntimeMetadata,
+            _work: tokio::sync::watch::Receiver<std::collections::BTreeSet<String>>,
+        ) -> Self {
             Self
         }
 

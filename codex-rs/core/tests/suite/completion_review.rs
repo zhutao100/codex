@@ -190,6 +190,55 @@ async fn append_crash_fixture(path: &std::path::Path, items: Vec<RolloutItem>) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn automatic_work_stays_owned_through_review_and_continuation() {
+    skip_if_no_network_unless_localhost!();
+    let server = MockServer::start().await;
+    let requests = core_test_support::responses::mount_response_sequence(
+        &server,
+        [
+            answer("First answer"),
+            verdict("Please correct it", true),
+            answer("Corrected answer"),
+            verdict("No more work", false),
+        ]
+        .into_iter()
+        .map(|body| sse_response(body).set_delay(std::time::Duration::from_millis(100)))
+        .collect(),
+    )
+    .await;
+    let test = test_codex()
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::AutoPostTurnCompletionReview);
+        })
+        .build(&server)
+        .await
+        .unwrap();
+    let prefix = format!("{}:", test.session_configured.session_id);
+    let mut work = codex_core::runtime_work::subscribe();
+    let has_parent_work = |items: &std::collections::BTreeSet<String>| {
+        items.iter().any(|key| key.starts_with(&prefix))
+    };
+    submit_request(&test.codex, "Finish the request").await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        drop(work.wait_for(has_parent_work).await.unwrap());
+        drop(
+            work.wait_for(|items| !has_parent_work(items))
+                .await
+                .unwrap(),
+        );
+    })
+    .await
+    .expect("parent work must end");
+    assert_eq!(
+        requests.requests().len(),
+        4,
+        "parent went idle before the final review"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn automatic_review_continues_past_three_with_only_initial_and_latest_answers() {
     skip_if_no_network_unless_localhost!();
     let server = MockServer::start().await;

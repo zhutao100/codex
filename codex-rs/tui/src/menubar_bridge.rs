@@ -96,6 +96,7 @@ mod imp {
                     cwd: Some(config.cwd.to_string_lossy().into_owned()),
                     display_name: Some("codex-tui".to_string()),
                 },
+                codex_core::runtime_work::subscribe(),
             );
 
             Some(Self {
@@ -1056,6 +1057,7 @@ mod imp {
                     cwd: None,
                     display_name: Some("test".to_string()),
                 },
+                codex_core::runtime_work::subscribe(),
             );
 
             MenuBarBridge {

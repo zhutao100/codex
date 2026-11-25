@@ -571,11 +571,27 @@ impl Session {
             .then_some(checkpoint)
     }
 
-    pub(crate) async fn queue_completion_review_operation(
+    pub(crate) fn reserve_review_work(
         &self,
         operation: InternalReviewOperation,
+    ) -> (InternalReviewOperation, crate::runtime_work::WorkGuard) {
+        let (ticket, stage) = match &operation {
+            InternalReviewOperation::Review(ticket) => (ticket, "queuedReview"),
+            InternalReviewOperation::Continue(ticket) => (ticket, "queuedContinuation"),
+        };
+        let work = crate::runtime_work::WorkGuard::new(
+            self.conversation_id,
+            &ticket.candidate_completion_id,
+            stage,
+        );
+        (operation, work)
+    }
+
+    pub(crate) async fn queue_completion_review_operation(
+        &self,
+        reservation: (InternalReviewOperation, crate::runtime_work::WorkGuard),
     ) {
-        let op = match &operation {
+        let op = match &reservation.0 {
             InternalReviewOperation::Review(_) => Op::ReviewCompletedTurn,
             InternalReviewOperation::Continue(_) => Op::Continue,
         };
@@ -584,7 +600,7 @@ impl Session {
             .lock()
             .await
             .internal_review_operations
-            .insert(id.clone(), operation);
+            .insert(id.clone(), (reservation.0, Some(reservation.1)));
         if self
             .tx_sub
             .try_send(Submission { id: id.clone(), op })
@@ -595,7 +611,8 @@ impl Session {
                 .lock()
                 .await
                 .internal_review_operations
-                .remove(&id);
+                .remove(&id)
+                .map(|(operation, _work)| operation);
             let message = match operation {
                 Some(InternalReviewOperation::Review(ticket))
                     if self.completion_review_ticket_is_current(&ticket).await =>
@@ -638,7 +655,10 @@ impl Session {
     pub(crate) async fn take_completion_review_operation(
         &self,
         id: &str,
-    ) -> Option<InternalReviewOperation> {
+    ) -> Option<(
+        InternalReviewOperation,
+        Option<crate::runtime_work::WorkGuard>,
+    )> {
         self.state
             .lock()
             .await
@@ -646,22 +666,18 @@ impl Session {
             .remove(id)
     }
 
-    pub(crate) async fn queue_prepared_completion_review_handoff(&self) {
-        let ticket = {
-            let state = self.state.lock().await;
-            if state.pending_continuation.is_some() {
-                return;
-            }
-            state
-                .completion_review
-                .unstarted_handoff()
-                .filter(|handoff| handoff.disposition == ReviewHandoffDisposition::Prepared)
-                .map(|handoff| handoff.ticket.clone())
-        };
-        if let Some(ticket) = ticket {
-            self.queue_completion_review_operation(InternalReviewOperation::Continue(ticket))
-                .await;
+    pub(crate) async fn prepared_completion_review_handoff(
+        &self,
+    ) -> Option<InternalReviewOperation> {
+        let state = self.state.lock().await;
+        if state.pending_continuation.is_some() {
+            return None;
         }
+        state
+            .completion_review
+            .unstarted_handoff()
+            .filter(|handoff| handoff.disposition == ReviewHandoffDisposition::Prepared)
+            .map(|handoff| InternalReviewOperation::Continue(handoff.ticket.clone()))
     }
 
     pub(crate) async fn completion_review_main_instructions(
@@ -782,6 +798,11 @@ impl Session {
     pub(crate) async fn stop_completion_review_operations(&self) {
         let _guard = self.completion_review_installation.lock().await;
         let mut state = self.state.lock().await;
+        // Release queued ownership now, but preserve the private submission IDs
+        // so draining the channel cannot reinterpret them as manual commands.
+        for (_, guard) in state.internal_review_operations.values_mut() {
+            *guard = None;
+        }
         let started_main = state
             .completion_review
             .handoff
@@ -814,7 +835,10 @@ impl Session {
     }
 
     pub(crate) async fn recover_completion_review(&self) {
-        self.queue_prepared_completion_review_handoff().await;
+        if let Some(operation) = self.prepared_completion_review_handoff().await {
+            self.queue_completion_review_operation(self.reserve_review_work(operation))
+                .await;
+        }
     }
 
     pub(crate) async fn invalidate_completion_review_history(&self) {
