@@ -293,12 +293,13 @@ impl OutgoingMessageSender {
         &self,
         thread_id: codex_protocol::ThreadId,
         turn_id: &str,
+        status: codex_protocol::protocol::TerminalTurnStatus,
     ) {
         if let Some(producer) = &self.codexd_producer {
             producer
                 .publish_hub_notification(codex_codexd::protocol::HubNotification {
                     method: "turn/completed".into(),
-                    params: Some(serde_json::json!({"threadId":thread_id, "turn":{"id":turn_id}})),
+                    params: Some(serde_json::json!({"threadId":thread_id, "turn":{"id":turn_id, "status":status}})),
                 })
                 .await;
         }

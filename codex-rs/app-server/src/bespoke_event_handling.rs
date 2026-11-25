@@ -98,6 +98,7 @@ use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem as CoreDynam
 use codex_protocol::dynamic_tools::DynamicToolResponse as CoreDynamicToolResponse;
 use codex_protocol::plan_tool::UpdatePlanArgs;
 use codex_protocol::protocol::ReviewOutputEvent;
+use codex_protocol::protocol::TerminalTurnStatus;
 use codex_protocol::request_user_input::RequestUserInputAnswer as CoreRequestUserInputAnswer;
 use codex_protocol::request_user_input::RequestUserInputResponse as CoreRequestUserInputResponse;
 use std::collections::HashMap;
@@ -189,7 +190,11 @@ pub(crate) async fn apply_bespoke_event_handling(
                 && let Some(id) = ended.started_id
             {
                 outgoing
-                    .publish_delegate_turn_ended(event.session_id, &id)
+                    .publish_delegate_turn_ended(
+                        event.session_id,
+                        &id,
+                        event.turn_status.unwrap_or(TerminalTurnStatus::Completed),
+                    )
                     .await;
             }
         }
@@ -847,14 +852,15 @@ pub(crate) async fn apply_bespoke_event_handling(
                 codex_error_info: ev.codex_error_info.map(V2CodexErrorInfo::from),
                 additional_details: None,
             };
-            let should_notify = handle_error(
-                conversation_id,
-                &event_turn_id,
-                turn_error.clone(),
-                &turn_summary_store,
-            )
-            .await;
-            if !should_notify {
+            if child.is_none()
+                && !handle_error(
+                    conversation_id,
+                    &event_turn_id,
+                    turn_error.clone(),
+                    &turn_summary_store,
+                )
+                .await
+            {
                 return;
             }
             outgoing
@@ -1477,9 +1483,23 @@ async fn maybe_emit_raw_response_item_completed(
 async fn find_and_remove_turn_summary(
     conversation_id: ThreadId,
     turn_summary_store: &TurnSummaryStore,
+    outgoing: &OutgoingMessageSender,
+    unfinished_child: TerminalTurnStatus,
 ) -> TurnSummary {
-    let mut map = turn_summary_store.lock().await;
-    map.remove(&conversation_id).unwrap_or_default()
+    let mut summary = turn_summary_store
+        .lock()
+        .await
+        .remove(&conversation_id)
+        .unwrap_or_default();
+    // Cancellation can drop the review consumer before its child deactivation is forwarded.
+    if let Some(child) = summary.delegate.take()
+        && let Some(id) = child.started_id
+    {
+        outgoing
+            .publish_delegate_turn_ended(child.context.session_id, &id, unfinished_child)
+            .await;
+    }
+    summary
 }
 
 async fn handle_turn_complete(
@@ -1488,7 +1508,13 @@ async fn handle_turn_complete(
     outgoing: &OutgoingMessageSender,
     turn_summary_store: &TurnSummaryStore,
 ) {
-    let turn_summary = find_and_remove_turn_summary(conversation_id, turn_summary_store).await;
+    let turn_summary = find_and_remove_turn_summary(
+        conversation_id,
+        turn_summary_store,
+        outgoing,
+        TerminalTurnStatus::Interrupted,
+    )
+    .await;
 
     if let Some(active_turn_id) = turn_summary.active_turn_id.clone()
         && active_turn_id != event_turn_id
@@ -1520,7 +1546,13 @@ async fn handle_turn_interrupted(
     outgoing: &OutgoingMessageSender,
     turn_summary_store: &TurnSummaryStore,
 ) {
-    let turn_summary = find_and_remove_turn_summary(conversation_id, turn_summary_store).await;
+    let turn_summary = find_and_remove_turn_summary(
+        conversation_id,
+        turn_summary_store,
+        outgoing,
+        TerminalTurnStatus::Interrupted,
+    )
+    .await;
     if let Some(active_turn_id) = turn_summary.active_turn_id
         && active_turn_id != event_turn_id
     {
@@ -1545,7 +1577,13 @@ async fn handle_turn_paused(
     outgoing: &OutgoingMessageSender,
     turn_summary_store: &TurnSummaryStore,
 ) {
-    let turn_summary = find_and_remove_turn_summary(conversation_id, turn_summary_store).await;
+    let turn_summary = find_and_remove_turn_summary(
+        conversation_id,
+        turn_summary_store,
+        outgoing,
+        TerminalTurnStatus::Paused,
+    )
+    .await;
     if let Some(active_turn_id) = turn_summary.active_turn_id
         && active_turn_id != event_turn_id
     {
@@ -2134,7 +2172,8 @@ mod tests {
         )
         .await;
 
-        let turn_summary = find_and_remove_turn_summary(conversation_id, &turn_summary_store).await;
+        let summaries = turn_summary_store.lock().await;
+        let turn_summary = &summaries[&conversation_id];
         assert_eq!(
             turn_summary.last_error,
             Some(TurnError {
@@ -2167,7 +2206,8 @@ mod tests {
         )
         .await;
 
-        let turn_summary = find_and_remove_turn_summary(conversation_id, &turn_summary_store).await;
+        let summaries = turn_summary_store.lock().await;
+        let turn_summary = &summaries[&conversation_id];
         assert_eq!(turn_summary.last_error, None);
         Ok(())
     }

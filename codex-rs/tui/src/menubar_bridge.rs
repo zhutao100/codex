@@ -22,6 +22,7 @@ mod imp {
     use codex_protocol::items::TurnItem;
     use codex_protocol::plan_tool::StepStatus;
     use codex_protocol::plan_tool::UpdatePlanArgs;
+    use codex_protocol::protocol::TerminalTurnStatus;
     use codex_protocol::protocol::UserMessageEvent;
     use serde_json::json;
     use std::collections::HashMap;
@@ -34,6 +35,7 @@ mod imp {
         turn_id: String,
         prompt_preview: Option<String>,
         token_usage_baseline: Option<TokenUsageInfo>,
+        failed: bool,
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -326,7 +328,10 @@ mod imp {
                 }
                 EventMsg::RuntimeContextDeactivated(event) => {
                     let session_id = event.session_id.to_string();
-                    notifications.extend(self.complete_turns_for_thread(&session_id));
+                    notifications.extend(self.complete_turns_for_thread(
+                        &session_id,
+                        event.turn_status.unwrap_or(TerminalTurnStatus::Completed),
+                    ));
                     if self
                         .active_runtime_context
                         .as_ref()
@@ -336,9 +341,33 @@ mod imp {
                     }
                 }
                 EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_) | EventMsg::TurnPaused(_) => {
-                    notifications.extend(self.complete_turn(normalize_turn_id(event_turn_id)));
+                    let status = match event {
+                        EventMsg::TurnAborted(_) => TerminalTurnStatus::Interrupted,
+                        EventMsg::TurnPaused(_) => TerminalTurnStatus::Paused,
+                        _ => TerminalTurnStatus::Completed,
+                    };
+                    if let Some(context) = self.active_runtime_context.take() {
+                        let unfinished = if status == TerminalTurnStatus::Paused {
+                            TerminalTurnStatus::Paused
+                        } else {
+                            TerminalTurnStatus::Interrupted
+                        };
+                        notifications.extend(self.complete_turns_for_thread(
+                            &context.session_id.to_string(),
+                            unfinished,
+                        ));
+                    }
+                    notifications
+                        .extend(self.complete_turn(normalize_turn_id(event_turn_id), status));
                 }
                 EventMsg::Error(error) => {
+                    if self.active_runtime_context.is_none()
+                        && let Some((thread, id)) =
+                            self.resolve_event_turn(event_turn_id, active_thread_id.as_deref())
+                        && let Some(turn) = self.active_turns.get_mut(&turn_key(&thread, &id))
+                    {
+                        turn.failed = true;
+                    }
                     notifications.push(HubNotification {
                         method: "error".to_string(),
                         params: Some(json!({
@@ -379,6 +408,7 @@ mod imp {
                     turn_id: turn_id.clone(),
                     prompt_preview: None,
                     token_usage_baseline,
+                    failed: false,
                 },
             );
             self.turn_start_order.push(key.clone());
@@ -761,7 +791,11 @@ mod imp {
             notifications
         }
 
-        fn complete_turn(&mut self, turn_id: Option<String>) -> Vec<HubNotification> {
+        fn complete_turn(
+            &mut self,
+            turn_id: Option<String>,
+            status: TerminalTurnStatus,
+        ) -> Vec<HubNotification> {
             if let Some(turn_id) = turn_id {
                 let Some(key) = self.resolve_turn_key_for_turn(&turn_id) else {
                     return Vec::new();
@@ -771,7 +805,7 @@ mod imp {
                 };
                 self.turn_start_order.retain(|existing| existing != &key);
                 self.prune_file_changes_for_turn(&key);
-                return vec![Self::turn_completed_notification(key, turn)];
+                return vec![Self::turn_completed_notification(key, turn, status)];
             }
 
             while let Some(key) = self.turn_start_order.pop() {
@@ -779,13 +813,17 @@ mod imp {
                     continue;
                 };
                 self.prune_file_changes_for_turn(&key);
-                return vec![Self::turn_completed_notification(key, turn)];
+                return vec![Self::turn_completed_notification(key, turn, status)];
             }
 
             Vec::new()
         }
 
-        fn complete_turns_for_thread(&mut self, thread_id: &str) -> Vec<HubNotification> {
+        fn complete_turns_for_thread(
+            &mut self,
+            thread_id: &str,
+            status: TerminalTurnStatus,
+        ) -> Vec<HubNotification> {
             let keys = self
                 .turn_start_order
                 .iter()
@@ -809,7 +847,7 @@ mod imp {
                     self.prune_file_changes_for_turn(&key);
                     self.active_turns
                         .remove(&key)
-                        .map(|turn| Self::turn_completed_notification(key, turn))
+                        .map(|turn| Self::turn_completed_notification(key, turn, status))
                 })
                 .collect()
         }
@@ -820,11 +858,20 @@ mod imp {
                 .retain(|existing| !existing.starts_with(&prefix));
         }
 
-        fn turn_completed_notification(key: String, turn: ActiveTurnState) -> HubNotification {
+        fn turn_completed_notification(
+            key: String,
+            turn: ActiveTurnState,
+            status: TerminalTurnStatus,
+        ) -> HubNotification {
             let mut turn_payload = serde_json::Map::new();
             turn_payload.insert("id".to_string(), json!(turn.turn_id));
             turn_payload.insert("key".to_string(), json!(key));
-            turn_payload.insert("status".to_string(), json!("completed"));
+            let status = if turn.failed && status == TerminalTurnStatus::Completed {
+                TerminalTurnStatus::Failed
+            } else {
+                status
+            };
+            turn_payload.insert("status".to_string(), json!(status));
             if let Some(prompt_preview) = turn.prompt_preview {
                 turn_payload.insert("promptPreview".to_string(), json!(prompt_preview));
             }
@@ -1152,12 +1199,14 @@ mod imp {
                 json!("thread-b:turn-1")
             );
 
-            let completed = bridge.complete_turn(Some("turn-1".to_string()));
+            let completed =
+                bridge.complete_turn(Some("turn-1".to_string()), TerminalTurnStatus::Completed);
             assert_eq!(
                 completed[0].params.as_ref().unwrap()["threadId"],
                 "thread-b"
             );
-            let completed = bridge.complete_turn(Some("turn-1".to_string()));
+            let completed =
+                bridge.complete_turn(Some("turn-1".to_string()), TerminalTurnStatus::Completed);
             assert_eq!(
                 completed[0].params.as_ref().unwrap()["threadId"],
                 "thread-a"
@@ -1180,7 +1229,8 @@ mod imp {
             let prompt_preview = bridge.record_prompt_preview("thread-1", "turn-1", &user_item);
             assert_eq!(prompt_preview, Some("Summarize this diff".to_string()));
 
-            let completed = bridge.complete_turn(Some("turn-1".to_string()));
+            let completed =
+                bridge.complete_turn(Some("turn-1".to_string()), TerminalTurnStatus::Completed);
             assert_eq!(
                 completed[0].params.as_ref().unwrap()["turn"]["promptPreview"],
                 json!("Summarize this diff")
@@ -1210,7 +1260,8 @@ mod imp {
                 None,
             );
 
-            let completed = bridge.complete_turn(Some("turn-3".to_string()));
+            let completed =
+                bridge.complete_turn(Some("turn-3".to_string()), TerminalTurnStatus::Completed);
             let params = completed[0].params.as_ref().unwrap();
             assert_eq!(params["threadId"], json!(thread_id_string));
             assert_eq!(params["turn"]["promptPreview"], json!(prompt));
@@ -1240,7 +1291,8 @@ mod imp {
                 json!("Review completed turn\ncopy prompt")
             );
 
-            let completed = bridge.complete_turn(Some("turn-2".to_string()));
+            let completed =
+                bridge.complete_turn(Some("turn-2".to_string()), TerminalTurnStatus::Completed);
             assert_eq!(
                 completed[0].params.as_ref().unwrap()["turn"]["promptPreview"],
                 json!("Review completed turn\ncopy prompt")
@@ -1410,7 +1462,8 @@ mod imp {
                 json!(runtime_turn_key)
             );
 
-            let completed = bridge.complete_turns_for_thread(&thread_id);
+            let completed =
+                bridge.complete_turns_for_thread(&thread_id, TerminalTurnStatus::Completed);
             assert_eq!(completed.len(), 1);
             assert_eq!(
                 completed[0].params.as_ref().unwrap()["turn"]["key"],
@@ -1487,7 +1540,8 @@ mod imp {
             assert_eq!(started.len(), 1);
             assert_eq!(bridge.active_turns.len(), 1);
 
-            let completed = bridge.complete_turns_for_thread(&thread_id);
+            let completed =
+                bridge.complete_turns_for_thread(&thread_id, TerminalTurnStatus::Completed);
             assert_eq!(completed.len(), 1);
             assert_eq!(completed[0].method, "turn/completed");
             assert_eq!(
@@ -1501,7 +1555,10 @@ mod imp {
             assert!(bridge.active_turns.is_empty());
             assert!(
                 bridge
-                    .complete_turn(Some("post-turn-review-0".to_string()))
+                    .complete_turn(
+                        Some("post-turn-review-0".to_string()),
+                        TerminalTurnStatus::Completed
+                    )
                     .is_empty()
             );
 
@@ -1529,8 +1586,13 @@ mod imp {
             assert_eq!(delegate.len(), 1);
             assert_eq!(bridge.active_turns.len(), 2);
 
-            let completed = bridge.complete_turns_for_thread(&delegate_thread_id);
+            let completed =
+                bridge.complete_turns_for_thread(&delegate_thread_id, TerminalTurnStatus::Failed);
             assert_eq!(completed.len(), 1);
+            assert_eq!(
+                completed[0].params.as_ref().unwrap()["turn"]["status"],
+                "failed"
+            );
             assert_eq!(
                 completed[0].params.as_ref().unwrap()["turn"]["id"],
                 json!("post-turn-review-0")
@@ -1538,7 +1600,10 @@ mod imp {
 
             assert!(
                 bridge
-                    .complete_turn(Some("post-turn-review-0".to_string()))
+                    .complete_turn(
+                        Some("post-turn-review-0".to_string()),
+                        TerminalTurnStatus::Completed
+                    )
                     .is_empty()
             );
             assert_eq!(bridge.active_turns.len(), 1);

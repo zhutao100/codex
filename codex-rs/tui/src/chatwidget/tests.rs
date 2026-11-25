@@ -3148,6 +3148,7 @@ async fn post_turn_review_parallel_exec_cascade_renders_every_completed_command(
         msg: EventMsg::RuntimeContextDeactivated(RuntimeContextDeactivatedEvent {
             scope_id: "review-delegate".to_string(),
             session_id: delegate_session_id,
+            turn_status: None,
         }),
     });
     chat.handle_codex_event(Event {
@@ -7321,6 +7322,7 @@ async fn runtime_context_status_output_uses_delegate_until_deactivated() {
         msg: EventMsg::RuntimeContextDeactivated(RuntimeContextDeactivatedEvent {
             scope_id: "delegate-status".to_string(),
             session_id: delegate_session_id,
+            turn_status: None,
         }),
     });
 
@@ -7379,6 +7381,7 @@ async fn runtime_context_status_line_uses_delegate_tokens_until_deactivated() {
         msg: EventMsg::RuntimeContextDeactivated(RuntimeContextDeactivatedEvent {
             scope_id: "delegate-tokens".to_string(),
             session_id: delegate_session_id,
+            turn_status: None,
         }),
     });
 
@@ -7426,6 +7429,7 @@ async fn runtime_context_updates_running_status_model_subject() {
         msg: EventMsg::RuntimeContextDeactivated(RuntimeContextDeactivatedEvent {
             scope_id: "delegate-model".to_string(),
             session_id: delegate_session_id,
+            turn_status: None,
         }),
     });
     let status = chat.bottom_pane.status_widget().expect("status widget");

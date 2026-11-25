@@ -20,6 +20,7 @@ use codex_protocol::protocol::RuntimeContextUpdatedEvent;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::Submission;
+use codex_protocol::protocol::TerminalTurnStatus;
 use codex_protocol::protocol::ThreadNameUpdatedEvent;
 use codex_protocol::protocol::TokenCountEvent;
 use codex_protocol::protocol::TurnStartedEvent;
@@ -223,6 +224,7 @@ async fn forward_events(
 ) {
     let cancelled = cancel_token.cancelled();
     tokio::pin!(cancelled);
+    let mut failed_turn = None;
 
     loop {
         tokio::select! {
@@ -235,6 +237,9 @@ async fn forward_events(
                     Ok(event) => event,
                     Err(_) => break,
                 };
+                if matches!(msg, EventMsg::Error(_)) {
+                    failed_turn = Some(id.clone());
+                }
                 match msg {
                     // ignore all legacy delta events
                     EventMsg::AgentMessageDelta(_)
@@ -283,6 +288,7 @@ async fn forward_events(
                         }
                     }
                     EventMsg::TurnStarted(event) => {
+                        failed_turn = None;
                         runtime_context.apply_turn_started(&event);
                         if !send_runtime_context_update(
                             &mut runtime_context,
@@ -306,11 +312,18 @@ async fn forward_events(
                         }
                     }
                     EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_) | EventMsg::TurnPaused(_) => {
+                        let status = match msg {
+                            EventMsg::TurnAborted(_) => TerminalTurnStatus::Interrupted,
+                            EventMsg::TurnPaused(_) => TerminalTurnStatus::Paused,
+                            _ if failed_turn.as_ref() == Some(&id) => TerminalTurnStatus::Failed,
+                            _ => TerminalTurnStatus::Completed,
+                        };
                         let terminal = Event { id, msg };
                         if !send_runtime_context_deactivation(
                             &mut runtime_context,
                             &tx_sub,
                             terminal.id.clone(),
+                            status,
                             &cancel_token,
                         )
                         .await
@@ -377,6 +390,7 @@ async fn forward_events(
         &mut runtime_context,
         &tx_sub,
         "runtime-context-ended".to_string(),
+        TerminalTurnStatus::Interrupted,
         &cancel_token,
     )
     .await;
@@ -516,6 +530,7 @@ async fn send_runtime_context_deactivation(
     runtime_context: &mut DelegateRuntimeContext,
     tx_sub: &Sender<Event>,
     id: String,
+    status: TerminalTurnStatus,
     cancel_token: &CancellationToken,
 ) -> bool {
     if !runtime_context.activated || runtime_context.finished {
@@ -531,6 +546,7 @@ async fn send_runtime_context_deactivation(
             msg: EventMsg::RuntimeContextDeactivated(RuntimeContextDeactivatedEvent {
                 scope_id: runtime_context.snapshot.scope_id.clone(),
                 session_id: runtime_context.snapshot.session_id,
+                turn_status: Some(status),
             }),
         },
         cancel_token,
@@ -1016,6 +1032,7 @@ mod tests {
             other => panic!("expected runtime context deactivation, got {other:?}"),
         };
         assert_eq!(deactivated.session_id, delegate_session_id);
+        assert_eq!(deactivated.turn_status, Some(TerminalTurnStatus::Completed));
 
         let terminal = rx_out.recv().await.expect("terminal event");
         assert!(matches!(terminal.msg, EventMsg::TurnComplete(_)));
