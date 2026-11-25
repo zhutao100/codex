@@ -128,9 +128,11 @@ The `notification` in `runtimeNotification` is a generic hub notification forwar
 
 ### Work Activity
 
-Daemon capability `workActivity` describes the wire format, not every producer. Check each runtime's `workActivitySupported`. For a capable producer, `workActivity` is a complete `{producerGeneration, revision, items}` object. `items` is a set of opaque string identifiers for running tasks, accepted queued review/continuation stages and projected active turns. Empty means idle; absent or malformed is not empty. Legacy producers provide `activeTurns` only. Always use turns (not work keys) for history.
+Daemon capability `workActivity` describes the wire format, not every producer. Check each runtime's `workActivitySupported`. For a capable producer, `workActivity` is a complete `{producerGeneration, revision, items}` object. `items` contains only scheduler-owned tasks and accepted queued review/continuation stages. An empty scheduler set also clears leftover projected turns; a delayed start, inactive UI or missing completion must not hold the system awake. Absent or malformed is not empty. Legacy producers provide `activeTurns` only. Always use turns (not work keys) for history.
 
 Core guards span task finalization and automatic submission dispatch. A queued guard is reserved before the predecessor's terminal event and retained through acceptance of the next task, or dropped on rejection/cancellation. This covers delegate preparation without requiring a delegate turn ID. The guard reports work; it does not create a macOS assertion.
+
+The TUI forwards live events at thread ingress, independent of selection; replaying a thread does not republish its history. App-server publishes daemon starts from core `TurnStarted`, not the public v2 `turn/start` acknowledgement: input submitted during an existing turn may be steered into it rather than starting a second task. Delegate starts use the child thread identity; matching context deactivation closes the child even if the parent consumes the child's terminal event and later completes under its own ID.
 
 Active turns are keyed by `turnKey`. Producers should send `turn.key` or
 `turnKey`; otherwise `codexd` computes `<threadId>:<turnId>`. Legacy

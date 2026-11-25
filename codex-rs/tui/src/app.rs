@@ -969,6 +969,9 @@ impl App {
     }
 
     async fn enqueue_thread_event(&mut self, thread_id: ThreadId, event: Event) -> Result<()> {
+        if let Some(bridge) = &mut self.menubar_bridge {
+            bridge.publish_event(&event.msg, &event.id, Some(thread_id.to_string()));
+        }
         let (sender, store) = {
             let channel = self.ensure_thread_channel(thread_id);
             (channel.sender.clone(), Arc::clone(&channel.store))
@@ -2742,13 +2745,6 @@ impl App {
             event.msg,
             EventMsg::SessionConfigured(_) | EventMsg::TokenCount(_)
         );
-        if let Some(bridge) = self.menubar_bridge.as_mut() {
-            bridge.publish_event(
-                &event.msg,
-                &event.id,
-                self.active_thread_id.map(|thread_id| thread_id.to_string()),
-            );
-        }
         if self.suppress_shutdown_complete && matches!(event.msg, EventMsg::ShutdownComplete) {
             self.suppress_shutdown_complete = false;
             return;
@@ -2821,6 +2817,11 @@ impl App {
                 service_tier: None,
             }),
         };
+        let mut stream_bridge = self.menubar_bridge.as_ref().map(|bridge| {
+            let mut stream = bridge.new_thread_stream();
+            stream.publish_event(&event.msg, &event.id, Some(thread_id.to_string()));
+            stream
+        });
         let channel =
             ThreadEventChannel::new_with_session_configured(THREAD_EVENT_CHANNEL_CAPACITY, event);
         let sender = channel.sender.clone();
@@ -2835,6 +2836,9 @@ impl App {
                         break;
                     }
                 };
+                if let Some(bridge) = &mut stream_bridge {
+                    bridge.publish_event(&event.msg, &event.id, Some(thread_id.to_string()));
+                }
                 let should_send = {
                     let mut guard = store.lock().await;
                     guard.push_event(event.clone());
@@ -3167,6 +3171,104 @@ mod tests {
         emit_syntax_theme_warning(&app_event_tx, &config);
 
         assert!(rx.try_recv().is_err(), "expected no warning history cell");
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "macos")]
+    async fn menubar_bridge_receives_completion_after_switch_away() -> Result<()> {
+        use codex_codexd::producer::CodexdProducerClient;
+        use codex_codexd::producer::RuntimeMetadata;
+        use codex_core::protocol::TurnCompleteEvent;
+        use codex_core::protocol::TurnStartedEvent;
+        use tokio::io::AsyncBufReadExt;
+        use tokio::io::BufReader;
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("hub");
+        let listener = tokio::net::UnixListener::bind(&path)?;
+        let (work, rx) =
+            tokio::sync::watch::channel(std::collections::BTreeSet::from(["task".into()]));
+        let producer = CodexdProducerClient::spawn_with_socket_path(
+            path,
+            RuntimeMetadata {
+                runtime_id: "switch".into(),
+                pid: None,
+                session_source: None,
+                cwd: None,
+                display_name: None,
+            },
+            rx,
+        );
+        let mut app = make_test_app().await;
+        app.menubar_bridge = Some(crate::menubar_bridge::MenuBarBridge::from_producer(
+            producer,
+        ));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let (peer, _) = listener.accept().await?;
+            let mut lines = BufReader::new(peer).lines();
+            async fn next(
+                lines: &mut tokio::io::Lines<BufReader<tokio::net::UnixStream>>,
+            ) -> Result<serde_json::Value> {
+                Ok(serde_json::from_str(
+                    &lines
+                        .next_line()
+                        .await?
+                        .expect("expected producer publication"),
+                )?)
+            }
+            next(&mut lines).await?;
+            let source = ThreadId::new();
+            app.ensure_thread_channel(source);
+            app.activate_thread_channel(source).await;
+            app.enqueue_thread_event(
+                source,
+                Event {
+                    id: "1".into(),
+                    msg: EventMsg::TurnStarted(TurnStartedEvent {
+                        model_context_window: None,
+                        collaboration_mode_kind: Default::default(),
+                    }),
+                },
+            )
+            .await?;
+            assert_eq!(
+                next(&mut lines).await?["params"]["notification"]["method"],
+                "turn/started"
+            );
+            app.store_active_thread_receiver().await;
+            app.active_thread_id = None;
+            let other = ThreadId::new();
+            app.ensure_thread_channel(other);
+            app.activate_thread_channel(other).await;
+            app.enqueue_thread_event(
+                source,
+                Event {
+                    id: "1".into(),
+                    msg: EventMsg::TurnComplete(TurnCompleteEvent {
+                        last_agent_message: None,
+                    }),
+                },
+            )
+            .await?;
+            let completed = next(&mut lines).await?;
+            assert_eq!(
+                completed["params"]["notification"]["method"],
+                "turn/completed"
+            );
+            assert_eq!(
+                completed["params"]["notification"]["params"]["threadId"],
+                source.to_string()
+            );
+            work.send_replace(Default::default());
+            let idle = next(&mut lines).await?;
+            assert_eq!(idle["params"]["activeTurns"], serde_json::json!([]));
+            assert_eq!(
+                idle["params"]["workActivity"]["items"],
+                serde_json::json!([])
+            );
+            Result::<()>::Ok(())
+        })
+        .await??;
+        Ok(())
     }
 
     #[tokio::test]

@@ -261,6 +261,13 @@ pub(crate) struct TurnSummary {
     pub(crate) last_error: Option<TurnError>,
     pub(crate) active_turn_id: Option<String>,
     pub(crate) active_turn_model: Option<String>,
+    pub(crate) delegate: Option<DelegateTurn>,
+}
+
+#[derive(Clone)]
+pub(crate) struct DelegateTurn {
+    pub(crate) context: codex_protocol::protocol::RuntimeContextSnapshot,
+    pub(crate) started_id: Option<String>,
 }
 
 pub(crate) type TurnSummaryStore = Arc<Mutex<HashMap<ThreadId, TurnSummary>>>;
@@ -4460,7 +4467,7 @@ impl CodexMessageProcessor {
     }
 
     async fn turn_start(&self, request_id: ConnectionRequestId, params: TurnStartParams) {
-        let (thread_uuid, thread) = match self.load_thread(&params.thread_id).await {
+        let (_, thread) = match self.load_thread(&params.thread_id).await {
             Ok(v) => v,
             Err(error) => {
                 self.outgoing.send_error(request_id, error).await;
@@ -4517,23 +4524,17 @@ impl CodexMessageProcessor {
             Ok(turn_id) => {
                 let turn = Turn {
                     id: turn_id.clone(),
-                    model: Some(turn_model.clone()),
+                    model: Some(turn_model),
                     items: vec![],
                     error: None,
                     status: TurnStatus::InProgress,
                 };
 
-                {
-                    let mut map = self.turn_summary_store.lock().await;
-                    let summary = map.entry(thread_uuid).or_default();
-                    summary.active_turn_id = Some(turn_id.clone());
-                    summary.active_turn_model = Some(turn_model);
-                }
-
                 let response = TurnStartResponse { turn: turn.clone() };
                 self.outgoing.send_response(request_id, response).await;
 
-                // Emit v2 turn/started notification.
+                // The v2 acknowledgement names the submission. Core may steer that
+                // submission into another turn, so codexd observes core starts instead.
                 let notif = TurnStartedNotification {
                     thread_id: params.thread_id,
                     turn,

@@ -127,11 +127,57 @@ pub(crate) async fn apply_bespoke_event_handling(
         msg,
     } = event;
     match msg {
-        EventMsg::TurnStarted(_) => {
+        EventMsg::RuntimeContextActivated(event) => {
             let mut map = turn_summary_store.lock().await;
-            let summary = map.entry(conversation_id).or_default();
-            summary.active_turn_id = Some(event_turn_id.clone());
-            summary.last_error = None;
+            map.entry(conversation_id).or_default().delegate =
+                Some(crate::codex_message_processor::DelegateTurn {
+                    context: event.snapshot,
+                    started_id: None,
+                });
+        }
+        EventMsg::RuntimeContextDeactivated(event) => {
+            let ended = {
+                let mut map = turn_summary_store.lock().await;
+                map.get_mut(&conversation_id).and_then(|summary| {
+                    summary.delegate.take_if(|d| {
+                        d.context.session_id == event.session_id
+                            && d.context.scope_id == event.scope_id
+                    })
+                })
+            };
+            // Completion review consumes the child's terminal event. Deactivation
+            // closes its projection even when the parent completes under another ID.
+            if let Some(ended) = ended
+                && let Some(id) = ended.started_id
+            {
+                outgoing
+                    .publish_delegate_turn_ended(event.session_id, &id)
+                    .await;
+            }
+        }
+        EventMsg::TurnStarted(start) => {
+            let model = conversation.config_snapshot().await.model;
+            let (source_thread, source_model) = {
+                let mut map = turn_summary_store.lock().await;
+                let summary = map.entry(conversation_id).or_default();
+                if let Some(delegate) = &mut summary.delegate {
+                    delegate.started_id = Some(event_turn_id.clone());
+                    (delegate.context.session_id, delegate.context.model.clone())
+                } else {
+                    summary.active_turn_id = Some(event_turn_id.clone());
+                    summary.active_turn_model = Some(model.clone());
+                    summary.last_error = None;
+                    (conversation_id, model)
+                }
+            };
+            outgoing
+                .publish_core_turn_started(
+                    source_thread,
+                    &event_turn_id,
+                    &source_model,
+                    start.model_context_window,
+                )
+                .await;
         }
         EventMsg::TurnComplete(_ev) => {
             handle_turn_complete(

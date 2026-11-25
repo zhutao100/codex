@@ -57,6 +57,15 @@ pub(crate) struct RuntimeState {
 }
 
 impl RuntimeState {
+    pub(crate) fn apply_scheduler_work(&mut self, work: WorkActivity) {
+        // Notifications may be delayed or missing. History is still forwarded,
+        // but a display projection cannot outlive the last real scheduler owner.
+        if work.items.is_empty() {
+            self.active_turns.clear();
+        }
+        self.work_activity = Some(work);
+    }
+
     pub(crate) fn with_register(params: &RuntimeRegisterParams) -> Self {
         Self {
             pid: params.pid,
@@ -260,18 +269,18 @@ impl DaemonState {
         let updated_snapshot = {
             let runtime = self.runtimes.entry(runtime_id.clone()).or_default();
 
+            if let (Some(work), Some(old)) = (&params.work_activity, &runtime.work_activity)
+                && (old.producer_generation != work.producer_generation
+                    || old.revision >= work.revision)
+            {
+                return;
+            }
+            let changed = apply_notification_to_runtime(runtime, &notification);
             let changed_work = params.work_activity.is_some();
             if let Some(work) = params.work_activity {
-                if let Some(old) = &runtime.work_activity
-                    && (old.producer_generation != work.producer_generation
-                        || old.revision >= work.revision)
-                {
-                    return;
-                }
-                runtime.work_activity = Some(work);
+                runtime.apply_scheduler_work(work);
             }
-            (apply_notification_to_runtime(runtime, &notification) || changed_work)
-                .then(|| runtime.as_snapshot(runtime_id.clone()))
+            (changed || changed_work).then(|| runtime.as_snapshot(runtime_id.clone()))
         };
 
         if let Some(runtime) = updated_snapshot {

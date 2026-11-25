@@ -99,7 +99,15 @@ mod imp {
                 codex_core::runtime_work::subscribe(),
             );
 
-            Some(Self {
+            let mut bridge = Self::from_producer(producer);
+            bridge.current_cwd = Some(config.cwd.to_string_lossy().into_owned());
+            bridge.current_approval = Some(config.approval_policy.value().to_string());
+            bridge.current_sandbox = Some(sandbox_status_label(config.sandbox_policy.get()));
+            Some(bridge)
+        }
+
+        pub(crate) fn from_producer(producer: CodexdProducerClient) -> Self {
+            Self {
                 producer,
                 active_turns: HashMap::new(),
                 turn_start_order: Vec::new(),
@@ -110,10 +118,14 @@ mod imp {
                 current_model: None,
                 current_model_provider: None,
                 current_thinking_level: None,
-                current_cwd: Some(config.cwd.to_string_lossy().into_owned()),
-                current_approval: Some(config.approval_policy.value().to_string()),
-                current_sandbox: Some(sandbox_status_label(config.sandbox_policy.get())),
-            })
+                current_cwd: None,
+                current_approval: None,
+                current_sandbox: None,
+            }
+        }
+
+        pub fn new_thread_stream(&self) -> Self {
+            Self::from_producer(self.producer.clone())
         }
 
         pub fn publish_event(
@@ -1647,6 +1659,10 @@ mod imp {
     pub struct MenuBarBridge;
 
     impl MenuBarBridge {
+        pub fn new_thread_stream(&self) -> Self {
+            Self
+        }
+
         pub async fn start(
             _codex_linux_sandbox_exe: Option<PathBuf>,
             _config: Arc<Config>,

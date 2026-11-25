@@ -79,12 +79,10 @@ impl Outbox {
 
     fn update_work(&mut self) {
         self.revision += 1;
-        let mut items = self.work.borrow_and_update().clone();
-        items.extend(self.state.active_turns.keys().cloned());
-        self.state.work_activity = Some(WorkActivity {
+        self.state.apply_scheduler_work(WorkActivity {
             producer_generation: self.generation.clone(),
             revision: self.revision,
-            items,
+            items: self.work.borrow_and_update().clone(),
         });
     }
 
@@ -416,7 +414,7 @@ mod tests {
         let started = read_json_line(&mut lines).await;
         assert_eq!(
             started["params"]["workActivity"]["items"],
-            serde_json::json!(["episode", "t:1"])
+            serde_json::json!(["episode"])
         );
         drop(lines);
         tokio::fs::remove_file(&path).await.unwrap();
@@ -430,8 +428,9 @@ mod tests {
         );
         drop(lines);
         tokio::fs::remove_file(&path).await.unwrap();
-        client.try_publish_hub_notification(turn("turn/completed"));
+        // No completion notification (for example an inactive UI stream).
         work_tx.send_replace(BTreeSet::new());
+        client.try_publish_hub_notification(turn("turn/started"));
         let mut lines = accept(UnixListener::bind(&path).unwrap()).await;
         let idle = read_json_line(&mut lines).await;
         assert_eq!(idle["params"]["activeTurns"], serde_json::json!([]));
@@ -443,13 +442,14 @@ mod tests {
         // Exercise ingress overflow deterministically with the writer excluded.
         {
             let mut outbox = client.outbox.lock().unwrap();
+            work_tx.send_replace(BTreeSet::from(["next".into()]));
             for _ in 0..=MAX_PENDING {
                 outbox.publish(turn("progress"));
             }
             outbox.publish(turn("turn/started"));
             let batch = outbox.drain(false);
             assert!(matches!(&batch[..], [Publication::State(state)]
-                if state.active_turns.len() == 1 && state.work_activity.as_ref().unwrap().items.contains("t:1")));
+                if state.active_turns.len() == 1 && state.work_activity.as_ref().unwrap().items.contains("next")));
         }
         client.shutdown().await;
         tokio::fs::remove_file(path).await.unwrap();

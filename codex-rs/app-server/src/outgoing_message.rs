@@ -202,6 +202,38 @@ impl OutgoingMessageSender {
         }
     }
 
+    pub(crate) async fn publish_core_turn_started(
+        &self,
+        thread_id: codex_protocol::ThreadId,
+        turn_id: &str,
+        model: &str,
+        context_window: Option<i64>,
+    ) {
+        if let Some(producer) = &self.codexd_producer {
+            producer.publish_hub_notification(codex_codexd::protocol::HubNotification {
+                method: "turn/started".into(),
+                params: Some(serde_json::json!({"threadId":thread_id, "turn":{
+                    "id":turn_id, "status":"inProgress", "model":model, "modelContextWindow":context_window
+                }})),
+            }).await;
+        }
+    }
+
+    pub(crate) async fn publish_delegate_turn_ended(
+        &self,
+        thread_id: codex_protocol::ThreadId,
+        turn_id: &str,
+    ) {
+        if let Some(producer) = &self.codexd_producer {
+            producer
+                .publish_hub_notification(codex_codexd::protocol::HubNotification {
+                    method: "turn/completed".into(),
+                    params: Some(serde_json::json!({"threadId":thread_id, "turn":{"id":turn_id}})),
+                })
+                .await;
+        }
+    }
+
     /// All notifications should be migrated to [`ServerNotification`] and
     /// [`OutgoingMessage::Notification`] should be removed.
     pub(crate) async fn send_notification(&self, notification: OutgoingNotification) {
@@ -245,7 +277,6 @@ fn should_publish_to_codexd(notification: &ServerNotification) -> bool {
         ServerNotification::ThreadStarted(_)
             | ServerNotification::ThreadNameUpdated(_)
             | ServerNotification::ThreadTokenUsageUpdated(_)
-            | ServerNotification::TurnStarted(_)
             | ServerNotification::TurnCompleted(_)
             | ServerNotification::TurnDiffUpdated(_)
             | ServerNotification::TurnPlanUpdated(_)

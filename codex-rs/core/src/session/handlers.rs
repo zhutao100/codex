@@ -19,6 +19,8 @@ pub(super) async fn submission_loop(
                 continue;
             };
             use crate::completion_review::InternalReviewOperation;
+            #[cfg(all(unix, debug_assertions, feature = "test-support"))]
+            wait_for_handoff_fixture(&operation).await;
             match operation {
                 InternalReviewOperation::Review(ticket) => {
                     if sess.active_turn.lock().await.is_none()
@@ -205,6 +207,33 @@ pub(super) async fn submission_loop(
         }
     }
     debug!("Agent loop exited");
+}
+
+// Debug integration builds only: let an external observer inspect actual
+// queued ownership before dispatch, without delaying model responses or powerd.
+#[cfg(all(unix, debug_assertions, feature = "test-support"))]
+async fn wait_for_handoff_fixture(operation: &crate::completion_review::InternalReviewOperation) {
+    use crate::completion_review::InternalReviewOperation;
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
+    let Some(socket) = std::env::var_os("CODEX_TEST_HANDOFF_SOCKET") else {
+        return;
+    };
+    let stage = match operation {
+        InternalReviewOperation::Review(_) => b'R',
+        InternalReviewOperation::Continue(_) => b'C',
+    };
+    let handshake = async {
+        let mut peer = tokio::net::UnixStream::connect(socket).await?;
+        peer.write_u8(stage).await?;
+        peer.read_u8().await
+    };
+    if !matches!(
+        tokio::time::timeout(std::time::Duration::from_secs(20), handshake).await,
+        Ok(Ok(b'+'))
+    ) {
+        tracing::warn!("automatic handoff fixture did not acknowledge the queued operation");
+    }
 }
 
 use crate::config::Config;
