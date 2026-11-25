@@ -59,11 +59,211 @@ pub(crate) struct RuntimeState {
     cwd: Option<String>,
     display_name: Option<String>,
     pub(crate) active_turns: BTreeMap<String, ActiveTurnSnapshot>,
+    last_start_order: u64,
     pub(crate) work_activity: Option<WorkActivity>,
     thread_token_usage: BTreeMap<String, JsonValue>,
+    associations: TurnAssociations,
+}
+
+#[derive(Debug, Clone, Default)]
+struct TurnAssociations(VecDeque<ObservedTurn>);
+
+#[derive(Debug, Clone)]
+struct ObservedTurn {
+    key: String,
+    thread: String,
+    id: String,
+    // EOF preserves identity, not evidence that a missing turn completed.
+    predecessor: bool,
+}
+
+fn cumulative_total(usage: &JsonValue) -> Option<u64> {
+    usage["total"]["totalTokens"].as_u64()
+}
+
+fn observe_thread_usage(heads: &mut BTreeMap<String, JsonValue>, thread: &str, usage: &JsonValue) {
+    if let Some(n) = cumulative_total(usage)
+        && heads
+            .get(thread)
+            .and_then(cumulative_total)
+            .is_none_or(|prior| n >= prior)
+    {
+        heads.insert(thread.to_owned(), usage.clone());
+    }
+}
+
+impl TurnAssociations {
+    fn latest_key(&self, thread: &str) -> Option<&str> {
+        self.0
+            .iter()
+            .rev()
+            .find(|t| t.predecessor && t.thread == thread)
+            .map(|t| t.key.as_str())
+    }
+
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0
+            .iter()
+            .find(|t| t.key == key)
+            .map(|t| t.thread.as_str())
+    }
+
+    fn remember(&mut self, key: &str, thread: &str, id: &str, predecessor: bool) {
+        if let Some(i) = self.0.iter().position(|t| t.key == key) {
+            self.0.remove(i);
+        } else if self.0.len() == crate::protocol::MAX_RECOVERED_TERMINALS {
+            self.0.pop_front();
+        }
+        self.0.push_back(ObservedTurn {
+            key: key.into(),
+            thread: thread.into(),
+            id: id.into(),
+            predecessor,
+        });
+    }
+
+    fn retire_once(&mut self, key: &str, thread: &str, id: &str) {
+        if !self.0.iter().any(|t| t.key == key && t.predecessor) {
+            self.remember(key, thread, id, true);
+        }
+    }
 }
 
 impl RuntimeState {
+    fn disconnected_identities(&self) -> Option<(String, TurnAssociations)> {
+        let generation = self.work_activity.as_ref()?.producer_generation.clone();
+        let mut ids = self.associations.clone();
+        for t in &mut ids.0 {
+            t.predecessor = false;
+        }
+        for (key, t) in &self.active_turns {
+            ids.remember(key, &t.thread_id, &t.turn_id, false);
+        }
+        Some((generation, ids))
+    }
+
+    // Ordinary app-server usage carries the pair, not the daemon key. Scope only the hub copy.
+    pub(crate) fn scope_usage(&self, notification: &mut HubNotification) -> bool {
+        if notification.method != "thread/tokenUsage/updated" {
+            return true;
+        }
+        let Some(fields) = notification.params.as_mut() else {
+            return true;
+        };
+        if !fields["turnKey"].is_null() {
+            return true;
+        }
+        let (Some(thread), Some(id)) = (fields["threadId"].as_str(), fields["turnId"].as_str())
+        else {
+            return true;
+        };
+        let mut keys = self
+            .active_turns
+            .iter()
+            .filter(|(_, t)| t.thread_id == thread && t.turn_id == id)
+            .map(|(k, _)| k.as_str())
+            .chain(
+                self.associations
+                    .0
+                    .iter()
+                    .filter(|t| t.thread == thread && t.id == id)
+                    .map(|t| t.key.as_str()),
+            );
+        if let Some(first) = keys.next() {
+            if keys.any(|k| k != first) {
+                return false;
+            }
+            fields["turnKey"] = first.into();
+        }
+        true
+    }
+
+    fn remember_recovered_threads(
+        &mut self,
+        state: &RuntimeUpdateStateParams,
+        recovered: &[(String, HubNotification)],
+    ) {
+        for (key, terminal) in recovered {
+            let Some(identity) = parse_active_turn_completed(terminal) else {
+                continue;
+            };
+            if state
+                .active_turns
+                .iter()
+                .any(|t| projected_key(t.turn_key.as_deref(), &t.thread_id, &t.turn_id) == *key)
+                || self.scheduler_holds_terminal(state.work_activity.as_ref(), key, &identity)
+            {
+                continue;
+            }
+            if let Some(thread) = identity
+                .thread_id
+                .as_deref()
+                .or_else(|| self.associations.get(key))
+                .map(str::to_owned)
+            {
+                self.associations
+                    .retire_once(key, &thread, &identity.turn_id);
+            }
+            if let Some(usage) = completion_usage(terminal) {
+                self.record_usage(Some(key), identity.thread_id.as_deref(), usage);
+            }
+        }
+    }
+
+    fn prepare_active_turn(
+        &self,
+        mut turn: ActiveTurnSnapshot,
+        infer_new_baseline: bool,
+        overlapping: bool,
+    ) -> (String, ActiveTurnSnapshot) {
+        let key = projected_key(turn.turn_key.as_deref(), &turn.thread_id, &turn.turn_id);
+        turn.turn_key = Some(key.clone());
+        let previous = self.active_turns.get(&key);
+        turn.started_at = turn
+            .started_at
+            .or_else(|| previous.and_then(|t| t.started_at));
+        // All previously unseen legacy turns in one full share an observation rank.
+        // Iteration order is not evidence that one of them started later.
+        turn.start_order = Some(
+            turn.start_order
+                .filter(|&n| n > 0)
+                .or_else(|| previous.and_then(|t| t.start_order))
+                .unwrap_or_else(|| self.last_start_order.saturating_add(1)),
+        );
+        let inferred = turn.token_usage_baseline_predecessor_key.is_some();
+        let missing_origin =
+            !turn.token_usage_baseline_known && !inferred && turn.token_usage_baseline.is_none();
+        if let Some(previous) = previous {
+            // A headerless replay is not a new start. Don't undo a later correction from
+            // the same predecessor if an older projection of the start arrives.
+            let fixed = previous.token_usage_baseline.is_some()
+                && previous.token_usage_baseline_predecessor_key.is_none();
+            let baseline =
+                |t: &ActiveTurnSnapshot| t.token_usage_baseline.as_ref().and_then(cumulative_total);
+            let stale = inferred
+                && turn.token_usage_baseline_predecessor_key
+                    == previous.token_usage_baseline_predecessor_key
+                && baseline(&turn) < baseline(previous);
+            if missing_origin || (inferred && !turn.token_usage_baseline_known && fixed) || stale {
+                turn.token_usage_baseline
+                    .clone_from(&previous.token_usage_baseline);
+                turn.token_usage_baseline_predecessor_key
+                    .clone_from(&previous.token_usage_baseline_predecessor_key);
+            }
+        } else if missing_origin && !overlapping {
+            if infer_new_baseline {
+                turn.token_usage_baseline = self.thread_token_usage.get(&turn.thread_id).cloned();
+            }
+            turn.token_usage_baseline_predecessor_key = self
+                .associations
+                .latest_key(&turn.thread_id)
+                .filter(|p| *p != key)
+                .map(str::to_owned);
+        }
+        turn.token_usage_baseline_known = true;
+        (key, turn)
+    }
+
     // Bind a legacy terminal before its upsert removes the only identifiable
     // turn. The producer journal, daemon ledger and subscriber see the same key.
     pub(crate) fn identify_live_completion(
@@ -94,13 +294,101 @@ impl RuntimeState {
         Some(key)
     }
 
-    fn has_attached_key(&self, key: &str) -> bool {
+    fn has_attached_terminal(&self, key: &str, notification: &HubNotification) -> bool {
         self.active_turns.contains_key(key)
-            || self
-                .work_activity
+            || parse_active_turn_completed(notification).is_some_and(|identity| {
+                self.scheduler_holds_terminal(self.work_activity.as_ref(), key, &identity)
+            })
+    }
+
+    fn scheduler_holds_terminal(
+        &self,
+        work: Option<&WorkActivity>,
+        key: &str,
+        id: &TurnIdentity,
+    ) -> bool {
+        let Some(owners) = work.and_then(|w| w.running_turn_keys.as_ref()) else {
+            return false;
+        };
+        let thread = id
+            .thread_id
+            .as_deref()
+            .or_else(|| {
+                self.active_turns
+                    .get(key)
+                    .filter(|t| t.turn_id == id.turn_id)
+                    .map(|t| t.thread_id.as_str())
+            })
+            .or_else(|| {
+                self.associations
+                    .0
+                    .iter()
+                    .find(|t| t.key == key && t.id == id.turn_id)
+                    .map(|t| t.thread.as_str())
+            });
+        owners.contains(key)
+            || thread.is_some_and(|thread| owners.contains(&turn_key(thread, &id.turn_id)))
+    }
+
+    fn record_usage(
+        &mut self,
+        key: Option<&str>,
+        explicit_thread: Option<&str>,
+        usage: &JsonValue,
+    ) -> ProjectionChange {
+        if !usage.is_object() {
+            return ProjectionChange::None;
+        }
+        if let Some(turn) = key.and_then(|k| self.active_turns.get(k)) {
+            observe_thread_usage(&mut self.thread_token_usage, &turn.thread_id, usage);
+            return ProjectionChange::None;
+        }
+        let retired = key.and_then(|k| self.associations.get(k));
+        let next = key.and_then(|key| {
+            self.active_turns.values_mut().find(|t| {
+                t.token_usage_baseline_predecessor_key.as_deref() == Some(key)
+                    && retired
+                        .or(explicit_thread)
+                        .is_none_or(|owner| t.thread_id == owner)
+            })
+        });
+        let history = retired.or_else(|| next.as_ref().map(|t| t.thread_id.as_str()));
+        if let Some(thread) = history.or(explicit_thread) {
+            observe_thread_usage(&mut self.thread_token_usage, thread, usage);
+        }
+        if let (Some(next), Some(n)) = (next, cumulative_total(usage))
+            && next.token_usage_baseline.as_ref() != Some(usage)
+            && next
+                .token_usage_baseline
                 .as_ref()
-                .and_then(|work| work.running_turn_keys.as_ref())
-                .is_some_and(|keys| keys.iter().any(|running| running == key))
+                .and_then(cumulative_total)
+                .is_none_or(|p| n >= p)
+        {
+            next.token_usage_baseline = Some(usage.clone());
+            return ProjectionChange::SuccessorBaseline;
+        }
+        ProjectionChange::None
+    }
+
+    fn account_settled_terminal(&mut self, notification: &HubNotification) -> ProjectionChange {
+        let Some(identity) = parse_active_turn_completed(notification) else {
+            return ProjectionChange::None;
+        };
+        let Some(key) = identity.turn_key.as_deref() else {
+            return ProjectionChange::None;
+        };
+        if let Some(thread) = identity
+            .thread_id
+            .as_deref()
+            .or_else(|| self.associations.get(key))
+            .map(str::to_owned)
+        {
+            self.associations
+                .retire_once(key, &thread, &identity.turn_id);
+        }
+        completion_usage(notification).map_or(ProjectionChange::None, |u| {
+            self.record_usage(Some(key), identity.thread_id.as_deref(), u)
+        })
     }
 
     pub(crate) fn apply_scheduler_work(&mut self, work: WorkActivity) {
@@ -112,7 +400,14 @@ impl RuntimeState {
         let Some(work) = &self.work_activity else {
             return;
         };
-        self.active_turns.retain(|_, turn| work.permits_turn(turn));
+        self.active_turns.retain(|key, turn| {
+            let keep = work.permits_turn(turn);
+            if !keep {
+                self.associations
+                    .remember(key, &turn.thread_id, &turn.turn_id, true);
+            }
+            keep
+        });
     }
 
     pub(crate) fn with_register(params: &RuntimeRegisterParams) -> Self {
@@ -139,7 +434,21 @@ impl RuntimeState {
     }
 
     pub(crate) fn as_snapshot(&self, runtime_id: String) -> RuntimeSnapshot {
-        let active_turns = self.active_turns.values().cloned().collect();
+        let active_turns = self
+            .active_turns
+            .values()
+            .cloned()
+            .map(|mut t| {
+                t.thread_token_usage = self
+                    .thread_token_usage
+                    .get(&t.thread_id)
+                    .filter(|head| {
+                        cumulative_total(head) > t.token_usage.as_ref().and_then(cumulative_total)
+                    })
+                    .cloned();
+                t
+            })
+            .collect();
 
         RuntimeSnapshot {
             runtime_id,
@@ -222,6 +531,8 @@ struct TerminalStamp {
 #[derive(Default)]
 struct RevisionCursors {
     accepted_generation: Option<String>,
+    // Belongs only to the last disconnected source. Never restore its turns, totals or work.
+    disconnected_identities: Option<(String, TurnAssociations)>,
     // Admission evidence for the daemon instance. It is not a live work projection.
     generations: HashMap<String, GenerationCursor>,
 }
@@ -510,27 +821,64 @@ impl DaemonState {
                 .display_name
                 .clone()
                 .or_else(|| runtime.display_name.clone());
-            let mut thread_token_usage = runtime.thread_token_usage.clone();
-            runtime.active_turns = params
+            let incoming: BTreeMap<_, _> = params
                 .active_turns
                 .into_iter()
-                .map(|mut turn| {
-                    let turn_key =
-                        projected_key(turn.turn_key.as_deref(), &turn.thread_id, &turn.turn_id);
-                    turn.turn_key = Some(turn_key.clone());
-                    // A complete producer projection already owns the baseline.
-                    // Its current-turn usage must not become its own starting total.
-                    if runtime.work_activity.is_none() && turn.token_usage_baseline.is_none() {
-                        turn.token_usage_baseline =
-                            thread_token_usage.get(turn.thread_id.as_str()).cloned();
+                .map(|t| {
+                    (
+                        projected_key(t.turn_key.as_deref(), &t.thread_id, &t.turn_id),
+                        t,
+                    )
+                })
+                .collect();
+            runtime.active_turns.retain(|key, turn| {
+                let keep = incoming.contains_key(key);
+                if !keep {
+                    runtime
+                        .associations
+                        .remember(key, &turn.thread_id, &turn.turn_id, true);
+                }
+                keep
+            });
+            let mut running = HashMap::<String, usize>::new();
+            for t in incoming.values().filter(|t| {
+                unfinished(t)
+                    && runtime
+                        .work_activity
+                        .as_ref()
+                        .is_none_or(|w| w.permits_turn(t))
+            }) {
+                *running.entry(t.thread_id.clone()).or_default() += 1;
+            }
+            let mut thread_token_usage = runtime.thread_token_usage.clone();
+            runtime.active_turns = incoming
+                .into_values()
+                .map(|turn| {
+                    let overlapping = running.get(&turn.thread_id).copied().unwrap_or(0)
+                        > usize::from(unfinished(&turn));
+                    let (turn_key, mut turn) = runtime.prepare_active_turn(
+                        turn,
+                        runtime.work_activity.is_none(),
+                        overlapping,
+                    );
+                    if let Some(usage) = &turn.token_usage {
+                        observe_thread_usage(&mut thread_token_usage, &turn.thread_id, usage);
                     }
-                    if let Some(token_usage) = turn.token_usage.clone() {
-                        thread_token_usage.insert(turn.thread_id.clone(), token_usage);
+                    if let Some(head) = turn.thread_token_usage.take() {
+                        observe_thread_usage(&mut thread_token_usage, &turn.thread_id, &head);
                     }
                     (turn_key, turn)
                 })
                 .collect();
             runtime.thread_token_usage = thread_token_usage;
+            if let Some(n) = runtime
+                .active_turns
+                .values()
+                .filter_map(|t| t.start_order)
+                .max()
+            {
+                runtime.last_start_order = runtime.last_start_order.max(n);
+            }
             runtime.prune_unowned_turns();
             runtime.as_snapshot(runtime_id)
         };
@@ -566,13 +914,16 @@ impl DaemonState {
                             .get_mut(&runtime_id)
                             .is_none_or(|slot| slot.admit_live_terminal(key, effective_work))
                     }),
+                "thread/tokenUsage/updated" => runtime.scope_usage(&mut notification),
                 _ => true,
             };
             // A legacy terminal can end an attached turn even if its unversioned
             // archive detail must not overwrite an earlier versioned outcome.
             let project =
                 forward || (effective_work.is_none() && notification.method == "turn/completed");
-            let changed = project && apply_notification_to_runtime(runtime, &notification);
+            let changed = project
+                && apply_notification_to_runtime(runtime, &mut notification)
+                    != ProjectionChange::None;
             let changed_work = params.work_activity.is_some();
             if let Some(work) = params.work_activity {
                 runtime.apply_scheduler_work(work);
@@ -643,13 +994,13 @@ impl DaemonState {
         if !removed && slot.requested_state.is_some() {
             return Vec::new();
         }
-        let runtime = self.runtimes.get(id);
+        let mut runtime = self.runtimes.get_mut(id);
         let mut released = Vec::new();
         // Deliver after the projection, never before. A different generation that
         // explicitly owns the same key cannot inherit the old task's terminal.
         for pending in std::mem::take(&mut slot.deferred_terminals) {
-            if let Some(r) = runtime
-                && r.has_attached_key(&pending.stamp.key)
+            if let Some(r) = runtime.as_deref()
+                && r.has_attached_terminal(&pending.stamp.key, &pending.notification)
             {
                 if r.work_activity.as_ref().map(|w| &w.producer_generation)
                     == pending.stamp.generation.as_ref()
@@ -657,13 +1008,28 @@ impl DaemonState {
                     slot.deferred_terminals.push(pending);
                 }
             } else {
+                let same_source = runtime.as_deref().is_some_and(|r| {
+                    r.work_activity.as_ref().map(|w| &w.producer_generation)
+                        == pending.stamp.generation.as_ref()
+                });
                 if !slot.record_published_terminal(pending.stamp) {
                     continue;
                 }
+                let corrected = runtime
+                    .as_deref_mut()
+                    .filter(|_| same_source)
+                    .and_then(|r| {
+                        (r.account_settled_terminal(&pending.notification)
+                            == ProjectionChange::SuccessorBaseline)
+                            .then(|| r.as_snapshot(id.to_owned()))
+                    });
                 released.push(CodexdEventPayload::RuntimeArchiveDetail {
                     runtime_id: id.to_owned(),
                     notification: pending.notification,
                 });
+                if let Some(runtime) = corrected {
+                    released.push(CodexdEventPayload::RuntimeUpsert { runtime });
+                }
             }
         }
         released
@@ -926,10 +1292,17 @@ async fn handle_subscribe_method(
 
 impl DaemonState {
     fn detach_producer(&mut self, id: &str) {
+        let identities = self
+            .runtimes
+            .get(id)
+            .and_then(RuntimeState::disconnected_identities);
         self.unregister_runtime(id);
-        let Some(slot) = self.runtime_connections.remove(id) else {
+        let Some(mut slot) = self.runtime_connections.remove(id) else {
             return;
         };
+        if identities.is_some() {
+            slot.cursors.disconnected_identities = identities;
+        }
         let negotiated_repair = slot.requires_work_activity && slot.requested_state.is_some();
         if negotiated_repair
             || !slot.cursors.generations.is_empty()
@@ -951,7 +1324,10 @@ impl DaemonState {
         let Some(slot) = self.runtime_connections.get_mut(id) else {
             return;
         };
-        if slot.connection != connection {
+        // Reject malformed legacy frames without changing the last visible-turn projection.
+        if slot.connection != connection
+            || (!slot.requires_work_activity && slot.requested_state.is_none())
+        {
             return;
         }
         let request = slot.socket_request(id);
@@ -1013,7 +1389,7 @@ impl DaemonState {
                     .as_ref()
                     .and_then(|p| p["workActivitySupported"].as_bool())
                     == Some(true));
-        let mut handoff_state = None;
+        let mut admitted_state = None;
         if let Some(incumbent) = self.runtime_connections.get_mut(&id)
             && incumbent.connection != connection
         {
@@ -1024,9 +1400,9 @@ impl DaemonState {
                 incumbent.cursors.observe(g, n);
             }
             if method == RUNTIME_UPDATE_STATE_METHOD {
-                handoff_state = checked_producer_state(params.as_ref()).ok();
+                admitted_state = checked_producer_state(params.as_ref()).ok();
             }
-            let eligible = handoff_state
+            let eligible = admitted_state
                 .as_ref()
                 .is_some_and(|p| match &p.state.work_activity {
                     Some(w) => incumbent
@@ -1040,11 +1416,6 @@ impl DaemonState {
                                 .runtimes
                                 .get(&id)
                                 .is_some_and(|r| r.work_activity.is_none())
-                            && params.as_ref().is_some_and(|v| v["activeTurns"].is_array())
-                            && p.state
-                                .active_turns
-                                .iter()
-                                .all(|t| valid_id(&t.thread_id) && valid_id(&t.turn_id))
                     }
                 });
             if !eligible {
@@ -1062,6 +1433,17 @@ impl DaemonState {
                 }
                 return Ok(Some(request));
             }
+        } else if owner.is_none()
+            && method == RUNTIME_UPDATE_STATE_METHOD
+            && !declares_work
+            && !claims.pending_work.contains(&id)
+            && self
+                .detached_revisions
+                .get(&id)
+                .is_none_or(|p| p.request.is_none())
+        {
+            // An invalid first legacy full cannot acquire an otherwise unclaimed runtime.
+            admitted_state = Some(checked_producer_state(params.as_ref())?);
         }
         // Remember the cursor even when the very first publication is unusable, without
         // exposing it as an empty runtime. Closing a superseded socket must not remove it.
@@ -1093,7 +1475,7 @@ impl DaemonState {
         if claims.pending_work.remove(&id) {
             slot.requires_work_activity = true;
             // The incumbent may have gone away before this challenger answered.
-            if handoff_state.is_none() && slot.requested_state.is_none() {
+            if admitted_state.is_none() && slot.requested_state.is_none() {
                 slot.requested_state = Some(slot.replacement_floor(&id));
             }
         }
@@ -1179,7 +1561,7 @@ impl DaemonState {
                 let ProducerState {
                     state,
                     history_recovery,
-                } = match handoff_state {
+                } = match admitted_state {
                     Some(full) => full,
                     None => checked_producer_state(params.as_ref())?,
                 };
@@ -1191,16 +1573,29 @@ impl DaemonState {
                 {
                     return Err("missing negotiated workActivity".into());
                 }
-                if let Some(prior) = self
-                    .runtimes
-                    .get(&id)
-                    .and_then(|r| r.work_activity.as_ref())
-                    && state.work_activity.as_ref().map(|w| &w.producer_generation)
-                        != Some(&prior.producer_generation)
-                {
-                    self.runtimes.remove(&id);
+                let mut displaced_turns = false;
+                if let Some(prior) = self.runtimes.get(&id) {
+                    let old = prior.work_activity.as_ref().map(|w| &w.producer_generation);
+                    let next = state.work_activity.as_ref().map(|w| &w.producer_generation);
+                    let new_socket = owner.is_some_and(|old| old != connection);
+                    if old != next || (next.is_none() && new_socket) {
+                        displaced_turns = !prior.active_turns.is_empty();
+                        // An in-place legacy registration can supply metadata before the first
+                        // negotiated state. Never seed a successor's turns from the old source.
+                        if new_socket || old.is_some() || displaced_turns {
+                            self.runtimes.remove(&id);
+                        }
+                    }
                 }
                 slot.requested_state = None;
+                if let Some((generation, identities)) = slot.cursors.disconnected_identities.take()
+                    && state
+                        .work_activity
+                        .as_ref()
+                        .is_some_and(|w| w.producer_generation == generation)
+                {
+                    self.runtimes.entry(id.clone()).or_default().associations = identities;
+                }
                 if let Some(work) = &state.work_activity {
                     slot.cursors.accepted_generation = Some(work.producer_generation.clone());
                 }
@@ -1210,15 +1605,8 @@ impl DaemonState {
                             .accept_recovery(&w.producer_generation, h.epoch)
                     })
                 });
-                // Two legacy sockets look identical to subscribers. Detach unfinished
-                // history before projecting the new claim, without revoking its work.
-                let history_lost = recovery.is_some()
-                    || (owner.is_some_and(|old| old != connection)
-                        && state.work_activity.is_none()
-                        && self
-                            .runtimes
-                            .get(&id)
-                            .is_some_and(|old| !old.active_turns.is_empty()));
+                // A subscriber joining during repair has turns but no incumbent generation.
+                let history_lost = recovery.is_some() || displaced_turns;
                 let mut recovered = Vec::new();
                 if let Some(h) = recovery {
                     recovered.extend(
@@ -1246,6 +1634,13 @@ impl DaemonState {
                     .as_ref()
                     .filter(|_| !recovered.is_empty())
                     .map(|w| (w.producer_generation.clone(), w.revision));
+                if !recovered.is_empty() {
+                    // Bind accounting before any successor in this same full state. Do not complete an attached turn.
+                    self.runtimes
+                        .entry(id.clone())
+                        .or_default()
+                        .remember_recovered_threads(&state, &recovered);
+                }
                 self.update_runtime_state(state);
                 for (key, notification) in recovered {
                     let stamp = recovered_at.as_ref().map(|(g, n)| (g.as_str(), *n));
@@ -1376,7 +1771,11 @@ impl DaemonState {
         notification: &HubNotification,
         stamp: Option<(&str, u64)>,
     ) -> bool {
-        let Some(r) = self.runtimes.get(id).filter(|r| r.has_attached_key(key)) else {
+        let Some(r) = self
+            .runtimes
+            .get(id)
+            .filter(|r| r.has_attached_terminal(key, notification))
+        else {
             return false;
         };
         let Some(slot) = self.runtime_connections.get_mut(id) else {
@@ -1433,37 +1832,44 @@ fn work_header(work: &JsonValue) -> Result<(&str, u64), String> {
 
 fn checked_producer_state(params: Option<&JsonValue>) -> Result<ProducerState, String> {
     let params = params.ok_or("missing producer state")?;
+    if !params.get("activeTurns").is_some_and(JsonValue::is_array) {
+        return Err("activeTurns must be an explicit array".into());
+    }
     let publication = ProducerState::deserialize(params).map_err(|err| err.to_string())?;
     let state = &publication.state;
-    if params.get("activeTurns").is_none()
-        && (state.work_activity_supported || state.work_activity.is_some())
+    if state
+        .active_turns
+        .iter()
+        .any(|t| !valid_id(&t.thread_id) || !valid_id(&t.turn_id))
     {
-        return Err("missing negotiated activeTurns".into());
+        return Err("activeTurns contains an unidentified turn".into());
+    }
+    if state.active_turns.iter().any(|t| {
+        t.token_usage_baseline_predecessor_key
+            .as_deref()
+            .is_some_and(|p| {
+                !valid_id(p) || p == projected_key(t.turn_key.as_deref(), &t.thread_id, &t.turn_id)
+            })
+    }) {
+        return Err("invalid tokenUsageBaselinePredecessorKey".into());
     }
     if state.work_activity_supported && state.work_activity.is_none() {
         return Err("missing negotiated workActivity".into());
     }
     if let Some(work) = &state.work_activity {
         work.validate()?;
-        if state
-            .active_turns
-            .iter()
-            .any(|t| !valid_id(&t.thread_id) || !valid_id(&t.turn_id))
-        {
-            return Err("negotiated activeTurns contains an unidentified turn".into());
-        }
-        if work.items.is_empty()
-            && state.active_turns.iter().any(|t| {
-                !matches!(
-                    t.status.as_deref(),
-                    Some("completed" | "failed" | "paused" | "interrupted")
-                )
-            })
-        {
+        if work.items.is_empty() && state.active_turns.iter().any(unfinished) {
             return Err("idle workActivity conflicts with reported turns".into());
         }
     }
     Ok(publication)
+}
+
+fn unfinished(turn: &ActiveTurnSnapshot) -> bool {
+    !matches!(
+        turn.status.as_deref(),
+        Some("completed" | "failed" | "paused" | "interrupted")
+    )
 }
 
 fn recovered_notification(
@@ -1477,11 +1883,13 @@ fn recovered_notification(
     {
         return None;
     }
+    let mut turn = serde_json::json!({"id":t.turn_id,"key":t.turn_key,"status":t.status});
+    if let Some(usage) = t.token_usage {
+        turn["tokenUsage"] = usage;
+    }
     let notification = HubNotification {
         method: "turn/completed".into(),
-        params: Some(
-            serde_json::json!({"threadId":t.thread_id,"turnKey":t.turn_key,"turn":{"id":t.turn_id,"key":t.turn_key,"status":t.status}}),
-        ),
+        params: Some(serde_json::json!({"threadId":t.thread_id,"turnKey":t.turn_key,"turn":turn})),
     };
     Some((t.turn_key, notification))
 }
@@ -1505,53 +1913,75 @@ fn keyed_item_or_progress(notification: &HubNotification) -> bool {
     named("turnKey") || (named("threadId") && named("turnId"))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProjectionChange {
+    None,
+    LiveTurn,
+    SuccessorBaseline,
+}
+
 pub(crate) fn apply_notification_to_runtime(
     runtime: &mut RuntimeState,
-    notification: &HubNotification,
-) -> bool {
-    if let Some(mut snapshot) = parse_active_turn_started(notification) {
-        let turn_key = snapshot
-            .turn_key
-            .clone()
-            .unwrap_or_else(|| turn_key(snapshot.thread_id.as_str(), snapshot.turn_id.as_str()));
-        if snapshot.token_usage_baseline.is_none() {
-            snapshot.token_usage_baseline = runtime
-                .thread_token_usage
-                .get(snapshot.thread_id.as_str())
-                .cloned();
+    notification: &mut HubNotification,
+) -> ProjectionChange {
+    if let Some(snapshot) = parse_active_turn_started(notification) {
+        let key = projected_key(
+            snapshot.turn_key.as_deref(),
+            &snapshot.thread_id,
+            &snapshot.turn_id,
+        );
+        let overlap = runtime
+            .active_turns
+            .iter()
+            .any(|(k, t)| k != &key && t.thread_id == snapshot.thread_id && unfinished(t));
+        let (turn_key, snapshot) = runtime.prepare_active_turn(snapshot, true, overlap);
+        if let Some(n) = snapshot.start_order {
+            runtime.last_start_order = runtime.last_start_order.max(n);
         }
-        if let Some(token_usage) = snapshot.token_usage.clone() {
-            runtime
-                .thread_token_usage
-                .insert(snapshot.thread_id.clone(), token_usage);
+        if let Some(usage) = &snapshot.token_usage {
+            observe_thread_usage(&mut runtime.thread_token_usage, &snapshot.thread_id, usage);
+        }
+        // The daemon receiving a delta may have joined after the prior turn retired.
+        // Carry the producer's start boundary on deltas as well as on full projections.
+        if let Some(turn) = notification
+            .params
+            .as_mut()
+            .and_then(|p| p["turn"].as_object_mut())
+        {
+            turn.insert("startOrder".into(), snapshot.start_order.into());
+            if let Some(at) = snapshot.started_at {
+                turn.insert("startedAt".into(), at.into());
+            }
+            turn.insert("tokenUsageBaselineKnown".into(), true.into());
+            if let Some(value) = &snapshot.token_usage_baseline {
+                turn.insert("tokenUsageBaseline".into(), value.clone());
+            } else {
+                turn.remove("tokenUsageBaseline");
+            }
+            if let Some(key) = &snapshot.token_usage_baseline_predecessor_key {
+                turn.insert(
+                    "tokenUsageBaselinePredecessorKey".into(),
+                    key.clone().into(),
+                );
+            } else {
+                turn.remove("tokenUsageBaselinePredecessorKey");
+            }
         }
         runtime.active_turns.insert(turn_key, snapshot);
-        return true;
+        return ProjectionChange::LiveTurn;
     }
 
     if let Some(completion) = parse_active_turn_completed(notification) {
-        return remove_completed_turn(runtime, completion);
+        return remove_completed_turn(runtime, completion, completion_usage(notification));
     }
 
-    if let Some(update) = parse_turn_context_update(notification) {
-        record_thread_token_usage(runtime, &update);
+    if let Some(update) = parse_turn_context_update(notification)
+        .or_else(|| parse_thread_token_usage_update(notification))
+    {
         return apply_turn_context_update(runtime, update);
     }
 
-    if let Some(update) = parse_thread_token_usage_update(notification) {
-        record_thread_token_usage(runtime, &update);
-        return apply_turn_context_update(runtime, update);
-    }
-
-    false
-}
-
-fn record_thread_token_usage(runtime: &mut RuntimeState, update: &TurnContextUpdate) {
-    if let (Some(thread_id), Some(token_usage)) = (&update.thread_id, &update.token_usage) {
-        runtime
-            .thread_token_usage
-            .insert(thread_id.clone(), token_usage.clone());
-    }
+    ProjectionChange::None
 }
 
 struct TurnIdentity {
@@ -1625,6 +2055,7 @@ fn parse_active_turn_started(notification: &HubNotification) -> Option<ActiveTur
         turn_id,
         status: parse_string_field(turn, "status").or_else(|| Some("inProgress".to_string())),
         started_at: parse_i64_field(turn, "startedAt"),
+        start_order: turn.get("startOrder").and_then(JsonValue::as_u64),
         model: parse_string_field(turn, "model"),
         scope: parse_string_field(turn, "scope"),
         task_kind: parse_string_field(turn, "taskKind"),
@@ -1640,7 +2071,19 @@ fn parse_active_turn_started(notification: &HubNotification) -> Option<ActiveTur
         model_context_window: parse_i64_field(turn, "modelContextWindow"),
         context_remaining_percent: parse_i64_field(turn, "contextRemainingPercent"),
         token_usage: turn.get("tokenUsage").cloned(),
-        token_usage_baseline: turn.get("tokenUsageBaseline").cloned(),
+        thread_token_usage: None,
+        token_usage_baseline: turn
+            .get("tokenUsageBaseline")
+            .filter(|v| !v.is_null())
+            .cloned(),
+        token_usage_baseline_known: turn
+            .get("tokenUsageBaselineKnown")
+            .and_then(JsonValue::as_bool)
+            .unwrap_or(false),
+        token_usage_baseline_predecessor_key: parse_string_field(
+            turn,
+            "tokenUsageBaselinePredecessorKey",
+        ),
         thread_name: parse_string_field(turn, "threadName"),
         latest_label: parse_string_field(turn, "latestLabel"),
     })
@@ -1678,6 +2121,7 @@ pub(crate) fn recovery_terminal(
             turn_id: completed.turn_id,
             turn_key: key,
             status: status.to_owned(),
+            token_usage: completion_usage(notification).cloned(),
         }
     })
 }
@@ -1753,14 +2197,47 @@ fn parse_thread_token_usage_update(notification: &HubNotification) -> Option<Tur
     })
 }
 
-fn remove_completed_turn(runtime: &mut RuntimeState, completion: TurnIdentity) -> bool {
+fn completion_usage(notification: &HubNotification) -> Option<&JsonValue> {
+    notification
+        .params
+        .as_ref()?
+        .get("turn")?
+        .get("tokenUsage")
+        .filter(|u| u.is_object())
+}
+
+fn remove_completed_turn(
+    runtime: &mut RuntimeState,
+    completion: TurnIdentity,
+    usage: Option<&JsonValue>,
+) -> ProjectionChange {
     let key = resolve_active_key(
         runtime,
         completion.turn_key,
         completion.thread_id.as_deref(),
         Some(&completion.turn_id),
     );
-    key.is_some_and(|key| runtime.active_turns.remove(&key).is_some())
+    let Some(key) = key else {
+        return ProjectionChange::None;
+    };
+    let removed = runtime.active_turns.remove(&key);
+    if let Some(turn) = &removed {
+        runtime
+            .associations
+            .remember(&key, &turn.thread_id, &turn.turn_id, true);
+    } else if let Some(thread) = completion.thread_id.as_deref() {
+        runtime
+            .associations
+            .retire_once(&key, thread, &completion.turn_id);
+    }
+    let change = usage.map_or(ProjectionChange::None, |u| {
+        runtime.record_usage(Some(&key), completion.thread_id.as_deref(), u)
+    });
+    if removed.is_some() {
+        ProjectionChange::LiveTurn
+    } else {
+        change
+    }
 }
 
 fn resolve_active_key(
@@ -1787,18 +2264,24 @@ fn resolve_active_key(
     matches.next().is_none().then(|| key.clone())
 }
 
-fn apply_turn_context_update(runtime: &mut RuntimeState, update: TurnContextUpdate) -> bool {
+fn apply_turn_context_update(
+    runtime: &mut RuntimeState,
+    update: TurnContextUpdate,
+) -> ProjectionChange {
     let key = resolve_active_key(
         runtime,
         update.turn_key,
         update.thread_id.as_deref(),
         update.turn_id.as_deref(),
     );
-    let Some(key) = key else {
-        return false;
-    };
-    let Some(turn) = runtime.active_turns.get_mut(&key) else {
-        return false;
+    let accounting = update
+        .token_usage
+        .as_ref()
+        .map_or(ProjectionChange::None, |usage| {
+            runtime.record_usage(key.as_deref(), update.thread_id.as_deref(), usage)
+        });
+    let Some(turn) = key.as_ref().and_then(|k| runtime.active_turns.get_mut(k)) else {
+        return accounting;
     };
 
     merge_opt(&mut turn.status, update.status);
@@ -1822,7 +2305,7 @@ fn apply_turn_context_update(runtime: &mut RuntimeState, update: TurnContextUpda
     );
     merge_opt(&mut turn.token_usage, update.token_usage);
     merge_opt(&mut turn.thread_name, update.thread_name);
-    true
+    ProjectionChange::LiveTurn
 }
 
 fn merge_opt<T>(target: &mut Option<T>, update: Option<T>) {
@@ -1988,11 +2471,14 @@ mod tests {
         let work =
             json!({"producerGeneration":"g","revision":8,"items":["queued"],"runningTurnKeys":[]});
         for (thread, turn) in [("T", ""), (" \n", "0")] {
-            let start = HubNotification {
+            let mut start = HubNotification {
                 method: "turn/started".into(),
                 params: Some(json!({"threadId":thread,"turn":{"id":turn}})),
             };
-            assert!(!apply_notification_to_runtime(&mut local, &start));
+            assert_eq!(
+                apply_notification_to_runtime(&mut local, &mut start),
+                ProjectionChange::None
+            );
             let invalid = json!({"runtimeId":"r","activeTurns":[{"threadId":thread,"turnId":turn}],"workActivity":work});
             assert!(
                 daemon
@@ -3537,7 +4023,9 @@ mod tests {
                 cwd: Some("/tmp/work".to_string()),
                 display_name: Some("codex-tui".to_string()),
                 active_turns: vec![ActiveTurnSnapshot {
+                    token_usage_baseline_known: true,
                     turn_key: Some("thread-2:turn-2".to_string()),
+                    start_order: Some(2),
                     thread_id: "thread-2".to_string(),
                     turn_id: "turn-2".to_string(),
                     status: Some("inProgress".to_string()),
@@ -3648,7 +4136,9 @@ mod tests {
             snapshot.runtimes[0].active_turns,
             vec![
                 ActiveTurnSnapshot {
+                    token_usage_baseline_known: true,
                     turn_key: Some("thread-a:turn-1".to_string()),
+                    start_order: Some(1),
                     thread_id: "thread-a".to_string(),
                     turn_id: "turn-1".to_string(),
                     status: Some("inProgress".to_string()),
@@ -3656,7 +4146,9 @@ mod tests {
                     ..Default::default()
                 },
                 ActiveTurnSnapshot {
+                    token_usage_baseline_known: true,
                     turn_key: Some("thread-b:turn-1".to_string()),
+                    start_order: Some(2),
                     thread_id: "thread-b".to_string(),
                     turn_id: "turn-1".to_string(),
                     status: Some("inProgress".to_string()),
@@ -3684,7 +4176,9 @@ mod tests {
         assert_eq!(
             state.snapshot().runtimes[0].active_turns,
             vec![ActiveTurnSnapshot {
+                token_usage_baseline_known: true,
                 turn_key: Some("thread-a:turn-1".to_string()),
+                start_order: Some(1),
                 thread_id: "thread-a".to_string(),
                 turn_id: "turn-1".to_string(),
                 status: Some("inProgress".to_string()),
@@ -3700,11 +4194,11 @@ mod tests {
         let publish = |r: &mut RuntimeState, method, params| {
             apply_notification_to_runtime(
                 r,
-                &HubNotification {
+                &mut HubNotification {
                     method: String::from(method),
                     params: Some(params),
                 },
-            )
+            ) != ProjectionChange::None
         };
         for thread in ["A", "B"] {
             publish(
@@ -3772,7 +4266,9 @@ mod tests {
         assert_eq!(
             state.snapshot().runtimes[0].active_turns,
             vec![ActiveTurnSnapshot {
+                token_usage_baseline_known: true,
                 turn_key: Some("thread-new:0".to_string()),
+                start_order: Some(1),
                 thread_id: "thread-new".to_string(),
                 turn_id: "0".to_string(),
                 status: Some("inProgress".to_string()),
@@ -3839,7 +4335,9 @@ mod tests {
         assert_eq!(
             snapshot.runtimes[0].active_turns,
             vec![ActiveTurnSnapshot {
+                token_usage_baseline_known: true,
                 turn_key: Some("thread-1:turn-1".to_string()),
+                start_order: Some(1),
                 thread_id: "thread-1".to_string(),
                 turn_id: "turn-1".to_string(),
                 status: Some("inProgress".to_string()),
@@ -3969,7 +4467,9 @@ mod tests {
         assert_eq!(
             state.snapshot().runtimes[0].active_turns,
             vec![ActiveTurnSnapshot {
+                token_usage_baseline_known: true,
                 turn_key: Some("thread-1:turn-2".to_string()),
+                start_order: Some(1),
                 thread_id: "thread-1".to_string(),
                 turn_id: "turn-2".to_string(),
                 status: Some("inProgress".to_string()),

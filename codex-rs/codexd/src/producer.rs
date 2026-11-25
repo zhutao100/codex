@@ -1,4 +1,5 @@
 use crate::SchedulerWork;
+use crate::daemon::ProjectionChange;
 use crate::daemon::RuntimeState;
 use crate::daemon::apply_notification_to_runtime;
 use crate::protocol::HubNotification;
@@ -84,6 +85,24 @@ struct Outbox {
 }
 
 impl Outbox {
+    fn new(metadata: RuntimeMetadata, work: watch::Receiver<SchedulerWork>) -> Self {
+        Self {
+            state: RuntimeState::with_register(&metadata.to_register_params()),
+            id: metadata.runtime_id,
+            generation: uuid::Uuid::new_v4().to_string(),
+            revision: 0,
+            work,
+            pending: Vec::new(),
+            replace: true,
+            recovery: None,
+            sent_initial: false,
+            terminal_seq: 0,
+            recovery_through: 0,
+            unwritten: VecDeque::new(),
+            stopped: false,
+        }
+    }
+
     fn snapshot(&self) -> RuntimeSnapshot {
         self.state.as_snapshot(self.id.clone())
     }
@@ -144,6 +163,9 @@ impl Outbox {
     }
 
     fn publish(&mut self, mut notification: HubNotification) {
+        if !self.state.scope_usage(&mut notification) {
+            return;
+        }
         if notification.method == "turn/completed"
             && self
                 .state
@@ -154,9 +176,12 @@ impl Outbox {
             return;
         }
         let cursor = self.remember_terminal(&notification);
-        let changed = apply_notification_to_runtime(&mut self.state, &notification);
+        let changed = apply_notification_to_runtime(&mut self.state, &mut notification);
         // An explicit keyed outcome orders history even when the scheduler remains idle.
-        let work_activity = if cursor != 0 || changed || self.work.has_changed().unwrap_or(false) {
+        let work_activity = if cursor != 0
+            || changed == ProjectionChange::LiveTurn
+            || self.work.has_changed().unwrap_or(false)
+        {
             self.update_work();
             self.state.work_activity.clone()
         } else {
@@ -170,6 +195,10 @@ impl Outbox {
             },
             cursor,
         ));
+        if changed == ProjectionChange::SuccessorBaseline {
+            // A reconnected daemon may not have witnessed the predecessor retiring.
+            self.push(self.state_publication());
+        }
     }
 
     fn drain(&mut self, reconnect: bool) -> Vec<Publication> {
@@ -229,21 +258,7 @@ impl CodexdProducerClient {
         work: watch::Receiver<SchedulerWork>,
     ) -> Self {
         let (wake, receiver) = watch::channel(());
-        let outbox = Arc::new(Mutex::new(Outbox {
-            state: RuntimeState::with_register(&metadata.to_register_params()),
-            id: metadata.runtime_id,
-            generation: uuid::Uuid::new_v4().to_string(),
-            revision: 0,
-            work: work.clone(),
-            pending: Vec::new(),
-            replace: true,
-            recovery: None,
-            sent_initial: false,
-            terminal_seq: 0,
-            recovery_through: 0,
-            unwritten: VecDeque::new(),
-            stopped: false,
-        }));
+        let outbox = Arc::new(Mutex::new(Outbox::new(metadata, work.clone())));
         let writer = Arc::clone(&outbox);
         tokio::spawn(async move {
             run_producer_task(socket_path, writer, receiver, work).await;
@@ -416,6 +431,66 @@ mod tests {
     use tokio::net::UnixListener;
     use tokio::time::Duration;
     use tokio::time::timeout;
+
+    #[test]
+    fn successor_contract_outbox_sends_the_corrected_baseline_without_a_work_transition() {
+        let owners = |id: &str| SchedulerWork::from([("owner".into(), Some(format!("T:{id}")))]);
+        let (tx, rx) = watch::channel(owners("A"));
+        let mut out = Outbox::new(
+            RuntimeMetadata {
+                runtime_id: "r".into(),
+                pid: None,
+                session_source: None,
+                cwd: None,
+                display_name: None,
+            },
+            rx,
+        );
+        let publish = |out: &mut Outbox, method: &str, params| {
+            out.publish(HubNotification {
+                method: method.into(),
+                params: Some(params),
+            })
+        };
+        out.drain(true);
+        publish(
+            &mut out,
+            "turn/started",
+            serde_json::json!({"threadId":"T","turn":{"id":"A","key":"opaque:A"}}),
+        );
+        publish(
+            &mut out,
+            "turn/completed",
+            serde_json::json!({"threadId":"T","turn":{"id":"A","key":"opaque:A","status":"completed"}}),
+        );
+        tx.send_replace(owners("B"));
+        publish(
+            &mut out,
+            "turn/started",
+            serde_json::json!({"threadId":"T","turn":{"id":"B","key":"opaque:B"}}),
+        );
+        out.drain(false);
+        let revision = out.revision;
+        publish(
+            &mut out,
+            "thread/tokenUsage/updated",
+            serde_json::json!({"turnKey":"opaque:A","tokenUsage":{"total":{"totalTokens":100}}}),
+        );
+        let batch = out.drain(false);
+        let [Publication::Event(detail, _), Publication::State(full, _)] = batch.as_slice() else {
+            panic!("expected detail then corrected state")
+        };
+        assert!(detail.work_activity.is_none());
+        assert_eq!(
+            full.state.work_activity.as_ref().unwrap().revision,
+            revision
+        );
+        assert_eq!(full.state.active_turns.len(), 1);
+        assert_eq!(
+            full.state.active_turns[0].token_usage_baseline,
+            Some(serde_json::json!({"total":{"totalTokens":100}}))
+        );
+    }
 
     #[tokio::test]
     async fn try_publish_hub_notification_preserves_call_order() {

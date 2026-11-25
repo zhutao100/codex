@@ -34,7 +34,6 @@ mod imp {
         thread_id: String,
         turn_id: String,
         prompt_preview: Option<String>,
-        token_usage_baseline: Option<TokenUsageInfo>,
         failed: bool,
     }
 
@@ -71,7 +70,6 @@ mod imp {
         turn_start_order: Vec<String>,
         known_turn_keys: HashSet<String>,
         file_change_started: HashSet<String>,
-        thread_token_usage: HashMap<String, TokenUsageInfo>,
         active_runtime_context: Option<RuntimeContextSnapshot>,
         current_model: Option<String>,
         current_model_provider: Option<String>,
@@ -115,7 +113,6 @@ mod imp {
                 turn_start_order: Vec::new(),
                 known_turn_keys: HashSet::new(),
                 file_change_started: HashSet::new(),
-                thread_token_usage: HashMap::new(),
                 active_runtime_context: None,
                 current_model: None,
                 current_model_provider: None,
@@ -266,7 +263,7 @@ mod imp {
                             .and_then(|id| {
                                 resolved_turn.as_ref().and_then(|(thread_id, _)| {
                                     let key = turn_key(thread_id, id);
-                                    self.active_turns.contains_key(&key).then_some(key)
+                                    self.known_turn_keys.contains(&key).then_some(key)
                                 })
                             })
                             .or_else(|| {
@@ -280,13 +277,9 @@ mod imp {
                             .map(|turn| turn.thread_id.clone())
                             .or_else(|| resolved_turn.map(|(thread_id, _)| thread_id))
                             .or(active_thread_id);
-                        let thread_id_for_usage = thread_id.clone();
                         notifications.push(Self::token_usage_notification(
                             info, thread_id, turn_id, turn_key,
                         ));
-                        if let Some(thread_id) = thread_id_for_usage {
-                            self.thread_token_usage.insert(thread_id, info.clone());
-                        }
                     }
                 }
                 EventMsg::PatchApplyBegin(event) => {
@@ -400,14 +393,12 @@ mod imp {
             }
 
             self.known_turn_keys.insert(key.clone());
-            let token_usage_baseline = self.thread_token_usage.get(&thread_id).cloned();
             self.active_turns.insert(
                 key.clone(),
                 ActiveTurnState {
                     thread_id: thread_id.clone(),
                     turn_id: turn_id.clone(),
                     prompt_preview: None,
-                    token_usage_baseline,
                     failed: false,
                 },
             );
@@ -668,15 +659,10 @@ mod imp {
                         );
                     }
                 }
-                if let Some(active_turn) = self.active_turns.get(key)
-                    && let Some(info) = active_turn.token_usage_baseline.as_ref()
-                {
-                    turn.insert("tokenUsageBaseline".to_string(), token_usage_value(info));
-                }
                 return serde_json::Value::Object(turn);
             }
 
-            let mut turn = json!({
+            json!({
                 "id": turn_id,
                 "key": key,
                 "status": "inProgress",
@@ -690,14 +676,7 @@ mod imp {
                 "approval": self.current_approval.clone(),
                 "sandbox": self.current_sandbox.clone(),
                 "modelContextWindow": model_context_window,
-            });
-            if let Some(active_turn) = self.active_turns.get(key)
-                && let Some(info) = active_turn.token_usage_baseline.as_ref()
-                && let Some(turn) = turn.as_object_mut()
-            {
-                turn.insert("tokenUsageBaseline".to_string(), token_usage_value(info));
-            }
-            turn
+            })
         }
 
         fn token_usage_notification(
@@ -782,11 +761,10 @@ mod imp {
             if let Some(info) = snapshot.token_info.as_ref() {
                 notifications.push(Self::token_usage_notification(
                     info,
-                    Some(thread_id.clone()),
+                    Some(thread_id),
                     Some(turn_id),
                     Some(turn_key),
                 ));
-                self.thread_token_usage.insert(thread_id, info.clone());
             }
             notifications
         }
@@ -1125,7 +1103,6 @@ mod imp {
                 turn_start_order: Vec::new(),
                 known_turn_keys: HashSet::new(),
                 file_change_started: HashSet::new(),
-                thread_token_usage: HashMap::new(),
                 active_runtime_context: None,
                 current_model: Some("parent-model".to_string()),
                 current_model_provider: Some("parent-provider".to_string()),
@@ -1507,22 +1484,120 @@ mod imp {
         }
 
         #[tokio::test]
-        async fn started_turn_carries_prior_thread_token_usage_baseline() {
-            let mut bridge = test_bridge();
-            bridge
-                .thread_token_usage
-                .insert("thread-1".to_string(), token_info(43_000, 100_000));
+        async fn provenance_on_the_tui_producer_wire() -> anyhow::Result<()> {
+            use codex_core::protocol::TokenCountEvent;
+            use codex_core::protocol::TurnCompleteEvent;
+            use codex_core::protocol::TurnStartedEvent;
+            use tokio::io::AsyncBufReadExt;
+            use tokio::io::BufReader;
+            use tokio::io::Lines;
+            use tokio::net::UnixListener;
+            use tokio::net::UnixStream;
+            use tokio::sync::watch;
 
-            let started =
-                bridge.ensure_turn_started("thread-1".to_string(), "turn-2".to_string(), None);
-
-            assert_eq!(started.len(), 1);
-            assert_eq!(
-                started[0].params.as_ref().unwrap()["turn"]["tokenUsageBaseline"]["total"]["totalTokens"],
-                json!(43_000)
+            async fn frame(
+                lines: &mut Lines<BufReader<UnixStream>>,
+            ) -> anyhow::Result<serde_json::Value> {
+                let line = lines
+                    .next_line()
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("producer closed"))?;
+                Ok(serde_json::from_str(&line)?)
+            }
+            async fn projected(
+                lines: &mut Lines<BufReader<UnixStream>>,
+                work: &watch::Sender<codex_codexd::SchedulerWork>,
+                marker: &str,
+                id: &str,
+            ) -> anyhow::Result<serde_json::Value> {
+                work.send_modify(|w| {
+                    w.insert(marker.into(), None);
+                });
+                loop {
+                    let p = &frame(lines).await?["params"];
+                    if p["workActivity"]["items"]
+                        .as_array()
+                        .is_some_and(|items| items.contains(&json!(marker)))
+                        && let Some(turns) = p["activeTurns"].as_array()
+                    {
+                        return turns
+                            .iter()
+                            .find(|t| t["turnId"] == id)
+                            .cloned()
+                            .ok_or_else(|| anyhow::anyhow!("missing {id} in {p}"));
+                    }
+                }
+            }
+            let tmp = tempfile::tempdir()?;
+            let path = tmp.path().join("hub");
+            let listener = UnixListener::bind(&path)?;
+            let owners =
+                ["A", "B", "C", "D"].map(|id| (format!("hold:{id}"), Some(format!("T:{id}"))));
+            let (work, rx) = watch::channel(codex_codexd::SchedulerWork::from(owners));
+            let client = CodexdProducerClient::spawn_with_socket_path(
+                path,
+                RuntimeMetadata {
+                    runtime_id: "wire".into(),
+                    pid: None,
+                    session_source: None,
+                    cwd: None,
+                    display_name: None,
+                },
+                rx,
             );
-
+            let mut bridge = MenuBarBridge::from_producer(client);
+            let start = || {
+                EventMsg::TurnStarted(TurnStartedEvent {
+                    model_context_window: None,
+                    collaboration_mode_kind: Default::default(),
+                })
+            };
+            let finish = || {
+                EventMsg::TurnComplete(TurnCompleteEvent {
+                    last_agent_message: None,
+                })
+            };
+            let usage = |n| {
+                EventMsg::TokenCount(TokenCountEvent {
+                    info: Some(token_info(n, 100_000)),
+                    rate_limits: None,
+                })
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(8), async {
+                let mut lines = BufReader::new(listener.accept().await?.0).lines();
+                frame(&mut lines).await?;
+                let mut publish = |id: &str, msg| bridge.publish_event(&msg, id, Some("T".into()));
+                publish("A", start());
+                publish("A", usage(20));
+                publish("A", finish());
+                publish("B", start());
+                publish("B", usage(140));
+                let b = projected(&mut lines, &work, "read-B", "B").await?;
+                assert_eq!(b["tokenUsageBaseline"]["total"]["totalTokens"], json!(20));
+                assert_eq!(b["tokenUsageBaselinePredecessorKey"], json!("T:A"));
+                publish("B", finish());
+                publish("A", usage(100));
+                loop {
+                    let params = &frame(&mut lines).await?["params"]["notification"]["params"];
+                    if params["tokenUsage"]["total"]["totalTokens"] == 100 {
+                        assert_eq!(params["turnKey"], json!("T:A"));
+                        break;
+                    }
+                }
+                publish("C", start());
+                publish("C", usage(170));
+                publish("D", start());
+                let d = projected(&mut lines, &work, "read-D", "D").await?;
+                assert!(
+                    d["tokenUsageBaseline"].is_null()
+                        && d.get("tokenUsageBaselinePredecessorKey").is_none(),
+                    "{d}"
+                );
+                anyhow::Ok(())
+            })
+            .await??;
             bridge.shutdown().await;
+            Ok(())
         }
 
         #[tokio::test]

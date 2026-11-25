@@ -2454,6 +2454,127 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ordinary_app_server_usage_preserves_predecessor_on_the_daemon_wire() -> Result<()> {
+        use codex_codexd::producer::CodexdProducerClient;
+        use codex_codexd::producer::RuntimeMetadata;
+        use tokio::io::AsyncBufReadExt;
+        use tokio::io::BufReader;
+        use tokio::net::UnixListener;
+        let tmp = tempfile::tempdir()?;
+        let path = tmp.path().join("hub");
+        let listener = UnixListener::bind(&path)?;
+        let thread = ThreadId::new();
+        let owners = ["A", "B"].map(|id| (format!("hold:{id}"), Some(format!("{thread}:{id}"))));
+        let (work, rx) = tokio::sync::watch::channel(codex_codexd::SchedulerWork::from(owners));
+        let producer = CodexdProducerClient::spawn_with_socket_path(
+            path,
+            RuntimeMetadata {
+                runtime_id: "ordinary".into(),
+                pid: None,
+                session_source: None,
+                cwd: None,
+                display_name: None,
+            },
+            rx,
+        );
+        let (tx, mut public) = mpsc::channel(CHANNEL_CAPACITY);
+        let out = OutgoingMessageSender::new_with_codexd(tx, Some(producer.clone()));
+        let usage = |n| {
+            let u = TokenUsage {
+                input_tokens: n,
+                total_tokens: n,
+                ..Default::default()
+            };
+            TokenCountEvent {
+                info: Some(TokenUsageInfo {
+                    total_token_usage: u.clone(),
+                    last_token_usage: u,
+                    model_context_window: None,
+                }),
+                rate_limits: None,
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(8), async {
+            let mut lines = BufReader::new(listener.accept().await?.0).lines();
+            lines.next_line().await?;
+            out.publish_core_turn_started(thread, "A", "model", None)
+                .await;
+            handle_token_count_event(thread, "A".into(), usage(20), &out).await;
+            out.send_server_notification(ServerNotification::TurnCompleted(
+                TurnCompletedNotification {
+                    thread_id: thread.to_string(),
+                    turn: codex_app_server_protocol::Turn {
+                        id: "A".into(),
+                        model: None,
+                        items: vec![],
+                        status: TurnStatus::Completed,
+                        error: None,
+                    },
+                },
+            ))
+            .await;
+            out.publish_core_turn_started(thread, "B", "model", None)
+                .await;
+            handle_token_count_event(thread, "B".into(), usage(140), &out).await;
+            handle_token_count_event(thread, "A".into(), usage(100), &out).await;
+            work.send_modify(|w| {
+                w.insert("barrier".into(), None);
+            });
+            let key = format!("{thread}:A");
+            let mut late_key = None;
+            loop {
+                let msg: serde_json::Value = serde_json::from_str(
+                    &lines
+                        .next_line()
+                        .await?
+                        .ok_or_else(|| anyhow!("producer closed"))?,
+                )?;
+                let p = &msg["params"];
+                let usage = &p["notification"]["params"];
+                if usage["tokenUsage"]["total"]["totalTokens"] == 100 {
+                    late_key = usage["turnKey"].as_str().map(str::to_owned);
+                }
+                if p["activeTurns"].is_array()
+                    && p["workActivity"]["items"]
+                        .as_array()
+                        .is_some_and(|v| v.contains(&serde_json::json!("barrier")))
+                {
+                    let b = &p["activeTurns"][0];
+                    assert_eq!(b["turnId"], "B");
+                    assert_eq!(b["tokenUsageBaseline"]["total"]["totalTokens"], 100);
+                    assert_eq!(b["tokenUsageBaselinePredecessorKey"], key);
+                    assert_eq!(b["tokenUsage"]["total"]["totalTokens"], 140);
+                    break;
+                }
+            }
+            assert_eq!(late_key.as_deref(), Some(key.as_str()));
+            let mut counts = vec![];
+            while let Ok(OutgoingEnvelope::Broadcast {
+                message: OutgoingMessage::AppServerNotification(n),
+            }) = public.try_recv()
+            {
+                if let ServerNotification::ThreadTokenUsageUpdated(n) = n {
+                    let fields = serde_json::to_value(n)?;
+                    assert!(fields.get("turnKey").is_none());
+                    counts.push(fields["tokenUsage"]["total"]["totalTokens"].clone());
+                }
+            }
+            assert_eq!(
+                counts,
+                serde_json::json!([20, 140, 100])
+                    .as_array()
+                    .unwrap()
+                    .clone()
+            );
+            anyhow::Ok(())
+        })
+        .await??;
+        producer.shutdown().await;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_handle_token_count_event_without_usage_info() -> Result<()> {
         let conversation_id = ThreadId::new();

@@ -30,6 +30,9 @@ pub struct ActiveTurnSnapshot {
     pub status: Option<String>,
     #[serde(default)]
     pub started_at: Option<i64>,
+    /// Producer-local start order. Legacy turns first seen in one full state can tie.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_order: Option<u64>,
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
@@ -60,8 +63,17 @@ pub struct ActiveTurnSnapshot {
     pub context_remaining_percent: Option<i64>,
     #[serde(default)]
     pub token_usage: Option<JsonValue>,
+    /// Shared cumulative head when it is ahead of this turn's own sample.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_token_usage: Option<JsonValue>,
     #[serde(default)]
     pub token_usage_baseline: Option<JsonValue>,
+    /// The start has been accounted for, even when no starting total exists.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub token_usage_baseline_known: bool,
+    /// An inferred starting total can be refined by this direct predecessor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_usage_baseline_predecessor_key: Option<String>,
     #[serde(default)]
     pub thread_name: Option<String>,
     #[serde(default)]
@@ -140,6 +152,8 @@ pub(crate) struct RecoveryTerminal {
     pub turn_id: String,
     pub turn_key: String,
     pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_usage: Option<JsonValue>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
