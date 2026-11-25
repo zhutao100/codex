@@ -150,6 +150,7 @@ struct ProducerSlot {
 
 #[derive(Default)]
 struct DaemonState {
+    instance_id: std::sync::OnceLock<uuid::Uuid>,
     next_connection_id: u64,
     seq: u64,
     runtimes: BTreeMap<String, RuntimeState>,
@@ -168,7 +169,11 @@ impl DaemonState {
         let runtimes = self
             .runtimes
             .iter()
-            .map(|(runtime_id, runtime)| runtime.as_snapshot(runtime_id.clone()))
+            .map(|(runtime_id, runtime)| {
+                let mut snapshot = runtime.as_snapshot(runtime_id.clone());
+                self.project_pending_repair(&mut snapshot);
+                snapshot
+            })
             .collect();
 
         CodexdSnapshotResponse {
@@ -180,6 +185,7 @@ impl DaemonState {
     fn hello(&self) -> CodexdHelloResponse {
         CodexdHelloResponse {
             protocol_version: PROTOCOL_VERSION,
+            instance_id: Some(self.instance_id.get_or_init(uuid::Uuid::new_v4).to_string()),
             capabilities: vec![
                 "eventReplay".to_string(),
                 "runtimeState".to_string(),
@@ -362,7 +368,22 @@ impl DaemonState {
         });
     }
 
-    fn broadcast_event(&mut self, payload: CodexdEventPayload) {
+    fn project_pending_repair(&self, runtime: &mut RuntimeSnapshot) {
+        if self
+            .runtime_connections
+            .get(&runtime.runtime_id)
+            .is_some_and(|slot| slot.requested_state.is_some())
+        {
+            // Keep the accepted turn details, but don't certify cached owners to a new observer.
+            runtime.work_activity_supported = true;
+            runtime.work_activity = None;
+        }
+    }
+
+    fn broadcast_event(&mut self, mut payload: CodexdEventPayload) {
+        if let CodexdEventPayload::RuntimeUpsert { runtime } = &mut payload {
+            self.project_pending_repair(runtime);
+        }
         self.seq = self.seq.saturating_add(1);
         let envelope = CodexdEventEnvelope {
             seq: self.seq,
@@ -521,13 +542,13 @@ async fn handle_connection(
                 let result =
                     daemon.producer_message(connection_id, &mut owned_runtime_ids, &method, params);
                 if result.is_err()
-                    && request_id.is_none()
                     && matches!(
                         method.as_str(),
                         RUNTIME_UPDATE_STATE_METHOD | RUNTIME_EVENT_METHOD
                     )
                     && let Some(id) = runtime_id
                     && let Some(request) = daemon.request_replacement(connection_id, id)
+                    && request_id.is_none()
                     && let Some(line) =
                         encode_notification(REQUEST_STATE_METHOD, serde_json::json!(request))
                 {
@@ -628,7 +649,11 @@ impl DaemonState {
             producer_generation,
             minimum_revision,
         };
-        slot.requested_state = Some(request.clone());
+        let first = slot.requested_state.replace(request.clone()).is_none();
+        if first && let Some(runtime) = self.runtimes.get(&request.runtime_id) {
+            let runtime = runtime.as_snapshot(request.runtime_id.clone());
+            self.broadcast_event(CodexdEventPayload::RuntimeUpsert { runtime });
+        }
         Some(request)
     }
 
@@ -1419,8 +1444,26 @@ mod tests {
             assert_eq!(repair["method"], "codexd/runtime/requestState");
             assert_eq!(repair["params"]["minimumRevision"], floor);
             assert!(repair.get("id").is_none());
-            assert_eq!(read(&mut d_rx).await["result"], json!(before));
+            let mut pending = before.clone();
             if !first {
+                pending.seq += 1;
+                pending.runtimes[0].work_activity = None;
+                assert!(pending.runtimes[0].work_activity_supported);
+            }
+            assert_eq!(read(&mut d_rx).await["result"], json!(pending));
+            if !first {
+                let daemon = state.lock().await;
+                assert_eq!(
+                    daemon.runtimes["r"].work_activity,
+                    before.runtimes[0].work_activity
+                );
+                let (_, frame) = daemon.recent_events.back().unwrap();
+                let frame: JsonValue = serde_json::from_str(frame).unwrap();
+                assert_eq!(
+                    frame["params"]["event"]["runtime"],
+                    json!(pending.runtimes[0])
+                );
+                drop(daemon);
                 let mut detail = stale.clone();
                 detail["method"] = RUNTIME_EVENT_METHOD.into();
                 for (revision, kind) in [
@@ -1435,12 +1478,12 @@ mod tests {
                 }
                 write(&mut d_tx, &barrier).await;
                 let while_waiting = read(&mut d_rx).await;
-                assert_eq!(while_waiting["result"]["runtimes"], json!(before.runtimes));
+                assert_eq!(while_waiting["result"]["runtimes"], json!(pending.runtimes));
                 let daemon = state.lock().await;
                 let detail: Vec<_> = daemon
                     .recent_events
                     .iter()
-                    .filter(|(seq, _)| *seq > before.seq)
+                    .filter(|(seq, _)| *seq > pending.seq)
                     .map(|(_, line)| {
                         let msg: JsonValue = serde_json::from_str(line).unwrap();
                         let evt = &msg["params"]["event"];
@@ -1470,7 +1513,7 @@ mod tests {
             );
             assert_eq!(
                 after["result"]["seq"],
-                before.seq + 1 + 3 * u64::from(!first)
+                pending.seq + 1 + 3 * u64::from(!first)
             );
         }
         client.shutdown().await;
@@ -1596,8 +1639,54 @@ mod tests {
     }
 
     #[test]
+    fn metadata_cannot_recertify_owners_while_a_replacement_is_pending() {
+        use serde_json::json;
+
+        let mut daemon = DaemonState::default();
+        let mut owned = HashSet::new();
+        let live = json!({"runtimeId":"r", "activeTurns":[], "workActivity":{
+            "producerGeneration":"g", "revision":1, "items":["queued"]}});
+        daemon
+            .producer_message(
+                1,
+                &mut owned,
+                RUNTIME_UPDATE_STATE_METHOD,
+                Some(live.clone()),
+            )
+            .unwrap();
+        assert!(daemon.request_replacement(1, "r".into()).is_some());
+        let pending_seq = daemon.seq;
+        assert!(daemon.request_replacement(1, "r".into()).is_none());
+        daemon
+            .producer_message(
+                1,
+                &mut owned,
+                RUNTIME_UPDATE_METADATA_METHOD,
+                Some(json!({"runtimeId":"r","displayName":"renamed"})),
+            )
+            .unwrap();
+        assert_eq!(daemon.seq, pending_seq + 1);
+        let view = &daemon.snapshot().runtimes[0];
+        assert!(view.work_activity_supported && view.work_activity.is_none());
+        assert_eq!(view.display_name.as_deref(), Some("renamed"));
+        let (_, frame) = daemon.recent_events.back().unwrap();
+        let frame: JsonValue = serde_json::from_str(frame).unwrap();
+        assert_eq!(frame["params"]["event"]["runtime"], json!(view));
+        daemon
+            .producer_message(1, &mut owned, RUNTIME_UPDATE_STATE_METHOD, Some(live))
+            .unwrap();
+        assert!(daemon.snapshot().runtimes[0].work_activity.is_some());
+    }
+
+    #[test]
     fn hello_reports_protocol_capabilities_and_seq() {
         let mut state = DaemonState::default();
+        let instance = state.hello().instance_id.unwrap();
+        assert!(uuid::Uuid::parse_str(&instance).is_ok());
+        assert_ne!(
+            DaemonState::default().hello().instance_id.as_ref(),
+            Some(&instance)
+        );
         state.broadcast_event(CodexdEventPayload::RuntimeRemoved {
             runtime_id: "rt-1".to_string(),
         });
@@ -1606,6 +1695,7 @@ mod tests {
             state.hello(),
             CodexdHelloResponse {
                 protocol_version: PROTOCOL_VERSION,
+                instance_id: Some(instance),
                 capabilities: vec![
                     "eventReplay".to_string(),
                     "runtimeState".to_string(),

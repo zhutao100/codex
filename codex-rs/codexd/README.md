@@ -76,6 +76,7 @@ Typical client flow:
 `codexd/hello` returns:
 
 - `protocolVersion`
+- `instanceId` (unique to this daemon lifetime; older daemons omit it)
 - `capabilities` (`eventReplay`, `runtimeState`, `activeTurnContext`, `workActivity`)
 - current `seq`
 
@@ -88,7 +89,7 @@ On subscribe, `codexd` replays a bounded in-memory buffer (currently the most re
 
 `afterSeq` must not be ahead of the current sequence or `codexd/subscribe` returns an error.
 
-If a client disconnects, it should reconnect, re-fetch a snapshot, and resubscribe using the last seen `seq` (or the snapshot `seq`).
+On reconnect, request a fresh snapshot for current work. Only resume history from the last contiguous `seq` if `instanceId` matches. Merge replay through the snapshot sequence before reconciling turns. A different or absent instance ID or a gap beyond the replay buffer cannot establish the outcome of a missing turn.
 
 ## `codexd/event` payloads
 
@@ -150,7 +151,7 @@ Runtimes connect to the same socket and send:
 - `codexd/runtime/event` (forward a hub notification)
 - `codexd/runtime/unregister` (optional; disconnect also unregisters claimed runtimes)
 
-For notification-only producers, a rejected state or event causes a reverse `codexd/runtime/requestState` notification on that same socket: `{runtimeId, producerGeneration, minimumRevision}`. The daemon retains the last usable projection, even if an invalid live event claims idle, and records identifiable revisions before the first accepted state. It coalesces outstanding requests. The producer drains queued detail, reads current scheduler ownership and sends a complete `updateState` at or above the observed revision without waiting for more activity or reconnecting. Stale frames cannot satisfy the request. Older producers that ignore this method cannot guarantee quiet repair.
+For notification-only producers, a rejected state or event causes a reverse `codexd/runtime/requestState` notification on that same socket: `{runtimeId, producerGeneration, minimumRevision}`. The daemon keeps accepted turn details and records identifiable revisions before the first accepted state. While a replacement is outstanding, snapshots and upserts for a known runtime advertise `workActivitySupported: true` but omit `workActivity`. The first rejection publishes this transition; it is neither confirmed work nor idle. The producer drains queued detail, reads current scheduler ownership and sends a complete `updateState` at or above the observed revision without waiting for more activity or reconnecting. Stale frames cannot satisfy the request. Older producers that ignore this method cannot guarantee quiet repair.
 
 Do not forward `turn/started` if the scheduler projection excludes that task, including when a sibling is still working. Valid terminal and item details still reach history; during repair they do not establish new power state.
 

@@ -122,6 +122,9 @@ pub struct CodexdSnapshotResponse {
 #[serde(rename_all = "camelCase")]
 pub struct CodexdHelloResponse {
     pub protocol_version: u32,
+    /// Replay cursors are meaningful only within this daemon instance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
     pub capabilities: Vec<String>,
     pub seq: u64,
 }
