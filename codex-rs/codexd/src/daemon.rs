@@ -151,6 +151,20 @@ struct ProducerSlot {
     applied_recovery: Option<(String, u64)>,
 }
 
+impl ProducerSlot {
+    fn replacement_floor(&self, id: &str) -> RequestState {
+        let (producer_generation, minimum_revision) = self
+            .observed
+            .as_ref()
+            .map_or((None, 0), |(g, r)| (Some(g.clone()), *r));
+        RequestState {
+            runtime_id: id.to_owned(),
+            producer_generation,
+            minimum_revision,
+        }
+    }
+}
+
 #[derive(Default)]
 struct DaemonState {
     instance_id: std::sync::OnceLock<uuid::Uuid>,
@@ -158,6 +172,8 @@ struct DaemonState {
     seq: u64,
     runtimes: BTreeMap<String, RuntimeState>,
     runtime_connections: HashMap<String, ProducerSlot>,
+    // A repair cursor is not a runtime or a lease. Never expose it as current work.
+    detached_repairs: HashMap<String, (String, u64)>,
     subscribers: HashMap<u64, mpsc::UnboundedSender<String>>,
     recent_events: VecDeque<(u64, String)>,
 }
@@ -518,6 +534,7 @@ async fn handle_connection(
         let params = value.get("params").cloned();
         let request_id = value.get("id").cloned();
 
+        let mut repair_notification = None;
         let result = match method.as_str() {
             CODEXD_HELLO_METHOD => handle_hello_method(Arc::clone(&state)).await,
             CODEXD_SNAPSHOT_METHOD => handle_snapshot_method(Arc::clone(&state)).await,
@@ -553,12 +570,9 @@ async fn handle_connection(
                     {
                         daemon.require_replacement(connection_id, &id);
                     }
-                    if request_id.is_none()
-                        && let Some(request) = daemon.take_replacement_request(connection_id, &id)
-                        && let Some(line) =
-                            encode_notification(REQUEST_STATE_METHOD, serde_json::json!(request))
-                    {
-                        let _ = writer_tx.send(line);
+                    if let Some(request) = daemon.take_replacement_request(connection_id, &id) {
+                        repair_notification =
+                            encode_notification(REQUEST_STATE_METHOD, serde_json::json!(request));
                     }
                 }
                 result
@@ -575,6 +589,9 @@ async fn handle_connection(
             if let Some(line) = line {
                 let _ = writer_tx.send(line);
             }
+        }
+        if let Some(line) = repair_notification {
+            let _ = writer_tx.send(line);
         }
     }
 
@@ -604,7 +621,12 @@ async fn cleanup_connection(
             .get(&runtime_id)
             .is_some_and(|slot| slot.connection == connection_id)
         {
-            state.runtime_connections.remove(&runtime_id);
+            if let Some(slot) = state.runtime_connections.remove(&runtime_id)
+                && slot.requested_state.is_some()
+                && let Some(floor) = slot.observed
+            {
+                state.detached_repairs.insert(runtime_id.clone(), floor);
+            }
             state.unregister_runtime(&runtime_id);
         }
     }
@@ -644,15 +666,7 @@ impl DaemonState {
         if slot.connection != connection {
             return;
         }
-        let (producer_generation, minimum_revision) = slot
-            .observed
-            .as_ref()
-            .map_or((None, 0), |(g, revision)| (Some(g.clone()), *revision));
-        let request = RequestState {
-            runtime_id: id.to_owned(),
-            producer_generation,
-            minimum_revision,
-        };
+        let request = slot.replacement_floor(id);
         if slot.requested_state.as_ref() == Some(&request) {
             return;
         }
@@ -669,7 +683,9 @@ impl DaemonState {
         if slot.connection != connection || slot.request_sent_on == Some(connection) {
             return None;
         }
-        let request = slot.requested_state.clone()?;
+        slot.requested_state.as_ref()?;
+        let request = slot.replacement_floor(id);
+        slot.requested_state = Some(request.clone());
         slot.request_sent_on = Some(connection);
         Some(request)
     }
@@ -702,6 +718,10 @@ impl DaemonState {
         // Remember the cursor even when the very first publication is unusable, without
         // exposing it as an empty runtime. Closing a superseded socket must not remove it.
         let slot = self.runtime_connections.entry(id.clone()).or_default();
+        if let Some(floor) = self.detached_repairs.remove(&id) {
+            slot.observed = Some(floor);
+            slot.requested_state = Some(slot.replacement_floor(&id));
+        }
         slot.connection = connection;
         owned.insert(id.clone());
         if let Some(work) = work.filter(|w| !w.is_null())
@@ -1774,6 +1794,102 @@ mod tests {
                 .revision,
             8
         );
+    }
+
+    #[tokio::test]
+    async fn pending_floor_survives_eof_without_retaining_live_ownership() {
+        use serde_json::json;
+        for reset_generation in [false, true] {
+            let d = Arc::new(Mutex::new(DaemonState::default()));
+            let frame = |g, n, items: Vec<&str>| json!({"runtimeId":"r","activeTurns":[],"workActivity":{"producerGeneration":g,"revision":n,"items":items}});
+            let mut owned = HashSet::new();
+            {
+                let mut state = d.lock().await;
+                state
+                    .producer_message(
+                        1,
+                        &mut owned,
+                        RUNTIME_UPDATE_STATE_METHOD,
+                        Some(frame("g", 5, vec!["live"])),
+                    )
+                    .unwrap();
+                let mut bad = frame("g", 10, vec![]);
+                bad.as_object_mut().unwrap().remove("activeTurns");
+                assert!(
+                    state
+                        .producer_message(1, &mut owned, RUNTIME_UPDATE_STATE_METHOD, Some(bad))
+                        .is_err()
+                );
+                state.require_replacement(1, "r");
+                assert_eq!(
+                    state
+                        .take_replacement_request(1, "r")
+                        .unwrap()
+                        .minimum_revision,
+                    10
+                );
+            }
+            cleanup_connection(Arc::clone(&d), 1, owned, false).await;
+            let mut second = HashSet::new();
+            {
+                let mut state = d.lock().await;
+                assert!(
+                    state.snapshot().runtimes.is_empty() && state.runtime_connections.is_empty()
+                );
+                assert!(
+                    state
+                        .recent_events
+                        .back()
+                        .unwrap()
+                        .1
+                        .contains("runtimeRemoved")
+                );
+                state
+                    .producer_message(
+                        2,
+                        &mut second,
+                        RUNTIME_UPDATE_STATE_METHOD,
+                        Some(frame("g", 9, vec!["stale"])),
+                    )
+                    .unwrap();
+                assert!(state.snapshot().runtimes.is_empty());
+                assert_eq!(
+                    state
+                        .take_replacement_request(2, "r")
+                        .unwrap()
+                        .minimum_revision,
+                    10
+                );
+            }
+            // A second EOF before the correction must not consume the checkpoint either.
+            cleanup_connection(Arc::clone(&d), 2, second, false).await;
+            let mut state = d.lock().await;
+            let (g, n) = if reset_generation {
+                ("new", 1)
+            } else {
+                ("g", 10)
+            };
+            state
+                .producer_message(
+                    3,
+                    &mut HashSet::new(),
+                    RUNTIME_UPDATE_STATE_METHOD,
+                    Some(frame(g, n, vec!["restored"])),
+                )
+                .unwrap();
+            assert_eq!(
+                state.snapshot().runtimes[0]
+                    .work_activity
+                    .as_ref()
+                    .unwrap()
+                    .revision,
+                n
+            );
+            assert!(
+                state.detached_repairs.is_empty()
+                    && state.take_replacement_request(3, "r").is_none()
+            );
+        }
     }
 
     #[test]

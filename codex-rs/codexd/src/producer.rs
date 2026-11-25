@@ -11,6 +11,7 @@ use crate::protocol::RuntimeUpdateMetadataParams;
 use crate::protocol::WorkActivity;
 use codex_app_server_protocol::ServerNotification;
 use serde_json::Value as JsonValue;
+use std::collections::VecDeque;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -59,8 +60,8 @@ impl RuntimeMetadata {
 }
 
 enum Publication {
-    State(crate::protocol::ProducerState),
-    Event(RuntimeEventParams),
+    State(crate::protocol::ProducerState, u64),
+    Event(RuntimeEventParams, u64),
 }
 
 // Projection and its outbound ordering barrier change under the same lock.
@@ -74,6 +75,11 @@ struct Outbox {
     pending: Vec<Publication>,
     replace: bool,
     recovery: Option<crate::protocol::HistoryRecovery>,
+    sent_initial: bool,
+    terminal_seq: u64,
+    recovery_through: u64,
+    // Draining publications is not delivery. Only a completed socket write retires its cursor.
+    unwritten: VecDeque<(u64, crate::protocol::RecoveryTerminal)>,
     stopped: bool,
 }
 
@@ -83,39 +89,36 @@ impl Outbox {
     }
 
     fn state_publication(&self) -> Publication {
-        Publication::State(crate::protocol::ProducerState {
-            state: self.snapshot(),
-            history_recovery: self.recovery.clone(),
-        })
+        Publication::State(
+            crate::protocol::ProducerState {
+                state: self.snapshot(),
+                history_recovery: self.recovery.clone(),
+            },
+            self.recovery_through,
+        )
     }
 
-    fn retain_lost_terminal(&mut self, publication: Publication) {
-        if let Some(recovery) = &mut self.recovery
-            && let Publication::Event(event) = publication
-            && let Some(terminal) = crate::daemon::recovery_terminal(&event.notification)
-        {
-            recovery
-                .terminals
-                .retain(|t| t.turn_key != terminal.turn_key);
-            if recovery.terminals.len() == crate::protocol::MAX_RECOVERED_TERMINALS {
-                recovery.terminals.pop_front();
-            }
-            recovery.terminals.push_back(terminal);
+    fn remember_terminal(&mut self, notification: &HubNotification) -> u64 {
+        let Some(terminal) = crate::daemon::recovery_terminal(notification) else {
+            return 0;
+        };
+        self.terminal_seq += 1;
+        self.unwritten
+            .retain(|(_, t)| t.turn_key != terminal.turn_key);
+        if self.unwritten.len() == crate::protocol::MAX_RECOVERED_TERMINALS {
+            self.unwritten.pop_front();
         }
+        self.unwritten.push_back((self.terminal_seq, terminal));
+        self.terminal_seq
     }
 
-    fn require_full_state(&mut self) {
-        self.replace = true;
-        let epoch = self
-            .recovery
-            .as_ref()
-            .map_or(1, |h| h.epoch.saturating_add(1));
-        self.recovery = Some(crate::protocol::HistoryRecovery {
-            epoch,
-            terminals: Default::default(),
-        });
-        for publication in std::mem::take(&mut self.pending) {
-            self.retain_lost_terminal(publication);
+    fn wrote_through(&mut self, cursor: u64) {
+        while self
+            .unwritten
+            .front()
+            .is_some_and(|(seq, _)| *seq <= cursor)
+        {
+            self.unwritten.pop_front();
         }
     }
 
@@ -132,16 +135,16 @@ impl Outbox {
 
     fn push(&mut self, update: Publication) {
         if !self.replace && self.pending.len() == MAX_PENDING {
-            self.require_full_state();
+            self.pending.clear();
+            self.replace = true;
         }
-        if self.replace {
-            self.retain_lost_terminal(update);
-        } else {
+        if !self.replace {
             self.pending.push(update);
         }
     }
 
     fn publish(&mut self, notification: HubNotification) {
+        let cursor = self.remember_terminal(&notification);
         let changed = apply_notification_to_runtime(&mut self.state, &notification);
         let work_activity = if changed || self.work.has_changed().unwrap_or(false) {
             self.update_work();
@@ -149,21 +152,30 @@ impl Outbox {
         } else {
             None
         };
-        self.push(Publication::Event(RuntimeEventParams {
-            runtime_id: self.id.clone(),
-            notification,
-            work_activity,
-        }));
+        self.push(Publication::Event(
+            RuntimeEventParams {
+                runtime_id: self.id.clone(),
+                notification,
+                work_activity,
+            },
+            cursor,
+        ));
     }
 
     fn drain(&mut self, reconnect: bool) -> Vec<Publication> {
-        if reconnect && !self.replace {
-            self.require_full_state();
-        }
-        if self.replace {
+        if reconnect || self.replace {
+            if self.sent_initial || !self.unwritten.is_empty() {
+                let epoch = self.recovery.as_ref().map_or(1, |h| h.epoch + 1);
+                self.recovery = Some(crate::protocol::HistoryRecovery {
+                    epoch,
+                    terminals: self.unwritten.iter().map(|(_, t)| t.clone()).collect(),
+                });
+                self.recovery_through = self.terminal_seq;
+            }
             self.update_work();
             self.pending.clear();
             self.replace = false;
+            self.sent_initial = true;
             return vec![self.state_publication()];
         }
         if self.work.has_changed().unwrap_or(false) {
@@ -216,6 +228,10 @@ impl CodexdProducerClient {
             pending: Vec::new(),
             replace: true,
             recovery: None,
+            sent_initial: false,
+            terminal_seq: 0,
+            recovery_through: 0,
+            unwritten: VecDeque::new(),
             stopped: false,
         }));
         let writer = Arc::clone(&outbox);
@@ -312,18 +328,26 @@ async fn run_producer_task(
             };
             reconnect = false;
             for publication in batch {
-                let line = match publication {
-                    Publication::State(state) => {
-                        encode_notification("codexd/runtime/updateState", serde_json::json!(state))
-                    }
-                    Publication::Event(event) => {
-                        encode_notification("codexd/runtime/event", serde_json::json!(event))
-                    }
+                let (line, cursor) = match publication {
+                    Publication::State(state, cursor) => (
+                        encode_notification("codexd/runtime/updateState", serde_json::json!(state)),
+                        cursor,
+                    ),
+                    Publication::Event(event, cursor) => (
+                        encode_notification("codexd/runtime/event", serde_json::json!(event)),
+                        cursor,
+                    ),
                 };
-                if let Some(line) = line
-                    && write_line(&mut writer, &line).await.is_err()
-                {
-                    continue 'connect;
+                if let Some(line) = line {
+                    if write_line(&mut writer, &line).await.is_err() {
+                        continue 'connect;
+                    }
+                    if cursor != 0 {
+                        outbox
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .wrote_through(cursor);
+                    }
                 }
             }
             tokio::select! {
@@ -442,6 +466,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn broken_socket_recovers_partial_frame_and_unwritten_tail_not_delivered_prefix() {
+        use serde_json::json;
+        use tokio::io::AsyncReadExt;
+
+        for partial_terminal in [false, true] {
+            let path = test_socket_path("mid-write");
+            let listener = UnixListener::bind(&path).unwrap();
+            let (work, owners) =
+                watch::channel(BTreeMap::from([("task".into(), Some("review:0".into()))]));
+            let client = CodexdProducerClient::spawn_with_socket_path(
+                path.clone(),
+                RuntimeMetadata {
+                    runtime_id: "r".into(),
+                    pid: None,
+                    session_source: None,
+                    cwd: None,
+                    display_name: None,
+                },
+                owners,
+            );
+            let mut lines = BufReader::new(listener.accept().await.unwrap().0).lines();
+            assert_eq!(
+                read_json_line(&mut lines).await["method"],
+                "codexd/runtime/updateState"
+            );
+            let terminal = |thread: &str, status: &str| HubNotification {
+                method: "turn/completed".into(),
+                params: Some(json!({"threadId":thread,"turn":{"id":"0","status":status}})),
+            };
+            client.try_publish_hub_notification(terminal("prior", "completed"));
+            assert_eq!(
+                read_json_line(&mut lines).await["params"]["notification"]["params"]["threadId"],
+                "prior"
+            );
+            let mut reader = lines.into_inner();
+            work.send_replace(BTreeMap::new());
+            let mut blocked = if partial_terminal {
+                terminal("review", "failed")
+            } else {
+                HubNotification {
+                    method: "fixture/writeBarrier".into(),
+                    params: Some(json!({})),
+                }
+            };
+            blocked.params.as_mut().unwrap()["zzPadding"] = "x".repeat(2 * 1024 * 1024).into();
+            client.try_publish_hub_notification(blocked);
+            if !partial_terminal {
+                client.try_publish_hub_notification(terminal("review", "failed"));
+            }
+            // This single-thread executor cannot run the writer until we yield. The first
+            // bytes prove it took the batch out of pending and is inside the real socket write.
+            let mut prefix = [0; 4096];
+            timeout(Duration::from_secs(3), reader.read_exact(&mut prefix))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!prefix.contains(&b'\n'));
+            assert!(std::str::from_utf8(&prefix).unwrap().contains("zzPadding"));
+            assert!(client.outbox.lock().unwrap().pending.is_empty());
+            client.try_publish_hub_notification(terminal("later", "interrupted"));
+            drop(reader);
+            let stream = timeout(Duration::from_secs(3), listener.accept())
+                .await
+                .unwrap()
+                .unwrap()
+                .0;
+            let mut next = BufReader::new(stream).lines();
+            let frame = read_json_line(&mut next).await;
+            assert_eq!(frame["params"]["workActivity"]["items"], json!([]));
+            assert_eq!(
+                frame["params"]["historyRecovery"]["terminals"],
+                json!([
+                {"threadId":"review","turnId":"0","turnKey":"review:0","status":"failed"},
+                {"threadId":"later","turnId":"0","turnKey":"later:0","status":"interrupted"}])
+            );
+            assert!(client.outbox.lock().unwrap().unwritten.is_empty());
+            client.shutdown().await;
+            tokio::fs::remove_file(&path).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn quiet_work_recovers_on_a_new_listener_and_offline_completion_is_not_replayed() {
         let path = test_socket_path("quiet");
         let listener = UnixListener::bind(&path).unwrap();
@@ -548,7 +654,7 @@ mod tests {
             outbox.publish(terminal("reviewB", "interrupted"));
             outbox.publish(turn("turn/started"));
             let batch = outbox.drain(false);
-            let [Publication::State(frame)] = &batch[..] else {
+            let [Publication::State(frame, _)] = &batch[..] else {
                 panic!("expected one recovery frame")
             };
             assert_eq!(frame.state.active_turns.len(), 1);
@@ -584,6 +690,6 @@ mod tests {
             .expect("clock after unix epoch")
             .as_nanos();
         let pid = std::process::id();
-        std::env::temp_dir().join(format!("codexd-producer-{pid}-{nanos}-{label}.sock"))
+        std::env::temp_dir().join(format!("cdp-{pid}-{nanos}-{label}.sock"))
     }
 }

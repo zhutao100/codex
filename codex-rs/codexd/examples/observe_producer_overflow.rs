@@ -1,4 +1,4 @@
-//! VM verification peer: publish one visible reviewer, then lose detail on the real producer queue.
+//! VM verification peer: lose queued detail or sever a real write while a reviewer fails.
 use codex_codexd::SchedulerWork;
 use codex_codexd::producer::CodexdProducerClient;
 use codex_codexd::producer::RuntimeMetadata;
@@ -27,6 +27,9 @@ async fn main() -> io::Result<()> {
         .nth(1)
         .map(PathBuf::from)
         .ok_or_else(|| io::Error::other("expected fixture daemon socket path"))?;
+    let write_fault = std::env::args_os()
+        .nth(2)
+        .is_some_and(|arg| arg == "--write-fault");
     let (work, owners) = watch::channel(SchedulerWork::from([(
         "review-owner".into(),
         Some("review:0".into()),
@@ -34,7 +37,12 @@ async fn main() -> io::Result<()> {
     let client = CodexdProducerClient::spawn_with_socket_path(
         path,
         RuntimeMetadata {
-            runtime_id: "overflow-fixture".into(),
+            runtime_id: if write_fault {
+                "write-fault-fixture"
+            } else {
+                "overflow-fixture"
+            }
+            .into(),
             pid: Some(std::process::id()),
             session_source: None,
             cwd: None,
@@ -44,8 +52,20 @@ async fn main() -> io::Result<()> {
     );
     client.try_publish_hub_notification(HubNotification { method:"turn/started".into(),
         params:Some(json!({"threadId":"review","turn":{"id":"0","key":"review:0","taskKind":"post_turn_completion_review"}}))});
-    command("overflow").await?;
-    // No await between the terminal and the burst: on this executor the socket writer cannot drain.
+    command(if write_fault {
+        "write-fault"
+    } else {
+        "overflow"
+    })
+    .await?;
+    // No yield until all frames are queued. The verifier cuts the socket inside this
+    // frame, after the writer has drained the batch containing the following terminal.
+    if write_fault {
+        client.try_publish_hub_notification(HubNotification {
+            method: "fixture/writeBarrier".into(),
+            params: Some(json!({"zzPadding":"x".repeat(2 * 1024 * 1024)})),
+        });
+    }
     work.send_replace(SchedulerWork::new());
     client.try_publish_hub_notification(HubNotification {
         method: "turn/completed".into(),
@@ -53,11 +73,13 @@ async fn main() -> io::Result<()> {
             json!({"threadId":"review","turn":{"id":"0","key":"review:0","status":"failed"}}),
         ),
     });
-    for _ in 0..4096 {
-        client.try_publish_hub_notification(HubNotification {
-            method: "fixture/detail".into(),
-            params: None,
-        });
+    if !write_fault {
+        for _ in 0..4096 {
+            client.try_publish_hub_notification(HubNotification {
+                method: "fixture/detail".into(),
+                params: None,
+            });
+        }
     }
     command("quit").await?;
     client.shutdown().await;
