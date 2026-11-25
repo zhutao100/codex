@@ -150,6 +150,10 @@ Runtimes connect to the same socket and send:
 - `codexd/runtime/event` (forward a hub notification)
 - `codexd/runtime/unregister` (optional; disconnect also unregisters claimed runtimes)
 
+For notification-only producers, a rejected state or event causes a reverse `codexd/runtime/requestState` notification on that same socket: `{runtimeId, producerGeneration, minimumRevision}`. The daemon retains the last usable projection, even if an invalid live event claims idle, and records identifiable revisions before the first accepted state. It coalesces outstanding requests. The producer drains queued detail, reads current scheduler ownership and sends a complete `updateState` at or above the observed revision without waiting for more activity or reconnecting. Stale frames cannot satisfy the request. Older producers that ignore this method cannot guarantee quiet repair.
+
+Do not forward `turn/started` if the scheduler projection excludes that task, including when a sibling is still working. Valid terminal and item details still reach history; during repair they do not establish new power state.
+
 TUI and app-server use one `CodexdProducerClient` projection per producing runtime. `updateState` is its first publication on every socket; there is no preliminary empty registration. On ordinary updates the notification and corresponding work revision are applied together, with `runtimeUpsert` preceding forwarded detail. A newer connection supersedes older writes and cleanup for the same runtime ID.
 
 Publish lifecycle notifications in order (`try_publish_hub_notification` on synchronous paths). The bounded outbox retains current state independently of pending detail. Overflow and reconnect discard superseded deltas in favor of a complete replacement; offline progress/history detail is not a durable replay service. Socket EOF triggers reconnect even when a running task produces no output.

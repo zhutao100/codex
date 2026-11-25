@@ -6,6 +6,8 @@ use crate::protocol::CodexdSnapshotResponse;
 use crate::protocol::CodexdSubscribeParams;
 use crate::protocol::CodexdSubscribeResponse;
 use crate::protocol::HubNotification;
+use crate::protocol::REQUEST_STATE_METHOD;
+use crate::protocol::RequestState;
 use crate::protocol::RuntimeEventParams;
 use crate::protocol::RuntimeRegisterParams;
 use crate::protocol::RuntimeSnapshot;
@@ -53,7 +55,6 @@ pub(crate) struct RuntimeState {
     display_name: Option<String>,
     pub(crate) active_turns: BTreeMap<String, ActiveTurnSnapshot>,
     pub(crate) work_activity: Option<WorkActivity>,
-    highest_seen_revision: u64,
     thread_token_usage: BTreeMap<String, JsonValue>,
 }
 
@@ -67,12 +68,7 @@ impl RuntimeState {
         let Some(work) = &self.work_activity else {
             return;
         };
-        if work.items.is_empty() {
-            self.active_turns.clear();
-        } else if let Some(running) = &work.running_turn_keys {
-            self.active_turns
-                .retain(|_, turn| running.contains(&turn_key(&turn.thread_id, &turn.turn_id)));
-        }
+        self.active_turns.retain(|_, turn| work.permits_turn(turn));
     }
 
     pub(crate) fn with_register(params: &RuntimeRegisterParams) -> Self {
@@ -114,12 +110,41 @@ impl RuntimeState {
     }
 }
 
+impl WorkActivity {
+    fn permits_turn(&self, turn: &ActiveTurnSnapshot) -> bool {
+        !self.items.is_empty()
+            && self
+                .running_turn_keys
+                .as_ref()
+                .is_none_or(|running| running.contains(&turn_key(&turn.thread_id, &turn.turn_id)))
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.items.is_empty()
+            && self
+                .running_turn_keys
+                .as_ref()
+                .is_some_and(|keys| !keys.is_empty())
+        {
+            return Err("idle workActivity conflicts with runningTurnKeys".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct ProducerSlot {
+    connection: u64,
+    observed: Option<(String, u64)>,
+    requested_state: bool,
+}
+
 #[derive(Default)]
 struct DaemonState {
     next_connection_id: u64,
     seq: u64,
     runtimes: BTreeMap<String, RuntimeState>,
-    runtime_connections: HashMap<String, u64>,
+    runtime_connections: HashMap<String, ProducerSlot>,
     subscribers: HashMap<u64, mpsc::UnboundedSender<String>>,
     recent_events: VecDeque<(u64, String)>,
 }
@@ -276,7 +301,7 @@ impl DaemonState {
     fn apply_runtime_notification(&mut self, params: RuntimeEventParams) {
         let runtime_id = params.runtime_id;
         let notification = params.notification;
-        let updated_snapshot = {
+        let (updated_snapshot, forward) = {
             let runtime = self.runtimes.entry(runtime_id.clone()).or_default();
 
             if let (Some(work), Some(old)) = (&params.work_activity, &runtime.work_activity)
@@ -285,24 +310,36 @@ impl DaemonState {
             {
                 return;
             }
-            let changed = apply_notification_to_runtime(runtime, &notification);
+            let effective_work = params
+                .work_activity
+                .as_ref()
+                .or(runtime.work_activity.as_ref());
+            let forward = effective_work.is_none_or(|work| {
+                parse_active_turn_started(&notification).is_none_or(|turn| work.permits_turn(&turn))
+            });
+            let changed = forward && apply_notification_to_runtime(runtime, &notification);
             let changed_work = params.work_activity.is_some();
             if let Some(work) = params.work_activity {
                 runtime.apply_scheduler_work(work);
             } else if changed {
                 runtime.prune_unowned_turns();
             }
-            (changed || changed_work).then(|| runtime.as_snapshot(runtime_id.clone()))
+            (
+                (changed || changed_work).then(|| runtime.as_snapshot(runtime_id.clone())),
+                forward,
+            )
         };
 
         if let Some(runtime) = updated_snapshot {
             self.broadcast_event(CodexdEventPayload::RuntimeUpsert { runtime });
         }
 
-        self.broadcast_event(CodexdEventPayload::RuntimeNotification {
-            runtime_id,
-            notification,
-        });
+        if forward {
+            self.broadcast_event(CodexdEventPayload::RuntimeNotification {
+                runtime_id,
+                notification,
+            });
+        }
     }
 
     fn unregister_runtime(&mut self, runtime_id: &str) {
@@ -464,12 +501,30 @@ async fn handle_connection(
             | RUNTIME_UPDATE_METADATA_METHOD
             | RUNTIME_UPDATE_STATE_METHOD
             | RUNTIME_EVENT_METHOD
-            | RUNTIME_UNREGISTER_METHOD => state.lock().await.producer_message(
-                connection_id,
-                &mut owned_runtime_ids,
-                &method,
-                params,
-            ),
+            | RUNTIME_UNREGISTER_METHOD => {
+                let runtime_id = params
+                    .as_ref()
+                    .and_then(|p| p.get("runtimeId"))
+                    .and_then(JsonValue::as_str)
+                    .map(str::to_owned);
+                let mut daemon = state.lock().await;
+                let result =
+                    daemon.producer_message(connection_id, &mut owned_runtime_ids, &method, params);
+                if result.is_err()
+                    && request_id.is_none()
+                    && matches!(
+                        method.as_str(),
+                        RUNTIME_UPDATE_STATE_METHOD | RUNTIME_EVENT_METHOD
+                    )
+                    && let Some(id) = runtime_id
+                    && let Some(request) = daemon.request_replacement(connection_id, id)
+                    && let Some(line) =
+                        encode_notification(REQUEST_STATE_METHOD, serde_json::json!(request))
+                {
+                    let _ = writer_tx.send(line);
+                }
+                result
+            }
             _ => Err(format!("unknown method `{method}`")),
         };
 
@@ -506,7 +561,11 @@ async fn cleanup_connection(
     }
 
     for runtime_id in owned_runtime_ids {
-        if state.runtime_connections.get(&runtime_id) == Some(&connection_id) {
+        if state
+            .runtime_connections
+            .get(&runtime_id)
+            .is_some_and(|slot| slot.connection == connection_id)
+        {
             state.runtime_connections.remove(&runtime_id);
             state.unregister_runtime(&runtime_id);
         }
@@ -540,6 +599,23 @@ async fn handle_subscribe_method(
 }
 
 impl DaemonState {
+    fn request_replacement(&mut self, connection: u64, id: String) -> Option<RequestState> {
+        let slot = self.runtime_connections.get_mut(&id)?;
+        if slot.connection != connection || slot.requested_state {
+            return None;
+        }
+        slot.requested_state = true;
+        let (producer_generation, minimum_revision) = slot
+            .observed
+            .as_ref()
+            .map_or((None, 0), |(g, revision)| (Some(g.clone()), *revision));
+        Some(RequestState {
+            runtime_id: id,
+            producer_generation,
+            minimum_revision,
+        })
+    }
+
     fn producer_message(
         &mut self,
         connection: u64,
@@ -553,26 +629,44 @@ impl DaemonState {
             .and_then(JsonValue::as_str)
             .ok_or("missing runtimeId")?
             .to_owned();
-        let owner = self.runtime_connections.get(&id).copied();
+        let owner = self.runtime_connections.get(&id).map(|s| s.connection);
         if owner.is_some_and(|n| n > connection)
             || (owned.contains(&id) && owner != Some(connection))
         {
             return Err("superseded producer connection".into());
         }
-        // A damaged publication can still identify its place in this producer's sequence.
-        // Do not let a later-arriving older state replace the last usable projection.
-        if matches!(method, RUNTIME_UPDATE_STATE_METHOD | RUNTIME_EVENT_METHOD)
-            && let Some(work) = params.as_ref().and_then(|p| p.get("workActivity"))
-            && let Some(runtime) = self.runtimes.get_mut(&id)
-            && let Some(prior) = &runtime.work_activity
-            && work.get("producerGeneration").and_then(JsonValue::as_str)
-                == Some(prior.producer_generation.as_str())
+        let work = params.as_ref().and_then(|p| p.get("workActivity"));
+        let generation = work
+            .and_then(|w| w.get("producerGeneration"))
+            .and_then(JsonValue::as_str);
+        // Remember the cursor even when the very first publication is unusable, without
+        // exposing it as an empty runtime. Closing a superseded socket must not remove it.
+        let slot = self.runtime_connections.entry(id.clone()).or_default();
+        if owner != Some(connection) {
+            slot.connection = connection;
+            slot.requested_state = false;
+            if slot
+                .observed
+                .as_ref()
+                .is_some_and(|(g, _)| Some(g.as_str()) != generation)
+            {
+                slot.observed = None;
+            }
+        }
+        owned.insert(id.clone());
+        if let (Some(work), Some(generation)) = (work, generation)
+            && matches!(method, RUNTIME_UPDATE_STATE_METHOD | RUNTIME_EVENT_METHOD)
             && let Some(revision) = work.get("revision").and_then(JsonValue::as_u64)
         {
-            if revision < runtime.highest_seen_revision.max(prior.revision) {
-                return Ok(serde_json::json!({}));
+            if let Some((prior, highest)) = &slot.observed {
+                if generation != prior {
+                    return Err("producer generation changed on a live connection".into());
+                }
+                if revision < *highest {
+                    return Ok(serde_json::json!({}));
+                }
             }
-            runtime.highest_seen_revision = revision;
+            slot.observed = Some((generation.to_owned(), revision));
         }
         match method {
             RUNTIME_REGISTER_METHOD => {
@@ -596,19 +690,21 @@ impl DaemonState {
                 if state.work_activity_supported && state.work_activity.is_none() {
                     return Err("missing negotiated workActivity".into());
                 }
-                if let Some(work) = &state.work_activity
-                    && work.items.is_empty()
-                    && (state.active_turns.iter().any(|t| {
-                        !matches!(
-                            t.status.as_deref(),
-                            Some("completed" | "failed" | "paused" | "interrupted")
-                        )
-                    }) || work
-                        .running_turn_keys
-                        .as_ref()
-                        .is_some_and(|keys| !keys.is_empty()))
-                {
-                    return Err("idle workActivity conflicts with reported turns".into());
+                if let Some(work) = &state.work_activity {
+                    work.validate()?;
+                    if work.items.is_empty()
+                        && state.active_turns.iter().any(|t| {
+                            !matches!(
+                                t.status.as_deref(),
+                                Some("completed" | "failed" | "paused" | "interrupted")
+                            )
+                        })
+                    {
+                        return Err("idle workActivity conflicts with reported turns".into());
+                    }
+                }
+                if slot.observed.is_some() && state.work_activity.is_none() {
+                    return Err("missing negotiated workActivity".into());
                 }
                 if let Some(prior) = self
                     .runtimes
@@ -617,14 +713,28 @@ impl DaemonState {
                     && state.work_activity.as_ref().map(|w| &w.producer_generation)
                         != Some(&prior.producer_generation)
                 {
-                    if owner == Some(connection) {
-                        return Err("producer generation changed on a live connection".into());
-                    }
                     self.runtimes.remove(&id);
                 }
+                slot.requested_state = false;
                 self.update_runtime_state(state);
             }
-            RUNTIME_EVENT_METHOD => self.apply_runtime_notification(deserialize_params(params)?),
+            RUNTIME_EVENT_METHOD => {
+                let mut event: RuntimeEventParams = deserialize_params(params)?;
+                if let Some(work) = &event.work_activity {
+                    work.validate()?;
+                }
+                if slot.requested_state {
+                    if !self.runtimes.contains_key(&id)
+                        || event.notification.method == "turn/started"
+                    {
+                        return Ok(serde_json::json!({}));
+                    }
+                    // Preserve valid terminal and item detail, not a power transition based
+                    // on a delta. Only a complete replacement closes the repair.
+                    event.work_activity = None;
+                }
+                self.apply_runtime_notification(event);
+            }
             RUNTIME_UNREGISTER_METHOD => {
                 self.unregister_runtime(&id);
                 self.runtime_connections.remove(&id);
@@ -633,8 +743,6 @@ impl DaemonState {
             }
             _ => unreachable!(),
         }
-        self.runtime_connections.insert(id.clone(), connection);
-        owned.insert(id);
         Ok(serde_json::json!({}))
     }
 }
@@ -1064,6 +1172,153 @@ async fn launchd_listener() -> anyhow::Result<Option<UnixListener>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn quiet_notification_producer_repairs_first_and_live_rejections_on_the_same_socket() {
+        use crate::producer::CodexdProducerClient;
+        use crate::producer::RuntimeMetadata;
+        use serde_json::json;
+        use tokio::net::unix::OwnedReadHalf;
+        use tokio::net::unix::OwnedWriteHalf;
+        use tokio::sync::watch;
+        use tokio::time::Duration;
+        use tokio::time::timeout;
+
+        async fn write(tx: &mut OwnedWriteHalf, msg: &JsonValue) {
+            tx.write_all(format!("{msg}\n").as_bytes()).await.unwrap();
+        }
+        async fn read(rx: &mut tokio::io::Lines<BufReader<OwnedReadHalf>>) -> JsonValue {
+            let line = timeout(Duration::from_secs(2), rx.next_line())
+                .await
+                .expect("wire message")
+                .unwrap()
+                .unwrap();
+            serde_json::from_str(&line).unwrap()
+        }
+        // Relay one socket without generating producer actions. Only the malformed messages
+        // and the read-only barrier are injected; the production outbox must originate repairs.
+        let path = PathBuf::from(format!("/tmp/cdx-{}.sock", uuid::Uuid::new_v4()));
+        let listener = UnixListener::bind(&path).unwrap();
+        let (_owner, work) = watch::channel(BTreeMap::from([("owner".into(), Some("B:1".into()))]));
+        let client = CodexdProducerClient::spawn_with_socket_path(
+            path.clone(),
+            RuntimeMetadata {
+                runtime_id: "r".into(),
+                pid: None,
+                session_source: None,
+                cwd: None,
+                display_name: None,
+            },
+            work,
+        );
+        let (producer, _) = listener.accept().await.unwrap();
+        tokio::fs::remove_file(path).await.unwrap();
+        let (p_rx, mut p_tx) = producer.into_split();
+        let mut p_rx = BufReader::new(p_rx).lines();
+        let (relay, daemon) = UnixStream::pair().unwrap();
+        let state = Arc::new(Mutex::new(DaemonState::default()));
+        let handler = tokio::spawn(handle_connection(Arc::clone(&state), daemon));
+        let (d_rx, mut d_tx) = relay.into_split();
+        let mut d_rx = BufReader::new(d_rx).lines();
+        let initial = read(&mut p_rx).await;
+        assert!(initial.get("id").is_none());
+        let barrier = json!({"id":17,"method":"codexd/snapshot"});
+        let mut good = initial;
+        for first in [true, false] {
+            let before = state.lock().await.snapshot();
+            let floor = good["params"]["workActivity"]["revision"].as_u64().unwrap() + 7;
+            let mut invalid = good.clone();
+            invalid["params"]["workActivity"]["revision"] = floor.into();
+            if first {
+                invalid["params"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("activeTurns");
+            } else {
+                invalid["method"] = RUNTIME_EVENT_METHOD.into();
+                invalid["params"]["notification"] =
+                    json!({"method":"turn/completed","params":{"threadId":"B","turn":{"id":"1"}}});
+                invalid["params"]["workActivity"]["items"] = json!([]);
+            }
+            write(&mut d_tx, &invalid).await;
+            write(&mut d_tx, &invalid).await;
+            let mut stale = good.clone();
+            stale["params"]["workActivity"] = json!({"producerGeneration":good["params"]["workActivity"]["producerGeneration"],
+                "revision":floor-1,"items":[],"runningTurnKeys":[]});
+            write(&mut d_tx, &stale).await;
+            write(&mut d_tx, &barrier).await;
+            let repair = read(&mut d_rx).await;
+            assert_eq!(repair["method"], "codexd/runtime/requestState");
+            assert_eq!(repair["params"]["minimumRevision"], floor);
+            assert!(repair.get("id").is_none());
+            assert_eq!(read(&mut d_rx).await["result"], json!(before));
+            if !first {
+                let mut detail = stale.clone();
+                detail["method"] = RUNTIME_EVENT_METHOD.into();
+                detail["params"]["workActivity"]["revision"] = floor.into();
+                detail["params"]["notification"] =
+                    json!({"method":"item/completed","params":{"turnKey":"A:1"}});
+                write(&mut d_tx, &detail).await;
+                write(&mut d_tx, &barrier).await;
+                let while_waiting = read(&mut d_rx).await;
+                assert_eq!(while_waiting["result"]["runtimes"], json!(before.runtimes));
+                let daemon = state.lock().await;
+                let (_, last) = daemon.recent_events.back().unwrap();
+                let last: JsonValue = serde_json::from_str(last).unwrap();
+                assert_eq!(
+                    last["params"]["event"]["notification"]["method"],
+                    "item/completed"
+                );
+            }
+            write(&mut p_tx, &repair).await;
+            good = read(&mut p_rx).await;
+            assert_eq!(good["method"], RUNTIME_UPDATE_STATE_METHOD);
+            assert!(good.get("id").is_none());
+            assert!(good["params"]["workActivity"]["revision"].as_u64().unwrap() >= floor);
+            write(&mut d_tx, &good).await;
+            write(&mut d_tx, &barrier).await;
+            let after = read(&mut d_rx).await;
+            assert_eq!(
+                after["result"]["runtimes"][0]["workActivity"]["items"],
+                json!(["owner"])
+            );
+            assert_eq!(after["result"]["seq"], before.seq + 1 + u64::from(!first));
+        }
+        client.shutdown().await;
+        drop(d_tx);
+        handler.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn connected_late_start_never_reenters_work_but_archive_details_still_flow() {
+        use serde_json::json;
+        let mut daemon = DaemonState::default();
+        let mut owned = HashSet::new();
+        daemon.producer_message(1, &mut owned, RUNTIME_UPDATE_STATE_METHOD, Some(json!({
+            "runtimeId":"r","activeTurns":[{"threadId":"B","turnId":"1"}],
+            "workActivity":{"producerGeneration":"g","revision":7,"items":["owner"],"runningTurnKeys":["B:1"]}
+        }))).unwrap();
+        let work = daemon.snapshot().runtimes[0].work_activity.clone().unwrap();
+        for method in ["turn/started", "item/completed", "turn/completed"] {
+            daemon.producer_message(1, &mut owned, RUNTIME_EVENT_METHOD, Some(json!({
+                "runtimeId":"r", "notification":{"method":method,"params":{"threadId":"A","turn":{"id":"1"}}}
+            }))).unwrap();
+        }
+        let snapshot = daemon.snapshot();
+        assert_eq!(snapshot.runtimes[0].active_turns[0].thread_id, "B");
+        assert_eq!(snapshot.runtimes[0].work_activity.as_ref(), Some(&work));
+        let methods: Vec<_> = daemon
+            .recent_events
+            .iter()
+            .filter_map(|(_, line)| {
+                let msg: JsonValue = serde_json::from_str(line).unwrap();
+                msg["params"]["event"]["notification"]["method"]
+                    .as_str()
+                    .map(str::to_owned)
+            })
+            .collect();
+        assert_eq!(methods, ["item/completed", "turn/completed"]);
+    }
 
     #[test]
     fn capable_replacement_requires_turns_and_prunes_only_unowned_projections() {

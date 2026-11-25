@@ -79,6 +79,16 @@ pub struct WorkActivity {
     pub running_turn_keys: Option<BTreeSet<String>>,
 }
 
+pub(crate) const REQUEST_STATE_METHOD: &str = "codexd/runtime/requestState";
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RequestState {
+    pub runtime_id: String,
+    pub producer_generation: Option<String>,
+    pub minimum_revision: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeSnapshot {

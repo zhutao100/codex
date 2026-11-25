@@ -1,6 +1,8 @@
 use crate::daemon::RuntimeState;
 use crate::daemon::apply_notification_to_runtime;
 use crate::protocol::HubNotification;
+use crate::protocol::REQUEST_STATE_METHOD;
+use crate::protocol::RequestState;
 use crate::protocol::RuntimeEventParams;
 use crate::protocol::RuntimeRegisterParams;
 use crate::protocol::RuntimeSnapshot;
@@ -16,7 +18,9 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::PoisonError;
 use std::time::Duration;
+use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncWriteExt;
+use tokio::io::BufReader;
 use tokio::net::UnixStream;
 use tokio::sync::watch;
 use tracing::warn;
@@ -78,7 +82,7 @@ impl Outbox {
     }
 
     fn update_work(&mut self) {
-        self.revision += 1;
+        self.revision = self.revision.saturating_add(1);
         let owners = self.work.borrow_and_update();
         self.state.apply_scheduler_work(WorkActivity {
             producer_generation: self.generation.clone(),
@@ -127,6 +131,17 @@ impl Outbox {
             self.pending.push(Publication::State(self.snapshot()));
         }
         std::mem::take(&mut self.pending)
+    }
+
+    fn repair(&mut self, request: RequestState) -> Option<Publication> {
+        if request.runtime_id != self.id {
+            return None;
+        }
+        if request.producer_generation.as_ref() == Some(&self.generation) {
+            self.revision = self.revision.max(request.minimum_revision);
+        }
+        self.update_work();
+        Some(Publication::State(self.snapshot()))
     }
 }
 
@@ -231,11 +246,14 @@ async fn run_producer_task(
         .stopped
         && wake.has_changed().is_ok()
     {
-        let Ok(mut stream) = UnixStream::connect(&socket_path).await else {
+        let Ok(stream) = UnixStream::connect(&socket_path).await else {
             tokio::time::sleep(Duration::from_millis(500)).await;
             continue;
         };
+        let (reader, mut writer) = stream.into_split();
+        let mut lines = BufReader::new(reader).lines();
         let mut reconnect = true;
+        let mut repair = None;
         loop {
             let batch = {
                 let mut outbox = outbox.lock().unwrap_or_else(PoisonError::into_inner);
@@ -244,7 +262,12 @@ async fn run_producer_task(
                 }
                 wake.borrow_and_update();
                 work.borrow_and_update();
-                outbox.drain(reconnect)
+                let mut batch = outbox.drain(reconnect);
+                // Already-queued history precedes the requested full projection.
+                if let Some(state) = repair.take().and_then(|request| outbox.repair(request)) {
+                    batch.push(state);
+                }
+                batch
             };
             reconnect = false;
             for publication in batch {
@@ -257,7 +280,7 @@ async fn run_producer_task(
                     }
                 };
                 if let Some(line) = line
-                    && write_line(&mut stream, &line).await.is_err()
+                    && write_line(&mut writer, &line).await.is_err()
                 {
                     continue 'connect;
                 }
@@ -265,13 +288,13 @@ async fn run_producer_task(
             tokio::select! {
                 signal = wake.changed() => if signal.is_err() { return; },
                 signal = work.changed() => if signal.is_err() { return; },
-                readable = stream.readable() => {
-                    // Notification-only producer connections receive no replies. EOF
-                    // is observable even if a long-running task emits no progress.
-                    match stream.try_read(&mut [0; 256]) {
-                        Err(err) if readable.is_ok() && err.kind() == std::io::ErrorKind::WouldBlock => (),
-                        Ok(n) if n > 0 => (),
-                        _ => continue 'connect,
+                line = lines.next_line() => {
+                    let Ok(Some(line)) = line else { continue 'connect; };
+                    if let Ok(control) = serde_json::from_str::<HubNotification>(&line)
+                        && control.method == REQUEST_STATE_METHOD
+                        && let Some(params) = control.params
+                    {
+                        repair = serde_json::from_value::<RequestState>(params).ok();
                     }
                 }
             }
@@ -288,7 +311,10 @@ fn encode_notification(method: &str, params: JsonValue) -> Option<String> {
     serde_json::to_string(&message).ok()
 }
 
-async fn write_line(stream: &mut UnixStream, line: &str) -> std::io::Result<()> {
+async fn write_line(
+    stream: &mut tokio::net::unix::OwnedWriteHalf,
+    line: &str,
+) -> std::io::Result<()> {
     stream.write_all(line.as_bytes()).await?;
     stream.write_all(b"\n").await?;
     stream.flush().await
