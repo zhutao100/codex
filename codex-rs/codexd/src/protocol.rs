@@ -74,6 +74,9 @@ pub struct WorkActivity {
     pub producer_generation: String,
     pub revision: u64,
     pub items: BTreeSet<String>,
+    /// Eligible projected turns, independent of opaque work IDs and queued handoffs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub running_turn_keys: Option<BTreeSet<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

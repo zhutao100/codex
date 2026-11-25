@@ -128,6 +128,8 @@ The `notification` in `runtimeNotification` is a generic hub notification forwar
 
 ### Work Activity
 
+Capable full state replacements require an explicit `activeTurns` array: omission is rejected without replacing the current runtime. New producers also send `workActivity.runningTurnKeys`, the complete set of canonical `threadId:turnId` identities owned by executing tasks. The producer and daemon intersect visible turns with this set on updates and reconnect; they never synthesize visible turns from work. A queued successor can prevent sleep without keeping its predecessor visible. Earlier producers without the field retain whole-runtime idle pruning.
+
 Daemon capability `workActivity` describes the wire format, not every producer. Check each runtime's `workActivitySupported`. For a capable producer, `workActivity` is a complete `{producerGeneration, revision, items}` object. `items` contains only scheduler-owned tasks and accepted queued review/continuation stages. An empty scheduler set also clears leftover projected turns; a delayed start, inactive UI or missing completion must not hold the system awake. Absent or malformed is not empty. Legacy producers provide `activeTurns` only. Always use turns (not work keys) for history.
 
 Core guards span task finalization and automatic submission dispatch. A queued guard is reserved before the predecessor's terminal event and retained through acceptance of the next task, or dropped on rejection/cancellation. This covers delegate preparation without requiring a delegate turn ID. The guard reports work; it does not create a macOS assertion.

@@ -217,8 +217,8 @@ async fn automatic_work_stays_owned_through_review_and_continuation() {
         .unwrap();
     let prefix = format!("{}:", test.session_configured.session_id);
     let mut work = codex_core::runtime_work::subscribe();
-    let has_parent_work = |items: &std::collections::BTreeSet<String>| {
-        items.iter().any(|key| key.starts_with(&prefix))
+    let has_parent_work = |items: &std::collections::BTreeMap<String, Option<String>>| {
+        items.keys().any(|key| key.starts_with(&prefix))
     };
     submit_request(&test.codex, "Finish the request").await;
     tokio::time::timeout(std::time::Duration::from_secs(10), async {

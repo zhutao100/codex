@@ -8,7 +8,7 @@ use crate::protocol::RuntimeUpdateMetadataParams;
 use crate::protocol::WorkActivity;
 use codex_app_server_protocol::ServerNotification;
 use serde_json::Value as JsonValue;
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -64,7 +64,7 @@ enum Publication {
 struct Outbox {
     id: String,
     state: RuntimeState,
-    work: watch::Receiver<BTreeSet<String>>,
+    work: watch::Receiver<BTreeMap<String, Option<String>>>,
     generation: String,
     revision: u64,
     pending: Vec<Publication>,
@@ -79,10 +79,12 @@ impl Outbox {
 
     fn update_work(&mut self) {
         self.revision += 1;
+        let owners = self.work.borrow_and_update();
         self.state.apply_scheduler_work(WorkActivity {
             producer_generation: self.generation.clone(),
             revision: self.revision,
-            items: self.work.borrow_and_update().clone(),
+            items: owners.keys().cloned().collect(),
+            running_turn_keys: Some(owners.values().flatten().cloned().collect()),
         });
     }
 
@@ -138,7 +140,7 @@ impl CodexdProducerClient {
     pub fn spawn(
         codex_home: &Path,
         metadata: RuntimeMetadata,
-        work: watch::Receiver<BTreeSet<String>>,
+        work: watch::Receiver<BTreeMap<String, Option<String>>>,
     ) -> Self {
         let socket_path = super::default_socket_path(codex_home);
         Self::spawn_with_socket_path(socket_path, metadata, work)
@@ -147,7 +149,7 @@ impl CodexdProducerClient {
     pub fn spawn_with_socket_path(
         socket_path: PathBuf,
         metadata: RuntimeMetadata,
-        work: watch::Receiver<BTreeSet<String>>,
+        work: watch::Receiver<BTreeMap<String, Option<String>>>,
     ) -> Self {
         let (wake, receiver) = watch::channel(());
         let outbox = Arc::new(Mutex::new(Outbox {
@@ -213,7 +215,7 @@ async fn run_producer_task(
     socket_path: PathBuf,
     outbox: Arc<Mutex<Outbox>>,
     mut wake: watch::Receiver<()>,
-    mut work: watch::Receiver<BTreeSet<String>>,
+    mut work: watch::Receiver<BTreeMap<String, Option<String>>>,
 ) {
     if socket_path_too_long(socket_path.as_path()) {
         warn!(
@@ -318,7 +320,7 @@ mod tests {
         let socket_path = test_socket_path("ordered");
         let _ = tokio::fs::remove_file(&socket_path).await;
         let listener = UnixListener::bind(&socket_path).expect("bind test listener");
-        let (_work_tx, work) = watch::channel(BTreeSet::new());
+        let (_work_tx, work) = watch::channel(BTreeMap::new());
         let client = CodexdProducerClient::spawn_with_socket_path(
             socket_path.clone(),
             RuntimeMetadata {
@@ -375,7 +377,10 @@ mod tests {
     async fn quiet_work_recovers_on_a_new_listener_and_offline_completion_is_not_replayed() {
         let path = test_socket_path("quiet");
         let listener = UnixListener::bind(&path).unwrap();
-        let (work_tx, work) = watch::channel(BTreeSet::from(["episode".into()]));
+        let (work_tx, work) = watch::channel(BTreeMap::from([
+            ("episode".into(), Some("t:1".into())),
+            ("peer".into(), Some("a:1".into())),
+        ]));
         let client = CodexdProducerClient::spawn_with_socket_path(
             path.clone(),
             RuntimeMetadata {
@@ -404,7 +409,16 @@ mod tests {
         let started = read_json_line(&mut lines).await;
         assert_eq!(
             started["params"]["workActivity"]["items"],
-            serde_json::json!(["episode"])
+            serde_json::json!(["episode", "peer"])
+        );
+        client.try_publish_hub_notification(HubNotification {
+            method: "turn/started".into(),
+            params: Some(serde_json::json!({"threadId":"a","turn":{"id":"1"}})),
+        });
+        read_json_line(&mut lines).await;
+        assert_eq!(
+            client.outbox.lock().unwrap().snapshot().active_turns.len(),
+            2
         );
         client.try_publish_hub_notification(HubNotification {
             method: "turn/completed".into(),
@@ -416,18 +430,30 @@ mod tests {
         );
         drop(lines);
         tokio::fs::remove_file(&path).await.unwrap();
+        // A ended offline with no terminal notification. B still owns work in this process.
+        work_tx.send_modify(|owners| {
+            owners.remove("peer");
+        });
         let mut lines = accept(UnixListener::bind(&path).unwrap()).await;
         let restored = read_json_line(&mut lines).await;
         assert_eq!(restored["method"], "codexd/runtime/updateState");
         assert_eq!(restored["params"]["activeTurns"][0]["turnKey"], "t:1");
         assert_eq!(
+            restored["params"]["activeTurns"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            restored["params"]["workActivity"]["runningTurnKeys"],
+            serde_json::json!(["t:1"])
+        );
+        assert_eq!(
             restored["params"]["workActivity"]["items"],
-            started["params"]["workActivity"]["items"]
+            serde_json::json!(["episode"])
         );
         drop(lines);
         tokio::fs::remove_file(&path).await.unwrap();
         // No completion notification (for example an inactive UI stream).
-        work_tx.send_replace(BTreeSet::new());
+        work_tx.send_replace(BTreeMap::new());
         client.try_publish_hub_notification(turn("turn/started"));
         let mut lines = accept(UnixListener::bind(&path).unwrap()).await;
         let idle = read_json_line(&mut lines).await;
@@ -440,7 +466,7 @@ mod tests {
         // Exercise ingress overflow deterministically with the writer excluded.
         {
             let mut outbox = client.outbox.lock().unwrap();
-            work_tx.send_replace(BTreeSet::from(["next".into()]));
+            work_tx.send_replace(BTreeMap::from([("next".into(), Some("t:1".into()))]));
             for _ in 0..=MAX_PENDING {
                 outbox.publish(turn("progress"));
             }

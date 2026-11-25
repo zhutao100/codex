@@ -53,17 +53,26 @@ pub(crate) struct RuntimeState {
     display_name: Option<String>,
     pub(crate) active_turns: BTreeMap<String, ActiveTurnSnapshot>,
     pub(crate) work_activity: Option<WorkActivity>,
+    highest_seen_revision: u64,
     thread_token_usage: BTreeMap<String, JsonValue>,
 }
 
 impl RuntimeState {
     pub(crate) fn apply_scheduler_work(&mut self, work: WorkActivity) {
-        // Notifications may be delayed or missing. History is still forwarded,
-        // but a display projection cannot outlive the last real scheduler owner.
+        self.work_activity = Some(work);
+        self.prune_unowned_turns();
+    }
+
+    fn prune_unowned_turns(&mut self) {
+        let Some(work) = &self.work_activity else {
+            return;
+        };
         if work.items.is_empty() {
             self.active_turns.clear();
+        } else if let Some(running) = &work.running_turn_keys {
+            self.active_turns
+                .retain(|_, turn| running.contains(&turn_key(&turn.thread_id, &turn.turn_id)));
         }
-        self.work_activity = Some(work);
     }
 
     pub(crate) fn with_register(params: &RuntimeRegisterParams) -> Self {
@@ -257,6 +266,7 @@ impl DaemonState {
                 })
                 .collect();
             runtime.thread_token_usage = thread_token_usage;
+            runtime.prune_unowned_turns();
             runtime.as_snapshot(runtime_id)
         };
 
@@ -279,6 +289,8 @@ impl DaemonState {
             let changed_work = params.work_activity.is_some();
             if let Some(work) = params.work_activity {
                 runtime.apply_scheduler_work(work);
+            } else if changed {
+                runtime.prune_unowned_turns();
             }
             (changed || changed_work).then(|| runtime.as_snapshot(runtime_id.clone()))
         };
@@ -547,6 +559,21 @@ impl DaemonState {
         {
             return Err("superseded producer connection".into());
         }
+        // A damaged publication can still identify its place in this producer's sequence.
+        // Do not let a later-arriving older state replace the last usable projection.
+        if matches!(method, RUNTIME_UPDATE_STATE_METHOD | RUNTIME_EVENT_METHOD)
+            && let Some(work) = params.as_ref().and_then(|p| p.get("workActivity"))
+            && let Some(runtime) = self.runtimes.get_mut(&id)
+            && let Some(prior) = &runtime.work_activity
+            && work.get("producerGeneration").and_then(JsonValue::as_str)
+                == Some(prior.producer_generation.as_str())
+            && let Some(revision) = work.get("revision").and_then(JsonValue::as_u64)
+        {
+            if revision < runtime.highest_seen_revision.max(prior.revision) {
+                return Ok(serde_json::json!({}));
+            }
+            runtime.highest_seen_revision = revision;
+        }
         match method {
             RUNTIME_REGISTER_METHOD => {
                 let registration = deserialize_params(params)?;
@@ -559,9 +586,29 @@ impl DaemonState {
                 self.update_runtime_metadata(deserialize_params(params)?)
             }
             RUNTIME_UPDATE_STATE_METHOD => {
+                let has_turns = params
+                    .as_ref()
+                    .is_some_and(|p| p.get("activeTurns").is_some());
                 let state: RuntimeSnapshot = deserialize_params(params)?;
+                if !has_turns && (state.work_activity_supported || state.work_activity.is_some()) {
+                    return Err("missing negotiated activeTurns".into());
+                }
                 if state.work_activity_supported && state.work_activity.is_none() {
                     return Err("missing negotiated workActivity".into());
+                }
+                if let Some(work) = &state.work_activity
+                    && work.items.is_empty()
+                    && (state.active_turns.iter().any(|t| {
+                        !matches!(
+                            t.status.as_deref(),
+                            Some("completed" | "failed" | "paused" | "interrupted")
+                        )
+                    }) || work
+                        .running_turn_keys
+                        .as_ref()
+                        .is_some_and(|keys| !keys.is_empty()))
+                {
+                    return Err("idle workActivity conflicts with reported turns".into());
                 }
                 if let Some(prior) = self
                     .runtimes
@@ -1017,6 +1064,66 @@ async fn launchd_listener() -> anyhow::Result<Option<UnixListener>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capable_replacement_requires_turns_and_prunes_only_unowned_projections() {
+        let mut daemon = DaemonState::default();
+        let mut owned = HashSet::new();
+        let state = serde_json::json!({
+            "runtimeId":"r", "workActivitySupported":true,
+            "activeTurns":[{"threadId":"A","turnId":"1"},{"threadId":"B","turnId":"1"}],
+            "workActivity":{"producerGeneration":"g","revision":5,
+                            "items":["B-task","A-queued"],"runningTurnKeys":["B:1"]}
+        });
+        daemon
+            .producer_message(
+                1,
+                &mut owned,
+                RUNTIME_UPDATE_STATE_METHOD,
+                Some(state.clone()),
+            )
+            .unwrap();
+        let before = daemon.snapshot();
+        assert_eq!(before.runtimes[0].active_turns.len(), 1);
+        assert_eq!(before.runtimes[0].active_turns[0].thread_id, "B");
+        let mut missing = state;
+        missing["workActivity"]["revision"] = 8.into();
+        missing.as_object_mut().unwrap().remove("activeTurns");
+        assert!(
+            daemon
+                .producer_message(
+                    1,
+                    &mut owned,
+                    RUNTIME_UPDATE_STATE_METHOD,
+                    Some(missing.clone())
+                )
+                .is_err()
+        );
+        assert_eq!(daemon.snapshot(), before);
+        let mut idle = missing.clone();
+        idle["workActivity"]["revision"] = 6.into();
+        idle["workActivity"]["items"] = serde_json::json!([]);
+        idle["workActivity"]["runningTurnKeys"] = serde_json::json!([]);
+        idle["activeTurns"] = serde_json::json!([]);
+        daemon
+            .producer_message(1, &mut owned, RUNTIME_UPDATE_STATE_METHOD, Some(idle))
+            .unwrap();
+        assert_eq!(daemon.snapshot(), before);
+        missing["activeTurns"] = serde_json::json!([]);
+        daemon
+            .producer_message(1, &mut owned, RUNTIME_UPDATE_STATE_METHOD, Some(missing))
+            .unwrap();
+        let queued = daemon.snapshot();
+        assert!(queued.runtimes[0].active_turns.is_empty());
+        assert!(
+            !queued.runtimes[0]
+                .work_activity
+                .as_ref()
+                .unwrap()
+                .items
+                .is_empty()
+        );
+    }
 
     #[test]
     fn subscribe_replays_events_after_seq() {
