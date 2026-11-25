@@ -126,6 +126,17 @@ pub(crate) async fn apply_bespoke_event_handling(
         id: event_turn_id,
         msg,
     } = event;
+    let child = {
+        let map = turn_summary_store.lock().await;
+        map.get(&conversation_id)
+            .and_then(|s| s.delegate.as_ref())
+            .filter(|d| d.started_id.as_deref() == Some(&event_turn_id))
+            .map(|d| d.context.session_id)
+    };
+    let outgoing = match child {
+        Some(child) => Arc::new(outgoing.for_delegate(conversation_id, child)),
+        None => outgoing,
+    };
     match msg {
         EventMsg::RuntimeContextActivated(event) => {
             let mut map = turn_summary_store.lock().await;
@@ -134,6 +145,33 @@ pub(crate) async fn apply_bespoke_event_handling(
                     context: event.snapshot,
                     started_id: None,
                 });
+        }
+        EventMsg::RuntimeContextUpdated(event) => {
+            let context = event.snapshot;
+            let (id, changed_usage) = {
+                let mut map = turn_summary_store.lock().await;
+                let Some(d) = map
+                    .get_mut(&conversation_id)
+                    .and_then(|s| s.delegate.as_mut())
+                    .filter(|d| {
+                        d.context.scope_id == context.scope_id
+                            && d.context.session_id == context.session_id
+                    })
+                else {
+                    return;
+                };
+                let changed_usage = d.context.token_info != context.token_info;
+                d.context = context.clone();
+                (d.started_id.clone(), changed_usage)
+            };
+            if let Some(id) = id {
+                outgoing.publish_delegate_context(&context, &id).await;
+                if changed_usage && let Some(info) = context.token_info {
+                    outgoing
+                        .publish_delegate_usage(context.session_id, &id, info)
+                        .await;
+                }
+            }
         }
         EventMsg::RuntimeContextDeactivated(event) => {
             let ended = {
@@ -157,27 +195,39 @@ pub(crate) async fn apply_bespoke_event_handling(
         }
         EventMsg::TurnStarted(start) => {
             let model = conversation.config_snapshot().await.model;
-            let (source_thread, source_model) = {
+            let delegate_context = {
                 let mut map = turn_summary_store.lock().await;
                 let summary = map.entry(conversation_id).or_default();
                 if let Some(delegate) = &mut summary.delegate {
                     delegate.started_id = Some(event_turn_id.clone());
-                    (delegate.context.session_id, delegate.context.model.clone())
+                    Some(delegate.context.clone())
                 } else {
                     summary.active_turn_id = Some(event_turn_id.clone());
                     summary.active_turn_model = Some(model.clone());
                     summary.last_error = None;
-                    (conversation_id, model)
+                    None
                 }
             };
             outgoing
                 .publish_core_turn_started(
-                    source_thread,
+                    delegate_context
+                        .as_ref()
+                        .map_or(conversation_id, |c| c.session_id),
                     &event_turn_id,
-                    &source_model,
+                    delegate_context.as_ref().map_or(&model, |c| &c.model),
                     start.model_context_window,
                 )
                 .await;
+            if let Some(context) = delegate_context {
+                outgoing
+                    .publish_delegate_context(&context, &event_turn_id)
+                    .await;
+                if let Some(info) = context.token_info {
+                    outgoing
+                        .publish_delegate_usage(context.session_id, &event_turn_id, info)
+                        .await;
+                }
+            }
         }
         EventMsg::TurnComplete(_ev) => {
             handle_turn_complete(

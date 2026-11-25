@@ -134,10 +134,7 @@ Core guards span task finalization and automatic submission dispatch. A queued g
 
 The TUI forwards live events at thread ingress, independent of selection; replaying a thread does not republish its history. App-server publishes daemon starts from core `TurnStarted`, not the public v2 `turn/start` acknowledgement: input submitted during an existing turn may be steered into it rather than starting a second task. Delegate starts use the child thread identity; matching context deactivation closes the child even if the parent consumes the child's terminal event and later completes under its own ID.
 
-Active turns are keyed by `turnKey`. Producers should send `turn.key` or
-`turnKey`; otherwise `codexd` computes `<threadId>:<turnId>`. Legacy
-`turn/completed` notifications without a key fall back to this composite key
-when `threadId` is present, then to a bare `turnId` search for older producers.
+An explicit `turn.key` or `turnKey` is authoritative. Without a key, a completion or context update naming a thread resolves within that thread only. Only a genuinely unthreaded legacy event may use a bare `turnId`, and only when exactly one active turn matches. A late completion for child `A:0` cannot remove `B:0`, including from a producer's reconnect snapshot.
 When a runtime notification changes the snapshot, `codexd` emits a
 `runtimeUpsert` before the corresponding `runtimeNotification`.
 

@@ -804,49 +804,46 @@ fn parse_thread_token_usage_update(notification: &HubNotification) -> Option<Tur
 }
 
 fn remove_completed_turn(runtime: &mut RuntimeState, completion: TurnCompletion) -> bool {
-    let had_turn_key = completion.turn_key.is_some();
-    if let Some(turn_key) = completion.turn_key
-        && runtime.active_turns.remove(&turn_key).is_some()
-    {
-        return true;
-    }
-
-    if let Some(thread_id) = completion.thread_id.as_deref() {
-        let key = turn_key(thread_id, completion.turn_id.as_str());
-        if runtime.active_turns.remove(&key).is_some() {
-            return true;
-        }
-    }
-
-    if had_turn_key {
-        return false;
-    }
-
-    let key = runtime
-        .active_turns
-        .iter()
-        .find_map(|(key, turn)| (turn.turn_id == completion.turn_id).then(|| key.clone()));
-
+    let key = resolve_active_key(
+        runtime,
+        completion.turn_key,
+        completion.thread_id.as_deref(),
+        Some(&completion.turn_id),
+    );
     key.is_some_and(|key| runtime.active_turns.remove(&key).is_some())
 }
 
+fn resolve_active_key(
+    runtime: &RuntimeState,
+    key: Option<String>,
+    thread: Option<&str>,
+    id: Option<&str>,
+) -> Option<String> {
+    if let Some(key) = key {
+        return Some(key);
+    }
+    let id = id?;
+    if let Some(thread) = thread {
+        let key = turn_key(thread, id);
+        if runtime.active_turns.contains_key(&key) {
+            return Some(key);
+        }
+    }
+    let mut matches = runtime
+        .active_turns
+        .iter()
+        .filter(|(_, turn)| turn.turn_id == id && thread.is_none_or(|t| t == turn.thread_id));
+    let (key, _) = matches.next()?;
+    matches.next().is_none().then(|| key.clone())
+}
+
 fn apply_turn_context_update(runtime: &mut RuntimeState, update: TurnContextUpdate) -> bool {
-    let key = update
-        .turn_key
-        .clone()
-        .or_else(|| {
-            Some(turn_key(
-                update.thread_id.as_deref()?,
-                update.turn_id.as_deref()?,
-            ))
-        })
-        .or_else(|| {
-            let turn_id = update.turn_id.as_ref()?;
-            runtime
-                .active_turns
-                .iter()
-                .find_map(|(key, turn)| (turn.turn_id == *turn_id).then(|| key.clone()))
-        });
+    let key = resolve_active_key(
+        runtime,
+        update.turn_key,
+        update.thread_id.as_deref(),
+        update.turn_id.as_deref(),
+    );
     let Some(key) = key else {
         return false;
     };
@@ -1277,6 +1274,46 @@ mod tests {
                 ..Default::default()
             }]
         );
+    }
+
+    #[test]
+    fn scoped_and_ambiguous_legacy_terminals_cannot_remove_another_child() {
+        let mut runtime = RuntimeState::default();
+        let publish = |r: &mut RuntimeState, method, params| {
+            apply_notification_to_runtime(
+                r,
+                &HubNotification {
+                    method: String::from(method),
+                    params: Some(params),
+                },
+            )
+        };
+        for thread in ["A", "B"] {
+            publish(
+                &mut runtime,
+                "turn/started",
+                serde_json::json!({"threadId":thread,"turn":{"id":"0"}}),
+            );
+        }
+        assert!(!publish(
+            &mut runtime,
+            "turn/completed",
+            serde_json::json!({"turn":{"id":"0"}})
+        ));
+        let done = serde_json::json!({"threadId":"A","turn":{"id":"0"}});
+        assert!(publish(&mut runtime, "turn/completed", done.clone()));
+        assert!(!publish(&mut runtime, "turn/completed", done));
+        assert!(!publish(
+            &mut runtime,
+            "turn/contextUpdated",
+            serde_json::json!({"threadId":"A","turnId":"0","model":"other"})
+        ));
+        assert_eq!(runtime.active_turns.keys().collect::<Vec<_>>(), ["B:0"]);
+        assert!(publish(
+            &mut runtime,
+            "turn/completed",
+            serde_json::json!({"turn":{"id":"0"}})
+        ));
     }
 
     #[test]

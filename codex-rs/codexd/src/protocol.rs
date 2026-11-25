@@ -11,6 +11,14 @@ pub struct HubNotification {
     pub params: Option<JsonValue>,
 }
 
+impl HubNotification {
+    pub fn from_server(
+        notification: &codex_app_server_protocol::ServerNotification,
+    ) -> Option<Self> {
+        serde_json::from_value(serde_json::to_value(notification).ok()?).ok()
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ActiveTurnSnapshot {

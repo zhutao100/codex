@@ -22,6 +22,8 @@ Runtime-context events are transient and excluded from rollout persistence. Revi
 
 Visible turns and automatic work have different lifetimes. Delegate context can lack a turn ID during preparation; use [per-runtime work activity](../../codexd/README.md#work-activity) for continuity, not a synthetic turn in history.
 
+In app-server, daemon-facing item, command and usage detail uses the same child thread and turn as the delegate's start. `RuntimeContextUpdated` carries the delegate's cumulative and last usage; publishing it does not charge the parent thread or emit a second public v2 notification. The public client retains its parent conversation envelope.
+
 The TUI's `MenuBarBridge` publishes the snapshots into the existing process-level runtime. The daemon advertises `activeTurnContext` and retains optional fields so older clients can continue reading the base active-turn shape.
 
 |Notification|State change|

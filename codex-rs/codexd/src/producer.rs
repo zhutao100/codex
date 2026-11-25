@@ -195,7 +195,7 @@ impl CodexdProducerClient {
     }
 
     pub async fn publish_server_notification(&self, notification: &ServerNotification) {
-        if let Some(hub_notification) = hub_notification_from_server_notification(notification) {
+        if let Some(hub_notification) = HubNotification::from_server(notification) {
             self.publish_hub_notification(hub_notification).await;
         }
     }
@@ -207,16 +207,6 @@ impl CodexdProducerClient {
             .stopped = true;
         self.wake.send_replace(());
     }
-}
-
-fn hub_notification_from_server_notification(
-    notification: &ServerNotification,
-) -> Option<HubNotification> {
-    let value = serde_json::to_value(notification).ok()?;
-    let object = value.as_object()?;
-    let method = object.get("method")?.as_str()?.to_string();
-    let params = object.get("params").cloned();
-    Some(HubNotification { method, params })
 }
 
 async fn run_producer_task(
@@ -415,6 +405,14 @@ mod tests {
         assert_eq!(
             started["params"]["workActivity"]["items"],
             serde_json::json!(["episode"])
+        );
+        client.try_publish_hub_notification(HubNotification {
+            method: "turn/completed".into(),
+            params: Some(serde_json::json!({"threadId":"old-thread","turn":{"id":"1"}})),
+        });
+        assert_eq!(
+            read_json_line(&mut lines).await["params"]["notification"]["method"],
+            "turn/completed"
         );
         drop(lines);
         tokio::fs::remove_file(&path).await.unwrap();
