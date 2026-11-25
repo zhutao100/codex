@@ -74,6 +74,21 @@ pub struct WorkActivity {
     pub producer_generation: String,
     pub revision: u64,
     pub items: BTreeSet<String>,
+    /// Eligible projected turns, independent of opaque work IDs and queued handoffs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub running_turn_keys: Option<BTreeSet<String>>,
+}
+
+#[cfg(unix)]
+pub(crate) const REQUEST_STATE_METHOD: &str = "codexd/runtime/requestState";
+
+#[cfg(unix)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RequestState {
+    pub runtime_id: String,
+    pub producer_generation: Option<String>,
+    pub minimum_revision: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -96,6 +111,37 @@ pub struct RuntimeSnapshot {
     pub work_activity: Option<WorkActivity>,
 }
 
+// Only on the producer link. A consumer snapshot must not repeatedly invalidate history.
+#[cfg(unix)]
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ProducerState {
+    #[serde(flatten)]
+    pub state: RuntimeSnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_recovery: Option<HistoryRecovery>,
+}
+
+#[cfg(unix)]
+pub(crate) const MAX_RECOVERED_TERMINALS: usize = 50;
+
+#[cfg(unix)]
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct HistoryRecovery {
+    pub epoch: u64,
+    pub terminals: std::collections::VecDeque<RecoveryTerminal>,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RecoveryTerminal {
+    pub thread_id: Option<String>,
+    pub turn_id: String,
+    pub turn_key: String,
+    pub status: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexdSnapshotResponse {
@@ -107,6 +153,9 @@ pub struct CodexdSnapshotResponse {
 #[serde(rename_all = "camelCase")]
 pub struct CodexdHelloResponse {
     pub protocol_version: u32,
+    /// Replay cursors are meaningful only within this daemon instance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
     pub capabilities: Vec<String>,
     pub seq: u64,
 }
@@ -183,6 +232,11 @@ pub enum CodexdEventPayload {
         runtime_id: String,
     },
     RuntimeNotification {
+        runtime_id: String,
+        notification: HubNotification,
+    },
+    /// Keyed detail accompanying superseded ownership; never a new live turn.
+    RuntimeArchiveDetail {
         runtime_id: String,
         notification: HubNotification,
     },

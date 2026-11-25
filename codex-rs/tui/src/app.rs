@@ -3185,8 +3185,11 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("hub");
         let listener = tokio::net::UnixListener::bind(&path)?;
-        let (work, rx) =
-            tokio::sync::watch::channel(std::collections::BTreeSet::from(["task".into()]));
+        let source = ThreadId::new();
+        let (work, rx) = tokio::sync::watch::channel(std::collections::BTreeMap::from([(
+            "task".into(),
+            Some(format!("{source}:1")),
+        )]));
         let producer = CodexdProducerClient::spawn_with_socket_path(
             path,
             RuntimeMetadata {
@@ -3216,7 +3219,6 @@ mod tests {
                 )?)
             }
             next(&mut lines).await?;
-            let source = ThreadId::new();
             app.ensure_thread_channel(source);
             app.activate_thread_channel(source).await;
             app.enqueue_thread_event(

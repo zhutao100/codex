@@ -76,6 +76,7 @@ Typical client flow:
 `codexd/hello` returns:
 
 - `protocolVersion`
+- `instanceId` (unique to this daemon lifetime; older daemons omit it)
 - `capabilities` (`eventReplay`, `runtimeState`, `activeTurnContext`, `workActivity`)
 - current `seq`
 
@@ -88,7 +89,7 @@ On subscribe, `codexd` replays a bounded in-memory buffer (currently the most re
 
 `afterSeq` must not be ahead of the current sequence or `codexd/subscribe` returns an error.
 
-If a client disconnects, it should reconnect, re-fetch a snapshot, and resubscribe using the last seen `seq` (or the snapshot `seq`).
+On reconnect, request a fresh snapshot for current work. Only resume history from the last contiguous `seq` if `instanceId` matches. Merge replay through the snapshot sequence before reconciling turns. A different or absent instance ID or a gap beyond the replay buffer cannot establish the outcome of a missing turn.
 
 ## `codexd/event` payloads
 
@@ -128,6 +129,8 @@ The `notification` in `runtimeNotification` is a generic hub notification forwar
 
 ### Work Activity
 
+Capable full state replacements require an explicit `activeTurns` array: omission is rejected without replacing the current runtime. New producers also send `workActivity.runningTurnKeys`, the complete set of canonical `threadId:turnId` identities owned by executing tasks. The producer and daemon intersect visible turns with this set on updates and reconnect; they never synthesize visible turns from work. A queued successor can prevent sleep without keeping its predecessor visible. Earlier producers without the field retain whole-runtime idle pruning.
+
 Daemon capability `workActivity` describes the wire format, not every producer. Check each runtime's `workActivitySupported`. For a capable producer, `workActivity` is a complete `{producerGeneration, revision, items}` object. `items` contains only scheduler-owned tasks and accepted queued review/continuation stages. An empty scheduler set also clears leftover projected turns; a delayed start, inactive UI or missing completion must not hold the system awake. Absent or malformed is not empty. Legacy producers provide `activeTurns` only. Always use turns (not work keys) for history.
 
 Core guards span task finalization and automatic submission dispatch. A queued guard is reserved before the predecessor's terminal event and retained through acceptance of the next task, or dropped on rejection/cancellation. This covers delegate preparation without requiring a delegate turn ID. The guard reports work; it does not create a macOS assertion.
@@ -148,6 +151,20 @@ Runtimes connect to the same socket and send:
 - `codexd/runtime/event` (forward a hub notification)
 - `codexd/runtime/unregister` (optional; disconnect also unregisters claimed runtimes)
 
+For notification-only producers, a rejected state or event causes a reverse `codexd/runtime/requestState` notification on that same socket: `{runtimeId, producerGeneration, minimumRevision}`. The daemon keeps accepted turn details and records identifiable revisions before the first accepted state. While a replacement is outstanding, snapshots and upserts for a known runtime advertise `workActivitySupported: true` but omit `workActivity`. The first rejection publishes this transition; it is neither confirmed work nor idle. The producer drains queued detail, reads current scheduler ownership and sends a complete `updateState` at or above the observed revision without waiting for more activity or reconnecting. Stale frames cannot satisfy the request. Older producers that ignore this method cannot guarantee quiet repair.
+
+Do not forward `turn/started` if the scheduler projection excludes that task, including when a sibling is still working. Valid terminal and item details still reach history; during repair they do not establish new power state.
+
+Runtime, generation, thread and turn IDs must be nonempty and unpadded. A malformed generation cannot establish a revision floor; a negotiated full state with an unidentified visible turn cannot be cached. A repair request for an unidentified producer uses a null generation and minimum revision zero; a valid generation can establish authority on the same socket. Work revisions must fit a signed 64-bit integer and work IDs must be nonempty.
+
+An older revision cannot change current work or live turns. Its explicitly keyed item or progress detail may still describe an existing archive: `runtimeArchiveDetail` carries only that notification and runtime ID. Consumers apply it to a matching completed run, never to create or modify live work. Old consumers ignore this additional event type.
+
 TUI and app-server use one `CodexdProducerClient` projection per producing runtime. `updateState` is its first publication on every socket; there is no preliminary empty registration. On ordinary updates the notification and corresponding work revision are applied together, with `runtimeUpsert` preceding forwarded detail. A newer connection supersedes older writes and cleanup for the same runtime ID.
 
-Publish lifecycle notifications in order (`try_publish_hub_notification` on synchronous paths). The bounded outbox retains current state independently of pending detail. Overflow and reconnect discard superseded deltas in favor of a complete replacement; offline progress/history detail is not a durable replay service. Socket EOF triggers reconnect even when a running task produces no output.
+Publish lifecycle notifications in order (`try_publish_hub_notification` on synchronous paths). When overflow or reconnect discards buffered detail, the producer sends a full replacement with a `historyRecovery` epoch and up to 50 distinct keyed terminal outcomes from the discarded batch. On the first accepted replacement for that epoch, the daemon sequences `runtime/historyLost`, the new ownership projection, and the retained `turn/completed` notifications, in that order. Consumers detach unfinished history on the loss marker; a missing terminal is not proof of success. Later full states and repair replies do not replay the same epoch twice. Progress and older outcomes are not durably retained. Socket EOF triggers reconnect even when a running task produces no output.
+
+A replacement socket inherits the outstanding repair floor even if the old socket has already closed. EOF removes the runtime and releases live ownership immediately. Only an unresolved generation/revision cursor remains until a coherent replacement, an explicit unregister, or daemon shutdown. An older first frame cannot restore the runtime; a distinct producer generation can start at its own revision. A requested RPC response precedes any directed `requestState` notification on that socket.
+
+Draining the producer queue is not a successful socket write. The producer keeps up to 50 distinct, keyed terminal outcomes not yet written, including frames in the writer's hands. A complete event or recovery-frame write retires only the outcomes it covered. A partial write, an unsent tail, or a second failed replacement therefore recovers current work and outstanding outcomes without replaying the successfully written prefix. This is not an acknowledgment of consumption by the daemon.
+
+To verify a real producer overflow with a consumer, build `cargo-local build -p codex-codexd --example observe_producer_overflow` and pass that example executable to the menu bar VM verifier's `--overflow-producer`.
