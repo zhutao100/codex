@@ -1,0 +1,17 @@
+# Review and compaction cache misses
+
+Status: accepted for implementation. The deliverable is stable client requests and evidence for every class of miss, not a promise of server cache residency.
+
+|Transition|Change|Acceptance|
+|---|---|---|
+|Tool round crosses the review limit, then reported usage falls|Choose the optional reference before first use. Freeze the exact frame for this candidate and history; compact rather than editing an already-used frame. The new history may choose again.|A full frame that stops fitting, even when mandatory-only would fit, remains intact in both helpers. A mandatory-only frame stays mandatory when headroom returns. No compaction loop or truncated mandatory scope.|
+|Independent review returns, including a handoff that must compact before ordinary sampling|Preserve the preceding review work at its original anchor; add, rather than replace, the current review context. Track exact selections in host-owned state for the unmodified request scope and uncompacted history. Never infer identity from token counts.|Last ordinary input and subsequent work remain a prefix of the next fitting handoff and both compaction helpers. Recover across restart; revoke stale instructions on a real scope change, rollback, fork or history replacement.|
+|Notes and streaming compact share work but report low reuse|Keep the helpers as siblings with distinct final items. Preserve prior notes and opaque replay data in source; keep only selected notes in replacement. Do not alter routing or send warming calls.|Captured HTTP and WebSocket requests establish prefix and branch identity, including repeated cycles. The first request after installation starts a new history.|
+|Apparently append-only ordinary rounds, review inactivity, reconnects and sibling misses|Add opt-in, content-free comparisons at the final logical request boundary against the preceding completion and preceding ordinary work. Correlate operation, transport, elapsed time, actual usage, replay availability and mismatches. Include streaming compact in completion reporting.|Distinguish client divergence, matching recorded request with unexplained low reuse, unavailable usage/report, and expected fresh history. Missing provider evidence is not zero and is not evidence of expiry or routing.|
+
+## Execution and release checks
+
+1. Implement the scoped frame projection, accounting and lifecycle. Keep admitted input, pending steering, review ownership, and the installed transcript independent of historical projection metadata. Do not change global context windows, cache keys, reviewer packets or retention policy.
+2. Implement diagnostics for HTTP and WebSocket without modifying inference inputs or retrying a successful request. Disable expensive comparisons when tracing is off; retain bounded metadata, not private prompts or ciphertext.
+3. Exercise the production loop with deterministic captured requests: optional-budget oscillation in both directions, consecutive handoffs, pre-first-sample compaction, notes and compact retries/restart, replacement, and multi-cycle wrapper retention. Check diagnostic classifications with synthetic cold usage; fixture cache counts are not hosted measurements.
+4. Run scoped guarded tests and lint/format checks. Move the lasting contract into feature documentation. Assess hosted cache behavior only from completed server usage in a representative new run; do not replay a private rollout or claim that every uncached token is recoverable.
