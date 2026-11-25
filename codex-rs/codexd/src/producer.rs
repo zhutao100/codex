@@ -143,10 +143,20 @@ impl Outbox {
         }
     }
 
-    fn publish(&mut self, notification: HubNotification) {
+    fn publish(&mut self, mut notification: HubNotification) {
+        if notification.method == "turn/completed"
+            && self
+                .state
+                .identify_live_completion(&mut notification)
+                .is_none()
+        {
+            // drain() independently publishes changed scheduler work.
+            return;
+        }
         let cursor = self.remember_terminal(&notification);
         let changed = apply_notification_to_runtime(&mut self.state, &notification);
-        let work_activity = if changed || self.work.has_changed().unwrap_or(false) {
+        // An explicit keyed outcome orders history even when the scheduler remains idle.
+        let work_activity = if cursor != 0 || changed || self.work.has_changed().unwrap_or(false) {
             self.update_work();
             self.state.work_activity.clone()
         } else {
@@ -412,7 +422,8 @@ mod tests {
         let socket_path = test_socket_path("ordered");
         let _ = tokio::fs::remove_file(&socket_path).await;
         let listener = UnixListener::bind(&socket_path).expect("bind test listener");
-        let (_work_tx, work) = watch::channel(BTreeMap::new());
+        let (_work_tx, work) =
+            watch::channel(BTreeMap::from([("task".into(), Some("T:0".into()))]));
         let client = CodexdProducerClient::spawn_with_socket_path(
             socket_path.clone(),
             RuntimeMetadata {
@@ -434,11 +445,11 @@ mod tests {
         assert_eq!(register["method"], "codexd/runtime/updateState");
         assert!(client.try_publish_hub_notification(HubNotification {
             method: "turn/started".to_string(),
-            params: Some(serde_json::json!({ "index": 1 })),
+            params: Some(serde_json::json!({ "index": 1, "threadId":"T","turnKey":"opaque-cli","turn":{"id":"0"} })),
         }));
         assert!(client.try_publish_hub_notification(HubNotification {
             method: "turn/completed".to_string(),
-            params: Some(serde_json::json!({ "index": 2 })),
+            params: Some(serde_json::json!({ "index": 2,"turn":{"id":"0","status":"completed"} })),
         }));
 
         let first = read_json_line(&mut lines).await;
@@ -449,6 +460,11 @@ mod tests {
         assert_eq!(second["method"], "codexd/runtime/event");
         assert_eq!(second["params"]["notification"]["method"], "turn/completed");
         assert_eq!(second["params"]["notification"]["params"]["index"], 2);
+        assert_eq!(
+            second["params"]["notification"]["params"]["turnKey"],
+            "opaque-cli"
+        );
+        assert_eq!(second["params"]["notification"]["params"]["threadId"], "T");
 
         client.shutdown().await;
         let _ = tokio::fs::remove_file(&socket_path).await;

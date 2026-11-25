@@ -235,7 +235,7 @@ pub enum CodexdEventPayload {
         runtime_id: String,
         notification: HubNotification,
     },
-    /// Keyed detail accompanying superseded ownership; never a new live turn.
+    /// Keyed archive detail or a terminal during detached repair; never live ownership.
     RuntimeArchiveDetail {
         runtime_id: String,
         notification: HubNotification,

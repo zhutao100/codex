@@ -27,9 +27,8 @@ async fn main() -> io::Result<()> {
         .nth(1)
         .map(PathBuf::from)
         .ok_or_else(|| io::Error::other("expected fixture daemon socket path"))?;
-    let write_fault = std::env::args_os()
-        .nth(2)
-        .is_some_and(|arg| arg == "--write-fault");
+    let mode = std::env::args().nth(2);
+    let write_fault = mode.as_deref() == Some("--write-fault");
     let (work, owners) = watch::channel(SchedulerWork::from([(
         "review-owner".into(),
         Some("review:0".into()),
@@ -67,18 +66,27 @@ async fn main() -> io::Result<()> {
         });
     }
     work.send_replace(SchedulerWork::new());
-    client.try_publish_hub_notification(HubNotification {
-        method: "turn/completed".into(),
-        params: Some(
-            json!({"threadId":"review","turn":{"id":"0","key":"review:0","status":"failed"}}),
-        ),
-    });
+    let terminal = |status: &str| {
+        client.try_publish_hub_notification(HubNotification {
+            method: "turn/completed".into(),
+            params: Some(
+                json!({"threadId":"review","turn":{"id":"0","key":"review:0","status":status}}),
+            ),
+        })
+    };
+    terminal("failed");
     if !write_fault {
         for _ in 0..4096 {
             client.try_publish_hub_notification(HubNotification {
                 method: "fixture/detail".into(),
                 params: None,
             });
+        }
+    }
+    if mode.as_deref() == Some("--late-correction") {
+        for status in ["completed", "failed"] {
+            command(status).await?;
+            terminal(status);
         }
     }
     command("quit").await?;

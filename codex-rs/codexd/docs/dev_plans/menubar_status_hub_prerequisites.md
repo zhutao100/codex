@@ -6,19 +6,7 @@ Evolve `codexd` from an active-turn event fanout daemon into a status hub that c
 
 ## Current `codexd` Contract
 
-- Local AF_UNIX JSON-lines daemon.
-- Consumer methods:
-  - `codexd/snapshot`;
-  - `codexd/subscribe`.
-- Runtime producer methods:
-  - `codexd/runtime/register`;
-  - `codexd/runtime/updateMetadata`;
-  - `codexd/runtime/event`;
-  - `codexd/runtime/unregister`.
-- Event stream:
-  - `codexd/event` with monotonic `seq`;
-  - bounded in-memory replay of the latest 1024 events;
-  - payloads: `runtimeUpsert`, `runtimeRemoved`, `runtimeNotification`.
+- Use the [daemon protocol](../../README.md) for consumer and producer methods (including `codexd/runtime/updateState`), and the [event payload table](../../README.md#codexdevent-payloads) for live versus archive-only events. The local AF_UNIX JSON-lines service sequences both kinds in the same bounded replay.
 - Runtime state:
   - `runtimeId`, `pid`, `sessionSource`, `cwd`, `displayName`;
   - active turns with `threadId` and `turnId`.
