@@ -283,9 +283,8 @@ impl DaemonState {
                 .active_turns
                 .into_iter()
                 .map(|mut turn| {
-                    let turn_key = turn.turn_key.clone().unwrap_or_else(|| {
-                        turn_key(turn.thread_id.as_str(), turn.turn_id.as_str())
-                    });
+                    let turn_key =
+                        projected_key(turn.turn_key.as_deref(), &turn.thread_id, &turn.turn_id);
                     turn.turn_key = Some(turn_key.clone());
                     // A complete producer projection already owns the baseline.
                     // Its current-turn usage must not become its own starting total.
@@ -323,9 +322,11 @@ impl DaemonState {
                 .work_activity
                 .as_ref()
                 .or(runtime.work_activity.as_ref());
-            let forward = effective_work.is_none_or(|work| {
-                parse_active_turn_started(&notification).is_none_or(|turn| work.permits_turn(&turn))
-            });
+            let forward = notification.method != "turn/started"
+                || effective_work.is_none_or(|work| {
+                    parse_active_turn_started(&notification)
+                        .is_some_and(|turn| work.permits_turn(&turn))
+                });
             let changed = forward && apply_notification_to_runtime(runtime, &notification);
             let changed_work = params.work_activity.is_some();
             if let Some(work) = params.work_activity {
@@ -642,6 +643,7 @@ impl DaemonState {
             .as_ref()
             .and_then(|p| p.get("runtimeId"))
             .and_then(JsonValue::as_str)
+            .filter(|id| valid_id(id))
             .ok_or("missing runtimeId")?
             .to_owned();
         let owner = self.runtime_connections.get(&id).map(|s| s.connection);
@@ -654,7 +656,7 @@ impl DaemonState {
         let generation = work
             .and_then(|w| w.get("producerGeneration"))
             .and_then(JsonValue::as_str)
-            .filter(|g| !g.is_empty() && *g == g.trim());
+            .filter(|g| valid_id(g));
         // Remember the cursor even when the very first publication is unusable, without
         // exposing it as an empty runtime. Closing a superseded socket must not remove it.
         let slot = self.runtime_connections.entry(id.clone()).or_default();
@@ -683,7 +685,15 @@ impl DaemonState {
                 if generation != prior {
                     return Err("producer generation changed on a live connection".into());
                 }
-                if revision < *highest {
+                let applied_event = method == RUNTIME_EVENT_METHOD
+                    && self
+                        .runtimes
+                        .get(&id)
+                        .and_then(|r| r.work_activity.as_ref())
+                        .is_some_and(|w| {
+                            w.producer_generation == generation && w.revision == revision
+                        });
+                if revision < *highest || applied_event {
                     if method == RUNTIME_EVENT_METHOD
                         && self.runtimes.contains_key(&id)
                         && let Some(notification) = archive_detail(params.as_ref())
@@ -730,6 +740,13 @@ impl DaemonState {
                 }
                 if let Some(work) = &state.work_activity {
                     work.validate()?;
+                    if state
+                        .active_turns
+                        .iter()
+                        .any(|turn| !valid_id(&turn.thread_id) || !valid_id(&turn.turn_id))
+                    {
+                        return Err("negotiated activeTurns contains an unidentified turn".into());
+                    }
                     if work.items.is_empty()
                         && state.active_turns.iter().any(|t| {
                             !matches!(
@@ -889,11 +906,18 @@ fn parse_active_turn_started(notification: &HubNotification) -> Option<ActiveTur
     }
 
     let params = notification.params.as_ref()?.as_object()?;
-    let thread_id = params.get("threadId")?.as_str()?.to_string();
+    let thread_id = params
+        .get("threadId")?
+        .as_str()
+        .filter(|s| valid_id(s))?
+        .to_owned();
     let turn = params.get("turn")?.as_object()?;
-    let turn_id = turn.get("id")?.as_str()?.to_string();
-    let turn_key =
-        parse_string_field(turn, "key").unwrap_or_else(|| turn_key(&thread_id, &turn_id));
+    let turn_id = turn.get("id")?.as_str().filter(|s| valid_id(s))?.to_owned();
+    let turn_key = projected_key(
+        turn.get("key").and_then(JsonValue::as_str),
+        &thread_id,
+        &turn_id,
+    );
 
     Some(ActiveTurnSnapshot {
         turn_key: Some(turn_key),
@@ -1108,6 +1132,17 @@ fn turn_key(thread_id: &str, turn_id: &str) -> String {
     format!("{thread_id}:{turn_id}")
 }
 
+fn valid_id(value: &str) -> bool {
+    !value.is_empty() && value == value.trim()
+}
+
+fn projected_key(explicit: Option<&str>, thread: &str, turn: &str) -> String {
+    explicit
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map_or_else(|| turn_key(thread, turn), str::to_owned)
+}
+
 fn deserialize_params<T: DeserializeOwned>(params: Option<JsonValue>) -> Result<T, String> {
     let value = params.unwrap_or(JsonValue::Null);
     serde_json::from_value(value).map_err(|err| err.to_string())
@@ -1229,6 +1264,60 @@ async fn launchd_listener() -> anyhow::Result<Option<UnixListener>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn anonymous_starts_never_enter_the_projection_and_stale_detail_is_archive_only() {
+        use serde_json::json;
+        let mut daemon = DaemonState::default();
+        let mut owner = HashSet::new();
+        let mut local = RuntimeState::default();
+        let work =
+            json!({"producerGeneration":"g","revision":8,"items":["queued"],"runningTurnKeys":[]});
+        for (thread, turn) in [("T", ""), (" \n", "0")] {
+            let start = HubNotification {
+                method: "turn/started".into(),
+                params: Some(json!({"threadId":thread,"turn":{"id":turn}})),
+            };
+            assert!(!apply_notification_to_runtime(&mut local, &start));
+            let invalid = json!({"runtimeId":"r","activeTurns":[{"threadId":thread,"turnId":turn}],"workActivity":work});
+            assert!(
+                daemon
+                    .producer_message(1, &mut owner, RUNTIME_UPDATE_STATE_METHOD, Some(invalid))
+                    .is_err()
+            );
+        }
+        assert!(daemon.snapshot().runtimes.is_empty());
+        daemon
+            .producer_message(
+                1,
+                &mut owner,
+                RUNTIME_UPDATE_STATE_METHOD,
+                Some(json!({"runtimeId":"r","activeTurns":[],"workActivity":work})),
+            )
+            .unwrap();
+        let before = daemon.snapshot();
+        for revision in [7, 8] {
+            let evt = json!({"runtimeId":"r","workActivity":{"producerGeneration":"g","revision":revision,"items":[]},
+                "notification":{"method":"item/completed","params":{"turnKey":"A:0"}}});
+            daemon
+                .producer_message(1, &mut owner, RUNTIME_EVENT_METHOD, Some(evt))
+                .unwrap();
+        }
+        assert_eq!(daemon.snapshot().runtimes, before.runtimes);
+        let kinds: Vec<_> = daemon
+            .recent_events
+            .iter()
+            .filter(|(seq, _)| *seq > before.seq)
+            .map(|(_, line)| {
+                let msg: JsonValue = serde_json::from_str(line).unwrap();
+                msg["params"]["event"]["type"].clone()
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [json!("runtimeArchiveDetail"), json!("runtimeArchiveDetail")]
+        );
+    }
 
     #[tokio::test]
     async fn quiet_notification_producer_repairs_first_and_live_rejections_on_the_same_socket() {
