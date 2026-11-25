@@ -9,7 +9,9 @@ use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::ServerRequestPayload;
 use codex_codexd::producer::CodexdProducerClient;
+use codex_codexd::protocol::HubNotification;
 use serde::Serialize;
+use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -43,11 +45,18 @@ pub(crate) enum OutgoingEnvelope {
 }
 
 /// Sends messages to the client and manages request callbacks.
+#[derive(Clone)]
 pub(crate) struct OutgoingMessageSender {
-    next_server_request_id: AtomicI64,
     sender: mpsc::Sender<OutgoingEnvelope>,
-    request_id_to_callback: Mutex<HashMap<RequestId, oneshot::Sender<Result>>>,
+    requests: Arc<RequestCallbacks>,
     codexd_producer: Option<CodexdProducerClient>,
+    delegate_route: Option<(String, String)>,
+}
+
+#[derive(Default)]
+struct RequestCallbacks {
+    next_id: AtomicI64,
+    pending: Mutex<HashMap<RequestId, oneshot::Sender<Result>>>,
 }
 
 impl OutgoingMessageSender {
@@ -61,10 +70,10 @@ impl OutgoingMessageSender {
         codexd_producer: Option<CodexdProducerClient>,
     ) -> Self {
         Self {
-            next_server_request_id: AtomicI64::new(0),
             sender,
-            request_id_to_callback: Mutex::new(HashMap::new()),
+            requests: Arc::default(),
             codexd_producer,
+            delegate_route: None,
         }
     }
 
@@ -80,11 +89,11 @@ impl OutgoingMessageSender {
         &self,
         request: ServerRequestPayload,
     ) -> (RequestId, oneshot::Receiver<Result>) {
-        let id = RequestId::Integer(self.next_server_request_id.fetch_add(1, Ordering::Relaxed));
+        let id = RequestId::Integer(self.requests.next_id.fetch_add(1, Ordering::Relaxed));
         let outgoing_message_id = id.clone();
         let (tx_approve, rx_approve) = oneshot::channel();
         {
-            let mut request_id_to_callback = self.request_id_to_callback.lock().await;
+            let mut request_id_to_callback = self.requests.pending.lock().await;
             request_id_to_callback.insert(id, tx_approve);
         }
 
@@ -98,7 +107,7 @@ impl OutgoingMessageSender {
             .await
         {
             warn!("failed to send request {outgoing_message_id:?} to client: {err:?}");
-            let mut request_id_to_callback = self.request_id_to_callback.lock().await;
+            let mut request_id_to_callback = self.requests.pending.lock().await;
             request_id_to_callback.remove(&outgoing_message_id);
         }
         (outgoing_message_id, rx_approve)
@@ -106,7 +115,7 @@ impl OutgoingMessageSender {
 
     pub(crate) async fn notify_client_response(&self, id: RequestId, result: Result) {
         let entry = {
-            let mut request_id_to_callback = self.request_id_to_callback.lock().await;
+            let mut request_id_to_callback = self.requests.pending.lock().await;
             request_id_to_callback.remove_entry(&id)
         };
 
@@ -124,7 +133,7 @@ impl OutgoingMessageSender {
 
     pub(crate) async fn notify_client_error(&self, id: RequestId, error: JSONRPCErrorError) {
         let entry = {
-            let mut request_id_to_callback = self.request_id_to_callback.lock().await;
+            let mut request_id_to_callback = self.requests.pending.lock().await;
             request_id_to_callback.remove_entry(&id)
         };
 
@@ -140,7 +149,7 @@ impl OutgoingMessageSender {
 
     pub(crate) async fn cancel_request(&self, id: &RequestId) -> bool {
         let entry = {
-            let mut request_id_to_callback = self.request_id_to_callback.lock().await;
+            let mut request_id_to_callback = self.requests.pending.lock().await;
             request_id_to_callback.remove_entry(id)
         };
         entry.is_some()
@@ -185,10 +194,18 @@ impl OutgoingMessageSender {
     pub(crate) async fn send_server_notification(&self, notification: ServerNotification) {
         if should_publish_to_codexd(&notification)
             && let Some(codexd_producer) = &self.codexd_producer
+            && let Some(mut hub) = HubNotification::from_server(&notification)
         {
-            codexd_producer
-                .publish_server_notification(&notification)
-                .await;
+            if let Some((parent, child)) = &self.delegate_route
+                && let Some(params) = hub.params.as_mut()
+                && params["threadId"].as_str() == Some(parent)
+                && let Some(turn) = params["turnId"].as_str()
+            {
+                let key = format!("{child}:{turn}");
+                params["threadId"] = serde_json::json!(child);
+                params["turnKey"] = serde_json::json!(key);
+            }
+            codexd_producer.publish_hub_notification(hub).await;
         }
 
         if let Err(err) = self
@@ -199,6 +216,92 @@ impl OutgoingMessageSender {
             .await
         {
             warn!("failed to send server notification to client: {err:?}");
+        }
+    }
+
+    /// Scope only the daemon copy of notifications emitted for this event.
+    /// Public v2 clients still receive the original thread and typed payload.
+    pub(crate) fn for_delegate(
+        &self,
+        parent: codex_protocol::ThreadId,
+        child: codex_protocol::ThreadId,
+    ) -> Self {
+        Self {
+            delegate_route: Some((parent.to_string(), child.to_string())),
+            ..self.clone()
+        }
+    }
+
+    pub(crate) async fn publish_delegate_context(
+        &self,
+        context: &codex_protocol::protocol::RuntimeContextSnapshot,
+        turn_id: &str,
+    ) {
+        let Some(producer) = &self.codexd_producer else {
+            return;
+        };
+        let key = format!("{}:{turn_id}", context.session_id);
+        producer.publish_hub_notification(HubNotification {
+            method: "turn/contextUpdated".into(),
+            params: Some(serde_json::json!({
+                "threadId":context.session_id, "turnId":turn_id, "turnKey":key,
+                "scope":"delegate","taskKind":context.task_kind, "sessionSource":context.session_source.to_string(),
+                "parentThreadId":context.parent_session_id, "parentTurnId":context.parent_turn_id,
+                "model":context.model,"modelProvider":context.model_provider_id,"cwd":context.cwd,
+                "thinkingLevel":context.reasoning_effort,"modelContextWindow":context.model_context_window,"threadName":context.thread_name
+            })),
+        }).await;
+    }
+
+    pub(crate) async fn publish_delegate_usage(
+        &self,
+        thread: codex_protocol::ThreadId,
+        turn: &str,
+        usage: codex_protocol::protocol::TokenUsageInfo,
+    ) {
+        if let Some(producer) = &self.codexd_producer {
+            producer
+                .publish_server_notification(&ServerNotification::ThreadTokenUsageUpdated(
+                    codex_app_server_protocol::ThreadTokenUsageUpdatedNotification {
+                        thread_id: thread.to_string(),
+                        turn_id: turn.to_owned(),
+                        token_usage: usage.into(),
+                    },
+                ))
+                .await;
+        }
+    }
+
+    pub(crate) async fn publish_core_turn_started(
+        &self,
+        thread_id: codex_protocol::ThreadId,
+        turn_id: &str,
+        model: &str,
+        context_window: Option<i64>,
+    ) {
+        if let Some(producer) = &self.codexd_producer {
+            producer.publish_hub_notification(codex_codexd::protocol::HubNotification {
+                method: "turn/started".into(),
+                params: Some(serde_json::json!({"threadId":thread_id, "turn":{
+                    "id":turn_id, "status":"inProgress", "model":model, "modelContextWindow":context_window
+                }})),
+            }).await;
+        }
+    }
+
+    pub(crate) async fn publish_delegate_turn_ended(
+        &self,
+        thread_id: codex_protocol::ThreadId,
+        turn_id: &str,
+        status: codex_protocol::protocol::TerminalTurnStatus,
+    ) {
+        if let Some(producer) = &self.codexd_producer {
+            producer
+                .publish_hub_notification(codex_codexd::protocol::HubNotification {
+                    method: "turn/completed".into(),
+                    params: Some(serde_json::json!({"threadId":thread_id, "turn":{"id":turn_id, "status":status}})),
+                })
+                .await;
         }
     }
 
@@ -245,7 +348,6 @@ fn should_publish_to_codexd(notification: &ServerNotification) -> bool {
         ServerNotification::ThreadStarted(_)
             | ServerNotification::ThreadNameUpdated(_)
             | ServerNotification::ThreadTokenUsageUpdated(_)
-            | ServerNotification::TurnStarted(_)
             | ServerNotification::TurnCompleted(_)
             | ServerNotification::TurnDiffUpdated(_)
             | ServerNotification::TurnPlanUpdated(_)

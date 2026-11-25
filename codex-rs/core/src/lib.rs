@@ -60,6 +60,7 @@ pub mod plugins;
 pub mod powershell;
 mod preserved_work_notes;
 mod proposed_plan_parser;
+pub mod runtime_work;
 pub mod sandboxing;
 mod session_prefix;
 mod stream_events_utils;

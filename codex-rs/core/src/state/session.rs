@@ -54,7 +54,13 @@ pub(crate) struct SessionState {
     /// Most recent paused/interrupted turn that can be continued without a new user input.
     pub(crate) pending_continuation: Option<PendingContinuation>,
     pub(crate) completion_review: CompletionReviewState,
-    pub(crate) internal_review_operations: HashMap<String, InternalReviewOperation>,
+    pub(crate) internal_review_operations: HashMap<
+        String,
+        (
+            InternalReviewOperation,
+            Option<crate::runtime_work::WorkGuard>,
+        ),
+    >,
     /// Tracks whether automatic thread naming has already been attempted.
     pub(crate) auto_rename_attempted: bool,
     /// Tracks whether this session originated from a fork.

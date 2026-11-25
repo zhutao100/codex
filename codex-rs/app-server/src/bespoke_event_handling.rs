@@ -98,6 +98,7 @@ use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem as CoreDynam
 use codex_protocol::dynamic_tools::DynamicToolResponse as CoreDynamicToolResponse;
 use codex_protocol::plan_tool::UpdatePlanArgs;
 use codex_protocol::protocol::ReviewOutputEvent;
+use codex_protocol::protocol::TerminalTurnStatus;
 use codex_protocol::request_user_input::RequestUserInputAnswer as CoreRequestUserInputAnswer;
 use codex_protocol::request_user_input::RequestUserInputResponse as CoreRequestUserInputResponse;
 use std::collections::HashMap;
@@ -126,12 +127,112 @@ pub(crate) async fn apply_bespoke_event_handling(
         id: event_turn_id,
         msg,
     } = event;
+    let child = {
+        let map = turn_summary_store.lock().await;
+        map.get(&conversation_id)
+            .and_then(|s| s.delegate.as_ref())
+            .filter(|d| d.started_id.as_deref() == Some(&event_turn_id))
+            .map(|d| d.context.session_id)
+    };
+    let outgoing = match child {
+        Some(child) => Arc::new(outgoing.for_delegate(conversation_id, child)),
+        None => outgoing,
+    };
     match msg {
-        EventMsg::TurnStarted(_) => {
+        EventMsg::RuntimeContextActivated(event) => {
             let mut map = turn_summary_store.lock().await;
-            let summary = map.entry(conversation_id).or_default();
-            summary.active_turn_id = Some(event_turn_id.clone());
-            summary.last_error = None;
+            map.entry(conversation_id).or_default().delegate =
+                Some(crate::codex_message_processor::DelegateTurn {
+                    context: event.snapshot,
+                    started_id: None,
+                });
+        }
+        EventMsg::RuntimeContextUpdated(event) => {
+            let context = event.snapshot;
+            let (id, changed_usage) = {
+                let mut map = turn_summary_store.lock().await;
+                let Some(d) = map
+                    .get_mut(&conversation_id)
+                    .and_then(|s| s.delegate.as_mut())
+                    .filter(|d| {
+                        d.context.scope_id == context.scope_id
+                            && d.context.session_id == context.session_id
+                    })
+                else {
+                    return;
+                };
+                let changed_usage = d.context.token_info != context.token_info;
+                d.context = context.clone();
+                (d.started_id.clone(), changed_usage)
+            };
+            if let Some(id) = id {
+                outgoing.publish_delegate_context(&context, &id).await;
+                if changed_usage && let Some(info) = context.token_info {
+                    outgoing
+                        .publish_delegate_usage(context.session_id, &id, info)
+                        .await;
+                }
+            }
+        }
+        EventMsg::RuntimeContextDeactivated(event) => {
+            let ended = {
+                let mut map = turn_summary_store.lock().await;
+                map.get_mut(&conversation_id).and_then(|summary| {
+                    summary.delegate.take_if(|d| {
+                        d.context.session_id == event.session_id
+                            && d.context.scope_id == event.scope_id
+                    })
+                })
+            };
+            // Completion review consumes the child's terminal event. Deactivation
+            // closes its projection even when the parent completes under another ID.
+            if let Some(ended) = ended
+                && let Some(id) = ended.started_id
+            {
+                outgoing
+                    .publish_delegate_turn_ended(
+                        event.session_id,
+                        &id,
+                        event.turn_status.unwrap_or(TerminalTurnStatus::Completed),
+                    )
+                    .await;
+            }
+        }
+        EventMsg::TurnStarted(start) => {
+            let model = conversation.config_snapshot().await.model;
+            let delegate_context = {
+                let mut map = turn_summary_store.lock().await;
+                let summary = map.entry(conversation_id).or_default();
+                if let Some(delegate) = &mut summary.delegate {
+                    delegate.started_id = Some(event_turn_id.clone());
+                    Some(delegate.context.clone())
+                } else {
+                    summary.active_turn_id = Some(event_turn_id.clone());
+                    summary.active_turn_model = Some(model.clone());
+                    summary.last_error = None;
+                    None
+                }
+            };
+            outgoing
+                .publish_core_turn_started(
+                    delegate_context
+                        .as_ref()
+                        .map_or(conversation_id, |c| c.session_id),
+                    &event_turn_id,
+                    delegate_context.as_ref().map_or(&model, |c| &c.model),
+                    start.model_context_window,
+                )
+                .await;
+            if let Some(context) = delegate_context {
+                outgoing
+                    .publish_delegate_context(&context, &event_turn_id)
+                    .await;
+                if let Some(info) = context.token_info {
+                    outgoing
+                        .publish_delegate_usage(context.session_id, &event_turn_id, info)
+                        .await;
+                }
+            }
         }
         EventMsg::TurnComplete(_ev) => {
             handle_turn_complete(
@@ -751,14 +852,15 @@ pub(crate) async fn apply_bespoke_event_handling(
                 codex_error_info: ev.codex_error_info.map(V2CodexErrorInfo::from),
                 additional_details: None,
             };
-            let should_notify = handle_error(
-                conversation_id,
-                &event_turn_id,
-                turn_error.clone(),
-                &turn_summary_store,
-            )
-            .await;
-            if !should_notify {
+            if child.is_none()
+                && !handle_error(
+                    conversation_id,
+                    &event_turn_id,
+                    turn_error.clone(),
+                    &turn_summary_store,
+                )
+                .await
+            {
                 return;
             }
             outgoing
@@ -1381,9 +1483,23 @@ async fn maybe_emit_raw_response_item_completed(
 async fn find_and_remove_turn_summary(
     conversation_id: ThreadId,
     turn_summary_store: &TurnSummaryStore,
+    outgoing: &OutgoingMessageSender,
+    unfinished_child: TerminalTurnStatus,
 ) -> TurnSummary {
-    let mut map = turn_summary_store.lock().await;
-    map.remove(&conversation_id).unwrap_or_default()
+    let mut summary = turn_summary_store
+        .lock()
+        .await
+        .remove(&conversation_id)
+        .unwrap_or_default();
+    // Cancellation can drop the review consumer before its child deactivation is forwarded.
+    if let Some(child) = summary.delegate.take()
+        && let Some(id) = child.started_id
+    {
+        outgoing
+            .publish_delegate_turn_ended(child.context.session_id, &id, unfinished_child)
+            .await;
+    }
+    summary
 }
 
 async fn handle_turn_complete(
@@ -1392,7 +1508,13 @@ async fn handle_turn_complete(
     outgoing: &OutgoingMessageSender,
     turn_summary_store: &TurnSummaryStore,
 ) {
-    let turn_summary = find_and_remove_turn_summary(conversation_id, turn_summary_store).await;
+    let turn_summary = find_and_remove_turn_summary(
+        conversation_id,
+        turn_summary_store,
+        outgoing,
+        TerminalTurnStatus::Interrupted,
+    )
+    .await;
 
     if let Some(active_turn_id) = turn_summary.active_turn_id.clone()
         && active_turn_id != event_turn_id
@@ -1424,7 +1546,13 @@ async fn handle_turn_interrupted(
     outgoing: &OutgoingMessageSender,
     turn_summary_store: &TurnSummaryStore,
 ) {
-    let turn_summary = find_and_remove_turn_summary(conversation_id, turn_summary_store).await;
+    let turn_summary = find_and_remove_turn_summary(
+        conversation_id,
+        turn_summary_store,
+        outgoing,
+        TerminalTurnStatus::Interrupted,
+    )
+    .await;
     if let Some(active_turn_id) = turn_summary.active_turn_id
         && active_turn_id != event_turn_id
     {
@@ -1449,7 +1577,13 @@ async fn handle_turn_paused(
     outgoing: &OutgoingMessageSender,
     turn_summary_store: &TurnSummaryStore,
 ) {
-    let turn_summary = find_and_remove_turn_summary(conversation_id, turn_summary_store).await;
+    let turn_summary = find_and_remove_turn_summary(
+        conversation_id,
+        turn_summary_store,
+        outgoing,
+        TerminalTurnStatus::Paused,
+    )
+    .await;
     if let Some(active_turn_id) = turn_summary.active_turn_id
         && active_turn_id != event_turn_id
     {
@@ -2038,7 +2172,8 @@ mod tests {
         )
         .await;
 
-        let turn_summary = find_and_remove_turn_summary(conversation_id, &turn_summary_store).await;
+        let summaries = turn_summary_store.lock().await;
+        let turn_summary = &summaries[&conversation_id];
         assert_eq!(
             turn_summary.last_error,
             Some(TurnError {
@@ -2071,7 +2206,8 @@ mod tests {
         )
         .await;
 
-        let turn_summary = find_and_remove_turn_summary(conversation_id, &turn_summary_store).await;
+        let summaries = turn_summary_store.lock().await;
+        let turn_summary = &summaries[&conversation_id];
         assert_eq!(turn_summary.last_error, None);
         Ok(())
     }

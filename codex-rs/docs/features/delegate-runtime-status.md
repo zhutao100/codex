@@ -11,7 +11,7 @@ Use this when changing review status rendering, delegate event forwarding, or `c
 |`SessionConfigured`|Update the runtime snapshot; do not forward it as the parent's session configuration.|
 |First status/content event|Activate the runtime context before forwarding content that depends on it.|
 |`TokenCount`, `ThreadNameUpdated`, `TurnStarted`|Update delegate-scoped usage/name/window metadata. Preserve the parent's token state.|
-|`TurnComplete`, `TurnAborted`, `TurnPaused`|Deactivate the active context before forwarding the normal terminal event.|
+|`TurnComplete`, `TurnAborted`, `TurnPaused`|Deactivate with the child's terminal status before forwarding the event to its review consumer. A non-retryable `Error` for that turn followed by completion is `failed`; an intermediate `StreamError` is not.|
 |Consumer cancellation or disconnect|Shut down and drain the owned delegate; do not leave a blocked forwarding task holding it alive.|
 
 The TUI stores one active runtime snapshot. `/status`, the running model/effort label, status-line session/model fields and context indicators use it until a matching scope deactivates; then they use the parent state again. This is not a general nested-context stack. Raw delegate status events must not overwrite parent identity, rollout metadata or configuration.
@@ -19,6 +19,10 @@ The TUI stores one active runtime snapshot. `/status`, the running model/effort 
 Runtime-context events are transient and excluded from rollout persistence. Review results and durable task ownership use their existing records; a status snapshot is not recovery provenance. The status renderer still receives the shared account/rate-limit display context, so the runtime snapshot is not an independent provider billing record.
 
 ## `codexd` projection
+
+Visible turns and automatic work have different lifetimes. Delegate context can lack a turn ID during preparation; use [per-runtime work activity](../../codexd/README.md#work-activity) for continuity, not a synthetic turn in history.
+
+In app-server, daemon-facing item, command and usage detail uses the same child thread and turn as the delegate's start. `RuntimeContextUpdated` carries the delegate's cumulative and last usage; publishing it does not charge the parent thread or emit a second public v2 notification. The public client retains its parent conversation envelope.
 
 The TUI's `MenuBarBridge` publishes the snapshots into the existing process-level runtime. The daemon advertises `activeTurnContext` and retains optional fields so older clients can continue reading the base active-turn shape.
 
@@ -29,7 +33,7 @@ The TUI's `MenuBarBridge` publishes the snapshots into the existing process-leve
 |`thread/tokenUsage/updated`|Update thread usage and the addressed active turn; usage retains `total`, `last` and `modelContextWindow`.|
 |`turn/completed`|Remove the addressed turn; explicit stale keys must not delete a different thread's reused turn id.|
 
-Context activation may precede a normal turn-start event, so the bridge can establish the delegate turn first and reuse it when later content arrives. Deactivation completes that delegate's turns; a duplicate completion must not remove the parent's active turn. Preserve per-thread prior token usage as the baseline for turn usage displays.
+Context activation may precede a normal turn-start event, so the bridge can establish the delegate turn first and reuse it when later content arrives. Both producers close the child under its own identity and status. If the parent stops before a child terminal is delivered, close the unfinished child as paused or interrupted, not successful. A child's failure does not change the completed user's turn; a duplicate completion must not remove another active turn. A completed model turn does not by itself establish a valid review verdict. Preserve per-thread prior token usage as the baseline for turn usage displays.
 
 Use composite keys in new producers. Legacy bare-turn-id fallback remains only for notifications without an explicit key. Snapshot-changing notifications also publish updated runtime snapshots, so consumers do not need to replay every raw event to observe current state. Expose provider ids and instruction-source summaries, not credentials, raw provider configuration or prompt bodies.
 

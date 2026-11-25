@@ -207,6 +207,8 @@ impl Session {
         input: Vec<UserInput>,
         task: T,
     ) {
+        let work =
+            crate::runtime_work::WorkGuard::new(self.conversation_id, &turn_context.sub_id, "task");
         self.abort_all_tasks(TurnAbortReason::Replaced).await;
         let _lifecycle = self.task_lifecycle.lock().await;
 
@@ -235,6 +237,7 @@ impl Session {
             let session_span = Span::current();
             tokio::spawn(
                 async move {
+                    let _work = work;
                     let _ = registered_rx.await;
                     let ctx_for_finish = Arc::clone(&ctx);
                     let last_agent_message = task_for_run
@@ -471,22 +474,30 @@ impl Session {
             )
             .await;
         }
+        // Reserve before the terminal event, dispatch afterwards: history keeps its
+        // ordering, but review preparation never depends on the delegate's turn ID.
+        let successor = if task_kind == TaskKind::PostTurnCompletionReview {
+            self.prepared_completion_review_handoff().await
+        } else {
+            self.auto_post_turn_review_operation(
+                &turn_context,
+                last_agent_message.as_deref(),
+                task_kind,
+            )
+            .await
+        }
+        .map(|operation| self.reserve_review_work(operation));
         let event = EventMsg::TurnComplete(TurnCompleteEvent {
             last_agent_message: last_agent_message.clone(),
         });
         self.send_event(turn_context.as_ref(), event).await;
-        if task_kind == TaskKind::PostTurnCompletionReview {
-            self.queue_prepared_completion_review_handoff().await;
-            return;
+        if task_kind != TaskKind::PostTurnCompletionReview {
+            self.maybe_auto_rename_thread(turn_context, last_agent_message, task_kind)
+                .await;
         }
-        self.maybe_auto_rename_thread(
-            Arc::clone(&turn_context),
-            last_agent_message.clone(),
-            task_kind,
-        )
-        .await;
-        self.maybe_auto_post_turn_completion_review(turn_context, last_agent_message, task_kind)
-            .await;
+        if let Some(reservation) = successor {
+            self.queue_completion_review_operation(reservation).await;
+        }
     }
 
     async fn maybe_auto_rename_thread(
@@ -584,37 +595,34 @@ impl Session {
         });
     }
 
-    async fn maybe_auto_post_turn_completion_review(
-        self: &Arc<Self>,
-        turn_context: Arc<TurnContext>,
-        last_agent_message: Option<String>,
+    async fn auto_post_turn_review_operation(
+        &self,
+        turn_context: &TurnContext,
+        last_agent_message: Option<&str>,
         task_kind: TaskKind,
-    ) {
+    ) -> Option<crate::completion_review::InternalReviewOperation> {
         if task_kind != TaskKind::Regular
             || !turn_context
                 .features
                 .enabled(Feature::AutoPostTurnCompletionReview)
             || matches!(turn_context.session_source, SessionSource::SubAgent(_))
         {
-            return;
+            return None;
         }
 
-        let Some(message) = last_agent_message.as_ref() else {
-            return;
-        };
-        if message.trim().is_empty() || self.active_turn.lock().await.is_some() {
-            return;
+        if last_agent_message?.trim().is_empty() || self.active_turn.lock().await.is_some() {
+            return None;
         }
 
         if let Some(ticket) = self.current_completion_review_ticket().await
             && ticket.automatic
             && ticket.candidate_completion_id == turn_context.sub_id
         {
-            self.queue_completion_review_operation(
-                crate::completion_review::InternalReviewOperation::Review(ticket),
-            )
-            .await;
+            return Some(crate::completion_review::InternalReviewOperation::Review(
+                ticket,
+            ));
         }
+        None
     }
 
     async fn register_new_active_task(&self, task: RunningTask) {

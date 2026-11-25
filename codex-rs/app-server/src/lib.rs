@@ -624,6 +624,7 @@ fn create_codexd_producer(config: &Config, session_source: &str) -> Option<Codex
         Some(CodexdProducerClient::spawn(
             config.codex_home.as_path(),
             runtime_metadata,
+            codex_core::runtime_work::subscribe(),
         ))
     }
 

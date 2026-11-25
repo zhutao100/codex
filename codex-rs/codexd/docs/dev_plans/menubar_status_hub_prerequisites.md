@@ -23,12 +23,12 @@ Evolve `codexd` from an active-turn event fanout daemon into a status hub that c
   - `runtimeId`, `pid`, `sessionSource`, `cwd`, `displayName`;
   - active turns with `threadId` and `turnId`.
 - Daemon-maintained state:
-  - active turns are derived only from forwarded `turn/started` and `turn/completed`;
-  - all other hub notifications are opaque.
+  - a complete replacement or ordered lifecycle/context notifications update active turns;
+  - capable producers also publish a complete work summary covering accepted automatic stages.
 - Current publisher behavior:
   - `app-server` publishes selected `ServerNotification` variants;
   - TUI publishes synthetic lifecycle, progress, token usage, and error notifications;
-  - producers reconnect and register metadata, but do not publish a complete current-state snapshot on reconnect.
+  - both publish complete current state on reconnect and after outbox overflow; see [work activity and producer recovery](../../README.md#work-activity).
 
 ## Why Expansion Is Worthwhile
 
@@ -76,7 +76,7 @@ Use camelCase wire fields and additive capabilities. Older consumers can continu
 
 ### 2. Refreshable Runtime State
 
-Extend runtime registration or add a follow-up method so producers can publish current state after reconnect:
+Implemented: producers can replace current state after reconnect. A legacy replacement without a work summary looks like:
 
 ```json
 {
@@ -201,20 +201,16 @@ Recommended state timestamps:
 
 ## Implementation Order
 
-1. Add `codexd/hello` and protocol tests.
-2. Add `runtime/updateState` with summary-only active turns.
-3. Teach app-server and TUI producers to resend current state after producer reconnect.
-4. Broaden app-server `should_publish_to_codexd` coverage for non-control notifications.
-5. Add bounded daemon state summaries and `codexd/runtime/read`.
-6. Add `codexd/turn/read` for compact turn details.
-7. Add request routing for interrupt only.
-8. Add pause/continue routing after core/app-server expose those operations.
-9. Evaluate optional persisted replay after state summaries prove insufficient.
+1. Add bounded daemon state summaries and `codexd/runtime/read`.
+2. Add `codexd/turn/read` for compact turn details.
+3. Add request routing for interrupt only.
+4. Add pause/continue routing after core/app-server expose those operations.
+5. Evaluate optional persisted replay after state summaries prove insufficient.
 
 ## Implemented Slice
 
 - `codexd/hello` reports protocol version, capabilities, and current sequence.
-- `codexd/runtime/updateState` lets producers replace the daemon's active-turn summary for a runtime.
+- `codexd/runtime/updateState` restores active turns and negotiated work on a new socket, including quiet turns. A producer restart is distinct from a menu-bar subscriber's reconnect.
 - App-server notification relay now includes additional status UI events such as diffs, deltas, account updates, compaction, and config warnings.
 
 ## Validation

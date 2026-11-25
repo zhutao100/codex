@@ -1,6 +1,7 @@
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
+use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -8,6 +9,14 @@ pub struct HubNotification {
     pub method: String,
     #[serde(default)]
     pub params: Option<JsonValue>,
+}
+
+impl HubNotification {
+    pub fn from_server(
+        notification: &codex_app_server_protocol::ServerNotification,
+    ) -> Option<Self> {
+        serde_json::from_value(serde_json::to_value(notification).ok()?).ok()
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -61,6 +70,14 @@ pub struct ActiveTurnSnapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
+pub struct WorkActivity {
+    pub producer_generation: String,
+    pub revision: u64,
+    pub items: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct RuntimeSnapshot {
     pub runtime_id: String,
     #[serde(default)]
@@ -73,6 +90,10 @@ pub struct RuntimeSnapshot {
     pub display_name: Option<String>,
     #[serde(default)]
     pub active_turns: Vec<ActiveTurnSnapshot>,
+    #[serde(default)]
+    pub work_activity_supported: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_activity: Option<WorkActivity>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -133,26 +154,14 @@ pub struct RuntimeUpdateMetadataParams {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub struct RuntimeUpdateStateParams {
-    pub runtime_id: String,
-    #[serde(default)]
-    pub pid: Option<u32>,
-    #[serde(default)]
-    pub session_source: Option<String>,
-    #[serde(default)]
-    pub cwd: Option<String>,
-    #[serde(default)]
-    pub display_name: Option<String>,
-    #[serde(default)]
-    pub active_turns: Vec<ActiveTurnSnapshot>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct RuntimeEventParams {
     pub runtime_id: String,
     pub notification: HubNotification,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_activity: Option<WorkActivity>,
 }
+
+pub type RuntimeUpdateStateParams = RuntimeSnapshot;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]

@@ -1464,6 +1464,19 @@ pub struct RuntimeContextUpdatedEvent {
 pub struct RuntimeContextDeactivatedEvent {
     pub scope_id: String,
     pub session_id: ThreadId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub turn_status: Option<TerminalTurnStatus>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+pub enum TerminalTurnStatus {
+    Completed,
+    Failed,
+    Interrupted,
+    Paused,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema, TS)]

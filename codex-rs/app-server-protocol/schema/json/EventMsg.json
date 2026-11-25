@@ -806,6 +806,16 @@
             "session_id": {
               "$ref": "#/definitions/ThreadId"
             },
+            "turn_status": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/TerminalTurnStatus"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "type": {
               "enum": [
                 "runtime_context_deactivated"
@@ -5185,6 +5195,15 @@
         }
       ]
     },
+    "TerminalTurnStatus": {
+      "enum": [
+        "completed",
+        "failed",
+        "interrupted",
+        "paused"
+      ],
+      "type": "string"
+    },
     "TextElement": {
       "properties": {
         "byte_range": {
@@ -6018,6 +6037,16 @@
         },
         "session_id": {
           "$ref": "#/definitions/ThreadId"
+        },
+        "turn_status": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TerminalTurnStatus"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "type": {
           "enum": [

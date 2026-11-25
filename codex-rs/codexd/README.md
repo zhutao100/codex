@@ -76,7 +76,7 @@ Typical client flow:
 `codexd/hello` returns:
 
 - `protocolVersion`
-- `capabilities` (`eventReplay`, `runtimeState`, `activeTurnContext`)
+- `capabilities` (`eventReplay`, `runtimeState`, `activeTurnContext`, `workActivity`)
 - current `seq`
 
 The `codexd/event` stream is sequenced:
@@ -126,10 +126,15 @@ Event `type` values:
 
 The `notification` in `runtimeNotification` is a generic hub notification forwarded from runtimes. `codexd` interprets `turn/started`, `turn/completed`, `turn/contextUpdated`, `turn/stateUpdated`, and `thread/tokenUsage/updated` to maintain `activeTurns` in snapshots; all notifications are still forwarded as-is.
 
-Active turns are keyed by `turnKey`. Producers should send `turn.key` or
-`turnKey`; otherwise `codexd` computes `<threadId>:<turnId>`. Legacy
-`turn/completed` notifications without a key fall back to this composite key
-when `threadId` is present, then to a bare `turnId` search for older producers.
+### Work Activity
+
+Daemon capability `workActivity` describes the wire format, not every producer. Check each runtime's `workActivitySupported`. For a capable producer, `workActivity` is a complete `{producerGeneration, revision, items}` object. `items` contains only scheduler-owned tasks and accepted queued review/continuation stages. An empty scheduler set also clears leftover projected turns; a delayed start, inactive UI or missing completion must not hold the system awake. Absent or malformed is not empty. Legacy producers provide `activeTurns` only. Always use turns (not work keys) for history.
+
+Core guards span task finalization and automatic submission dispatch. A queued guard is reserved before the predecessor's terminal event and retained through acceptance of the next task, or dropped on rejection/cancellation. This covers delegate preparation without requiring a delegate turn ID. The guard reports work; it does not create a macOS assertion.
+
+The TUI forwards live events at thread ingress, independent of selection; replaying a thread does not republish its history. App-server publishes daemon starts from core `TurnStarted`, not the public v2 `turn/start` acknowledgement: input submitted during an existing turn may be steered into it rather than starting a second task. Delegate starts use the child thread identity; matching context deactivation closes the child even if the parent consumes the child's terminal event and later completes under its own ID.
+
+An explicit `turn.key` or `turnKey` is authoritative. Without a key, a completion or context update naming a thread resolves within that thread only. Only a genuinely unthreaded legacy event may use a bare `turnId`, and only when exactly one active turn matches. A late completion for child `A:0` cannot remove `B:0`, including from a producer's reconnect snapshot.
 When a runtime notification changes the snapshot, `codexd` emits a
 `runtimeUpsert` before the corresponding `runtimeNotification`.
 
@@ -139,12 +144,10 @@ Runtimes connect to the same socket and send:
 
 - `codexd/runtime/register` (claim a `runtimeId` for that connection)
 - `codexd/runtime/updateMetadata`
-- `codexd/runtime/updateState` (replace the runtime's active-turn summary after reconnect)
+- `codexd/runtime/updateState` (atomically claim the runtime and replace its metadata, active turns and optional work summary)
 - `codexd/runtime/event` (forward a hub notification)
 - `codexd/runtime/unregister` (optional; disconnect also unregisters claimed runtimes)
 
-In Rust, prefer using `codex_codexd::producer::CodexdProducerClient` instead of writing to the socket directly.
-Publish lifecycle notifications in observed order for a runtime. In synchronous
-UI event paths, enqueue notifications with `try_publish_hub_notification`
-rather than spawning one task per notification; if `turn/completed` reaches
-`codexd` before its matching `turn/started`, active-turn state can remain stale.
+TUI and app-server use one `CodexdProducerClient` projection per producing runtime. `updateState` is its first publication on every socket; there is no preliminary empty registration. On ordinary updates the notification and corresponding work revision are applied together, with `runtimeUpsert` preceding forwarded detail. A newer connection supersedes older writes and cleanup for the same runtime ID.
+
+Publish lifecycle notifications in order (`try_publish_hub_notification` on synchronous paths). The bounded outbox retains current state independently of pending detail. Overflow and reconnect discard superseded deltas in favor of a complete replacement; offline progress/history detail is not a durable replay service. Socket EOF triggers reconnect even when a running task produces no output.

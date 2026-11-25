@@ -203,6 +203,7 @@ export type { StepStatus } from "./StepStatus";
 export type { StreamErrorEvent } from "./StreamErrorEvent";
 export type { SubAgentSource } from "./SubAgentSource";
 export type { TerminalInteractionEvent } from "./TerminalInteractionEvent";
+export type { TerminalTurnStatus } from "./TerminalTurnStatus";
 export type { TextElement } from "./TextElement";
 export type { ThreadId } from "./ThreadId";
 export type { ThreadNameUpdatedEvent } from "./ThreadNameUpdatedEvent";
