@@ -83,7 +83,7 @@ pub struct WorkActivity {
 pub(crate) const REQUEST_STATE_METHOD: &str = "codexd/runtime/requestState";
 
 #[cfg(unix)]
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RequestState {
     pub runtime_id: String,
@@ -109,6 +109,37 @@ pub struct RuntimeSnapshot {
     pub work_activity_supported: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work_activity: Option<WorkActivity>,
+}
+
+// Only on the producer link. A consumer snapshot must not repeatedly invalidate history.
+#[cfg(unix)]
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ProducerState {
+    #[serde(flatten)]
+    pub state: RuntimeSnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_recovery: Option<HistoryRecovery>,
+}
+
+#[cfg(unix)]
+pub(crate) const MAX_RECOVERED_TERMINALS: usize = 50;
+
+#[cfg(unix)]
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct HistoryRecovery {
+    pub epoch: u64,
+    pub terminals: std::collections::VecDeque<RecoveryTerminal>,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RecoveryTerminal {
+    pub thread_id: Option<String>,
+    pub turn_id: String,
+    pub turn_key: String,
+    pub status: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

@@ -59,7 +59,7 @@ impl RuntimeMetadata {
 }
 
 enum Publication {
-    State(RuntimeSnapshot),
+    State(crate::protocol::ProducerState),
     Event(RuntimeEventParams),
 }
 
@@ -73,12 +73,50 @@ struct Outbox {
     revision: u64,
     pending: Vec<Publication>,
     replace: bool,
+    recovery: Option<crate::protocol::HistoryRecovery>,
     stopped: bool,
 }
 
 impl Outbox {
     fn snapshot(&self) -> RuntimeSnapshot {
         self.state.as_snapshot(self.id.clone())
+    }
+
+    fn state_publication(&self) -> Publication {
+        Publication::State(crate::protocol::ProducerState {
+            state: self.snapshot(),
+            history_recovery: self.recovery.clone(),
+        })
+    }
+
+    fn retain_lost_terminal(&mut self, publication: Publication) {
+        if let Some(recovery) = &mut self.recovery
+            && let Publication::Event(event) = publication
+            && let Some(terminal) = crate::daemon::recovery_terminal(&event.notification)
+        {
+            recovery
+                .terminals
+                .retain(|t| t.turn_key != terminal.turn_key);
+            if recovery.terminals.len() == crate::protocol::MAX_RECOVERED_TERMINALS {
+                recovery.terminals.pop_front();
+            }
+            recovery.terminals.push_back(terminal);
+        }
+    }
+
+    fn require_full_state(&mut self) {
+        self.replace = true;
+        let epoch = self
+            .recovery
+            .as_ref()
+            .map_or(1, |h| h.epoch.saturating_add(1));
+        self.recovery = Some(crate::protocol::HistoryRecovery {
+            epoch,
+            terminals: Default::default(),
+        });
+        for publication in std::mem::take(&mut self.pending) {
+            self.retain_lost_terminal(publication);
+        }
     }
 
     fn update_work(&mut self) {
@@ -93,12 +131,11 @@ impl Outbox {
     }
 
     fn push(&mut self, update: Publication) {
-        if self.replace {
-            return;
+        if !self.replace && self.pending.len() == MAX_PENDING {
+            self.require_full_state();
         }
-        if self.pending.len() == MAX_PENDING {
-            self.pending.clear();
-            self.replace = true;
+        if self.replace {
+            self.retain_lost_terminal(update);
         } else {
             self.pending.push(update);
         }
@@ -120,15 +157,18 @@ impl Outbox {
     }
 
     fn drain(&mut self, reconnect: bool) -> Vec<Publication> {
-        if reconnect || self.replace {
+        if reconnect && !self.replace {
+            self.require_full_state();
+        }
+        if self.replace {
             self.update_work();
             self.pending.clear();
             self.replace = false;
-            return vec![Publication::State(self.snapshot())];
+            return vec![self.state_publication()];
         }
         if self.work.has_changed().unwrap_or(false) {
             self.update_work();
-            self.pending.push(Publication::State(self.snapshot()));
+            self.pending.push(self.state_publication());
         }
         std::mem::take(&mut self.pending)
     }
@@ -141,7 +181,7 @@ impl Outbox {
             self.revision = self.revision.max(request.minimum_revision);
         }
         self.update_work();
-        Some(Publication::State(self.snapshot()))
+        Some(self.state_publication())
     }
 }
 
@@ -175,6 +215,7 @@ impl CodexdProducerClient {
             work: work.clone(),
             pending: Vec::new(),
             replace: true,
+            recovery: None,
             stopped: false,
         }));
         let writer = Arc::clone(&outbox);
@@ -190,8 +231,8 @@ impl CodexdProducerClient {
             .state
             .apply_metadata_update(&metadata.to_update_params());
         outbox.update_work();
-        let snapshot = outbox.snapshot();
-        outbox.push(Publication::State(snapshot));
+        let state = outbox.state_publication();
+        outbox.push(state);
         self.wake.send_replace(());
     }
 
@@ -494,13 +535,44 @@ mod tests {
         {
             let mut outbox = client.outbox.lock().unwrap();
             work_tx.send_replace(BTreeMap::from([("next".into(), Some("t:1".into()))]));
+            let terminal = |thread: &str, status: &str| HubNotification {
+                method: "turn/completed".into(),
+                params: Some(
+                    serde_json::json!({"threadId":thread,"turn":{"id":"0","status":status}}),
+                ),
+            };
+            outbox.publish(terminal("reviewA", "failed"));
             for _ in 0..=MAX_PENDING {
                 outbox.publish(turn("progress"));
             }
+            outbox.publish(terminal("reviewB", "interrupted"));
             outbox.publish(turn("turn/started"));
             let batch = outbox.drain(false);
-            assert!(matches!(&batch[..], [Publication::State(state)]
-                if state.active_turns.len() == 1 && state.work_activity.as_ref().unwrap().items.contains("next")));
+            let [Publication::State(frame)] = &batch[..] else {
+                panic!("expected one recovery frame")
+            };
+            assert_eq!(frame.state.active_turns.len(), 1);
+            assert!(
+                frame
+                    .state
+                    .work_activity
+                    .as_ref()
+                    .unwrap()
+                    .items
+                    .contains("next")
+            );
+            let outcomes: Vec<_> = frame
+                .history_recovery
+                .as_ref()
+                .unwrap()
+                .terminals
+                .iter()
+                .map(|t| (t.turn_key.as_str(), t.status.as_str()))
+                .collect();
+            assert_eq!(
+                outcomes,
+                [("reviewA:0", "failed"), ("reviewB:0", "interrupted")]
+            );
         }
         client.shutdown().await;
         tokio::fs::remove_file(path).await.unwrap();
