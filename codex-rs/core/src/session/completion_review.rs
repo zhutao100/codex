@@ -1,4 +1,5 @@
 use super::*;
+use crate::completion_review::AcceptedReviewInput;
 use crate::completion_review::AutoCompactionDecision;
 use crate::completion_review::CaptureJournal;
 use crate::completion_review::CompletionReviewReservationError;
@@ -6,15 +7,238 @@ use crate::completion_review::CompletionReviewState;
 use crate::completion_review::DeferredCaptureSource;
 use crate::completion_review::InputContextProjection;
 use crate::completion_review::InternalReviewOperation;
+use crate::completion_review::PendingReviewAdvice;
+use crate::completion_review::ReviewAdvice;
 use crate::completion_review::ReviewHandoff;
 use crate::completion_review::ReviewHandoffDisposition;
 use crate::completion_review::ReviewInputInstallation;
 use crate::completion_review::ReviewPromptFrame;
 use crate::completion_review::ReviewPromptFrames;
 use crate::completion_review::ReviewSampling;
+use crate::completion_review::ReviewSamplingInput;
 use crate::completion_review::ReviewTicket;
 use crate::completion_review::TaggedCaptureCall;
 use crate::completion_review::WorkNotesCheckpoint;
+
+/// A new ordinary handoff, not yet part of the outgoing work. The authenticated
+/// send publishes it before any possible transmission, including the first retry.
+#[derive(Debug)]
+pub(crate) struct ReviewFrameProposal {
+    session: std::sync::Weak<Session>,
+    context: Arc<TurnContext>,
+    frames: ReviewPromptFrames,
+    mandatory: Option<(usize, Box<ReviewPromptFrame>)>,
+    advice: Option<ResponseItem>,
+    committed: tokio::sync::OnceCell<FrameForm>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FrameForm {
+    Preferred,
+    Mandatory,
+}
+
+impl ReviewFrameProposal {
+    pub(super) fn new(
+        session: &Arc<Session>,
+        context: &Arc<TurnContext>,
+        frames: ReviewPromptFrames,
+        advice: Option<ResponseItem>,
+        mandatory: Option<(usize, Box<ReviewPromptFrame>)>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            session: Arc::downgrade(session),
+            context: Arc::clone(context),
+            frames,
+            mandatory,
+            advice,
+            committed: Default::default(),
+        })
+    }
+
+    pub(super) fn unrecorded_advice(&self) -> Option<&ResponseItem> {
+        self.advice
+            .as_ref()
+            .filter(|_| self.committed.get().is_none())
+    }
+
+    fn owns_outgoing(&self, state: &SessionState) -> CodexResult<bool> {
+        let Some((last, outgoing)) = self.frames.0.split_last() else {
+            return Ok(false);
+        };
+        Ok(state.completion_review.replacement_answer_required
+            && Session::active_review_attempt(state)? == last.attempt
+            && state.completion_review.prompt_frames.0 == outgoing)
+    }
+
+    pub(super) async fn defer_refused(
+        self: &Arc<Self>,
+        source: &Arc<TurnContext>,
+        endpoint: Option<String>,
+        cancel: &CancellationToken,
+    ) -> CodexResult<()> {
+        let session = self.session.upgrade().ok_or(CodexErr::TurnAborted)?;
+        if self.committed.get().is_some() {
+            // An earlier attempt crossed the dispatch boundary, even if its stream failed.
+            return session
+                .check_review_handoff_floor(&self.context, source, cancel)
+                .await;
+        }
+        let proposal = Arc::clone(self);
+        let source = Arc::clone(source);
+        let cancel = cancel.clone();
+        session
+            .completion_review_transaction(move |session| async move {
+                let state = session.state.lock().await;
+                if !proposal.owns_outgoing(&state)? {
+                    return Err(CodexErr::ReviewSuperseded);
+                }
+                if state.completion_review.defer_new_prompt_frame {
+                    // Revalidate an already-selected handoff without replacing its saved source.
+                    drop(state);
+                    return session
+                        .check_review_handoff_floor(&proposal.context, &source, &cancel)
+                        .await;
+                }
+                let mut outgoing = state.completion_review.prompt_frames.clone();
+                // A completion without usage still owns the outgoing prefix. Its size
+                // receipt, if any, is selected independently by helper_work_tokens.
+                let same_source = source.model_provider_id == proposal.context.model_provider_id
+                    && state
+                        .completion_review
+                        .last_work_settings
+                        .as_ref()
+                        .filter(|work| work.mode.model() == source.model_info.slug)
+                        .and_then(|work| work.sampled_controls.as_ref())
+                        .is_some_and(|sample| {
+                            sample.route.provider == source.model_provider_id
+                                && sample.owns_endpoint(endpoint.as_deref())
+                        });
+                drop(state);
+                let addition = if same_source {
+                    session
+                        .checkpoint_addition(
+                            &source,
+                            &proposal.context,
+                            &outgoing,
+                            proposal.unrecorded_advice(),
+                            &cancel,
+                        )
+                        .await?
+                        .unwrap_or_default()
+                } else {
+                    CheckpointAddition::default()
+                };
+                session
+                    .check_review_handoff_floor_with_advice(
+                        &proposal.context,
+                        &source,
+                        addition.advice.is_some(),
+                        &cancel,
+                    )
+                    .await?;
+                if let Some(advice) = addition.advice {
+                    session
+                        .record_review_advice_locked(&proposal.context, advice)
+                        .await;
+                }
+                outgoing.0.extend(addition.frame);
+                session
+                    .record_frame_selection_locked(&outgoing, Some(&source))
+                    .await
+            })
+            .await?
+    }
+
+    fn cost(&self, original: i64, form: FrameForm) -> i64 {
+        match (&self.mandatory, self.frames.0.last(), form) {
+            (Some((_, mandatory)), Some(preferred), FrameForm::Mandatory) => {
+                original.saturating_sub(preferred.tokens - mandatory.tokens)
+            }
+            _ => original,
+        }
+    }
+
+    pub(super) fn dispatched_tokens(&self, original: i64) -> i64 {
+        self.cost(
+            original,
+            self.committed
+                .get()
+                .copied()
+                .unwrap_or(FrameForm::Preferred),
+        )
+    }
+
+    pub(crate) async fn admit(
+        self: &Arc<Self>,
+        estimated: i64,
+        target: i64,
+        items: &mut [ResponseItem],
+        endpoint: Option<&str>,
+    ) -> CodexResult<()> {
+        self.commit(estimated, target, endpoint).await?;
+        if let Some((index, mandatory)) = &self.mandatory
+            && self.committed.get() == Some(&FrameForm::Mandatory)
+        {
+            items[*index] = mandatory.item.clone();
+        }
+        Ok(())
+    }
+
+    pub(super) async fn commit(
+        self: &Arc<Self>,
+        estimated: i64,
+        target: i64,
+        endpoint: Option<&str>,
+    ) -> CodexResult<()> {
+        let chosen = self
+            .committed
+            .get_or_try_init(|| async {
+                let session = self.session.upgrade().ok_or(CodexErr::TurnAborted)?;
+                let proposal = Arc::clone(self);
+                let endpoint = endpoint.map(str::to_owned);
+                session
+                    .completion_review_transaction(move |session| async move {
+                        let state = session.state.lock().await;
+                        if !proposal.owns_outgoing(&state)? {
+                            return Err(CodexErr::ReviewSuperseded);
+                        }
+                        let form = if estimated > target && proposal.mandatory.is_some() {
+                            FrameForm::Mandatory
+                        } else {
+                            FrameForm::Preferred
+                        };
+                        crate::client_common::ReviewAdmission::check_size(
+                            proposal.cost(estimated, form),
+                            target,
+                            endpoint.as_deref(),
+                        )?;
+                        drop(state);
+                        if let Some(advice) = &proposal.advice {
+                            session
+                                .record_review_advice_locked(&proposal.context, advice)
+                                .await;
+                        }
+                        let mut frames = std::borrow::Cow::Borrowed(&proposal.frames);
+                        if let Some((_, mandatory)) = &proposal.mandatory
+                            && form == FrameForm::Mandatory
+                            && let Some(current) = frames.to_mut().0.last_mut()
+                        {
+                            *current = mandatory.as_ref().clone();
+                        }
+                        session.record_frame_selection_locked(&frames, None).await?;
+                        Ok(form)
+                    })
+                    .await?
+            })
+            .await?;
+        crate::client_common::ReviewAdmission::check_size(
+            self.cost(estimated, *chosen),
+            target,
+            endpoint,
+        )
+    }
+}
 
 fn review_input_budget(context: &TurnContext) -> i64 {
     context
@@ -23,29 +247,23 @@ fn review_input_budget(context: &TurnContext) -> i64 {
         .saturating_sub(8_192)
 }
 
+impl AutoCompactionDecision {
+    pub(super) fn fit_for_source(&self, source: &TurnContext) -> compact::WorkFit {
+        if self.source.mode.model() == source.model_info.slug {
+            // Each helper checks its provider and its actual authenticated endpoint.
+            self.fit.clone()
+        } else {
+            compact::WorkFit::local()
+        }
+    }
+}
+
 struct ReviewWorkEstimate {
     transcript: i64,
     routing_input: Vec<ResponseItem>,
 }
 
 impl ReviewWorkEstimate {
-    async fn resolve_source(
-        self,
-        session: &Session,
-        context: &TurnContext,
-        active: &TurnContext,
-        active_tools: i64,
-        cancel: &CancellationToken,
-    ) -> CodexResult<i64> {
-        if std::ptr::eq(context, active) {
-            Ok(self.transcript.saturating_add(active_tools).max(0))
-        } else {
-            self.resolve(session, context, active, cancel)
-                .await
-                .map(|(tokens, _)| tokens)
-        }
-    }
-
     fn new(state: &SessionState, end: usize, transcript: i64) -> Self {
         // Only user messages and the separately journaled app selections choose connector tools.
         let routing_input = state.history.raw_items()[..end]
@@ -65,32 +283,27 @@ impl ReviewWorkEstimate {
         context: &TurnContext,
         active: &TurnContext,
         cancel: &CancellationToken,
-    ) -> CodexResult<(i64, ToolSurface)> {
+    ) -> CodexResult<i64> {
         let tools =
             super::turn::compaction_tool_specs(session, context, &self.routing_input, cancel).await;
         if !std::ptr::eq(active, context) {
             session.activate_mcp_context(active).await;
         }
-        let tools = tools?;
-        Ok((self.transcript.saturating_add(tools.tokens()).max(0), tools))
+        Ok(self.transcript.saturating_add(tools?.tokens()).max(0))
     }
 }
 
-fn review_transcript_tokens(state: &SessionState, context: &TurnContext) -> i64 {
-    let base = state.base_instructions_for_turn(context);
-    state
-        .history
-        .review_transcript_tokens(
-            &context.model_info.slug,
-            &base,
-            state.server_reasoning_included(),
-            context.helper_projection(),
-        )
-        .unwrap_or_else(|| {
-            state
-                .history
-                .projected_tokens(&base, context.helper_projection())
-        })
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReviewFrameView {
+    Work,
+    AdmittingAdvice,
+    AfterCheckpoint { separate_advice: bool },
+}
+
+#[derive(Default)]
+struct CheckpointAddition<'a> {
+    advice: Option<&'a ResponseItem>,
+    frame: Option<ReviewPromptFrame>,
 }
 
 fn helper_work_tokens(
@@ -100,19 +313,79 @@ fn helper_work_tokens(
 ) -> ReviewWorkEstimate {
     let base = state.base_instructions_for_turn(source);
     let end = marker.unwrap_or(state.history.raw_items().len());
-    let transcript = super::turn::measured_helper_work(state, source, &base, marker).map_or_else(
-        || {
-            state
-                .history
-                .projected_prefix_tokens(end, source.helper_projection())
-                .saturating_add(crate::truncate::approx_token_count(&base.text) as i64)
-        },
-        |(work, _)| work,
+    let local = state
+        .history
+        .projected_prefix_tokens(end, source.helper_projection())
+        .saturating_add(crate::truncate::approx_token_count(&base.text) as i64);
+    let chat = source
+        .provider
+        .configured_endpoint(Some(crate::auth::AuthMode::Chatgpt));
+    let api = source
+        .provider
+        .configured_endpoint(Some(crate::auth::AuthMode::ApiKey));
+    let measured = state
+        .history
+        .work_receipt_source(marker)
+        .filter(|r| {
+            r.model == source.model_info.slug
+                && r.provider == source.model_provider_id
+                && (r.endpoint == chat.as_deref() || r.endpoint == api.as_deref())
+        })
+        .and_then(|r| super::turn::measured_helper_work(state, source, &base, marker, r));
+    // Only unsampled additions use this bound. Both helpers keep the chosen suffix,
+    // but a login switch can make either one price the work locally at dispatch.
+    let transcript = measured.map_or(
+        local,
+        |(work, _)| if chat == api { work } else { work.max(local) },
     );
     ReviewWorkEstimate::new(state, end, transcript)
 }
 
 impl Session {
+    pub(super) async fn ordinary_review_admission(
+        &self,
+        context: &TurnContext,
+        prompt: &Prompt,
+        request_only_tokens: i64,
+        proposal: Option<Arc<ReviewFrameProposal>>,
+    ) -> crate::client_common::ReviewAdmission {
+        let state = self.state.lock().await;
+        let endpoint = state
+            .history
+            .work_receipt_source(None)
+            .and_then(|s| s.endpoint);
+        let measured = state
+            .history
+            .review_transcript_tokens(
+                context.usage_source(endpoint),
+                &prompt.base_instructions,
+                state.server_reasoning_included(),
+                crate::context_manager::HelperProjection {
+                    structured_outputs: prompt.tools.structured_outputs,
+                    ..context.helper_projection()
+                },
+            )
+            .map(|tokens| {
+                tokens
+                    .saturating_add(prompt.tools.tokens())
+                    .max(0)
+                    .saturating_add(request_only_tokens)
+                    .saturating_add(
+                        proposal
+                            .as_ref()
+                            .and_then(|p| p.unrecorded_advice())
+                            .map_or(0, crate::context_manager::estimate_item_token_count),
+                    )
+            });
+        crate::client_common::ReviewAdmission {
+            target: review_input_budget(context),
+            measured: endpoint
+                .zip(measured)
+                .map(|(owner, tokens)| (owner.to_owned(), tokens)),
+            proposal,
+        }
+    }
+
     pub(super) async fn completion_review_transaction<T, F, Fut>(
         self: &Arc<Self>,
         install: F,
@@ -222,7 +495,7 @@ impl Session {
         &self,
         source: &TurnContext,
         placement: crate::compact::InitialContextInjection,
-        source_fit: crate::compact::SourceFit,
+        source_fit: &crate::compact::WorkFit,
         legacy_attempts: u8,
         allow_new_capture: bool,
     ) -> CodexResult<AutoCompactionDecision> {
@@ -230,21 +503,33 @@ impl Session {
         let (decision, previous) = {
             let mut state = self.state.lock().await;
             let slot = &state.completion_review.pending_compaction;
+            let complete = |d: &AutoCompactionDecision| match d.fit.source_fit {
+                Some(crate::compact::SourceFit::Local) => true,
+                Some(crate::compact::SourceFit::Measured { .. }) => d.fit.fit_route.is_some(),
+                None => false,
+            };
             if let Some(saved) = slot
                 && saved.capture.notes_remaining.is_some()
-                && saved.source_fit.is_some()
+                && complete(saved)
             {
                 return Ok(saved.clone());
             }
             let mut decision = slot.clone().unwrap_or_else(|| AutoCompactionDecision {
-                source: state.sampled_settings(source, &state.base_instructions_for_turn(source)),
+                source: state.checkpoint_source_settings(source),
                 placement,
-                source_fit: Some(source_fit),
+                fit: Default::default(),
                 capture: CaptureJournal::default(),
             });
             // Older offsets included an unidentified tool surface. Upgrade from attributable
             // pre-capture work if available, otherwise use the current local projection.
-            decision.source_fit.get_or_insert(source_fit);
+            if !complete(&decision) {
+                decision.fit = if decision.fit.source_fit.is_some() {
+                    // A legacy measured correction without its owner cannot be attributed.
+                    crate::compact::WorkFit::local()
+                } else {
+                    source_fit.clone()
+                };
+            }
             decision.capture.notes_remaining.get_or_insert_with(|| {
                 if decision.source.captures_notes() && (slot.is_some() || allow_new_capture) {
                     crate::compact::WORK_NOTES_CAPTURE_MAX_ATTEMPTS.saturating_sub(legacy_attempts)
@@ -675,11 +960,15 @@ impl Session {
     pub(super) async fn finish_ordinary_input(
         self: &Arc<Self>,
         context: &TurnContext,
-        base: &BaseInstructions,
+        prompt: &Prompt,
+        endpoint: Option<&str>,
     ) -> bool {
+        let base = &prompt.base_instructions;
         let settings = {
             let state = self.state.lock().await;
-            let settings = state.sampled_settings(context, base);
+            let mut settings = state.task_settings(context, base);
+            settings.sampled_controls =
+                context.sampled_controls_at(endpoint, prompt.parallel_tool_calls_at(endpoint));
             let review = &state.completion_review;
             if settings.recorded_base.is_some()
                 && !review.awaiting_compact_followup
@@ -1099,72 +1388,89 @@ impl Session {
         let context = Arc::clone(context);
         let cancel = cancel.clone();
         self.completion_review_transaction(move |session| async move {
-            session
-                .compaction_review_frames_locked(&context, &cancel)
+            let mut frames = session
+                .state
+                .lock()
                 .await
+                .completion_review
+                .prompt_frames
+                .clone();
+            if let Some(addition) = session
+                .checkpoint_addition(&context, &context, &frames, None, &cancel)
+                .await?
+            {
+                let deferred = addition.frame.is_none();
+                frames.0.extend(addition.frame);
+                session
+                    .record_frame_selection_locked(&frames, deferred.then_some(context.as_ref()))
+                    .await?;
+            }
+            Ok(frames)
         })
         .await
         .map_err(|e| CodexErr::Fatal(e.to_string()))?
     }
 
-    async fn compaction_review_frames_locked(
+    /// Preview under the installation guard. An empty addition defers a new candidate;
+    /// `None` leaves an existing selection (including its recovery source) alone.
+    async fn checkpoint_addition<'a>(
         &self,
         context: &TurnContext,
+        active: &TurnContext,
+        frames: &ReviewPromptFrames,
+        advice: Option<&'a ResponseItem>,
         cancel: &CancellationToken,
-    ) -> CodexResult<ReviewPromptFrames> {
+    ) -> CodexResult<Option<CheckpointAddition<'a>>> {
         let state = self.state.lock().await;
-        let mut frames = state.completion_review.prompt_frames.clone();
         if state.completion_review.defer_new_prompt_frame {
-            return Ok(frames);
+            return Ok(None);
         }
         let attempt = Self::active_review_attempt(&state)?;
-        if state.completion_review.replacement_answer_required
-            && state.completion_review.input_revision
-                == state.completion_review.consumed_input_revision
-            && frames.0.last().is_none_or(|f| f.attempt != attempt)
+        if !state.completion_review.replacement_answer_required
+            || state.completion_review.input_revision
+                != state.completion_review.consumed_input_revision
+            || frames.0.last().is_some_and(|f| f.attempt == attempt)
         {
-            let items = state.history.raw_items();
-            let marker = items
-                .iter()
-                .rposition(crate::compact::is_work_notes_request_item);
-            let work = &items[..marker.unwrap_or(items.len())];
-            // A job checkpoint (and a manual compact) can run before new advice is
-            // admitted. Its candidate has no insertion point in already sampled work.
-            if state
+            return Ok(None);
+        }
+        let items = state.history.raw_items();
+        let marker = items.iter().rposition(compact::is_work_notes_request_item);
+        let work = &items[..marker.unwrap_or(items.len())];
+        // Even a small candidate must not be inserted into already sampled work.
+        if advice.is_none()
+            && state
                 .completion_review
                 .handoff
                 .as_ref()
                 .is_some_and(|handoff| {
                     !handoff.advisory_recorded || work.last() != Some(&handoff.advisory_item())
                 })
-            {
-                drop(state);
-                self.record_frame_selection_locked(&frames, Some(context))
-                    .await?;
-                return Ok(frames);
-            }
-            let Some(text) = Self::render_review_instructions(&state, false)? else {
-                return Ok(frames);
-            };
-            let work_tokens = helper_work_tokens(&state, context, marker);
-            let new = ReviewPromptFrame::new(text, ReviewPromptFrame::anchor(work), attempt);
-            drop(state);
-            if work_tokens
-                .resolve(self, context, context, cancel)
-                .await?
-                .0
-                .saturating_add(frames.tokens())
-                .saturating_add(new.tokens)
-                > super::turn::unsampled_review_token_limit(context)
-            {
-                self.record_frame_selection_locked(&frames, Some(context))
-                    .await?;
-                return Ok(frames);
-            }
-            frames.0.push(new);
-            self.record_frame_selection_locked(&frames, None).await?;
+        {
+            return Ok(Some(CheckpointAddition::default()));
         }
-        Ok(frames)
+        let view = if advice.is_some() {
+            ReviewFrameView::AdmittingAdvice
+        } else {
+            ReviewFrameView::Work
+        };
+        let text = Self::render_review_frame(&state, false, view)?
+            .ok_or_else(|| CodexErr::Fatal("Missing active review frame.".into()))?;
+        let work_tokens = helper_work_tokens(&state, context, marker);
+        let new = ReviewPromptFrame::new(
+            text,
+            ReviewPromptFrame::anchor(work) + usize::from(advice.is_some()),
+            attempt,
+        );
+        drop(state);
+        let work = work_tokens.resolve(self, context, active, cancel).await?;
+        let remaining = super::turn::unsampled_review_token_limit(context)
+            .saturating_sub(work)
+            .saturating_sub(frames.tokens());
+        let advice_cost = advice.map_or(0, crate::context_manager::estimate_item_token_count);
+        Ok(Some(CheckpointAddition {
+            advice: advice.filter(|_| advice_cost <= remaining),
+            frame: (advice_cost.saturating_add(new.tokens) <= remaining).then_some(new),
+        }))
     }
 
     async fn record_frame_selection_locked(
@@ -1177,9 +1483,7 @@ impl Session {
             state.completion_review.prompt_frames = frames.clone();
             state.completion_review.defer_new_prompt_frame = deferred_source.is_some();
             state.completion_review.deferred_capture_source = deferred_source.map(|ctx| {
-                DeferredCaptureSource::Settings(Box::new(
-                    state.sampled_settings(ctx, &state.base_instructions_for_turn(ctx)),
-                ))
+                DeferredCaptureSource::Settings(Box::new(state.checkpoint_source_settings(ctx)))
             });
         }
         if !self.persist_completion_review_locked().await {
@@ -1211,100 +1515,74 @@ impl Session {
     }
 
     pub(super) async fn review_sampling(
-        self: &Arc<Self>,
-        context: &Arc<TurnContext>,
-        capture_source: &Arc<TurnContext>,
-        input: &[ResponseItem],
-        tool_tokens: i64,
-        allow_compact: bool,
-        cancel: &CancellationToken,
+        &self,
+        input: ReviewSamplingInput<'_>,
     ) -> CodexResult<ReviewSampling> {
-        let target = review_input_budget(context);
+        let state = self.state.lock().await;
+        let review = &state.completion_review;
+        let attempt = Self::active_review_attempt(&state)?;
+        if input
+            .advice
+            .is_some_and(|a| Some(&a.attempt) != attempt.as_ref())
         {
-            let state = self.state.lock().await;
-            if !state.completion_review.replacement_answer_required {
-                return Ok(ReviewSampling::Ready(ReviewPromptFrames::default()));
-            }
-            // Already-admitted tool rounds only read the projection. Avoid spawning a durable
-            // installation transaction or scanning the history for a new anchor on the hot path.
-            let frames = &state.completion_review.prompt_frames;
-            if let Some(frame) = frames.0.last()
-                && frame.attempt == Self::active_review_attempt(&state)?
-                && review_transcript_tokens(&state, context)
-                    .saturating_add(tool_tokens)
-                    .max(0)
-                    .saturating_add(frames.tokens())
-                    <= target
-            {
-                return Ok(ReviewSampling::Ready(frames.clone()));
-            }
+            return Err(CodexErr::ReviewSuperseded);
         }
-        let anchor = ReviewPromptFrame::anchor(input);
-        let helper_limit = super::turn::unsampled_review_token_limit(capture_source);
-        let context = Arc::clone(context);
-        let capture_source = Arc::clone(capture_source);
-        let cancel = cancel.clone();
-        self.completion_review_transaction(move |session| async move {
-            let state = session.state.lock().await;
-            let attempt = Self::active_review_attempt(&state)?;
-            if !state.completion_review.replacement_answer_required {
-                return Ok(ReviewSampling::Ready(ReviewPromptFrames::default()));
-            }
-            let mut frames = state.completion_review.prompt_frames.clone();
-            let history = review_transcript_tokens(&state, &context).saturating_add(tool_tokens).max(0);
-            let pinned = frames.0.last().is_some_and(|frame| frame.attempt == attempt);
-            let render = |full| -> CodexResult<ReviewPromptFrame> {
-                let text = Self::render_review_instructions(&state, full)?
-                    .ok_or_else(|| CodexErr::Fatal("Missing active review frame.".into()))?;
-                Ok(ReviewPromptFrame::new(text, anchor, attempt.clone()))
+        if !review.replacement_answer_required {
+            return Ok(ReviewSampling::Ready(ReviewPromptFrames::default()));
+        }
+        let mut frames = review.prompt_frames.clone();
+        if frames
+            .0
+            .last()
+            .is_some_and(|frame| frame.attempt == attempt)
+        {
+            return if input.advice.is_some() {
+                Err(CodexErr::ReviewSuperseded)
+            } else {
+                Ok(ReviewSampling::Ready(frames))
             };
-            let mandatory = render(false)?;
-            let full = (!pinned).then(|| render(true)).transpose()?;
-            drop(state);
-            if let Some(full) = full {
-                let cost = history.saturating_add(frames.tokens()).saturating_add(full.tokens);
-                frames.0.push(if cost <= target { full } else { mandatory.clone() });
-            }
-            let prompt_tokens = history.saturating_add(frames.tokens());
-            if prompt_tokens > target {
-                // Even if omitting the optional reference would now fit, changing a frame that
-                // has governed work would rewrite the hot input. Compact that work unchanged.
-                if mandatory.tokens <= target && allow_compact {
-                    tracing::info!(prompt_tokens, target, pinned, "compacting history to fit review follow-up");
-                    if !pinned {
-                        let estimate = {
-                            let state = session.state.lock().await;
-                            helper_work_tokens(&state, &capture_source, None)
-                        };
-                        if estimate.resolve_source(&session, &capture_source, &context, tool_tokens, &cancel).await?
-                            .saturating_add(frames.tokens()) > helper_limit {
-                            // The handoff owns the unsampled frame. Keep only the outgoing prefix.
-                            frames.0.pop();
-                            session.record_frame_selection_locked(&frames, Some(&capture_source)).await?;
-                            return Ok(ReviewSampling::Compact);
-                        }
-                    }
-                } else {
-                    let recovery = if mandatory.tokens > target {
-                        "The mandatory review frame alone does not fit. Select a larger context window, then /continue."
-                    } else {
-                        "Compaction did not free enough space. Run /compact or select a larger context window, then /continue."
-                    };
-                    return Err(CodexErr::Fatal(format!(
-                        "Review follow-up context exceeds the main model's payload budget ({prompt_tokens} estimated tokens, {target} available). {recovery} No truncated follow-up request was sent."
-                    )));
-                }
-            }
-            if !pinned {
-                session.record_frame_selection_locked(&frames, None).await?;
-            }
-            Ok(if prompt_tokens > target { ReviewSampling::Compact } else { ReviewSampling::Ready(frames) })
-        }).await.map_err(|e| CodexErr::Fatal(e.to_string()))?
+        }
+        if review.awaiting_compact_followup
+            && review.handoff.is_none()
+            && review
+                .pending_inputs
+                .iter()
+                .any(AcceptedReviewInput::is_uninstalled_steering)
+        {
+            return Ok(ReviewSampling::Ready(frames));
+        }
+        let anchor = ReviewPromptFrame::anchor(input.items);
+        let view = if input.advice.is_some() {
+            ReviewFrameView::AdmittingAdvice
+        } else {
+            ReviewFrameView::Work
+        };
+        let render = |full| -> CodexResult<ReviewPromptFrame> {
+            let text = Self::render_review_frame(&state, full, view)?
+                .ok_or_else(|| CodexErr::Fatal("Missing active review frame.".into()))?;
+            Ok(ReviewPromptFrame::new(text, anchor, attempt.clone()))
+        };
+        let full = render(true)?;
+        let mandatory = render(false)?;
+        let mandatory_alternative = (mandatory.tokens < full.tokens).then(|| Box::new(mandatory));
+        frames.0.push(full);
+        Ok(ReviewSampling::FirstSend {
+            frames,
+            mandatory_alternative,
+        })
     }
 
     fn render_review_instructions(
         state: &SessionState,
         include_reference: bool,
+    ) -> CodexResult<Option<String>> {
+        Self::render_review_frame(state, include_reference, ReviewFrameView::Work)
+    }
+
+    fn render_review_frame(
+        state: &SessionState,
+        include_reference: bool,
+        view: ReviewFrameView,
     ) -> CodexResult<Option<String>> {
         let review = &state.completion_review;
         if !review.replacement_answer_required {
@@ -1325,15 +1603,22 @@ impl Session {
         let episode = review
             .eligible_episode()
             .ok_or_else(|| CodexErr::Fatal("Review follow-up candidate is unavailable.".into()))?;
-        let advisory = handoff.advisory_item();
-        let instructions = if state.history.raw_items().contains(&advisory) {
+        let separate_advice = match view {
+            ReviewFrameView::Work => state.history.raw_items().contains(&handoff.advisory_item()),
+            ReviewFrameView::AdmittingAdvice => true,
+            // An unrecorded handoff will append its advice after installation. An admitted
+            // advisory can disappear in the summary, so the frame itself must then carry it.
+            ReviewFrameView::AfterCheckpoint { separate_advice } => separate_advice,
+        };
+        let instructions = if separate_advice {
             crate::tasks::post_turn_completion_review::REPLACEMENT_ANSWER_CONTRACT
         } else {
             &handoff.advisory
         };
-        let precedence = if review.prompt_frames.0.first().is_some_and(|frame| {
-            frame.attempt.as_deref() != Some(handoff.ticket.attempt_id.as_str())
-        }) {
+        let precedence = if !matches!(view, ReviewFrameView::AfterCheckpoint { .. })
+            && review.prompt_frames.0.first().is_some_and(|frame| {
+                frame.attempt.as_deref() != Some(handoff.ticket.attempt_id.as_str())
+            }) {
             "\nEarlier review frames describe earlier work. Use the current scope and candidate below; earlier verdicts are not additional user requirements."
         } else {
             ""
@@ -1347,39 +1632,154 @@ impl Session {
         )))
     }
 
-    /// False means compact the outgoing work before writing this advisory to history.
     pub(super) async fn admit_completion_review_advisory(
         self: &Arc<Self>,
         context: &Arc<TurnContext>,
-        capture_source: &Arc<TurnContext>,
-        allow_compact: bool,
-        cancel: &CancellationToken,
-    ) -> CodexResult<bool> {
+    ) -> CodexResult<ReviewAdvice> {
         // Enter the installation transaction before reading state; pause joins this owner.
         let context = Arc::clone(context);
-        let capture_source = Arc::clone(capture_source);
-        let cancel = cancel.clone();
         self.completion_review_transaction(move |session| async move {
             session
-                .admit_completion_review_advisory_locked(
-                    &context,
-                    &capture_source,
-                    allow_compact,
-                    &cancel,
-                )
+                .admit_completion_review_advisory_locked(&context)
                 .await
         })
         .await
         .map_err(|e| CodexErr::Fatal(e.to_string()))?
     }
 
+    fn mandatory_frame_tokens(state: &SessionState, view: ReviewFrameView) -> CodexResult<i64> {
+        let text = Self::render_review_frame(state, false, view)?
+            .ok_or_else(|| CodexErr::Fatal("Missing active review frame.".into()))?;
+        Ok(crate::context_manager::estimate_item_token_count(
+            &ResponseItem::from(DeveloperInstructions::new(text)),
+        ))
+    }
+
+    fn checkpoint_review_cost(
+        state: &SessionState,
+        admitting_advice: bool,
+    ) -> CodexResult<(i64, i64)> {
+        let separate_advice = state
+            .completion_review
+            .handoff
+            .as_ref()
+            .filter(|h| !h.advisory_recorded && !admitting_advice);
+        let frame = Self::mandatory_frame_tokens(
+            state,
+            ReviewFrameView::AfterCheckpoint {
+                separate_advice: separate_advice.is_some(),
+            },
+        )?;
+        Ok((
+            frame,
+            separate_advice.map_or(0, |h| {
+                crate::context_manager::estimate_item_token_count(&h.advisory_item())
+            }),
+        ))
+    }
+
+    /// Space for history, instructions and tools on the first ordinary request.
+    /// A newly accepted revision must not reserve a retired handoff's frame.
+    pub(crate) async fn replacement_review_limit(
+        &self,
+        context: &TurnContext,
+    ) -> CodexResult<Option<usize>> {
+        let state = self.state.lock().await;
+        let review = &state.completion_review;
+        if !review.replacement_answer_required
+            || !review.pending_inputs.is_empty()
+            || review
+                .handoff
+                .as_ref()
+                .is_some_and(|h| !review.ticket_is_current(&h.ticket))
+        {
+            return Ok(None);
+        }
+        let (frame, advice) = Self::checkpoint_review_cost(&state, false)?;
+        Ok(Some(
+            usize::try_from(
+                review_input_budget(context)
+                    .saturating_sub(frame)
+                    .saturating_sub(advice),
+            )
+            .unwrap_or(0),
+        ))
+    }
+
+    pub(super) async fn check_review_handoff_floor(
+        &self,
+        context: &TurnContext,
+        source: &TurnContext,
+        cancel: &CancellationToken,
+    ) -> CodexResult<()> {
+        self.check_review_handoff_floor_with_advice(context, source, false, cancel)
+            .await
+    }
+
+    async fn check_review_handoff_floor_with_advice(
+        &self,
+        context: &TurnContext,
+        source: &TurnContext,
+        admitting_advice: bool,
+        cancel: &CancellationToken,
+    ) -> CodexResult<()> {
+        let (frame, advice, notes) = {
+            let state = self.state.lock().await;
+            if !state.completion_review.replacement_answer_required
+                || !state.completion_review.pending_inputs.is_empty()
+            {
+                return Ok(());
+            }
+            let notes = if source.final_output_json_schema.is_some() {
+                // A structured source will not capture fresh notes. Its existing
+                // wrapper, when present, is fixed rather than an unknown future output.
+                compact::extract_existing_preserved_work_notes(state.history.raw_items())
+                    .map(|text| compact::preserved_work_notes_message(&text))
+            } else {
+                None
+            };
+            let (frame, advice) = Self::checkpoint_review_cost(&state, admitting_advice)?;
+            (frame, advice, notes)
+        };
+        let target = review_input_budget(context);
+        if frame > target {
+            return Err(CodexErr::Fatal(format!(
+                "Review follow-up context exceeds the main model's payload budget. The mandatory review frame alone does not fit ({frame} estimated tokens, {target} available). Select a larger context window, then /continue. No truncated follow-up request was sent."
+            )));
+        }
+        let initial_context = self.build_initial_context(context).await;
+        let tools =
+            super::turn::compaction_tool_specs(self, context, &initial_context, cancel).await?;
+        let base = self.get_base_instructions_for_turn(context).await;
+        let fixed = crate::compact_remote_v2::fixed_context_tokens(&initial_context, &base.text)
+            .saturating_add(tools.tokens() as usize)
+            .saturating_add(notes.as_ref().map_or(0, |item| {
+                crate::context_manager::estimate_item_token_count(item) as usize
+            }));
+        let floor = (fixed as i64).saturating_add(frame).saturating_add(advice);
+        if floor > target {
+            return Err(CodexErr::Fatal(format!(
+                "Review follow-up context exceeds the main model's payload budget even without history ({floor} estimated tokens, {target} available). Select a larger context window, then /continue. No truncated follow-up request was sent."
+            )));
+        }
+        if compaction_implementation(source) == CompactionImplementation::RemoteV2
+            && let Some(target) = crate::compact_remote_v2::installation_target(
+                context.model_context_window(),
+                context.model_info.auto_compact_token_limit(),
+            )
+            && fixed > target
+        {
+            return Err(CodexErr::Fatal(format!(
+                "Review checkpoint needs {fixed} fixed tokens even before a summary, exceeding the {target}-token context target. Increase the limiting context window or automatic compaction threshold, then /continue. No helper request was sent."
+            )));
+        }
+        Ok(())
+    }
+
     async fn admit_completion_review_advisory_locked(
         &self,
         context: &TurnContext,
-        capture_source: &TurnContext,
-        allow_compact: bool,
-        cancel: &CancellationToken,
-    ) -> CodexResult<bool> {
+    ) -> CodexResult<ReviewAdvice> {
         let state = self.state.lock().await;
         let handoff = state.completion_review.handoff.as_ref();
         let Some(handoff) = handoff.filter(|handoff| {
@@ -1389,57 +1789,49 @@ impl Session {
                     ReviewHandoffDisposition::Started { .. }
                 )
         }) else {
-            return Ok(true);
+            return Ok(ReviewAdvice::Recorded);
         };
-        // A crash can leave this handoff's advisory at the tail without its state flag.
-        // The same advice *before* intervening work belongs to an earlier review.
         let item = handoff.advisory_item();
-        let exists = state.history.raw_items().last() == Some(&item);
-        if !exists {
-            let work = ReviewWorkEstimate::new(
-                &state,
-                state.history.raw_items().len(),
-                review_transcript_tokens(&state, context),
-            );
-            let outgoing = state.completion_review.prompt_frames.clone();
-            let helper = allow_compact.then(|| helper_work_tokens(&state, capture_source, None));
-            drop(state);
-            let advice_tokens = crate::context_manager::estimate_item_token_count(&item);
-            let (work_tokens, tools) = work.resolve(self, context, context, cancel).await?;
-            let prompt_tokens = work_tokens
-                .saturating_add(outgoing.tokens())
-                .saturating_add(advice_tokens);
-            let target = review_input_budget(context);
-            if advice_tokens > target || (!allow_compact && prompt_tokens > target) {
-                return Err(CodexErr::Fatal(format!(
-                    "Review advice exceeds the main model's payload budget ({prompt_tokens} estimated tokens, {target} available). Select a larger context window, then /continue. No truncated follow-up request was sent."
-                )));
-            }
-            if let Some(helper) = helper
-                && helper
-                    .resolve_source(self, capture_source, context, tools.tokens(), cancel)
-                    .await?
-                    .saturating_add(outgoing.tokens())
-                    .saturating_add(advice_tokens)
-                    > super::turn::unsampled_review_token_limit(capture_source)
-            {
-                self.record_frame_selection_locked(&outgoing, Some(capture_source))
-                    .await?;
-                return Ok(false);
-            }
-            self.record_conversation_items(context, &[item]).await;
-        } else {
-            drop(state);
+        let attempt = handoff.ticket.attempt_id.clone();
+        if state
+            .completion_review
+            .prompt_frames
+            .0
+            .last()
+            .is_none_or(|f| f.attempt.as_ref() != Some(&attempt))
+        {
+            return Ok(ReviewAdvice::FirstSend(Box::new(PendingReviewAdvice {
+                attempt,
+                item,
+            })));
         }
-        if let Some(handoff) = self.state.lock().await.completion_review.handoff.as_mut() {
-            handoff.advisory_recorded = true;
-        }
+        drop(state);
+        self.record_review_advice_locked(context, &item).await;
         if !self.persist_completion_review_locked().await {
             return Err(CodexErr::Fatal(
                 "Could not persist review advisory admission.".into(),
             ));
         }
-        Ok(true)
+        Ok(ReviewAdvice::Recorded)
+    }
+
+    async fn record_review_advice_locked(&self, context: &TurnContext, item: &ResponseItem) {
+        if self
+            .state
+            .lock()
+            .await
+            .completion_review
+            .handoff
+            .as_ref()
+            .is_none_or(|h| h.advisory_recorded)
+        {
+            return;
+        }
+        self.record_conversation_items(context, std::slice::from_ref(item))
+            .await;
+        if let Some(handoff) = self.state.lock().await.completion_review.handoff.as_mut() {
+            handoff.advisory_recorded = true;
+        }
     }
 
     pub(crate) async fn stop_completion_review_operations(&self) {

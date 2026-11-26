@@ -499,6 +499,7 @@ impl RolloutRecorder {
                         items.push(RolloutItem::PostTurnCompletionReviewState(item));
                     }
                     item @ (RolloutItem::ToolOutputPolicy { .. }
+                    | RolloutItem::ContextSeed { .. }
                     | RolloutItem::SampledInstructions { .. }
                     | RolloutItem::TokenUsageContext { .. }) => {
                         items.push(item);

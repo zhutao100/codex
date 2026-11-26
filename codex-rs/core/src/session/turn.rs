@@ -5,7 +5,9 @@ use crate::compact::WORK_NOTES_TOOL_REJECT_REASON;
 use crate::compact_remote_v2::CompactionReason;
 use crate::completion_review::AcceptedReviewInput;
 use crate::completion_review::DeferredCaptureSource;
+use crate::completion_review::ReviewAdvice;
 use crate::completion_review::ReviewSampling;
+use crate::completion_review::ReviewSamplingInput;
 use crate::completion_review::WorkNotesCheckpoint;
 use crate::context_manager::estimate_item_token_count;
 use crate::session_prefix::is_turn_aborted_marker;
@@ -57,6 +59,10 @@ impl SamplingPurpose<'_> {
 const AUTO_COMPACT_WORK_NOTES_OUTPUT_TOKEN_RESERVE_MAX: i64 = 4_096;
 const AUTO_COMPACT_WORK_NOTES_OUTPUT_TOKEN_RESERVE_FRACTION: i64 = 20;
 const AUTO_COMPACT_WORK_NOTES_MIN_TOOL_OUTPUT_TOKENS: usize = 128;
+
+fn explorer_report_item() -> ResponseItem {
+    DeveloperInstructions::new("Exploration budget reached. Do not call tools. Report partial findings, source locators, and unchecked scope now.".to_string()).into()
+}
 
 fn work_notes_request_item(turn_context: &TurnContext) -> ResponseItem {
     let source_model = serde_json::Value::String(turn_context.model_info.slug.clone());
@@ -157,19 +163,21 @@ async fn sampling_input_for_pre_compact_work_notes(
     Ok(input)
 }
 
-fn fit_work_notes_prompt(prompt: &mut Prompt, context: &CompactionContext<'_>) {
-    let turn_context = context.request;
-    let adjustment = context.source_fit.adjustment(&prompt.tools);
+pub(crate) fn fit_work_notes_input(
+    input: &mut [ResponseItem],
+    base: &BaseInstructions,
+    window: Option<i64>,
+    adjustment: i64,
+    turn_id: &str,
+) {
     if let Some(stats) = trim_pre_compact_work_notes_input_to_headroom(
-        &mut prompt.input,
-        &prompt.base_instructions,
+        input, base,
         // Use the literal context window here; work_notes_input_token_target
         // already reserves output headroom for the final work notes.
-        turn_context.model_info.resolved_context_window(),
-        adjustment,
+        window, adjustment,
     ) {
         info!(
-            turn_id = %turn_context.sub_id,
+            turn_id,
             estimated_tokens_before = stats.estimated_tokens_before,
             estimated_tokens_after = stats.estimated_tokens_after,
             target_input_tokens = stats.target_input_tokens,
@@ -181,18 +189,31 @@ fn fit_work_notes_prompt(prompt: &mut Prompt, context: &CompactionContext<'_>) {
 pub(crate) async fn compaction_source_fit(
     sess: &Session,
     turn_context: &TurnContext,
-) -> compact::SourceFit {
+) -> compact::WorkFit {
     let state = sess.state.lock().await;
-    let base = state.base_instructions_for_turn(turn_context);
     let capture_start = state
         .history
         .raw_items()
         .iter()
         .rposition(compact::is_work_notes_request_item);
-    measured_helper_work(&state, turn_context, &base, capture_start).map_or(
-        compact::SourceFit::Local,
-        |(work, local)| compact::SourceFit::Measured {
-            transcript_adjustment: work.saturating_sub(local),
+    let Some(source) = state
+        .history
+        .work_receipt_source(capture_start)
+        .filter(|s| s.model == turn_context.model_info.slug)
+    else {
+        return compact::WorkFit::local();
+    };
+    let base = state.base_instructions_for_turn(turn_context);
+    measured_helper_work(&state, turn_context, &base, capture_start, source).map_or_else(
+        compact::WorkFit::local,
+        |(work, local)| compact::WorkFit {
+            source_fit: Some(compact::SourceFit::Measured {
+                transcript_adjustment: work.saturating_sub(local),
+            }),
+            fit_route: crate::model_provider_info::CheckpointRoute::new(
+                source.provider,
+                source.endpoint,
+            ),
         },
     )
 }
@@ -203,12 +224,12 @@ pub(super) fn measured_helper_work(
     context: &TurnContext,
     base: &BaseInstructions,
     marker: Option<usize>,
+    source: crate::context_manager::UsageSource<'_>,
 ) -> Option<(i64, i64)> {
-    let model = &context.model_info.slug;
     let projection = context.helper_projection();
     if let Some(start) = marker {
         // A receipt after the marker cannot measure work on the sibling branch.
-        let frozen = state.history.work_notes_baseline_at(start, model)?;
+        let frozen = state.history.work_notes_baseline_at(start, source)?;
         return Some((
             frozen
                 .work_tokens(base, projection)
@@ -220,7 +241,7 @@ pub(super) fn measured_helper_work(
         return None;
     }
     let work = state
-        .helper_tokens_from_usage(model, projection)?
+        .helper_tokens_from_usage(source, projection)?
         .saturating_add(state.history.base_delta(base))
         .max(0)
         .saturating_sub(state.history.measured_tool_tokens?);
@@ -531,11 +552,12 @@ async fn run_turn_inner(
             return None;
         }
     };
-    let (saved_source, queued_steering, fresh_before_admission) = {
+    let (saved_source, only_deferred, queued_steering, fresh_before_admission) = {
         let state = sess.state.lock().await;
         let review = &state.completion_review;
         (
             review.recovery_capture_source(&turn_context.model_info.slug),
+            review.defer_new_prompt_frame && review.pending_compaction.is_none(),
             review
                 .pending_inputs
                 .iter()
@@ -575,12 +597,27 @@ async fn run_turn_inner(
                 return None;
             }
         };
+        // A frame-only deferral can predate the installation preflight, or the
+        // destination may have shrunk. Preserve its source, but do not start an
+        // impossible capture. Actual capture journals and markers still finish first.
+        if only_deferred
+            && pending_notes.is_none()
+            && input.is_empty()
+            && let Err(error) = sess
+                .check_review_handoff_floor(turn_context, &request_context, &cancellation_token)
+                .await
+        {
+            sess.send_event(turn_context, EventMsg::Error(error.to_error_event(None)))
+                .await;
+            return None;
+        }
         if let Err(error) = run_pre_turn_compact(
             &sess,
             &request_context,
             turn_context,
             injection,
             &cancellation_token,
+            None,
         )
         .await
         {
@@ -665,6 +702,21 @@ async fn run_turn_inner(
         turn_context.model_context_window(),
     );
     if check_outgoing && (downshift || over_limit_work) {
+        // Do not start a new capacity checkpoint for a review that cannot run even on
+        // empty history. A checkpoint already in flight or input changing the owner wins.
+        if review_active
+            && input.is_empty()
+            && recovery_revisions.is_empty()
+            && !queued_steering
+            && !fresh_before_admission
+            && let Err(error) = sess
+                .check_review_handoff_floor(turn_context, &source_context, &cancellation_token)
+                .await
+        {
+            sess.send_event(turn_context, EventMsg::Error(error.to_error_event(None)))
+                .await;
+            return None;
+        }
         let injection = if fresh_before_admission && !queued_steering {
             InitialContextInjection::DoNotInject
         } else {
@@ -676,6 +728,7 @@ async fn run_turn_inner(
             turn_context,
             injection,
             &cancellation_token,
+            None,
         )
         .await
         {
@@ -750,21 +803,45 @@ async fn run_turn_inner(
     let mut explorer_limited = false;
 
     let mut compact_context = CompactionContext::new(turn_context);
+    let mut refused_proposal: Option<(Arc<ReviewFrameProposal>, Option<String>)> = None;
     loop {
         if matches!(compaction, FollowUpCompaction::Pending) {
-            if !Arc::ptr_eq(&source_context, turn_context)
-                && (RegularTaskSettings::from_turn(&source_context)
-                    != RegularTaskSettings::from_turn(turn_context)
-                    || source_context.sampled_reasoning() != turn_context.sampled_reasoning()
-                    || sess.get_base_instructions_for_turn(&source_context).await
-                        != sess.get_base_instructions_for_turn(turn_context).await)
-            {
+            let admission = if let Some((proposal, endpoint)) = refused_proposal.take() {
+                // Source placement determines the destination floor; publish only after both fit.
+                proposal
+                    .defer_refused(&source_context, endpoint, &cancellation_token)
+                    .await
+            } else {
+                sess.check_review_handoff_floor(turn_context, &source_context, &cancellation_token)
+                    .await
+            };
+            match admission {
+                Ok(()) => {}
+                Err(CodexErr::ReviewSuperseded) => {
+                    compaction = FollowUpCompaction::Idle;
+                    can_drain_pending_input = true;
+                    check_advisory = true;
+                    continue;
+                }
+                Err(error) => {
+                    sess.send_event(turn_context, EventMsg::Error(error.to_error_event(None)))
+                        .await;
+                    return None;
+                }
+            }
+            if !Arc::ptr_eq(&source_context, turn_context) {
+                // The checkpoint belongs to the outgoing task even when its controls
+                // happen to match the destination on the currently selected endpoint.
+                let same_provider = source_context.model_provider_id
+                    == turn_context.model_provider_id
+                    && source_context.provider == turn_context.provider;
                 if let Err(error) = run_pre_turn_compact(
                     &sess,
                     &source_context,
                     turn_context,
                     InitialContextInjection::BeforeLastUserMessage,
                     &cancellation_token,
+                    same_provider.then_some(&mut client_session),
                 )
                 .await
                 {
@@ -777,6 +854,7 @@ async fn run_turn_inner(
             }
             // Tool execution may have invalidated the sampled scope (e.g. human clarification).
             // Freeze the authoritative selection at the checkpoint, not the last loop iteration.
+            compact_context = CompactionContext::new(turn_context);
             compact_context.review_frames = match sess
                 .compaction_review_frames(turn_context, &cancellation_token)
                 .await
@@ -791,7 +869,7 @@ async fn run_turn_inner(
             compact_context.source_fit = compaction_source_fit(&sess, turn_context).await;
             compaction = match begin_follow_up_compaction(
                 &sess,
-                &compact_context,
+                &mut compact_context,
                 &mut client_session,
                 &cancellation_token,
             )
@@ -849,21 +927,18 @@ async fn run_turn_inner(
             }
         }
 
+        if matches!(compaction, FollowUpCompaction::Compacted)
+            && let Err(error) = sess.seed_initial_context_if_needed(turn_context).await
+        {
+            sess.send_event(turn_context, EventMsg::Error(error.to_error_event(None)))
+                .await;
+            return None;
+        }
+        let mut staged_advice = None;
         if check_advisory && !capturing_notes {
-            match sess
-                .admit_completion_review_advisory(
-                    turn_context,
-                    &source_context,
-                    matches!(compaction, FollowUpCompaction::Idle),
-                    &cancellation_token,
-                )
-                .await
-            {
-                Ok(true) => check_advisory = false,
-                Ok(false) => {
-                    compaction = FollowUpCompaction::Pending;
-                    continue;
-                }
+            match sess.admit_completion_review_advisory(turn_context).await {
+                Ok(ReviewAdvice::Recorded) => check_advisory = false,
+                Ok(ReviewAdvice::FirstSend(item)) => staged_advice = Some(item),
                 Err(error) => {
                     sess.send_event(turn_context, EventMsg::Error(error.to_error_event(None)))
                         .await;
@@ -884,6 +959,7 @@ async fn run_turn_inner(
         } else {
             sess.prompt_history(turn_context.as_ref()).await
         };
+        sampling_request_input.extend(staged_advice.iter().map(|a| a.item.clone()));
         let work_end = sampling_request_input.len();
         if let Some(deadline) = explorer_deadline
             && !capturing_notes
@@ -897,37 +973,58 @@ async fn run_turn_inner(
                 || turn_context.exploration.exhausted()
                 || Instant::now() + EXPLORER_REPORT_RESERVE >= deadline;
             if explorer_limited {
-                sampling_request_input.push(
-                    DeveloperInstructions::new(
-                        "Exploration budget reached. Do not call tools. Report partial findings, source locators, and unchecked scope now.".to_string(),
-                    ).into(),
-                );
+                sampling_request_input.push(explorer_report_item());
             }
         }
         let mut selected_tools = None;
+        let mut proposal = None;
         if !capturing_notes {
             match prepare_review_sampling(
                 &sess,
                 turn_context,
-                &source_context,
-                &sampling_request_input[..work_end],
+                ReviewSamplingInput {
+                    items: &sampling_request_input[..work_end],
+                    advice: staged_advice.as_deref(),
+                },
                 &skill_names,
-                matches!(compaction, FollowUpCompaction::Idle),
                 &cancellation_token,
             )
             .await
             {
-                Ok((ReviewSampling::Ready(frames), tools)) => {
+                Ok((decision, tools)) => {
+                    let (frames, first_send) = match decision {
+                        ReviewSampling::Ready(frames) => (frames, None),
+                        ReviewSampling::FirstSend {
+                            frames,
+                            mandatory_alternative,
+                        } => (frames, Some(mandatory_alternative)),
+                    };
                     selected_tools = tools;
-                    if let Err(error) = frames.insert(&mut sampling_request_input, None) {
-                        sess.send_event(turn_context, EventMsg::Error(error.to_error_event(None)))
+                    let index = match frames.insert(&mut sampling_request_input, None) {
+                        Ok(index) => index,
+                        Err(error) => {
+                            sess.send_event(
+                                turn_context,
+                                EventMsg::Error(error.to_error_event(None)),
+                            )
                             .await;
-                        return None;
-                    }
+                            return None;
+                        }
+                    };
+                    proposal = first_send.map(|mandatory| {
+                        ReviewFrameProposal::new(
+                            &sess,
+                            turn_context,
+                            frames.clone(),
+                            staged_advice.map(|a| a.item),
+                            index.zip(mandatory),
+                        )
+                    });
                     compact_context.review_frames = frames;
                 }
-                Ok((ReviewSampling::Compact, _)) => {
-                    compaction = FollowUpCompaction::Pending;
+                Err(CodexErr::ReviewSuperseded) => {
+                    can_drain_pending_input = true;
+                    check_advisory = true;
                     continue;
                 }
                 Err(error) => {
@@ -966,6 +1063,7 @@ async fn run_turn_inner(
             request_context_tokens,
             &skill_names,
             selected_tools,
+            proposal.clone(),
             purpose,
             sampling_cancel.clone(),
         );
@@ -1004,6 +1102,7 @@ async fn run_turn_inner(
                 let SamplingRequestResult {
                     needs_follow_up,
                     last_agent_message: sampling_request_last_agent_message,
+                    notes_tools,
                 } = sampling_request_output;
                 let needs_follow_up =
                     needs_follow_up || !after_compaction.is_empty() || initial_input.is_some();
@@ -1048,6 +1147,7 @@ async fn run_turn_inner(
                 );
 
                 if capturing_notes {
+                    compact_context.notes_tools = notes_tools;
                     let (notes, remaining) =
                         match captured_pre_compact_work_notes(&sess, turn_context).await {
                             Ok(notes) => notes,
@@ -1128,9 +1228,38 @@ async fn run_turn_inner(
                 }
                 continue;
             }
-            Err(CodexErr::TurnAborted) => {
+            Err(CodexErr::ReviewSuperseded) if !cancellation_token.is_cancelled() => {
+                can_drain_pending_input = true;
+                check_advisory = true;
+                continue;
+            }
+            Err(CodexErr::TurnAborted | CodexErr::ReviewSuperseded) => {
                 // Aborted turn is reported via a different event.
                 break;
+            }
+            Err(CodexErr::ReviewPayloadExceeded {
+                estimated,
+                target,
+                endpoint,
+            }) if matches!(compaction, FollowUpCompaction::Idle) => {
+                info!(
+                    estimated,
+                    target,
+                    "review follow-up refused before model send; checking checkpoint feasibility"
+                );
+                refused_proposal = proposal.map(|p| (p, endpoint));
+                compaction = FollowUpCompaction::Pending;
+                continue;
+            }
+            Err(CodexErr::ReviewPayloadExceeded {
+                estimated, target, ..
+            }) if matches!(compaction, FollowUpCompaction::Compacted) => {
+                let error = CodexErr::Fatal(format!(
+                    "Compaction did not free enough space for the review follow-up ({estimated} estimated tokens, {target} available). Run /compact or select a larger context window, then /continue. No oversized request was sent."
+                ));
+                sess.send_event(turn_context, EventMsg::Error(error.to_error_event(None)))
+                    .await;
+                return None;
             }
             Err(e) if capturing_notes => {
                 info!("Work-notes capture failed; compacting without notes: {e:#}");
@@ -1221,8 +1350,10 @@ async fn admit_recovered_inputs(
         if let Some(input) = fresh {
             admit_new_turn_input(sess, context, &input, Some(revision), cancellation).await?;
         } else {
-            if !prepared {
-                sess.seed_initial_context_if_needed(context).await;
+            if !prepared && let Err(error) = sess.seed_initial_context_if_needed(context).await {
+                sess.send_event(context, EventMsg::Error(error.to_error_event(None)))
+                    .await;
+                return None;
             }
             if !sess
                 .install_completion_review_input(context, revision, true)
@@ -1328,7 +1459,7 @@ async fn admit_new_turn_input(
 
 async fn begin_follow_up_compaction(
     sess: &Arc<Session>,
-    context: &CompactionContext<'_>,
+    context: &mut CompactionContext<'_>,
     client_session: &mut ModelClientSession,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<FollowUpCompaction> {
@@ -1336,11 +1467,12 @@ async fn begin_follow_up_compaction(
         .checkpoint_auto_compaction(
             context.request,
             InitialContextInjection::BeforeLastUserMessage,
-            context.source_fit,
+            &context.source_fit,
             0,
             true,
         )
         .await?;
+    context.source_fit = decision.fit_for_source(context.request);
     if decision.capture.notes_remaining.unwrap_or_default() > 0 {
         inject_pre_compact_work_notes_request(sess, context.request).await;
         return Ok(FollowUpCompaction::AwaitingNotes);
@@ -1483,6 +1615,7 @@ async fn run_pre_turn_compact(
     destination: &Arc<TurnContext>,
     injection: InitialContextInjection,
     cancellation_token: &CancellationToken,
+    client_session: Option<&mut ModelClientSession>,
 ) -> CodexResult<bool> {
     let mut context = CompactionContext {
         request: turn_context,
@@ -1525,7 +1658,7 @@ async fn run_pre_turn_compact(
         .checkpoint_auto_compaction(
             turn_context,
             injection,
-            context.source_fit,
+            &context.source_fit,
             pending.as_ref().map_or(0, |p| p.legacy_attempts),
             // A fresh structured task skips a new free-form capture. A capture already
             // selected by the outgoing task retains its recorded attempts instead.
@@ -1533,13 +1666,20 @@ async fn run_pre_turn_compact(
                 || destination.final_output_json_schema.is_none(),
         )
         .await?;
-    context.source_fit = decision.source_fit.unwrap_or(context.source_fit);
+    context.source_fit = decision.fit_for_source(turn_context);
     let mut notes = pending.as_ref().and_then(|pending| pending.notes.clone());
     let mut remaining = decision.capture.notes_remaining.unwrap_or_default();
-    let mut client_session = sess
-        .services
-        .model_client
-        .new_session_with_provider(turn_context.provider.clone());
+    let mut owned_client;
+    let client_session = match client_session {
+        Some(client) => client,
+        None => {
+            owned_client = sess
+                .services
+                .model_client
+                .new_session_with_provider(turn_context.provider.clone());
+            &mut owned_client
+        }
+    };
     if notes.is_none() && remaining > 0 && !has_following_input {
         if pending.is_none() {
             inject_pre_compact_work_notes_request(sess, turn_context).await;
@@ -1555,18 +1695,20 @@ async fn run_pre_turn_compact(
                 Arc::clone(turn_context),
                 turn_state.clone(),
                 Arc::clone(&tracker),
-                &mut client_session,
+                client_session,
                 metadata.as_deref(),
                 input,
                 context.review_frame_tokens(),
                 &skill_names,
+                None,
                 None,
                 SamplingPurpose::WorkNotes(&context),
                 cancellation_token.child_token(),
             )
             .await;
             match output {
-                Ok(_) => {
+                Ok(completed) => {
+                    context.notes_tools = completed.notes_tools;
                     (notes, remaining) =
                         captured_pre_compact_work_notes(sess, turn_context).await?;
                     if notes.is_some() {
@@ -1586,7 +1728,7 @@ async fn run_pre_turn_compact(
         &context,
         notes,
         decision.placement,
-        Some(&mut client_session),
+        Some(client_session),
         reason,
         cancellation_token,
     )
@@ -1823,11 +1965,17 @@ async fn run_sampling_request(
     request_context_tokens: i64,
     skill_names: &HashMap<String, usize>,
     selected_tools: Option<SamplingTools>,
+    proposal: Option<Arc<ReviewFrameProposal>>,
     purpose: SamplingPurpose<'_>,
     cancellation_token: CancellationToken,
 ) -> CodexResult<SamplingRequestResult> {
     client_session.cache_operation = purpose.cache_operation();
-    let mut input_item_count = sess.state.lock().await.history.raw_items().len();
+    let mut input_item_count = sess.state.lock().await.history.raw_items().len()
+        + usize::from(
+            proposal
+                .as_ref()
+                .is_some_and(|p| p.unrecorded_advice().is_some()),
+        );
     let SamplingTools {
         router,
         surface: tools,
@@ -1844,14 +1992,18 @@ async fn run_sampling_request(
             .await?
         }
     };
-    client_session.sampling_tools = Some((turn_context.model_info.slug.clone(), tools.clone()));
-
     let model_supports_parallel = turn_context.model_info.supports_parallel_tool_calls;
 
     let base_instructions = sess.get_base_instructions_for_turn(&turn_context).await;
 
     let mut prompt = Prompt {
         input,
+        verbosity: Some(turn_context.verbosity),
+        sampled_controls: turn_context.sampled_controls.clone(),
+        helper_fit: match purpose {
+            SamplingPurpose::WorkNotes(context) => Some(context.notes_fit()),
+            SamplingPurpose::Work | SamplingPurpose::ExplorerReport => None,
+        },
         parallel_tool_calls: model_supports_parallel,
         base_instructions,
         personality: turn_context.personality,
@@ -1859,13 +2011,28 @@ async fn run_sampling_request(
         ..Default::default()
     }
     .with_tools(tools);
-    if let SamplingPurpose::WorkNotes(context) = purpose {
-        fit_work_notes_prompt(&mut prompt, context);
-    }
 
     let mut retries = 0;
     client_session.cache_attempt = 0;
     loop {
+        // Price each attempt, including the suffix of a failed stream. Auth may still
+        // change inside this attempt, between a refused upgrade and the actual send.
+        if request_context_tokens > 0 && !matches!(purpose, SamplingPurpose::WorkNotes(_)) {
+            let extra = if matches!(purpose, SamplingPurpose::ExplorerReport) {
+                estimate_item_token_count(&explorer_report_item())
+            } else {
+                0
+            };
+            prompt.review_admission = Some(
+                sess.ordinary_review_admission(
+                    &turn_context,
+                    &prompt,
+                    request_context_tokens.saturating_add(extra),
+                    proposal.clone(),
+                )
+                .await,
+            );
+        }
         client_session.cache_attempt += 1;
         let err = match try_run_sampling_request(
             Arc::clone(&router),
@@ -1965,7 +2132,6 @@ async fn run_sampling_request(
                 // The durable capture suffix can consume the original reserve.
                 prompt.input = sampling_input_for_pre_compact_work_notes(&sess, context).await?;
                 prompt.format_tool_results();
-                fit_work_notes_prompt(&mut prompt, context);
                 input_item_count = sess.state.lock().await.history.raw_items().len();
             }
             SamplingPurpose::Work | SamplingPurpose::ExplorerReport => {
@@ -2013,32 +2179,22 @@ struct SamplingTools {
 async fn prepare_review_sampling(
     sess: &Arc<Session>,
     context: &Arc<TurnContext>,
-    source: &Arc<TurnContext>,
-    input: &[ResponseItem],
+    input: ReviewSamplingInput<'_>,
     skill_names: &HashMap<String, usize>,
-    allow_compact: bool,
     cancel: &CancellationToken,
 ) -> CodexResult<(ReviewSampling, Option<SamplingTools>)> {
-    if !sess
-        .state
-        .lock()
-        .await
-        .completion_review
-        .replacement_answer_required
+    if input.advice.is_none()
+        && !sess
+            .state
+            .lock()
+            .await
+            .completion_review
+            .replacement_answer_required
     {
         return Ok((ReviewSampling::Ready(Default::default()), None));
     }
-    let tools = sampling_tools(sess, context, input, skill_names, cancel).await?;
-    let decision = sess
-        .review_sampling(
-            context,
-            source,
-            input,
-            tools.surface.tokens(),
-            allow_compact,
-            cancel,
-        )
-        .await?;
+    let tools = sampling_tools(sess, context, input.items, skill_names, cancel).await?;
+    let decision = sess.review_sampling(input).await?;
     Ok((decision, Some(tools)))
 }
 
@@ -2102,6 +2258,7 @@ pub(crate) async fn compaction_tool_specs(
 struct SamplingRequestResult {
     needs_follow_up: bool,
     last_agent_message: Option<String>,
+    notes_tools: Option<ToolSurface>,
 }
 
 /// Ephemeral per-response state for streaming a single proposed plan.
@@ -2680,6 +2837,13 @@ async fn try_run_sampling_request(
         .await??;
 
     let tool_execution_mode = purpose.tool_execution();
+    let request_context_tokens = prompt
+        .review_admission
+        .as_ref()
+        .and_then(|a| a.proposal.as_ref())
+        .map_or(request_context_tokens, |p| {
+            p.dispatched_tokens(request_context_tokens)
+        });
     let mut emitted_notes = false;
     let tool_runtime = ToolCallRuntime::new(
         Arc::clone(&router),
@@ -2891,7 +3055,7 @@ async fn try_run_sampling_request(
                     sess.advance_work_notes(WorkNotesCheckpoint::CompletedResponse)
                         .await?;
                 } else if !sess
-                    .finish_ordinary_input(&turn_context, &prompt.base_instructions)
+                    .finish_ordinary_input(&turn_context, prompt, stream.endpoint_sha256.as_deref())
                     .await
                 {
                     return Err(CodexErr::Fatal(
@@ -2904,7 +3068,7 @@ async fn try_run_sampling_request(
                 }
                 sess.update_token_usage_info_with_request_context(
                     &turn_context,
-                    token_usage.as_ref(),
+                    stream.usage(token_usage.as_ref()),
                     request_context_tokens,
                     server_reasoning_included,
                     input_item_count,
@@ -2923,6 +3087,8 @@ async fn try_run_sampling_request(
                 break Ok(SamplingRequestResult {
                     needs_follow_up,
                     last_agent_message,
+                    notes_tools: matches!(purpose, SamplingPurpose::WorkNotes(_))
+                        .then(|| prompt.tools.clone()),
                 });
             }
             ResponseEvent::OutputTextDelta(delta) => {
@@ -3081,6 +3247,13 @@ pub(crate) fn get_last_assistant_message_from_turn(responses: &[ResponseItem]) -
 }
 
 #[cfg(test)]
+#[path = "live_helper_route_tests.rs"]
+mod live_helper_route_tests;
+#[cfg(test)]
+#[path = "live_review_dispatch_tests.rs"]
+mod live_review_dispatch_tests;
+
+#[cfg(test)]
 mod tests {
     use super::AUTO_COMPACT_WORK_NOTES_REQUEST_TAG;
     use super::compaction_source_fit;
@@ -3091,6 +3264,7 @@ mod tests {
     use super::unsampled_review_token_limit;
     use super::work_notes_input_token_target;
     use super::work_notes_request_item;
+    use crate::client_common::ResponseUsage;
     use crate::protocol::TokenUsage;
     use crate::session::tests::make_session_and_context;
     use codex_protocol::models::BaseInstructions;
@@ -3182,7 +3356,10 @@ mod tests {
         };
         sess.update_token_usage_info_with_request_context(
             &context,
-            Some(&usage),
+            ResponseUsage {
+                tokens: Some(&usage),
+                endpoint: context.current_endpoint().as_deref(),
+            },
             2_000,
             true,
             start,
@@ -3191,16 +3368,19 @@ mod tests {
         .await;
         inject_pre_compact_work_notes_request(&sess, &context).await;
         assert_eq!(
-            compaction_source_fit(&sess, &context).await,
-            crate::compact::SourceFit::Measured {
+            compaction_source_fit(&sess, &context).await.source_fit,
+            Some(crate::compact::SourceFit::Measured {
                 transcript_adjustment: 7_000 - local
-            }
+            })
         );
 
         // Usage now covers a possibly trimmed capture. Keep the preceding work measurement.
         sess.update_token_usage_info_with_request_context(
             &context,
-            Some(&usage),
+            ResponseUsage {
+                tokens: Some(&usage),
+                endpoint: context.current_endpoint().as_deref(),
+            },
             0,
             true,
             start + 1,
@@ -3208,10 +3388,10 @@ mod tests {
         )
         .await;
         assert_eq!(
-            compaction_source_fit(&sess, &context).await,
-            crate::compact::SourceFit::Measured {
+            compaction_source_fit(&sess, &context).await.source_fit,
+            Some(crate::compact::SourceFit::Measured {
                 transcript_adjustment: 7_000 - local
-            }
+            })
         );
     }
 

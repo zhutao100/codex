@@ -61,6 +61,7 @@ pub(crate) fn builder_from_items(
         RolloutItem::SessionMeta(meta_line) => Some(meta_line),
         RolloutItem::ResponseItem(_)
         | RolloutItem::Compacted(_)
+        | RolloutItem::ContextSeed { .. }
         | RolloutItem::TurnContext(_)
         | RolloutItem::ToolOutputPolicy { .. }
         | RolloutItem::SampledInstructions { .. }

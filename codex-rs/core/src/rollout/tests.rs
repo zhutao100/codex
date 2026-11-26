@@ -454,6 +454,7 @@ async fn clean_for_continue_removes_abort_custom_and_dangling_records() -> Resul
         measured_format_delta: None,
         measured_base_tokens: None,
         measured_tool_tokens: None,
+        measured_surface: None,
     };
     let lines = [
         rollout_json_line(RolloutItem::SessionMeta(SessionMetaLine {

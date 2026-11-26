@@ -2477,6 +2477,115 @@ async fn review_followup_budget_recovery_preserves_scope(
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reviewer_seeds_standalone_replacement_once_before_main_send_and_restart()
+-> anyhow::Result<()> {
+    skip_if_no_network_unless_localhost!(Ok(()));
+    let server = MockServer::start().await;
+    let home = Arc::new(TempDir::new()?);
+    let cwd = home.path().join("workspace");
+    let project = "Check retained evidence in this project.\n".repeat(480);
+    std::fs::create_dir_all(&cwd)?;
+    std::fs::write(cwd.join("AGENTS.md"), &project)?;
+    let configure = |cfg: &mut Config| {
+        configure_recovery_windows(cfg, 200_000, 64_000);
+    };
+    let wire = mount_sse_sequence(
+        &server,
+        vec![
+            answer("Original."),
+            compacted_answer(),
+            verdict("Check the project.", true),
+            answer("Live."),
+            answer("Resumed."),
+        ],
+    )
+    .await;
+    let live = new_conversation_for_server(&server, home.clone(), configure).await;
+    submit_request(&live, "Inspect the project.").await;
+    wait_for_event(&live, |e| matches!(e, EventMsg::TurnComplete(_))).await;
+    live.submit(Op::Compact).await?;
+    wait_for_event(&live, |e| match e {
+        EventMsg::Error(e) => panic!("{}", e.message),
+        EventMsg::TurnComplete(_) => true,
+        _ => false,
+    })
+    .await;
+    live.submit(Op::ReviewCompletedTurn).await?;
+    wait_for_event(&live, |e| match e {
+        EventMsg::Error(e) => panic!("{}", e.message),
+        EventMsg::TurnComplete(t) => t.last_agent_message.as_deref() == Some("Live."),
+        _ => false,
+    })
+    .await;
+    let path = live.rollout_path().context("main rollout")?;
+    live.submit(Op::Shutdown).await?;
+    wait_for_event(&live, |e| matches!(e, EventMsg::ShutdownComplete)).await;
+    // Crash after the non-regular task seeded the parent and handed it back, before
+    // the first ordinary admission. No subsequent user boundary owns this context.
+    let original = std::fs::read_to_string(&path)?;
+    let mut end = 0;
+    let mut cut = None;
+    let mut seeds = 0;
+    for line in original.split_inclusive('\n') {
+        end += line.len();
+        match serde_json::from_str::<codex_protocol::protocol::RolloutLine>(line)?.item {
+            RolloutItem::ContextSeed { .. } => seeds += 1,
+            RolloutItem::PostTurnCompletionReviewState(s)
+                if s["handoff"]["disposition"]["Started"].is_object() =>
+            {
+                cut = Some(end);
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(seeds, 1);
+    std::fs::write(
+        &path,
+        &original[..cut.context("claimed review before main send")?],
+    )?;
+    let resumed =
+        resume_conversation_for_server(&server, home.clone(), path.clone(), configure).await;
+    resumed.submit(Op::Continue).await?;
+    wait_for_event(&resumed, |e| match e {
+        EventMsg::Error(e) => panic!("{}", e.message),
+        EventMsg::TurnComplete(t) => t.last_agent_message.as_deref() == Some("Resumed."),
+        _ => false,
+    })
+    .await;
+    resumed.submit(Op::Shutdown).await?;
+    wait_for_event(&resumed, |e| matches!(e, EventMsg::ShutdownComplete)).await;
+    assert_eq!(
+        core_test_support::responses::model_post_count(&server).await?,
+        5
+    );
+    let sent = wire.requests();
+    assert_eq!(sent[3].input(), sent[4].input());
+    for (role, marker) in [
+        ("user", project.trim_end()),
+        ("user", "<environment_context>"),
+        ("developer", "<permissions instructions>"),
+    ] {
+        assert_eq!(
+            sent[4]
+                .message_input_texts(role)
+                .iter()
+                .filter(|t| t.contains(marker))
+                .count(),
+            1
+        );
+    }
+    assert_eq!(
+        read_rollout_lines(&path)
+            .into_iter()
+            .filter(|l| matches!(l.item, RolloutItem::ContextSeed { .. }))
+            .count(),
+        1
+    );
+    Ok(())
+}
+
 #[test_case::test_case(false, CompactionMode::Auto; "pause")]
 #[test_case::test_case(true, CompactionMode::Auto; "interrupt")]
 #[test_case::test_case(false, CompactionMode::Local; "local summary")]
@@ -2509,6 +2618,10 @@ async fn stopped_review_followup_survives_standalone_compaction_and_restart(
             configure_recovery_models(config);
             config.compaction_mode = mode;
         };
+        let project = "Compare the restored project evidence.";
+        let cwd = home.path().join("workspace");
+        std::fs::create_dir_all(&cwd)?;
+        std::fs::write(cwd.join("AGENTS.md"), project)?;
         let codex = new_conversation_for_server(&server, home.clone(), configure).await;
         submit_request(&codex, "Complete the original user scope.").await;
         wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
@@ -2528,10 +2641,29 @@ async fn stopped_review_followup_survives_standalone_compaction_and_restart(
         });
         let frame = followup_frame(&requests.requests()[2]).context("sampled review frame")?;
         let unary = if mode == CompactionMode::Unary {
-            let output = serde_json::json!({"output": [
-                {"type":"message","role":"developer","id":"server-echo","status":"completed","content":[{"type":"input_text","text":frame}]},
-                {"type":"compaction","encrypted_content":"summary"}
-            ]});
+            let mut echoed = requests.requests()[0]
+                .input()
+                .into_iter()
+                .filter(|i| {
+                    i["content"][0]["text"].as_str().is_some_and(|t| {
+                        [
+                            project,
+                            "<permissions instructions>",
+                            "<environment_context>",
+                        ]
+                        .iter()
+                        .any(|m| t.contains(m))
+                    })
+                })
+                .collect::<Vec<_>>();
+            for (i, item) in echoed.iter_mut().enumerate() {
+                item["id"] = serde_json::json!(format!("server-context-{i}"));
+            }
+            echoed.extend([
+                serde_json::json!({"type":"message","role":"developer","id":"server-echo","status":"completed","content":[{"type":"input_text","text":frame}]}),
+                serde_json::json!({"type":"compaction","encrypted_content":"summary"}),
+            ]);
+            let output = serde_json::json!({"output":echoed});
             Some(core_test_support::responses::mount_compact_json_once(&server, output).await)
         } else {
             None
@@ -2580,7 +2712,33 @@ async fn stopped_review_followup_survives_standalone_compaction_and_restart(
         let captured = requests.requests();
         assert_eq!(captured.len(), if unary.is_some() { 4 } else { 5 });
         let compact = unary.map_or_else(|| captured[3].clone(), |mock| mock.single_request());
+        let continued = captured.last().context("continued work")?;
         assert_eq!(followup_frame(&compact), Some(frame.clone()));
+        for marker in [
+            project,
+            "<permissions instructions>",
+            "<environment_context>",
+        ] {
+            let matched = |request: &ResponsesRequest| {
+                request
+                    .input()
+                    .into_iter()
+                    .filter(|item| {
+                        item["content"][0]["text"]
+                            .as_str()
+                            .is_some_and(|t| t.contains(marker))
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let original = matched(&captured[0]);
+            assert_eq!(original.len(), 1, "{marker}");
+            assert_eq!(matched(&compact), original, "source: {marker}");
+            assert_eq!(
+                matched(continued),
+                original,
+                "ordinary: {marker}, restart={restart}"
+            );
+        }
         let installed = read_rollout_lines(&path)
             .into_iter()
             .find_map(|line| match line.item {
@@ -2589,7 +2747,7 @@ async fn stopped_review_followup_survives_standalone_compaction_and_restart(
             })
             .context("durable replacement")?;
         assert!(!serde_json::to_string(&installed)?.contains("<completed_turn_review_context>"));
-        let input = serde_json::to_string(&captured.last().context("continued work")?.input())?;
+        let input = serde_json::to_string(&continued.input())?;
         for text in [
             "Complete the original user scope.",
             "Original complete answer.",
@@ -3161,15 +3319,14 @@ async fn durable_handoffs_recover_prepared_and_started_work_without_duplicate_ad
             "advisory_recorded": false,
         });
         state["replacement_answer_required"] = serde_json::json!(started);
-        // This is the durable boundary left by a process stopping before enqueue
-        // or immediately after the main task claimed the handoff.
-        let mut fixture = Vec::new();
+        // Claim is flushed before the main task can append its advisory. A cut
+        // after the item can therefore be missing only the admission snapshot.
+        let mut fixture = vec![RolloutItem::PostTurnCompletionReviewState(state)];
         if advisory_already_written {
             let item: ResponseItem =
                 codex_protocol::models::DeveloperInstructions::new(advisory).into();
             fixture.push(RolloutItem::ResponseItem(item));
         }
-        fixture.push(RolloutItem::PostTurnCompletionReviewState(state));
         append_crash_fixture(&path, fixture).await;
         let resumed =
             resume_conversation_for_server(&server, home.clone(), path.clone(), |_| {}).await;

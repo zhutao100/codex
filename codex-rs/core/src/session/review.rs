@@ -77,6 +77,8 @@ pub(super) async fn spawn_review_thread(
     let per_turn_config = Arc::new(per_turn_config);
 
     let review_turn_context = TurnContext {
+        sampled_controls: None,
+        verbosity: SampledVerbosity::for_request(&model_info, per_turn_config.model_verbosity),
         sub_id: sub_id.to_string(),
         config: Arc::clone(&per_turn_config),
         auth_manager: auth_manager_for_context,

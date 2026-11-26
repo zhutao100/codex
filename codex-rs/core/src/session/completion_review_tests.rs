@@ -1,11 +1,14 @@
 use super::*;
 use crate::completion_review::CompletionReviewReservationError;
 use crate::completion_review::CompletionReviewState;
+use crate::completion_review::ReviewAdvice;
 use crate::completion_review::ReviewHandoffDisposition;
 use crate::completion_review::ReviewInputInstallation;
 use crate::completion_review::ReviewPromptFrame;
 use crate::completion_review::ReviewPromptFrames;
 use crate::completion_review::ReviewRequestFrame;
+use crate::completion_review::ReviewSampling;
+use crate::completion_review::ReviewSamplingInput;
 use codex_protocol::models::ResponseInputItem;
 use pretty_assertions::assert_eq;
 use tokio::sync::Notify;
@@ -73,6 +76,246 @@ async fn completed_session() -> (Arc<Session>, Arc<TurnContext>) {
     )
     .await;
     (session, context)
+}
+
+async fn propose_first_review(
+    session: &Arc<Session>,
+    context: &Arc<TurnContext>,
+) -> (
+    Arc<ReviewFrameProposal>,
+    ReviewPromptFrames,
+    Vec<ResponseItem>,
+    ToolSurface,
+) {
+    let cancel = CancellationToken::new();
+    let ReviewAdvice::FirstSend(advice) = session
+        .admit_completion_review_advisory(context)
+        .await
+        .unwrap()
+    else {
+        panic!("expected pending advice")
+    };
+    let mut input = session.prompt_history(context).await;
+    input.push(advice.item.clone());
+    let tools = super::turn::compaction_tool_specs(session, context, &input, &cancel)
+        .await
+        .unwrap();
+    let ReviewSampling::FirstSend {
+        frames,
+        mandatory_alternative,
+    } = session
+        .review_sampling(ReviewSamplingInput {
+            items: &input,
+            advice: Some(&advice),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("expected proposed frame")
+    };
+    let mut projected = input.clone();
+    let index = frames.insert(&mut projected, None).unwrap();
+    let proposal = ReviewFrameProposal::new(
+        session,
+        context,
+        frames.clone(),
+        Some(advice.item),
+        index.zip(mandatory_alternative),
+    );
+    (proposal, frames, input, tools)
+}
+
+async fn commit_first_review(
+    session: &Arc<Session>,
+    context: &Arc<TurnContext>,
+) -> (ReviewPromptFrames, Vec<ResponseItem>, ToolSurface) {
+    let (proposal, frames, input, tools) = propose_first_review(session, context).await;
+    proposal.commit(0, i64::MAX, None).await.unwrap();
+    proposal.commit(0, i64::MAX, None).await.unwrap();
+    (frames, input, tools)
+}
+
+#[tokio::test]
+async fn no_input_replacement_seed_replays_at_one_rollout_boundary() {
+    let (session, context) = completed_session().await;
+    let (_home, path) = attach_recorder(&session, &context).await;
+    let summary = ResponseItem::Compaction {
+        encrypted_content: "summary".into(),
+    };
+    session
+        .replace_compacted_history(&context, vec![summary.clone()], None, String::new())
+        .await;
+    session
+        .seed_initial_context_if_needed(&context)
+        .await
+        .unwrap();
+    session
+        .seed_initial_context_if_needed(&context)
+        .await
+        .unwrap();
+    let (items, _, errors) = RolloutRecorder::load_rollout_items(&path).await.unwrap();
+    assert_eq!(errors, 0);
+    let seeds = items
+        .iter()
+        .enumerate()
+        .filter(|(_, i)| matches!(i, RolloutItem::ContextSeed { .. }))
+        .map(|(i, _)| i)
+        .collect::<Vec<_>>();
+    let [seed] = seeds[..] else {
+        panic!("expected exactly one canonical seed")
+    };
+    let mut expected = vec![summary];
+    let before = session
+        .reconstruct_history_from_rollout(&context, &items[..seed])
+        .await;
+    assert_eq!(
+        (before.history, before.reference_context_item),
+        (expected.clone(), None)
+    );
+    expected.extend(session.build_initial_context(&context).await);
+    let after = session
+        .reconstruct_history_from_rollout(&context, &items[..=seed])
+        .await;
+    assert_eq!(
+        (after.history, after.reference_context_item),
+        (expected, Some(context.to_turn_context_item()))
+    );
+    assert_eq!(after.previous_turn_settings, before.previous_turn_settings);
+}
+
+#[test_case::test_case(None; "refused first send leaves only outgoing work")]
+#[test_case::test_case(Some(false); "refused retry cannot shorten a dispatched full handoff")]
+#[test_case::test_case(Some(true); "fitting retry cannot expand a dispatched mandatory handoff")]
+#[tokio::test]
+async fn review_refusal_replays_the_correct_side_of_dispatch(mandatory: Option<bool>) {
+    let (session, context, _) = make_session_and_context_with_rx().await;
+    complete_new_request(
+        &session,
+        &context,
+        "Verify.",
+        &"Distinct initial reference.\n".repeat(130),
+    )
+    .await;
+    let (_home, path) = attach_recorder(&session, &context).await;
+    let claim = |advice: &'static str| async {
+        let ticket = session.begin_completion_review(false).await.unwrap();
+        assert!(
+            session
+                .prepare_completion_review_handoff(
+                    &ticket,
+                    advice.into(),
+                    context.model_info.slug.clone()
+                )
+                .await
+        );
+        session
+            .claim_completion_review_handoff(&ticket.attempt_id, &context.sub_id, false)
+            .await
+            .unwrap();
+    };
+    claim("First advice.").await;
+    let (outgoing, _, _) = commit_first_review(&session, &context).await;
+    assert!(
+        session
+            .start_completion_review_main_task(&context.sub_id, &context)
+            .await
+    );
+    session
+        .record_conversation_items(&context, &[assistant_message("Another candidate.")])
+        .await;
+    session
+        .capture_completed_regular_turn_for_review(&context, Some("Another candidate."))
+        .await;
+    claim("Second advice.").await;
+    let advice = session
+        .state
+        .lock()
+        .await
+        .completion_review
+        .handoff
+        .as_ref()
+        .unwrap()
+        .advisory_item();
+    let (proposal, frames, input, _) = propose_first_review(&session, &context).await;
+    assert_eq!(frames.0[..frames.0.len() - 1], outgoing.0);
+    let mut expected = input.clone();
+    if let Some(short) = mandatory {
+        let mut preferred = input.clone();
+        let index = frames.insert(&mut preferred, None).unwrap().unwrap();
+        expected = preferred.clone();
+        let cost = 1_000 + frames.tokens();
+        proposal
+            .admit(cost, cost - i64::from(short), &mut expected, None)
+            .await
+            .unwrap();
+        assert_eq!(expected[index] != preferred[index], short);
+        let mut retry = preferred;
+        let result = proposal
+            .admit(
+                cost,
+                if short { cost + 1 } else { cost - 1 },
+                &mut retry,
+                None,
+            )
+            .await;
+        if short {
+            result.unwrap();
+            assert_eq!(retry, expected);
+        } else {
+            assert!(matches!(
+                result,
+                Err(CodexErr::ReviewPayloadExceeded { .. })
+            ));
+        }
+    } else {
+        outgoing.insert(&mut expected, None).unwrap();
+    }
+    proposal
+        .defer_refused(&context, None, &CancellationToken::new())
+        .await
+        .unwrap();
+    if mandatory.is_none() {
+        let saved = session
+            .state
+            .lock()
+            .await
+            .completion_review
+            .deferred_capture_source
+            .clone();
+        let rebound = session
+            .turn_context_with_model(&context, "other-work-model")
+            .await
+            .unwrap();
+        proposal
+            .defer_refused(&rebound, None, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            session
+                .state
+                .lock()
+                .await
+                .completion_review
+                .deferred_capture_source,
+            saved
+        );
+    }
+    let (items, _, errors) = RolloutRecorder::load_rollout_items(&path).await.unwrap();
+    assert_eq!(errors, 0);
+    let replay = session
+        .reconstruct_history_from_rollout(&context, &items)
+        .await;
+    let review = replay.completion_review.unwrap();
+    let dispatched = mandatory.is_some();
+    assert_eq!(review.defer_new_prompt_frame, !dispatched);
+    let mut recovered = input;
+    review.prompt_frames.insert(&mut recovered, None).unwrap();
+    assert_eq!(recovered, expected);
+    assert_eq!(review.handoff.unwrap().advisory_recorded, dispatched);
+    assert_eq!(
+        replay.history.iter().filter(|i| **i == advice).count(),
+        usize::from(dispatched)
+    );
 }
 
 #[tokio::test]
@@ -146,7 +389,7 @@ fn metadata(state: &CompletionReviewState) -> RolloutItem {
     RolloutItem::PostTurnCompletionReviewState(serde_json::to_value(state).unwrap())
 }
 
-async fn attach_recorder(
+pub(in crate::session) async fn attach_recorder(
     session: &Arc<Session>,
     context: &TurnContext,
 ) -> (tempfile::TempDir, PathBuf) {
@@ -173,6 +416,89 @@ async fn attach_recorder(
     let path = recorder.rollout_path().to_path_buf();
     *session.services.rollout.lock().await = Some(recorder);
     (home, path)
+}
+
+#[tokio::test]
+async fn replay_attributes_identical_advice_to_its_own_append() {
+    let (session, context) = completed_session().await;
+    let (_home, path) = attach_recorder(&session, &context).await;
+    let ticket = session.begin_completion_review(false).await.unwrap();
+    let text = "Check the evidence again.";
+    assert!(
+        session
+            .prepare_completion_review_handoff(
+                &ticket,
+                text.into(),
+                context.model_info.slug.clone()
+            )
+            .await
+    );
+    let identical = ResponseItem::from(DeveloperInstructions::new(text));
+    session
+        .record_conversation_items(&context, std::slice::from_ref(&identical))
+        .await;
+    session
+        .claim_completion_review_handoff(&ticket.attempt_id, &context.sub_id, false)
+        .await
+        .unwrap();
+    session.flush_rollout().await;
+    let (items, _, errors) = RolloutRecorder::load_rollout_items(&path).await.unwrap();
+    assert_eq!(errors, 0);
+    let replay = session
+        .reconstruct_history_from_rollout(&context, &items)
+        .await;
+    assert_eq!(replay.history.last(), Some(&identical));
+    assert!(
+        !replay
+            .completion_review
+            .as_ref()
+            .unwrap()
+            .handoff
+            .as_ref()
+            .unwrap()
+            .advisory_recorded
+    );
+    session.replace_with_reconstructed_rollout(replay).await;
+    commit_first_review(&session, &context).await;
+    assert_eq!(
+        session
+            .prompt_history(&context)
+            .await
+            .iter()
+            .filter(|item| **item == identical)
+            .count(),
+        2
+    );
+    // A later interrupt and repeated stale metadata cannot turn the owned write
+    // back into a pending advisory, or confer ownership on the earlier copy.
+    session.flush_rollout().await;
+    let (mut written, _, errors) = RolloutRecorder::load_rollout_items(&path).await.unwrap();
+    assert_eq!(errors, 0);
+    let append = written
+        .iter()
+        .rposition(|i| matches!(i, RolloutItem::ResponseItem(item) if item == &identical))
+        .unwrap();
+    written.truncate(append + 1);
+    written.push(RolloutItem::ResponseItem(user_message(
+        "<turn_aborted>\nInterrupted.\n</turn_aborted>",
+    )));
+    let stale = items
+        .iter()
+        .rev()
+        .find(|i| matches!(i, RolloutItem::PostTurnCompletionReviewState(_)))
+        .unwrap();
+    written.push(stale.clone());
+    let replay = session
+        .reconstruct_history_from_rollout(&context, &written)
+        .await;
+    assert!(
+        replay
+            .completion_review
+            .unwrap()
+            .handoff
+            .unwrap()
+            .advisory_recorded
+    );
 }
 
 #[tokio::test]
@@ -400,16 +726,80 @@ async fn completion_review_late_input_remains_unreviewed_until_consumed() {
     assert_eq!(episode.final_agent_message, "answer including amendment");
 }
 
-#[test_case::test_case(0, None; "unmeasured exact advice")]
-#[test_case::test_case(1, None; "unmeasured advice one over")]
-#[test_case::test_case(0, Some(true); "schemas shrink to exact fit")]
-#[test_case::test_case(1, Some(false); "schemas grow one over")]
 #[tokio::test]
-async fn review_admission_charges_resolved_tool_schemas(overflow: i64, shrink: Option<bool>) {
+async fn only_unavoidable_previous_notes_count_in_the_checkpoint_floor() {
     let (session, mut context) = completed_session().await;
     let ctx = Arc::get_mut(&mut context).unwrap();
+    ctx.provider = crate::ModelProviderInfo::create_openai_provider();
+    ctx.model_info.context_window = Some(64_000);
+    ctx.model_info.auto_compact_token_limit = Some(20_000);
+    ctx.model_info.effective_context_window_percent = 100;
+    Arc::make_mut(&mut ctx.config).compaction_mode = crate::config::types::CompactionMode::Auto;
+    let ticket = session.begin_completion_review(false).await.unwrap();
+    assert!(
+        session
+            .prepare_completion_review_handoff(
+                &ticket,
+                "Verify.".into(),
+                ctx.model_info.slug.clone()
+            )
+            .await
+    );
+    session
+        .claim_completion_review_handoff(&ticket.attempt_id, "main", false)
+        .await
+        .unwrap();
+    session
+        .record_conversation_items(
+            ctx,
+            &[compact::preserved_work_notes_message(
+                &"Recorded note.\n".repeat(6_000),
+            )],
+        )
+        .await;
+    let cancel = CancellationToken::new();
+    session
+        .check_review_handoff_floor(ctx, ctx, &cancel)
+        .await
+        .unwrap();
+    ctx.final_output_json_schema = Some(serde_json::json!({"type":"object"}));
+    let error = session
+        .check_review_handoff_floor(ctx, ctx, &cancel)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("19999-token context target"),
+        "{error}"
+    );
+}
+
+#[test_case::test_case(0, None, None, true; "unmeasured exact advice")]
+#[test_case::test_case(1, None, None, true; "unmeasured advice one over")]
+#[test_case::test_case(0, None, None, false; "login alone cannot place unmeasured advice")]
+#[test_case::test_case(0, Some(true), None, true; "schemas shrink to exact fit")]
+#[test_case::test_case(1, Some(false), None, true; "schemas grow one over")]
+#[test_case::test_case(1, Some(false), Some(false), true; "one token of measured credit admits advice on a fixed route")]
+#[test_case::test_case(1, Some(false), Some(false), false; "positive receipt alone cannot place advice")]
+#[test_case::test_case(1, Some(false), Some(true), true; "the same credit cannot commit advice across a login switch")]
+#[tokio::test]
+async fn review_admission_charges_resolved_tool_schemas(
+    overflow: i64,
+    shrink: Option<bool>,
+    variable_route: Option<bool>,
+    sampled_route_known: bool,
+) {
+    let (session, mut context) = completed_session().await;
+    let ctx = Arc::get_mut(&mut context).unwrap();
+    if let Some(variable) = variable_route {
+        ctx.provider = crate::ModelProviderInfo::create_openai_provider();
+        ctx.provider.base_url = (!variable).then(|| "http://localhost/fixed".to_string());
+    }
     ctx.model_info.context_window = Some(40_000);
     ctx.model_info.effective_context_window_percent = 100;
+    // The boundary under test is recoverable: the schemas fit once old work is gone.
+    session
+        .record_conversation_items(ctx, &[assistant_message(&"older work ".repeat(4_000))])
+        .await;
     ctx.dynamic_tools.push(DynamicToolSpec {
         name: "schema_probe".into(),
         description: String::new(),
@@ -454,28 +844,37 @@ async fn review_admission_charges_resolved_tool_schemas(overflow: i64, shrink: O
         - crate::context_manager::estimate_item_token_count(&advice)
         + overflow;
     assert!(extra > 1_000);
-    if let Some(shrink) = shrink {
-        if shrink {
-            ctx.dynamic_tools.last_mut().unwrap().description =
-                "a".repeat(4 * (extra as usize + 2000));
-        }
-        let tools = super::turn::compaction_tool_specs(&session, ctx, &items, &cancel)
+    if shrink == Some(true) {
+        ctx.dynamic_tools.last_mut().unwrap().description = "a".repeat(4 * (extra as usize + 2000));
+    }
+    let tools = super::turn::compaction_tool_specs(&session, ctx, &items, &cancel)
+        .await
+        .unwrap();
+    let total = work + tools.tokens() - i64::from(variable_route.is_some());
+    let prompt = Prompt {
+        input: items.clone(),
+        base_instructions: base.clone(),
+        tools,
+        ..Default::default()
+    };
+    let sampled_route = ctx.current_endpoint().filter(|_| sampled_route_known);
+    assert!(
+        session
+            .finish_ordinary_input(ctx, &prompt, sampled_route.as_deref())
             .await
-            .unwrap();
-        let total = work + tools.tokens();
-        let prompt = Prompt {
-            base_instructions: base,
-            tools,
-            ..Default::default()
-        };
+    );
+    if shrink.is_some() {
         session
             .update_token_usage_info_with_request_context(
                 ctx,
-                Some(&TokenUsage {
-                    input_tokens: total,
-                    total_tokens: total,
-                    ..Default::default()
-                }),
+                ResponseUsage {
+                    tokens: Some(&TokenUsage {
+                        input_tokens: total,
+                        total_tokens: total,
+                        ..Default::default()
+                    }),
+                    endpoint: ctx.current_endpoint().as_deref(),
+                },
                 0,
                 true,
                 items.len(),
@@ -484,26 +883,31 @@ async fn review_admission_charges_resolved_tool_schemas(overflow: i64, shrink: O
             .await;
     }
     ctx.dynamic_tools.last_mut().unwrap().description = "a".repeat(4 * extra as usize);
+    let (proposal, frames, mut input, tools) = propose_first_review(&session, &context).await;
+    frames.insert(&mut input, None).unwrap();
+    let prompt = Prompt {
+        input: input.clone(),
+        tools,
+        base_instructions: base,
+        ..Default::default()
+    };
+    let admit = session
+        .ordinary_review_admission(&context, &prompt, frames.tokens(), Some(proposal.clone()))
+        .await;
+    let Err(CodexErr::ReviewPayloadExceeded { endpoint, .. }) = admit
+        .admit(&prompt, &mut input, context.current_endpoint().as_deref())
+        .await
+    else {
+        panic!("ordinary request must be refused at dispatch")
+    };
+    proposal
+        .defer_refused(&context, endpoint, &cancel)
+        .await
+        .unwrap();
     assert_eq!(
-        session
-            .admit_completion_review_advisory(&context, &context, true, &cancel)
-            .await
-            .unwrap(),
-        overflow == 0
+        session.prompt_history(&context).await.contains(&advice),
+        sampled_route_known && (overflow == 0 || variable_route == Some(false))
     );
-    if overflow == 0 {
-        let input = session.prompt_history(&context).await;
-        assert_eq!(input.last(), Some(&advice));
-        assert!(matches!(
-            session
-                .review_sampling(&context, &context, &input, fixed + extra, true, &cancel)
-                .await
-                .unwrap(),
-            crate::completion_review::ReviewSampling::Compact
-        ));
-    } else {
-        assert!(!session.prompt_history(&context).await.contains(&advice));
-    }
     let state = session.state.lock().await;
     assert!(state.completion_review.prompt_frames.is_empty());
     assert!(state.completion_review.defer_new_prompt_frame);
@@ -539,24 +943,7 @@ async fn pinned_review_accounts_for_only_the_instruction_delta(grow: bool) {
         .claim_completion_review_handoff(&ticket.attempt_id, "main", false)
         .await
         .unwrap();
-    let cancel = CancellationToken::new();
-    assert!(
-        session
-            .admit_completion_review_advisory(&context, &context, false, &cancel)
-            .await
-            .unwrap()
-    );
-    let input = session.prompt_history(&context).await;
-    let tools = super::turn::compaction_tool_specs(&session, &context, &input, &cancel)
-        .await
-        .unwrap();
-    let crate::completion_review::ReviewSampling::Ready(frames) = session
-        .review_sampling(&context, &context, &input, tools.tokens(), true, &cancel)
-        .await
-        .unwrap()
-    else {
-        panic!("expected admitted frame")
-    };
+    let (frames, input, tools) = commit_first_review(&session, &context).await;
     let tokens = 40_000 - 8_192 + if grow { -1 } else { 1 };
     let prompt = Prompt {
         base_instructions: session.get_base_instructions_for_turn(&context).await,
@@ -566,11 +953,14 @@ async fn pinned_review_accounts_for_only_the_instruction_delta(grow: bool) {
     session
         .update_token_usage_info_with_request_context(
             &context,
-            Some(&TokenUsage {
-                input_tokens: tokens,
-                total_tokens: tokens,
-                ..Default::default()
-            }),
+            ResponseUsage {
+                tokens: Some(&TokenUsage {
+                    input_tokens: tokens,
+                    total_tokens: tokens,
+                    ..Default::default()
+                }),
+                endpoint: context.current_endpoint().as_deref(),
+            },
             frames.tokens(),
             true,
             input.len(),
@@ -579,17 +969,35 @@ async fn pinned_review_accounts_for_only_the_instruction_delta(grow: bool) {
         .await;
     Arc::make_mut(&mut Arc::get_mut(&mut context).unwrap().config).base_instructions =
         Some(base(grow));
-    match session
-        .review_sampling(&context, &context, &input, tools.tokens(), true, &cancel)
+    let ReviewSampling::Ready(ready) = session
+        .review_sampling(ReviewSamplingInput {
+            items: &input,
+            advice: None,
+        })
         .await
         .unwrap()
-    {
-        crate::completion_review::ReviewSampling::Ready(ready) => {
-            assert!(!grow);
-            assert_eq!(ready, frames);
-        }
-        crate::completion_review::ReviewSampling::Compact => assert!(grow),
-    }
+    else {
+        panic!("already sent")
+    };
+    assert_eq!(ready, frames);
+    let mut items = input;
+    frames.insert(&mut items, None).unwrap();
+    let prompt = Prompt {
+        input: items.clone(),
+        tools,
+        base_instructions: session.get_base_instructions_for_turn(&context).await,
+        ..Default::default()
+    };
+    let admit = session
+        .ordinary_review_admission(&context, &prompt, frames.tokens(), None)
+        .await;
+    assert_eq!(
+        admit
+            .admit(&prompt, &mut items, context.current_endpoint().as_deref())
+            .await
+            .is_ok(),
+        !grow
+    );
 }
 
 #[tokio::test]
@@ -646,17 +1054,13 @@ async fn completion_review_handoff_is_claimed_once_and_survives_compaction() {
     assert!(prompt.contains("original request"));
     assert!(prompt.contains(" initial complete answer\n"));
     assert!(prompt.contains("advisory plus replacement contract"));
-    assert!(
+    commit_first_review(&session, &context).await;
+    assert_eq!(
         session
-            .admit_completion_review_advisory(&context, &context, false, &CancellationToken::new())
+            .admit_completion_review_advisory(&context)
             .await
-            .expect("admit advice")
-    );
-    assert!(
-        session
-            .admit_completion_review_advisory(&context, &context, false, &CancellationToken::new())
-            .await
-            .expect("admit advice")
+            .expect("admit advice"),
+        ReviewAdvice::Recorded
     );
     assert_eq!(
         session
@@ -1550,21 +1954,16 @@ impl SessionTask for ReviewInstallationTask {
         _input: Vec<UserInput>,
         _cancellation: CancellationToken,
     ) -> Option<String> {
+        let session = session.clone_session();
+        let proposal = if self.main {
+            Some(propose_first_review(&session, &context).await.0)
+        } else {
+            None
+        };
         self.ready.notify_one();
         self.enter.notified().await;
-        let session = session.clone_session();
-        if self.main {
-            assert!(
-                session
-                    .admit_completion_review_advisory(
-                        &context,
-                        &context,
-                        false,
-                        &CancellationToken::new()
-                    )
-                    .await
-                    .expect("admit advice")
-            );
+        if let Some(proposal) = proposal {
+            proposal.commit(0, i64::MAX, None).await.unwrap();
         } else {
             session
                 .prepare_completion_review_handoff(

@@ -9,9 +9,9 @@ use crate::client_common::ResponseEvent;
 use crate::client_common::ResponseStream;
 use crate::compact::CompactionContext;
 use crate::compact::InitialContextInjection;
+use crate::compact::SentCompactInput;
 use crate::compact::insert_initial_context_before_last_real_user_message;
 use crate::compact::preserved_work_notes_message;
-use crate::compact_remote::trim_function_call_history_to_fit_context_window;
 use crate::context_manager::estimate_item_token_count;
 use crate::error::CodexErr;
 use crate::error::Result as CodexResult;
@@ -125,12 +125,15 @@ async fn run_compact(
         .source_history
         .for_prompt_with_modalities(&turn_context.model_info.input_modalities);
     let base_instructions = sess.get_base_instructions_for_turn(turn_context).await;
-    let tools = match &client_session.sampling_tools {
-        Some((model, tools)) if model == &turn_context.model_info.slug => tools.clone(),
-        _ => compaction_tool_specs(sess, turn_context, &input, cancellation_token).await?,
+    let tools = match &context.notes_tools {
+        Some(tools) => tools.clone(),
+        None => compaction_tool_specs(sess, turn_context, &input, cancellation_token).await?,
     };
-    let mut prompt = Prompt {
+    let prompt = Prompt {
         input,
+        verbosity: Some(turn_context.verbosity),
+        sampled_controls: turn_context.sampled_controls.clone(),
+        helper_fit: Some(context.v2_fit()),
         parallel_tool_calls: turn_context.model_info.supports_parallel_tool_calls,
         base_instructions,
         personality: turn_context.personality,
@@ -138,21 +141,12 @@ async fn run_compact(
         ..Default::default()
     }
     .with_tools(tools);
-    let adjustment = context.source_fit.adjustment(&prompt.tools);
-    let (rewritten_outputs, estimated_deleted_tokens) =
-        trim_function_call_history_to_fit_context_window(
-            &mut prompt.input,
-            source_token_limit(turn_context),
-            &prompt.base_instructions,
-            adjustment,
-        );
-    prompt.input.push(ResponseItem::CompactionTrigger {});
     let metadata = compaction_metadata(
         turn_context.resolve_turn_metadata_header().await.as_deref(),
         reason,
         injection,
     );
-    let output = request_compaction(
+    let (output, sent) = request_compaction(
         sess,
         context,
         client_session,
@@ -161,7 +155,11 @@ async fn run_compact(
         cancellation_token,
     )
     .await?;
-    prompt.input.pop();
+    let SentCompactInput {
+        items,
+        rewritten_outputs,
+        estimated_deleted_tokens,
+    } = sent;
 
     // Reserve canonical context even for standalone/pre-turn compaction: the
     // next normal request seeds it. Count notes and tools outside retention.
@@ -175,25 +173,64 @@ async fn run_compact(
     let replacement_instructions = sess
         .get_base_instructions_for_turn(replacement_context)
         .await;
-    let replacement_tools = if Arc::ptr_eq(turn_context, replacement_context) {
-        prompt.tools.clone()
-    } else {
-        compaction_tool_specs(sess, replacement_context, &prompt.input, cancellation_token).await?
+    let fixed = fixed_context_tokens(&initial_context, &replacement_instructions.text)
+        .saturating_add(history::retained_tokens(&output.item))
+        .saturating_add(notes_item.as_ref().map_or(0, history::retained_tokens));
+    let review_limit = sess.replacement_review_limit(replacement_context).await?;
+    let budget_for = |fixed| -> CodexResult<usize> {
+        let install = retention_budget(
+            fixed,
+            replacement_context.model_context_window(),
+            replacement_context.model_info.auto_compact_token_limit(),
+        )?;
+        Ok(review_limit.map_or(install, |limit| install.min(limit.saturating_sub(fixed))))
     };
-    let fixed_tokens = initial_context
-        .iter()
-        .chain(std::iter::once(&output.item))
-        .chain(notes_item.iter())
-        .map(history::retained_tokens)
-        .sum::<usize>()
-        .saturating_add(approx_token_count(&replacement_instructions.text))
-        .saturating_add(replacement_tools.tokens() as usize);
-    let budget = retention_budget(
-        fixed_tokens,
-        replacement_context.model_context_window(),
-        replacement_context.model_info.auto_compact_token_limit(),
-    )?;
-    let mut replacement = history::retain_messages(&prompt.input, budget);
+    // Only retained user messages can add transcript-selected connectors. Start with
+    // the mandatory surface, not the (possibly larger) outgoing helper's schemas.
+    let minimum = fixed.saturating_add(
+        compaction_tool_specs(
+            sess,
+            replacement_context,
+            &initial_context,
+            cancellation_token,
+        )
+        .await?
+        .tokens() as usize,
+    );
+    let mut fixed_tokens = minimum;
+    let mut replacement = history::retain_messages(&items, budget_for(minimum)?);
+    if replacement_context
+        .features
+        .enabled(crate::features::Feature::Apps)
+    {
+        // Recheck once if truncation changes a textual mention. The empty selection
+        // is always feasible when an optional connector costs more than all headroom.
+        for resized in [false, true] {
+            if replacement.is_empty() {
+                break;
+            }
+            let cost = fixed.saturating_add(
+                compaction_tool_specs(sess, replacement_context, &replacement, cancellation_token)
+                    .await?
+                    .tokens() as usize,
+            );
+            let available = budget_for(cost).unwrap_or(0);
+            if replacement
+                .iter()
+                .map(history::retained_tokens)
+                .sum::<usize>()
+                <= available
+            {
+                fixed_tokens = cost;
+                break;
+            }
+            replacement = if resized {
+                Vec::new()
+            } else {
+                history::retain_messages(&items, available)
+            };
+        }
+    }
     let retained_tokens = replacement
         .iter()
         .map(history::retained_tokens)
@@ -270,21 +307,32 @@ async fn install_compacted_history(
     Ok(())
 }
 
+pub(crate) fn fixed_context_tokens(initial_context: &[ResponseItem], base: &str) -> usize {
+    initial_context
+        .iter()
+        .map(history::retained_tokens)
+        .sum::<usize>()
+        .saturating_add(approx_token_count(base))
+}
+
+pub(crate) fn installation_target(window: Option<i64>, auto_limit: Option<i64>) -> Option<usize> {
+    window
+        .filter(|limit| *limit > 0)
+        .into_iter()
+        .chain(auto_limit.filter(|limit| *limit > 0).map(|limit| limit - 1))
+        .min()
+        .map(|limit| usize::try_from(limit).unwrap_or(usize::MAX))
+}
+
 fn retention_budget(
     fixed_tokens: usize,
     window: Option<i64>,
     auto_limit: Option<i64>,
 ) -> CodexResult<usize> {
-    let target = window
-        .filter(|limit| *limit > 0)
-        .into_iter()
-        .chain(auto_limit.filter(|limit| *limit > 0).map(|limit| limit - 1))
-        .min()
-        .map(|limit| usize::try_from(limit).unwrap_or(usize::MAX));
-    if let Some(target) = target {
+    if let Some(target) = installation_target(window, auto_limit) {
         if fixed_tokens > target {
             return Err(CodexErr::Fatal(format!(
-                "Compaction summary, notes, instructions and tools need about {fixed_tokens} tokens, exceeding the {target}-token context target; use a larger context window"
+                "Compaction summary, notes, instructions and tools need about {fixed_tokens} tokens, exceeding the {target}-token context target; increase the limiting context window or automatic compaction threshold"
             )));
         }
         return Ok(history::RETAINED_MESSAGE_TOKEN_BUDGET.min(target - fixed_tokens));
@@ -348,7 +396,7 @@ async fn request_compaction(
     prompt: &Prompt,
     metadata: &str,
     token: &CancellationToken,
-) -> CodexResult<CompactionOutput> {
+) -> CodexResult<(CompactionOutput, SentCompactInput)> {
     let context = source.request;
     client.cache_operation = crate::client::CacheOperation::Compact;
     client.cache_attempt = 0;
@@ -357,7 +405,7 @@ async fn request_compaction(
     loop {
         client.cache_attempt += 1;
         let attempt = async {
-            let stream = client
+            let mut stream = client
                 .stream(
                     prompt,
                     &context.model_info,
@@ -368,8 +416,19 @@ async fn request_compaction(
                     Some(metadata),
                 )
                 .await?;
-            collect_compaction_output(sess, context, stream, source.review_frame_tokens(), prompt)
-                .await
+            let sent = stream
+                .compact_input
+                .take()
+                .ok_or_else(|| CodexErr::Fatal("Missing fitted compact input".into()))?;
+            let output = collect_compaction_output(
+                sess,
+                context,
+                stream,
+                source.review_frame_tokens(),
+                prompt,
+            )
+            .await?;
+            Ok((output, sent))
         };
         let error = tokio::select! {
             biased;
@@ -447,7 +506,7 @@ async fn collect_compaction_output(
             } => {
                 sess.update_token_usage_info_with_request_context(
                     context,
-                    token_usage.as_ref(),
+                    stream.usage(token_usage.as_ref()),
                     frame_tokens,
                     server_reasoning_included,
                     0,

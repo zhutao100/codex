@@ -145,7 +145,6 @@ async fn measured_text_only_image_reserves_notes_headroom_on_the_actual_projecti
             28_900 + wire_tokens(&compact)? + wire_tokens(&json!({"type":"compaction_trigger"}))?;
         for (window, fits) in [(full_window, true), (full_window - 1, false)] {
             std::fs::write(&path, &raw[..after_output])?;
-            let server = responses::start_mock_server().await;
             let wire = responses::mount_sse_sequence(&server, replies[1..].to_vec()).await;
             let active = build()
                 .with_config(move |cfg| cfg.model_context_window = Some(window))
@@ -209,7 +208,6 @@ async fn measured_text_only_image_reserves_notes_headroom_on_the_actual_projecti
             prefix.push('\n');
         }
         std::fs::write(&path, prefix)?;
-        let server = responses::start_mock_server().await;
         let wire = responses::mount_sse_sequence(&server, replies[1..].to_vec()).await;
         let active = build()
             .resume(&server, original.home.clone(), path.clone())
@@ -335,7 +333,6 @@ async fn notes_retry_refits_recorded_hosted_output_at_the_headroom_boundary(
     let path = original.codex.rollout_path().unwrap();
     let raw = std::fs::read_to_string(&path)?;
     std::fs::write(&path, &raw[..cut_after_output(&raw, "capture")?])?;
-    let server = responses::start_mock_server().await;
     let resumed = responses::mount_sse_sequence(&server, replies[3..].to_vec()).await;
     let active = build().resume(&server, original.home.clone(), path).await?;
     active.codex.submit(Op::Continue).await?;
@@ -428,7 +425,6 @@ async fn partial_ordinary_batch_keeps_known_results_and_their_recorded_policy_on
         let kept = &ids[..=index];
         let missing = &ids[index + 1..];
         std::fs::write(&path, &prefix[..cut_after_output(&prefix, id)?])?;
-        let server = responses::start_mock_server().await;
         let resumed = responses::mount_sse_sequence(&server, replies[1..].to_vec()).await;
         // Missing admission metadata would shorten known results on the following restart.
         let active = builder(cwd.path(), window, TruncationPolicyConfig::bytes(320))

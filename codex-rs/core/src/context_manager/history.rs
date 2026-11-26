@@ -15,10 +15,18 @@ use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::InputModality;
+use codex_protocol::protocol::MeasuredInputSurface;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TokenUsageInfo;
 use codex_protocol::protocol::TurnContextItem;
 use std::ops::Deref;
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct UsageSource<'a> {
+    pub(crate) model: &'a str,
+    pub(crate) provider: &'a str,
+    pub(crate) endpoint: Option<&'a str>,
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct HelperProjection {
@@ -117,6 +125,8 @@ impl ProjectionCost {
 pub(crate) struct WorkNotesBaseline {
     index: usize,
     model: String,
+    provider: String,
+    endpoint: String,
     // [images][structured shell outputs]. Each mode respects the receipt's input floor.
     work: [[i64; 2]; 2],
     items: ProjectionCost,
@@ -164,6 +174,7 @@ pub(crate) struct ContextManager {
     pub(crate) measured_base_tokens: Option<i64>,
     pub(crate) measured_tool_tokens: Option<i64>,
     token_info: Option<TokenUsageInfo>,
+    pub(crate) measured_surface: Option<MeasuredInputSurface>,
     source_model: Option<String>,
     /// Items at this index and later are not covered by the stored usage baseline.
     last_usage_item_count: usize,
@@ -185,6 +196,7 @@ impl ContextManager {
             measured_base_tokens: None,
             measured_tool_tokens: None,
             token_info: TokenUsageInfo::new_or_append(&None, &None, None),
+            measured_surface: None,
             source_model: None,
             last_usage_item_count: 0,
             request_context_tokens: 0,
@@ -216,6 +228,7 @@ impl ContextManager {
     ) {
         self.token_info = info;
         self.source_model = None;
+        self.measured_surface = None;
         self.last_usage_item_count = covered_item_count.min(self.items.len());
         self.original_covered_cost = if self.last_usage_item_count == 0 {
             ProjectionCost::default()
@@ -237,12 +250,23 @@ impl ContextManager {
         self.request_context_tokens
     }
 
-    pub(crate) fn mark_measured_projection(&mut self, projection: HelperProjection) {
+    pub(crate) fn mark_measured_projection(
+        &mut self,
+        provider: &str,
+        endpoint: Option<&str>,
+        projection: HelperProjection,
+    ) {
         let plain = self
             .original_covered_cost
             .get(HelperProjection::plain(projection.images));
         self.measured_item_tokens = Some(plain);
         self.measured_format_delta = Some(self.original_covered_cost.get(projection) - plain);
+        self.measured_surface = Some(MeasuredInputSurface {
+            provider: provider.to_owned(),
+            endpoint_sha256: endpoint.map(str::to_owned),
+            images: projection.images,
+            structured_outputs: projection.structured_outputs,
+        });
     }
 
     pub(crate) fn base_delta(&self, base: &BaseInstructions) -> i64 {
@@ -251,6 +275,27 @@ impl ContextManager {
 
     pub(crate) fn usage_source_model(&self) -> Option<&str> {
         self.source_model.as_deref()
+    }
+
+    /// After a capture marker, only the frozen pre-marker receipt describes the sibling work.
+    pub(crate) fn work_receipt_source(&self, marker: Option<usize>) -> Option<UsageSource<'_>> {
+        if let Some(index) = marker {
+            let frozen = self
+                .work_notes_baseline
+                .as_ref()
+                .filter(|b| b.index == index)?;
+            return Some(UsageSource {
+                model: &frozen.model,
+                provider: &frozen.provider,
+                endpoint: Some(&frozen.endpoint),
+            });
+        }
+        let surface = self.measured_surface.as_ref()?;
+        Some(UsageSource {
+            model: self.usage_source_model()?,
+            provider: &surface.provider,
+            endpoint: Some(surface.endpoint_sha256.as_deref()?),
+        })
     }
 
     pub(crate) fn set_measured_context(&mut self, tokens: i64, source_model: Option<String>) {
@@ -269,16 +314,16 @@ impl ContextManager {
     /// which reasoning is rendered, so do not extrapolate across an unmeasured one.
     pub(crate) fn helper_tokens_from_usage(
         &self,
-        model: &str,
+        source: UsageSource<'_>,
         reasoning_included: bool,
         projection: HelperProjection,
     ) -> Option<i64> {
-        self.projected_work_usage(model, reasoning_included, projection, WorkBudget::Helper)
+        self.projected_work_usage(source, reasoning_included, projection, WorkBudget::Helper)
     }
 
     pub(crate) fn review_transcript_tokens(
         &self,
-        model: &str,
+        source: UsageSource<'_>,
         base: &BaseInstructions,
         reasoning_included: bool,
         projection: HelperProjection,
@@ -286,7 +331,7 @@ impl ContextManager {
         self.measured_base_tokens?;
         let tools = self.measured_tool_tokens?;
         Some(
-            self.projected_work_usage(model, reasoning_included, projection, WorkBudget::Review)?
+            self.projected_work_usage(source, reasoning_included, projection, WorkBudget::Review)?
                 .saturating_add(self.base_delta(base))
                 .saturating_sub(tools),
         )
@@ -294,7 +339,7 @@ impl ContextManager {
 
     fn projected_work_usage(
         &self,
-        model: &str,
+        source: UsageSource<'_>,
         reasoning_included: bool,
         projection: HelperProjection,
         budget: WorkBudget,
@@ -313,28 +358,40 @@ impl ContextManager {
                     .max(0)
             });
         }
-        if self.usage_source_model() != Some(model) {
+        let surface = self.measured_surface.as_ref()?;
+        if self.usage_source_model() != Some(source.model)
+            || surface.provider != source.provider
+            || surface.endpoint_sha256.as_deref()? != source.endpoint?
+        {
             return None;
         }
-        let tail = self.uncovered_cost().get(projection);
-        let retained = self.total_item_tokens.get(projection).saturating_sub(tail);
+        let previous_projection = HelperProjection {
+            images: surface.images,
+            structured_outputs: surface.structured_outputs,
+        };
+        let uncovered = self.uncovered_cost();
+        let tail = uncovered.get(projection);
+        let retained = self.total_item_tokens.sub(uncovered);
+        let retained_then = retained.get(previous_projection);
+        let projection_change = retained.get(projection).saturating_sub(retained_then);
         let measured = self
             .measured_item_tokens
             .unwrap_or(
                 self.original_covered_cost
-                    .get(HelperProjection::plain(projection.images)),
+                    .get(HelperProjection::plain(previous_projection.images)),
             )
             .saturating_add(self.measured_format_delta.unwrap_or(
-                if projection.structured_outputs {
+                if previous_projection.structured_outputs {
                     self.original_covered_cost.structured_delta
                 } else {
                     0
                 },
             ));
-        // Cleanup can discard covered sampled output, never the already-billed input.
-        let change = retained
+        // Cap the credit for discarded output, not the cost change on surviving input.
+        let change = retained_then
             .saturating_sub(measured)
-            .max(-usage.output_tokens.max(0));
+            .max(-usage.output_tokens.max(0))
+            .saturating_add(projection_change);
         let reserve = if !reasoning_included
             && (budget == WorkBudget::Review
                 || self.items[self.last_usage_item_count..]
@@ -359,11 +416,15 @@ impl ContextManager {
     pub(crate) fn work_notes_baseline_at(
         &self,
         index: usize,
-        model: &str,
+        source: UsageSource<'_>,
     ) -> Option<&WorkNotesBaseline> {
-        self.work_notes_baseline
-            .as_ref()
-            .filter(|b| b.index == index && b.model == model)
+        let endpoint = source.endpoint?;
+        self.work_notes_baseline.as_ref().filter(|b| {
+            b.index == index
+                && b.model == source.model
+                && b.provider == source.provider
+                && b.endpoint == endpoint
+        })
     }
 
     pub(crate) fn record_session_item(
@@ -373,10 +434,10 @@ impl ContextManager {
         reasoning_included: bool,
     ) {
         if crate::compact::is_work_notes_request_item(item) {
-            self.work_notes_baseline = self.usage_source_model().and_then(|model| {
+            self.work_notes_baseline = self.work_receipt_source(None).and_then(|source| {
                 let work = |images, structured_outputs| {
                     self.helper_tokens_from_usage(
-                        model,
+                        source,
                         reasoning_included,
                         HelperProjection {
                             images,
@@ -386,7 +447,9 @@ impl ContextManager {
                 };
                 Some(WorkNotesBaseline {
                     index: self.items.len(),
-                    model: model.to_owned(),
+                    model: source.model.to_owned(),
+                    provider: source.provider.to_owned(),
+                    endpoint: source.endpoint?.to_owned(),
                     work: [
                         [work(false, false)?, work(false, true)?],
                         [work(true, false)?, work(true, true)?],
@@ -410,6 +473,7 @@ impl ContextManager {
 
     pub(crate) fn set_token_usage_full(&mut self, context_window: i64) {
         self.source_model = None;
+        self.measured_surface = None;
         self.measured_item_tokens = None;
         self.measured_format_delta = None;
         self.measured_base_tokens = None;

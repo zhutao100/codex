@@ -74,14 +74,18 @@ fn model_override(model: &str) -> Op {
     }
 }
 
-#[test_case::test_case(false, false; "fresh acceptance")]
-#[test_case::test_case(true, false; "ordinary continuation before the decision")]
-#[test_case::test_case(true, true; "absent sampled default stays absent")]
+#[test_case::test_case(false, false, false; "fresh acceptance")]
+#[test_case::test_case(true, false, false; "ordinary continuation before the decision")]
+#[test_case::test_case(true, true, false; "absent sampled defaults stay absent")]
+#[test_case::test_case(true, false, true; "only the configured verbosity changes")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn second_model_checkpoint_reuses_archived_work_after_catalog_refresh(
     plain: bool,
     absent_default: bool,
+    verbosity_only: bool,
 ) -> Result<()> {
+    use codex_protocol::config_types::Verbosity;
+    use codex_protocol::openai_models::ReasoningEffort;
     skip_if_no_network_unless_localhost!(Ok(()));
     const A: &str = "previous-provider-model";
     const B: &str = "destination-provider-model";
@@ -96,11 +100,24 @@ async fn second_model_checkpoint_reuses_archived_work_after_catalog_refresh(
             configure_providers(cfg, base.clone(), base, false);
             cfg.cwd = cwd;
             cfg.model_reasoning_effort = None;
+            let refreshed = text == REFRESHED;
+            cfg.model_verbosity = verbosity_only.then_some(if refreshed {
+                Verbosity::High
+            } else {
+                Verbosity::Low
+            });
             let patch = &mut cfg.model_overlay.as_mut().unwrap().models[1].patch;
-            patch.base_instructions = Some(text.into());
+            patch.base_instructions = Some(if verbosity_only { SAMPLED } else { text }.into());
             patch.supports_reasoning_summaries = Some(true);
-            use codex_protocol::openai_models::ReasoningEffort;
-            patch.default_reasoning_level = Some(if text == REFRESHED {
+            patch.support_verbosity = Some(true);
+            patch.default_verbosity = Some(if verbosity_only {
+                Some(Verbosity::Medium)
+            } else if refreshed {
+                Some(Verbosity::High)
+            } else {
+                (!absent_default).then_some(Verbosity::Low)
+            });
+            patch.default_reasoning_level = Some(if refreshed && !verbosity_only {
                 Some(ReasoningEffort::High)
             } else {
                 (!absent_default).then_some(ReasoningEffort::Low)
@@ -146,6 +163,14 @@ async fn second_model_checkpoint_reuses_archived_work_after_catalog_refresh(
     assert_ne!(sent[0].instructions_text(), SAMPLED);
     for req in &sent[1..] {
         assert_eq!(req.instructions_text(), SAMPLED);
+        assert_eq!(
+            req.body_json()["text"]["verbosity"],
+            if absent_default {
+                Value::Null
+            } else {
+                json!("low")
+            }
+        );
         assert_eq!(
             req.body_json()["reasoning"]["effort"],
             if absent_default {
@@ -194,12 +219,11 @@ async fn second_model_checkpoint_reuses_archived_work_after_catalog_refresh(
     assert_eq!((archived, cuts.len()), (1, 2));
     for (cut, next) in cuts {
         std::fs::write(&path, &raw[..cut])?;
-        let server = responses::start_mock_server().await;
         let traffic = responses::mount_sse_sequence(&server, replies[next..].to_vec()).await;
         let active = build(&server, REFRESHED)
             .resume(&server, original.home.clone(), path.clone())
             .await?;
-        if plain {
+        if plain && !verbosity_only {
             let mut changed = model_override(B);
             if let Op::OverrideTurnContext { service_tier, .. } = &mut changed {
                 *service_tier = Some("priority".into());
@@ -217,12 +241,17 @@ async fn second_model_checkpoint_reuses_archived_work_after_catalog_refresh(
                 "B's helper changed after a catalog refresh"
             );
         }
-        assert_eq!(restarted.last().unwrap().instructions_text(), REFRESHED);
+        let destination = restarted.last().unwrap();
+        assert_eq!(
+            destination.instructions_text(),
+            if verbosity_only { SAMPLED } else { REFRESHED }
+        );
+        assert_eq!(destination.body_json()["text"]["verbosity"], "high");
         assert_eq!(
             restarted.last().unwrap().body_json()["reasoning"]["effort"],
-            "high"
+            if verbosity_only { "low" } else { "high" }
         );
-        if plain {
+        if plain && !verbosity_only {
             assert_eq!(
                 restarted.last().unwrap().body_json()["service_tier"],
                 "priority"

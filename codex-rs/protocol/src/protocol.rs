@@ -2006,6 +2006,12 @@ pub enum RolloutItem {
     },
     Compacted(CompactedItem),
     TurnContext(TurnContextItem),
+    /// Install context for an ordinary continuation without manufacturing a user turn.
+    /// One rollout line owns both the messages and their reference across interruption.
+    ContextSeed {
+        items: Vec<ResponseItem>,
+        reference: TurnContextItem,
+    },
     /// Versioned host-owned completion-review metadata, not conversation input.
     PostTurnCompletionReviewState(Value),
     /// Host-owned usage baseline accounting, not conversation input or a UI event.
@@ -2039,8 +2045,22 @@ pub enum RolloutItem {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional, type = "number")]
         measured_tool_tokens: Option<i64>,
+        /// Configured provider and item projection that produced this receipt.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        measured_surface: Option<MeasuredInputSurface>,
     },
     EventMsg(EventMsg),
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
+pub struct MeasuredInputSurface {
+    pub provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub endpoint_sha256: Option<String>,
+    pub images: bool,
+    pub structured_outputs: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, TS)]

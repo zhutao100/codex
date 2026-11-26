@@ -158,11 +158,11 @@ impl SessionState {
 
     pub(crate) fn helper_tokens_from_usage(
         &self,
-        model: &str,
+        source: crate::context_manager::UsageSource<'_>,
         projection: crate::context_manager::HelperProjection,
     ) -> Option<i64> {
         self.history
-            .helper_tokens_from_usage(model, self.server_reasoning_included(), projection)
+            .helper_tokens_from_usage(source, self.server_reasoning_included(), projection)
     }
 
     pub(crate) fn set_server_reasoning_included(&mut self, included: bool) {

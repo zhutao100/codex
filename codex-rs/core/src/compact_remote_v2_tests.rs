@@ -1,4 +1,5 @@
 use super::*;
+use crate::compact_remote::trim_function_call_history_to_fit_context_window;
 use crate::context_manager::ContextManager;
 use crate::protocol::CompactedItem;
 use crate::protocol::CompactionCheckpoint;
@@ -33,6 +34,8 @@ fn stream(events: Vec<CodexResult<ResponseEvent>>) -> ResponseStream {
         tx.try_send(event).unwrap();
     }
     ResponseStream {
+        endpoint_sha256: None,
+        compact_input: None,
         rx_event,
         consumer_dropped: CancellationToken::new(),
     }
@@ -178,6 +181,11 @@ fn budget_reserves_all_fixed_context_and_rejects_unfittable_notes() {
     );
     assert_eq!(retention_budget(1000, Some(2000), None).unwrap(), 1000);
     assert_eq!(retention_budget(1000, Some(1000), None).unwrap(), 0);
+    assert_eq!(
+        retention_budget(19_999, Some(64_000), Some(20_000)).unwrap(),
+        0
+    );
+    assert!(retention_budget(20_000, Some(64_000), Some(20_000)).is_err());
     assert!(matches!(
         retention_budget(1000, Some(999), None),
         Err(CodexErr::Fatal(_))
