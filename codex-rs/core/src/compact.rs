@@ -280,6 +280,7 @@ pub(crate) async fn run_compact_task(
     let start_event = EventMsg::TurnStarted(TurnStartedEvent {
         model_context_window: turn_context.model_context_window(),
         collaboration_mode_kind: turn_context.collaboration_mode.mode,
+        restored_token_usage: None,
     });
     sess.send_event(turn_context, start_event).await;
     run_compact_task_inner(

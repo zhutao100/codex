@@ -77,8 +77,56 @@ struct ObservedTurn {
     predecessor: bool,
 }
 
+fn context_estimate(usage: &JsonValue, field: &str) -> bool {
+    let counts = &usage[field];
+    let Some(amount) = counts["totalTokens"].as_u64() else {
+        return false;
+    };
+    let categories = [
+        "inputTokens",
+        "cachedInputTokens",
+        "outputTokens",
+        "reasoningOutputTokens",
+    ];
+    // Only the exact full-window total is synthetic. `last` can independently be a context estimate.
+    amount > 0
+        && !categories
+            .iter()
+            .any(|k| counts[*k].as_u64().is_some_and(|n| n > 0))
+        && (usage["modelContextWindow"].as_u64() == Some(amount)
+            || (field == "last" && categories.iter().any(|k| counts.get(*k).is_some())))
+}
+
 fn cumulative_total(usage: &JsonValue) -> Option<u64> {
-    usage["total"]["totalTokens"].as_u64()
+    usage["total"]["totalTokens"]
+        .as_u64()
+        .filter(|_| !context_estimate(usage, "total"))
+}
+
+fn turn_usage(incoming: Option<JsonValue>, previous: Option<&JsonValue>) -> Option<JsonValue> {
+    let Some(mut usage) = incoming else {
+        return previous.cloned();
+    };
+    if !usage.is_object()
+        || context_estimate(&usage, "total")
+        || (cumulative_total(&usage).is_none() && context_estimate(&usage, "last"))
+    {
+        return previous.cloned();
+    }
+    if cumulative_total(&usage).is_none()
+        && let Some(prior) = previous.filter(|p| cumulative_total(p).is_some())
+    {
+        usage["total"] = prior["total"].clone();
+    }
+    // Compaction can retain the measured lifetime but replace `last` with an estimate.
+    if context_estimate(&usage, "last")
+        && let Some(last) = previous
+            .filter(|p| !context_estimate(p, "last"))
+            .and_then(|p| p.get("last"))
+    {
+        usage["last"] = last.clone();
+    }
+    Some(usage)
 }
 
 fn observe_thread_usage(heads: &mut BTreeMap<String, JsonValue>, thread: &str, usage: &JsonValue) {
@@ -88,7 +136,29 @@ fn observe_thread_usage(heads: &mut BTreeMap<String, JsonValue>, thread: &str, u
             .and_then(cumulative_total)
             .is_none_or(|prior| n >= prior)
     {
-        heads.insert(thread.to_owned(), usage.clone());
+        heads.insert(thread.to_owned(), starting_usage(usage));
+    }
+}
+
+fn starting_usage(usage: &JsonValue) -> JsonValue {
+    let mut measured = usage.clone();
+    if context_estimate(usage, "last")
+        && let Some(fields) = measured.as_object_mut()
+    {
+        fields.remove("last");
+    }
+    measured
+}
+
+fn observe_turn_usage(heads: &mut BTreeMap<String, JsonValue>, turn: &ActiveTurnSnapshot) {
+    // A restored start can be our only measurement. Don't replace a real sample at the same total with a baseline.
+    if let Some(start) = &turn.token_usage_baseline
+        && heads.get(&turn.thread_id).and_then(cumulative_total) < cumulative_total(start)
+    {
+        observe_thread_usage(heads, &turn.thread_id, start);
+    }
+    if let Some(usage) = &turn.token_usage {
+        observe_thread_usage(heads, &turn.thread_id, usage);
     }
 }
 
@@ -219,6 +289,21 @@ impl RuntimeState {
         let key = projected_key(turn.turn_key.as_deref(), &turn.thread_id, &turn.turn_id);
         turn.turn_key = Some(key.clone());
         let previous = self.active_turns.get(&key);
+        turn.token_usage = turn_usage(
+            turn.token_usage.take(),
+            previous.and_then(|t| t.token_usage.as_ref()),
+        );
+        if turn
+            .token_usage_baseline
+            .as_ref()
+            .is_some_and(|u| context_estimate(u, "total"))
+        {
+            turn.token_usage_baseline = previous.and_then(|t| t.token_usage_baseline.clone());
+            if let Some(previous) = previous {
+                turn.token_usage_baseline_predecessor_key
+                    .clone_from(&previous.token_usage_baseline_predecessor_key);
+            }
+        }
         turn.started_at = turn
             .started_at
             .or_else(|| previous.and_then(|t| t.started_at));
@@ -357,15 +442,17 @@ impl RuntimeState {
             observe_thread_usage(&mut self.thread_token_usage, thread, usage);
         }
         if let (Some(next), Some(n)) = (next, cumulative_total(usage))
-            && next.token_usage_baseline.as_ref() != Some(usage)
             && next
                 .token_usage_baseline
                 .as_ref()
                 .and_then(cumulative_total)
                 .is_none_or(|p| n >= p)
         {
-            next.token_usage_baseline = Some(usage.clone());
-            return ProjectionChange::SuccessorBaseline;
+            let measured = starting_usage(usage);
+            if next.token_usage_baseline.as_ref() != Some(&measured) {
+                next.token_usage_baseline = Some(measured);
+                return ProjectionChange::SuccessorBaseline;
+            }
         }
         ProjectionChange::None
     }
@@ -861,9 +948,7 @@ impl DaemonState {
                         runtime.work_activity.is_none(),
                         overlapping,
                     );
-                    if let Some(usage) = &turn.token_usage {
-                        observe_thread_usage(&mut thread_token_usage, &turn.thread_id, usage);
-                    }
+                    observe_turn_usage(&mut thread_token_usage, &turn);
                     if let Some(head) = turn.thread_token_usage.take() {
                         observe_thread_usage(&mut thread_token_usage, &turn.thread_id, &head);
                     }
@@ -1938,9 +2023,7 @@ pub(crate) fn apply_notification_to_runtime(
         if let Some(n) = snapshot.start_order {
             runtime.last_start_order = runtime.last_start_order.max(n);
         }
-        if let Some(usage) = &snapshot.token_usage {
-            observe_thread_usage(&mut runtime.thread_token_usage, &snapshot.thread_id, usage);
-        }
+        observe_turn_usage(&mut runtime.thread_token_usage, &snapshot);
         // The daemon receiving a delta may have joined after the prior turn retired.
         // Carry the producer's start boundary on deltas as well as on full projections.
         if let Some(turn) = notification
@@ -2303,7 +2386,9 @@ fn apply_turn_context_update(
         &mut turn.context_remaining_percent,
         update.context_remaining_percent,
     );
-    merge_opt(&mut turn.token_usage, update.token_usage);
+    if let Some(usage) = update.token_usage {
+        turn.token_usage = turn_usage(Some(usage), turn.token_usage.as_ref());
+    }
     merge_opt(&mut turn.thread_name, update.thread_name);
     ProjectionChange::LiveTurn
 }

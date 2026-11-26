@@ -30,6 +30,154 @@ fn events(d: &DaemonState, after: u64) -> Vec<JsonValue> {
 }
 
 #[test]
+fn capacity_signal_is_context_not_turn_usage_or_successor_baseline() {
+    let (mut d, mut c) = (DaemonState::default(), ConnectionClaims::default());
+    let counts = |n| json!({"totalTokens":n,"inputTokens":n});
+    let measured =
+        |n, last| json!({"total":counts(n),"last":counts(last),"modelContextWindow":1000});
+    let signal = json!({"total":{"totalTokens":1000,"inputTokens":0},"last":{"totalTokens":860,"inputTokens":0},"modelContextWindow":1000});
+    let state = |turns| json!({"runtimeId":"r","activeTurns":turns});
+    let a = json!({"turnId":"A","threadId":"t","tokenUsage":measured(140,40)});
+    send(
+        &mut d,
+        1,
+        &mut c,
+        RUNTIME_UPDATE_STATE_METHOD,
+        state(vec![a.clone()]),
+    );
+    let event = |id, usage| json!({"runtimeId":"r","notification":{"method":"thread/tokenUsage/updated","params":{"threadId":"t","turnId":id,"tokenUsage":usage,"contextRemainingPercent":0}}});
+    send(
+        &mut d,
+        1,
+        &mut c,
+        RUNTIME_EVENT_METHOD,
+        event("A", signal.clone()),
+    );
+    let mut legacy = a;
+    legacy["tokenUsage"] = signal.clone();
+    legacy["threadTokenUsage"] = signal.clone();
+    send(
+        &mut d,
+        1,
+        &mut c,
+        RUNTIME_UPDATE_STATE_METHOD,
+        state(vec![legacy]),
+    );
+    assert_eq!(d.runtimes["r"].thread_token_usage["t"], measured(140, 40));
+    assert_eq!(
+        d.runtimes["r"].active_turns["t:A"].token_usage,
+        Some(measured(140, 40))
+    );
+    let wire = serde_json::to_value(&d.snapshot().runtimes[0]).unwrap();
+    let (mut fresh, mut owner) = (DaemonState::default(), ConnectionClaims::default());
+    send(&mut fresh, 1, &mut owner, RUNTIME_UPDATE_STATE_METHOD, wire);
+    send(
+        &mut fresh,
+        1,
+        &mut owner,
+        RUNTIME_EVENT_METHOD,
+        json!({"runtimeId":"r","notification":{"method":"turn/completed","params":{"threadId":"t","turn":{"id":"A","status":"completed","tokenUsage":signal}}}}),
+    );
+    send(
+        &mut fresh,
+        1,
+        &mut owner,
+        RUNTIME_EVENT_METHOD,
+        json!({"runtimeId":"r","notification":{"method":"turn/started","params":{"threadId":"t","turn":{"id":"B"}}}}),
+    );
+    send(
+        &mut fresh,
+        1,
+        &mut owner,
+        RUNTIME_EVENT_METHOD,
+        event("B", measured(160, 20)),
+    );
+    let r = &fresh.runtimes["r"];
+    assert_eq!(r.thread_token_usage["t"], measured(160, 20));
+    assert_eq!(
+        r.active_turns["t:B"].token_usage_baseline,
+        Some(measured(140, 40))
+    );
+}
+
+#[test]
+fn restored_start_is_a_thread_measurement_even_if_the_turn_never_spends() {
+    let initial = json!({"total":{"inputTokens":100,"totalTokens":100}});
+    for full in [false, true] {
+        let (mut d, mut owner) = (DaemonState::default(), ConnectionClaims::default());
+        let first = json!({"threadId":"t","turnId":"B","tokenUsageBaseline":initial});
+        send(
+            &mut d,
+            1,
+            &mut owner,
+            RUNTIME_UPDATE_STATE_METHOD,
+            json!({
+                "runtimeId":"r","activeTurns":if full {vec![first]} else {vec![]}
+            }),
+        );
+        let frame = |method, turn| json!({"runtimeId":"r","notification":{"method":method,"params":{"threadId":"t","turn":turn}}});
+        if !full {
+            send(
+                &mut d,
+                1,
+                &mut owner,
+                RUNTIME_EVENT_METHOD,
+                frame(
+                    "turn/started",
+                    json!({"id":"B","tokenUsageBaseline":initial}),
+                ),
+            );
+        }
+        let b = &d.snapshot().runtimes[0].active_turns[0];
+        assert_eq!(b.token_usage, None);
+        assert_eq!(b.thread_token_usage.as_ref(), Some(&initial));
+        send(
+            &mut d,
+            1,
+            &mut owner,
+            RUNTIME_UPDATE_STATE_METHOD,
+            json!({"runtimeId":"r","activeTurns":[{
+                "threadId":"t","turnId":"B","tokenUsageBaseline":{"total":{"totalTokens":100}}
+            }]}),
+        );
+        assert_eq!(d.runtimes["r"].thread_token_usage["t"], initial);
+        send(
+            &mut d,
+            1,
+            &mut owner,
+            RUNTIME_EVENT_METHOD,
+            frame("turn/completed", json!({"id":"B","status":"interrupted"})),
+        );
+        send(
+            &mut d,
+            1,
+            &mut owner,
+            RUNTIME_EVENT_METHOD,
+            frame("turn/started", json!({"id":"C"})),
+        );
+        let c = &d.runtimes["r"].active_turns["t:C"];
+        assert_eq!(c.token_usage_baseline.as_ref(), Some(&initial));
+        assert_eq!(
+            c.token_usage_baseline_predecessor_key.as_deref(),
+            Some("t:B")
+        );
+        let end = json!({"total":{"inputTokens":120,"totalTokens":120},"last":{"inputTokens":20,"totalTokens":20}});
+        send(
+            &mut d,
+            1,
+            &mut owner,
+            RUNTIME_EVENT_METHOD,
+            json!({"runtimeId":"r","notification":{
+                "method":"thread/tokenUsage/updated","params":{"threadId":"t","turnId":"C","tokenUsage":end}
+            }}),
+        );
+        let c = &d.runtimes["r"].active_turns["t:C"];
+        assert_eq!(c.token_usage.as_ref(), Some(&end));
+        assert_eq!(c.token_usage_baseline.as_ref(), Some(&initial));
+    }
+}
+
+#[test]
 fn unordered_legacy_full_shares_a_start_rank_and_keeps_reported_times() {
     let (mut daemon, mut claims) = (DaemonState::default(), ConnectionClaims::default());
     let mut turns = vec![

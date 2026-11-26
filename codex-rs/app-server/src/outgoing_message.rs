@@ -278,14 +278,21 @@ impl OutgoingMessageSender {
         turn_id: &str,
         model: &str,
         context_window: Option<i64>,
+        restored_usage: Option<codex_protocol::protocol::TokenUsage>,
     ) {
         if let Some(producer) = &self.codexd_producer {
-            producer.publish_hub_notification(codex_codexd::protocol::HubNotification {
-                method: "turn/started".into(),
-                params: Some(serde_json::json!({"threadId":thread_id, "turn":{
-                    "id":turn_id, "status":"inProgress", "model":model, "modelContextWindow":context_window
-                }})),
-            }).await;
+            let mut turn = serde_json::json!({
+                "id":turn_id, "status":"inProgress", "model":model, "modelContextWindow":context_window
+            });
+            if let Some(usage) = restored_usage {
+                turn["tokenUsageBaseline"] = serde_json::json!({"total":codex_app_server_protocol::TokenUsageBreakdown::from(usage)});
+            }
+            producer
+                .publish_hub_notification(codex_codexd::protocol::HubNotification {
+                    method: "turn/started".into(),
+                    params: Some(serde_json::json!({"threadId":thread_id, "turn":turn})),
+                })
+                .await;
         }
     }
 

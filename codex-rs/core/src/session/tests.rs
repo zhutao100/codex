@@ -180,6 +180,33 @@ async fn request_context_usage_replays_atomic_prefixes_and_duplicate_token_event
             "prefix {prefix}"
         );
     }
+    let mut capacity = info.clone();
+    capacity.fill_to_context_window(24_000);
+    let mut records_with_capacity = records[..2].to_vec();
+    for normalized_total in [false, true] {
+        if normalized_total {
+            capacity.total_token_usage = info.total_token_usage.clone();
+        }
+        let mut context_record = records[4].clone();
+        let RolloutItem::TokenUsageContext { info: stored, .. } = &mut context_record else {
+            unreachable!();
+        };
+        *stored = capacity.clone();
+        records_with_capacity.extend([
+            context_record,
+            RolloutItem::EventMsg(EventMsg::TokenCount(TokenCountEvent {
+                info: Some(capacity.clone()),
+                rate_limits: None,
+            })),
+        ]);
+        assert_eq!(
+            session
+                .reconstruct_history_from_rollout(&context, &records_with_capacity)
+                .await
+                .token_usage,
+            expected(info.clone(), 5_000, true),
+        );
+    }
     let mut legacy = serde_json::to_value(&records[1]).unwrap();
     legacy["payload"]
         .as_object_mut()
@@ -1277,7 +1304,7 @@ async fn resumed_history_seeds_initial_context_on_first_turn_only() {
 
 #[tokio::test]
 async fn record_initial_history_seeds_token_info_from_rollout() {
-    let (session, turn_context) = make_session_and_context().await;
+    let (session, turn_context, events) = make_session_and_context_with_rx().await;
     let (mut rollout_items, _expected) = sample_rollout(&session, &turn_context).await;
 
     let info1 = TokenUsageInfo {
@@ -1349,7 +1376,32 @@ async fn record_initial_history_seeds_token_info_from_rollout() {
         .await;
 
     let actual = session.state.lock().await.token_info();
-    assert_eq!(actual, Some(info2));
+    assert_eq!(actual.as_ref(), Some(&info2));
+    for expected in [Some(info2.total_token_usage), None] {
+        session
+            .send_event(
+                &turn_context,
+                EventMsg::TurnStarted(TurnStartedEvent {
+                    model_context_window: None,
+                    collaboration_mode_kind: Default::default(),
+                    restored_token_usage: None,
+                }),
+            )
+            .await;
+        let start = std::iter::from_fn(|| events.try_recv().ok())
+            .find_map(|e| match e.msg {
+                EventMsg::TurnStarted(start) => Some(start),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(start.restored_token_usage, expected);
+        assert!(
+            serde_json::to_value(start)
+                .unwrap()
+                .get("restored_token_usage")
+                .is_none()
+        );
+    }
 }
 
 #[tokio::test]

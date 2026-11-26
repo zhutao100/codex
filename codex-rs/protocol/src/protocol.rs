@@ -1312,6 +1312,10 @@ pub struct TurnStartedEvent {
     pub model_context_window: Option<i64>,
     #[serde(default)]
     pub collaboration_mode_kind: ModeKind,
+    /// Measured lifetime before the first live turn after a resume or fork. For in-process observers only.
+    #[serde(skip)]
+    #[ts(skip)]
+    pub restored_token_usage: Option<TokenUsage>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq, JsonSchema, TS)]

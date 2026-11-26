@@ -48,6 +48,7 @@ impl SessionTask for CompactTask {
                     EventMsg::TurnStarted(TurnStartedEvent {
                         model_context_window: ctx.model_context_window(),
                         collaboration_mode_kind: ctx.collaboration_mode.mode,
+                        restored_token_usage: None,
                     }),
                 )
                 .await;

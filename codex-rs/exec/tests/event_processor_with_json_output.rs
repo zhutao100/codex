@@ -119,6 +119,7 @@ fn task_started_produces_turn_started_event() {
         EventMsg::TurnStarted(codex_core::protocol::TurnStartedEvent {
             model_context_window: Some(32_000),
             collaboration_mode_kind: ModeKind::Default,
+            restored_token_usage: None,
         }),
     ));
 

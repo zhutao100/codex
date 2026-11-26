@@ -21,6 +21,35 @@ const EXEC_FORMAT_MAX_BYTES: usize = 10_000;
 const EXEC_FORMAT_MAX_TOKENS: usize = 2_500;
 
 #[test]
+fn refusal_preserves_work_and_helper_bills_for_the_next_round() {
+    let measured = |n| TokenUsage {
+        input_tokens: n,
+        total_tokens: n,
+        ..Default::default()
+    };
+    let source = UsageSource {
+        model: "model",
+        provider: "provider",
+        endpoint: None,
+    };
+    let mut history = ContextManager::new();
+    history.update_token_info(&measured(100), Some(1_000), 0);
+    history.bill_helper(&measured(40), Some(1_000), source);
+    history.mark_rejected(source, 1_000);
+    let previous = history.token_info().unwrap();
+    assert_eq!(previous.total_token_usage, measured(140));
+    assert_eq!(previous.last_token_usage, measured(40));
+    assert_eq!(history.work_usage(), Some(&measured(100)));
+    assert!(history.rejected_on(source, Some(1_000)));
+    history.update_token_info(&measured(20), Some(1_000), 0);
+    assert_eq!(
+        history.token_info().unwrap().total_token_usage,
+        measured(160)
+    );
+    assert!(!history.rejected_on(source, Some(1_000)));
+}
+
+#[test]
 fn sampled_output_replay_does_not_double_count_model_tokens() {
     let opaque = "x".repeat(32_000);
     for plain in [

@@ -687,6 +687,7 @@ async fn review_mode_exec_after_completed_read_remains_visible() {
         msg: EventMsg::TurnStarted(TurnStartedEvent {
             model_context_window: None,
             collaboration_mode_kind: ModeKind::Default,
+            restored_token_usage: None,
         }),
     });
     let _ = drain_insert_history(&mut rx);
@@ -3126,6 +3127,7 @@ async fn post_turn_review_parallel_exec_cascade_renders_every_completed_command(
         msg: EventMsg::TurnStarted(TurnStartedEvent {
             model_context_window: None,
             collaboration_mode_kind: ModeKind::Default,
+            restored_token_usage: None,
         }),
     });
 
@@ -3362,6 +3364,7 @@ async fn unified_exec_wait_after_final_agent_message_snapshot() {
         msg: EventMsg::TurnStarted(TurnStartedEvent {
             model_context_window: None,
             collaboration_mode_kind: ModeKind::Default,
+            restored_token_usage: None,
         }),
     });
 
@@ -3397,6 +3400,7 @@ async fn unified_exec_wait_before_streamed_agent_message_snapshot() {
         msg: EventMsg::TurnStarted(TurnStartedEvent {
             model_context_window: None,
             collaboration_mode_kind: ModeKind::Default,
+            restored_token_usage: None,
         }),
     });
 
@@ -4386,6 +4390,7 @@ async fn interrupted_turn_error_message_snapshot() {
         msg: EventMsg::TurnStarted(TurnStartedEvent {
             model_context_window: None,
             collaboration_mode_kind: ModeKind::Default,
+            restored_token_usage: None,
         }),
     });
 
@@ -6367,6 +6372,7 @@ async fn interrupt_clears_unified_exec_wait_streak_snapshot() {
         msg: EventMsg::TurnStarted(TurnStartedEvent {
             model_context_window: None,
             collaboration_mode_kind: ModeKind::Default,
+            restored_token_usage: None,
         }),
     });
 
@@ -6441,6 +6447,7 @@ async fn ui_snapshots_small_heights_task_running() {
         msg: EventMsg::TurnStarted(TurnStartedEvent {
             model_context_window: None,
             collaboration_mode_kind: ModeKind::Default,
+            restored_token_usage: None,
         }),
     });
     chat.handle_codex_event(Event {
@@ -6473,6 +6480,7 @@ async fn status_widget_and_approval_modal_snapshot() {
         msg: EventMsg::TurnStarted(TurnStartedEvent {
             model_context_window: None,
             collaboration_mode_kind: ModeKind::Default,
+            restored_token_usage: None,
         }),
     });
     // Provide a deterministic header for the status line.
@@ -6527,6 +6535,7 @@ async fn status_widget_active_snapshot() {
         msg: EventMsg::TurnStarted(TurnStartedEvent {
             model_context_window: None,
             collaboration_mode_kind: ModeKind::Default,
+            restored_token_usage: None,
         }),
     });
     // Provide a deterministic header via a bold reasoning chunk.
@@ -6577,6 +6586,7 @@ async fn mcp_startup_complete_does_not_clear_running_task() {
         msg: EventMsg::TurnStarted(TurnStartedEvent {
             model_context_window: None,
             collaboration_mode_kind: ModeKind::Default,
+            restored_token_usage: None,
         }),
     });
 
@@ -7448,6 +7458,7 @@ async fn stream_recovery_restores_previous_status_header() {
         msg: EventMsg::TurnStarted(TurnStartedEvent {
             model_context_window: None,
             collaboration_mode_kind: ModeKind::Default,
+            restored_token_usage: None,
         }),
     });
     drain_insert_history(&mut rx);
@@ -7486,6 +7497,7 @@ async fn multiple_agent_messages_in_single_turn_emit_multiple_headers() {
         msg: EventMsg::TurnStarted(TurnStartedEvent {
             model_context_window: None,
             collaboration_mode_kind: ModeKind::Default,
+            restored_token_usage: None,
         }),
     });
 
@@ -7682,6 +7694,7 @@ async fn chatwidget_exec_and_status_layout_vt100_snapshot() {
         msg: EventMsg::TurnStarted(TurnStartedEvent {
             model_context_window: None,
             collaboration_mode_kind: ModeKind::Default,
+            restored_token_usage: None,
         }),
     });
     chat.handle_codex_event(Event {
@@ -8040,6 +8053,7 @@ async fn chatwidget_markdown_code_blocks_vt100_snapshot() {
         msg: EventMsg::TurnStarted(TurnStartedEvent {
             model_context_window: None,
             collaboration_mode_kind: ModeKind::Default,
+            restored_token_usage: None,
         }),
     });
     // Build a vt100 visual from the history insertions only (no UI overlay)
@@ -8131,6 +8145,7 @@ async fn chatwidget_tall() {
         msg: EventMsg::TurnStarted(TurnStartedEvent {
             model_context_window: None,
             collaboration_mode_kind: ModeKind::Default,
+            restored_token_usage: None,
         }),
     });
     for i in 0..30 {

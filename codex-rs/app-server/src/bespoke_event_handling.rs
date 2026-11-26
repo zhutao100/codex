@@ -221,6 +221,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                     &event_turn_id,
                     delegate_context.as_ref().map_or(&model, |c| &c.model),
                     start.model_context_window,
+                    start.restored_token_usage,
                 )
                 .await;
             if let Some(context) = delegate_context {
@@ -2499,7 +2500,7 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(8), async {
             let mut lines = BufReader::new(listener.accept().await?.0).lines();
             lines.next_line().await?;
-            out.publish_core_turn_started(thread, "A", "model", None)
+            out.publish_core_turn_started(thread, "A", "model", None, None)
                 .await;
             handle_token_count_event(thread, "A".into(), usage(20), &out).await;
             out.send_server_notification(ServerNotification::TurnCompleted(
@@ -2515,7 +2516,7 @@ mod tests {
                 },
             ))
             .await;
-            out.publish_core_turn_started(thread, "B", "model", None)
+            out.publish_core_turn_started(thread, "B", "model", None, None)
                 .await;
             handle_token_count_event(thread, "B".into(), usage(140), &out).await;
             handle_token_count_event(thread, "A".into(), usage(100), &out).await;

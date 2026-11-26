@@ -101,6 +101,7 @@ pub(crate) async fn execute_user_shell_command(
         let event = EventMsg::TurnStarted(TurnStartedEvent {
             model_context_window: turn_context.model_context_window(),
             collaboration_mode_kind: turn_context.collaboration_mode.mode,
+            restored_token_usage: None,
         });
         session.send_event(turn_context.as_ref(), event).await;
     }

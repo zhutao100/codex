@@ -1082,6 +1082,7 @@ impl Session {
             state.recorded_bases = bases;
         }
         let turn_context = self.new_default_turn().await;
+        let restored = !matches!(conversation_history, InitialHistory::New);
         match conversation_history {
             InitialHistory::New => {
                 // Initial context is recorded with the first real user turn so the
@@ -1161,6 +1162,7 @@ impl Session {
                 self.flush_rollout().await;
             }
         }
+        self.state.lock().await.first_start_after_restore = restored;
         self.recover_completion_review().await;
     }
 
@@ -1420,7 +1422,16 @@ impl Session {
     }
 
     /// Persist the event to rollout and send it to clients.
-    pub(crate) async fn send_event(&self, turn_context: &TurnContext, msg: EventMsg) {
+    pub(crate) async fn send_event(&self, turn_context: &TurnContext, mut msg: EventMsg) {
+        if let EventMsg::TurnStarted(start) = &mut msg {
+            let mut state = self.state.lock().await;
+            if std::mem::take(&mut state.first_start_after_restore) {
+                start.restored_token_usage = state
+                    .history
+                    .token_info()
+                    .map(|info| info.total_token_usage);
+            }
+        }
         let show_raw_agent_reasoning = self.show_raw_agent_reasoning();
         let legacy_events = msg.as_legacy_events(show_raw_agent_reasoning);
         let event = Event {

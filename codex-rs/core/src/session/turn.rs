@@ -528,6 +528,7 @@ async fn run_turn_inner(
     let event = EventMsg::TurnStarted(TurnStartedEvent {
         model_context_window: turn_context.model_context_window(),
         collaboration_mode_kind: turn_context.collaboration_mode.mode,
+        restored_token_usage: None,
     });
     sess.send_event(turn_context, event).await;
     let turn_state = sess.turn_state_for_sub_id(&turn_context.sub_id).await;

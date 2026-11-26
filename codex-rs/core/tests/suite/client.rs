@@ -1627,7 +1627,7 @@ async fn usage_limit_error_emits_rate_limit_event() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn context_window_error_does_not_publish_a_synthetic_bill() -> anyhow::Result<()> {
-    core_test_support::skip_if_no_network_unless_localhost!(Ok(()));
+    skip_if_no_network_unless_localhost!(Ok(()));
     let server = MockServer::start().await;
 
     mount_sse_once_match(
@@ -1641,23 +1641,24 @@ async fn context_window_error_does_not_publish_a_synthetic_bill() -> anyhow::Res
     )
     .await;
 
+    let mut seed = ev_completed("resp_seed");
+    seed["response"]["usage"]["input_tokens"] = 140.into();
+    seed["response"]["usage"]["total_tokens"] = 140.into();
     mount_sse_once_match(
         &server,
         body_string_contains("seed turn"),
-        sse(vec![
-            ev_response_created("resp_seed"),
-            ev_completed("resp_seed"),
-        ]),
+        sse(vec![ev_response_created("resp_seed"), seed]),
     )
     .await;
 
-    let TestCodex { codex, .. } = test_codex()
+    let test = test_codex()
         .with_config(|config| {
             config.model = Some("gpt-5.1".to_string());
             config.model_context_window = Some(272_000);
         })
         .build(&server)
         .await?;
+    let codex = test.codex.clone();
 
     codex
         .submit(Op::UserInput {
@@ -1687,7 +1688,7 @@ async fn context_window_error_does_not_publish_a_synthetic_bill() -> anyhow::Res
                 payload
                     .info
                     .as_ref()
-                    .is_none_or(|i| i.total_token_usage.total_tokens == 0)
+                    .is_none_or(|i| i.total_token_usage.total_tokens == 140)
             );
         }
         matches!(ev, EventMsg::Error(_))
@@ -1703,6 +1704,26 @@ async fn context_window_error_does_not_publish_a_synthetic_bill() -> anyhow::Res
     );
 
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    let path = codex.rollout_path().expect("recorded thread");
+    codex.submit(Op::Shutdown {}).await?;
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::ShutdownComplete)).await;
+    let raw = std::fs::read_to_string(path)?;
+    let mut refusal = None;
+    for line in raw.lines() {
+        if let codex_protocol::protocol::RolloutItem::TokenUsageContext {
+            info,
+            rejected_context: Some(rejected),
+            ..
+        } = serde_json::from_str::<codex_protocol::protocol::RolloutLine>(line)?.item
+        {
+            refusal = Some((info, rejected));
+        }
+    }
+    let (measured, rejected) = refusal.expect("persisted refusal without a synthetic bill");
+    assert!(rejected.window > 140);
+    assert_eq!(measured.total_token_usage.total_tokens, 140);
+    assert_eq!(measured.last_token_usage.input_tokens, 140);
+    assert_eq!(measured.last_token_usage.total_tokens, 140);
 
     Ok(())
 }

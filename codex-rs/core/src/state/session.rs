@@ -42,6 +42,7 @@ pub(crate) struct SessionState {
     /// Immutable bases from rollout headers and later sampled instruction records.
     pub(crate) recorded_bases: Vec<(codex_protocol::ThreadId, String)>,
     pub(crate) history: ContextManager,
+    pub(crate) first_start_after_restore: bool,
     pub(crate) latest_rate_limits: Option<RateLimitSnapshot>,
     /// Whether the stored usage baseline already includes earlier reasoning.
     pub(crate) server_reasoning_included: bool,
@@ -77,6 +78,7 @@ impl SessionState {
             session_configuration,
             recorded_bases: Vec::new(),
             history,
+            first_start_after_restore: false,
             latest_rate_limits: None,
             server_reasoning_included: false,
             mcp_dependency_prompted: HashSet::new(),

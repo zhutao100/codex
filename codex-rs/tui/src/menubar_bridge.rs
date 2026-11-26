@@ -139,10 +139,11 @@ mod imp {
                     if let Some((thread_id, turn_id)) =
                         self.resolve_event_turn(event_turn_id, active_thread_id.as_deref())
                     {
-                        notifications.extend(self.ensure_turn_started(
+                        notifications.extend(self.ensure_turn_started_at(
                             thread_id,
                             turn_id,
                             event.model_context_window,
+                            event.restored_token_usage.clone().map(Into::into),
                         ));
                     }
                 }
@@ -387,24 +388,37 @@ mod imp {
             turn_id: String,
             model_context_window: Option<i64>,
         ) -> Vec<HubNotification> {
+            self.ensure_turn_started_at(thread_id, turn_id, model_context_window, None)
+        }
+
+        fn ensure_turn_started_at(
+            &mut self,
+            thread_id: String,
+            turn_id: String,
+            model_context_window: Option<i64>,
+            restored: Option<codex_app_server_protocol::TokenUsageBreakdown>,
+        ) -> Vec<HubNotification> {
             let key = format!("{thread_id}:{turn_id}");
-            if self.known_turn_keys.contains(&key) {
+            if self.known_turn_keys.insert(key.clone()) {
+                self.active_turns.insert(
+                    key.clone(),
+                    ActiveTurnState {
+                        thread_id: thread_id.clone(),
+                        turn_id: turn_id.clone(),
+                        prompt_preview: None,
+                        failed: false,
+                    },
+                );
+                self.turn_start_order.push(key.clone());
+            } else if restored.is_none() || !self.active_turns.contains_key(&key) {
                 return Vec::new();
             }
-
-            self.known_turn_keys.insert(key.clone());
-            self.active_turns.insert(
-                key.clone(),
-                ActiveTurnState {
-                    thread_id: thread_id.clone(),
-                    turn_id: turn_id.clone(),
-                    prompt_preview: None,
-                    failed: false,
-                },
-            );
-            self.turn_start_order.push(key.clone());
-
-            let turn = self.turn_started_payload(&key, &thread_id, &turn_id, model_context_window);
+            let mut turn =
+                self.turn_started_payload(&key, &thread_id, &turn_id, model_context_window);
+            if let Some(total) = restored {
+                // Runtime context may have made this same delegate visible before the core start.
+                turn["tokenUsageBaseline"] = json!({"total":total});
+            }
 
             vec![HubNotification {
                 method: "turn/started".to_string(),
@@ -1337,9 +1351,28 @@ mod imp {
             assert_eq!(params["turn"]["taskKind"], json!("review"));
             assert!(params["turn"]["tokenUsage"].is_object());
 
-            let duplicate_started =
-                bridge.ensure_turn_started(thread_id, "post-turn-review-0".to_string(), None);
+            let duplicate_started = bridge.ensure_turn_started(
+                thread_id.clone(),
+                "post-turn-review-0".to_string(),
+                None,
+            );
             assert!(duplicate_started.is_empty());
+            let total = TokenUsage {
+                input_tokens: 100,
+                total_tokens: 100,
+                ..Default::default()
+            };
+            let corrected = bridge.ensure_turn_started_at(
+                thread_id,
+                "post-turn-review-0".to_string(),
+                None,
+                Some(total.into()),
+            );
+            assert_eq!(corrected.len(), 1);
+            let turn = &corrected[0].params.as_ref().unwrap()["turn"];
+            assert_eq!(turn["key"], params["turn"]["key"]);
+            assert_eq!(turn["tokenUsageBaseline"]["total"]["totalTokens"], 100);
+            assert_eq!(bridge.turn_start_order.len(), 1);
 
             bridge.shutdown().await;
         }
@@ -1406,6 +1439,7 @@ mod imp {
                 &EventMsg::TurnStarted(codex_core::protocol::TurnStartedEvent {
                     model_context_window: Some(100_000),
                     collaboration_mode_kind: Default::default(),
+                    restored_token_usage: None,
                 }),
                 "post-turn-review-0",
                 None,
@@ -1550,6 +1584,7 @@ mod imp {
                 EventMsg::TurnStarted(TurnStartedEvent {
                     model_context_window: None,
                     collaboration_mode_kind: Default::default(),
+                    restored_token_usage: None,
                 })
             };
             let finish = || {

@@ -224,6 +224,26 @@ impl ContextManager {
         self.token_info.clone()
     }
 
+    pub(crate) fn is_legacy_capacity_signal(&self, info: &TokenUsageInfo) -> bool {
+        let Some(window) = info.model_context_window.filter(|&w| w > 0) else {
+            return false;
+        };
+        let counter = |total_tokens| TokenUsage {
+            total_tokens,
+            ..Default::default()
+        };
+        let last = info.last_token_usage.total_tokens;
+        // Old writers filled both counters, or kept the measured total and filled only `last`.
+        (0..=window).contains(&last)
+            && info.last_token_usage == counter(last)
+            && (info.total_token_usage == counter(window)
+                || (last > 0
+                    && self.token_info.as_ref().is_some_and(|previous| {
+                        previous.total_token_usage == info.total_token_usage
+                            && window.saturating_sub(info.total_token_usage.total_tokens) == last
+                    })))
+    }
+
     pub(crate) fn work_usage(&self) -> Option<&TokenUsage> {
         self.helper_receipt
             .as_ref()

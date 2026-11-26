@@ -355,6 +355,19 @@ impl Session {
                 }
                 RolloutItem::TokenUsageContext {
                     info,
+                    helper: None,
+                    rejected_context: None,
+                    ..
+                }
+                | RolloutItem::EventMsg(EventMsg::TokenCount(TokenCountEvent {
+                    info: Some(info),
+                    ..
+                })) if history.is_legacy_capacity_signal(info) => {
+                    // A display remainder is neither a bill nor a new work or refusal receipt.
+                    awaiting_adjacent_post_compaction_context = false;
+                }
+                RolloutItem::TokenUsageContext {
+                    info,
                     helper,
                     source_model,
                     request_context_tokens,

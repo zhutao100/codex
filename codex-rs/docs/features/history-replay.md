@@ -36,6 +36,10 @@ Restore sampled base instructions by reference to immutable rollout data, not by
 
 Legacy compaction records without `replacement_history` are rebuilt from surviving user messages and their summary with an empty initial-context prefix. Injecting resume-time initial context at a historical compaction point changes history and is incorrect.
 
+An ordinary context-window refusal records the [refused route and window](post_turn_completion_review/budget_accounting.md#recovering-from-overflow), not a token bill. On resume or fork, ignore legacy full-window display counts and their synthetic remainder at an unchanged measured total. They cannot replace the last work or helper receipt, establish a refused route, or seed a turn with model capacity.
+
+After initial reconstruction, the first live `TurnStarted` carries the restored measured counter to in-process observers. It is not serialized into rollouts or the public event stream. Capture at dispatch, before the new response; reading session usage later in an asynchronous listener can include that response.
+
 Rollback uses the same real-user boundaries for history and metadata checkpoints. Context-only tasks do not consume rollback slots. When rollback reaches beyond known checkpoints into an opaque compaction base, clear uncertain metadata instead of attributing it to guessed historical turns. Retain the surviving history prefix according to `ContextManager::drop_last_n_user_turns`.
 
 ## Continuation and retained ownership
