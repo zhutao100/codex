@@ -13,6 +13,8 @@ pub(crate) struct TurnContext {
     pub(crate) provider: ModelProviderInfo,
     pub(crate) reasoning_effort: Option<ReasoningEffortConfig>,
     pub(crate) reasoning_summary: ReasoningSummaryConfig,
+    pub(crate) verbosity: SampledVerbosity,
+    pub(crate) sampled_controls: Option<SampledControls>,
     pub(crate) service_tier: Option<String>,
     pub(crate) session_source: SessionSource,
     /// The session's current working directory. All relative paths provided by
@@ -43,8 +45,53 @@ pub(crate) struct TurnContext {
     pub(crate) exec_capture_locators: Mutex<HashMap<String, String>>,
 }
 impl TurnContext {
-    pub(crate) fn sampled_reasoning(&self) -> SampledReasoning {
-        SampledReasoning::for_request(&self.model_info, self.reasoning_effort)
+    pub(crate) fn current_endpoint(&self) -> Option<String> {
+        self.provider
+            .configured_endpoint(self.auth_manager.as_ref().and_then(|m| m.auth_mode()))
+    }
+
+    pub(crate) fn usage_source<'a>(
+        &'a self,
+        endpoint: Option<&'a str>,
+    ) -> crate::context_manager::UsageSource<'a> {
+        crate::context_manager::UsageSource {
+            model: &self.model_info.slug,
+            provider: &self.model_provider_id,
+            endpoint,
+        }
+    }
+
+    pub(super) fn sampled_controls_at(
+        &self,
+        endpoint: Option<&str>,
+        parallel_tool_calls: bool,
+    ) -> Option<SampledControls> {
+        let route =
+            crate::model_provider_info::CheckpointRoute::new(&self.model_provider_id, endpoint)?;
+        let (reasoning, verbosity) = self.controls_at(endpoint);
+        Some(SampledControls {
+            route,
+            reasoning,
+            verbosity,
+            parallel_tool_calls: Some(parallel_tool_calls),
+        })
+    }
+
+    pub(crate) fn controls_at(
+        &self,
+        endpoint: Option<&str>,
+    ) -> (SampledReasoning, SampledVerbosity) {
+        match self
+            .sampled_controls
+            .as_ref()
+            .filter(|c| c.owns_endpoint(endpoint))
+        {
+            Some(c) => (c.reasoning, c.verbosity),
+            None => (
+                SampledReasoning::for_request(&self.model_info, self.reasoning_effort),
+                self.verbosity,
+            ),
+        }
     }
 
     pub(crate) fn helper_projection(&self) -> crate::context_manager::HelperProjection {
@@ -212,6 +259,8 @@ impl Session {
 
         let cwd = session_configuration.cwd.clone();
         TurnContext {
+            sampled_controls: None,
+            verbosity: SampledVerbosity::for_request(&model_info, per_turn_config.model_verbosity),
             sub_id,
             config: per_turn_config.clone(),
             auth_manager: auth_manager_for_context,
@@ -288,14 +337,14 @@ impl Session {
         session_configuration: SessionConfiguration,
         final_output_json_schema: Option<Option<Value>>,
         sampled_base: Option<String>,
-        sampled_reasoning: Option<SampledReasoning>,
+        sampled: Option<&RegularTaskSettings>,
     ) -> Arc<TurnContext> {
         let mut per_turn_config = Self::build_per_turn_config(&session_configuration);
         if let Some(base) = sampled_base {
             per_turn_config.base_instructions = Some(base);
         }
 
-        let mut model_info = self
+        let model_info = self
             .services
             .models_manager
             .get_model_info(
@@ -303,9 +352,6 @@ impl Session {
                 &per_turn_config,
             )
             .await;
-        if let Some(reasoning) = sampled_reasoning {
-            reasoning.restore(&mut model_info);
-        }
         let final_instruction_override = self
             .services
             .models_manager
@@ -325,6 +371,11 @@ impl Session {
             sub_id,
         );
 
+        if let Some(controls) = sampled.and_then(|s| s.sampled_controls.as_ref())
+            && controls.route.provider == turn_context.model_provider_id
+        {
+            turn_context.sampled_controls = Some(controls.clone());
+        }
         if let Some(final_schema) = final_output_json_schema {
             turn_context.final_output_json_schema = final_schema;
         }
@@ -384,7 +435,7 @@ impl Session {
                 configuration,
                 updates.final_output_json_schema,
                 base,
-                settings.sampled_reasoning,
+                Some(settings),
             )
             .await)
     }

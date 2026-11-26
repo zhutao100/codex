@@ -54,6 +54,7 @@ use pretty_assertions::assert_eq;
 mod compaction;
 #[path = "completion_review_tests.rs"]
 mod completion_review;
+pub(super) use completion_review::attach_recorder;
 use serde::Deserialize;
 use serde_json::json;
 use std::path::PathBuf;
@@ -108,6 +109,7 @@ async fn request_context_usage_replays_atomic_prefixes_and_duplicate_token_event
             measured_format_delta: None,
             measured_base_tokens: None,
             measured_tool_tokens: None,
+            measured_surface: None,
             work_notes_baseline: None,
         })
     };
@@ -137,6 +139,7 @@ async fn request_context_usage_replays_atomic_prefixes_and_duplicate_token_event
             measured_format_delta: None,
             measured_base_tokens: None,
             measured_tool_tokens: None,
+            measured_surface: None,
         },
         event.clone(),
         event.clone(),
@@ -150,6 +153,7 @@ async fn request_context_usage_replays_atomic_prefixes_and_duplicate_token_event
             measured_format_delta: None,
             measured_base_tokens: None,
             measured_tool_tokens: None,
+            measured_surface: None,
         },
         event,
     ];
@@ -220,6 +224,7 @@ async fn request_context_usage_replays_atomic_prefixes_and_duplicate_token_event
             measured_format_delta: None,
             measured_base_tokens: None,
             measured_tool_tokens: None,
+            measured_surface: None,
         },
         RolloutItem::EventMsg(EventMsg::TokenCount(TokenCountEvent {
             info: Some(changed.clone()),
@@ -255,7 +260,10 @@ async fn reasoning_accounting_changes_only_with_a_completed_usage_baseline() {
         session
             .update_token_usage_info_with_request_context(
                 &context,
-                reported,
+                ResponseUsage {
+                    tokens: reported,
+                    endpoint: context.current_endpoint().as_deref(),
+                },
                 frame_tokens,
                 reasoning_included,
                 0,
@@ -323,6 +331,7 @@ async fn usage_boundary_replays_unreported_output(context_record: bool, explicit
             measured_format_delta: None,
             measured_base_tokens: None,
             measured_tool_tokens: None,
+            measured_surface: None,
         });
     }
     records.push(event.clone());
@@ -344,6 +353,7 @@ async fn usage_boundary_replays_unreported_output(context_record: bool, explicit
             measured_format_delta: None,
             measured_base_tokens: None,
             measured_tool_tokens: None,
+            measured_surface: None,
             work_notes_baseline: None,
         })
     );
@@ -1223,6 +1233,7 @@ fn trims_dangling_tool_call_before_continuation() {
 #[tokio::test]
 async fn resumed_history_seeds_initial_context_on_first_turn_only() {
     let (session, turn_context) = make_session_and_context().await;
+    let (session, turn_context) = (Arc::new(session), Arc::new(turn_context));
     let (rollout_items, mut expected) = sample_rollout(&session, &turn_context).await;
 
     session
@@ -1236,12 +1247,18 @@ async fn resumed_history_seeds_initial_context_on_first_turn_only() {
     let history_before_seed = session.state.lock().await.clone_history();
     assert_eq!(expected, history_before_seed.raw_items());
 
-    session.seed_initial_context_if_needed(&turn_context).await;
+    session
+        .seed_initial_context_if_needed(&turn_context)
+        .await
+        .unwrap();
     expected.extend(session.build_initial_context(&turn_context).await);
     let history_after_seed = session.clone_history().await;
     assert_eq!(expected, history_after_seed.raw_items());
 
-    session.seed_initial_context_if_needed(&turn_context).await;
+    session
+        .seed_initial_context_if_needed(&turn_context)
+        .await
+        .unwrap();
     let history_after_second_seed = session.clone_history().await;
     assert_eq!(expected, history_after_second_seed.raw_items());
 }

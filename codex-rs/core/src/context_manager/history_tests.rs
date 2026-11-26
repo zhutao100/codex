@@ -344,16 +344,18 @@ fn usage_boundary_keeps_unreported_model_output(includes_reasoning: bool) {
 
 #[test]
 fn helper_fit_uses_measured_work_only_for_a_known_unchanged_user_boundary() {
+    let source = UsageSource {
+        model: "source",
+        provider: "one",
+        endpoint: Some("route-a"),
+    };
+    let projection = HelperProjection::plain(true);
     let reasoning = reasoning_with_encrypted_content(64_000);
     let reserve = estimate_item_token_count(&reasoning);
     let mut history =
         create_history_with_items(vec![user_msg("first"), reasoning, user_msg("second")]);
     assert_eq!(
-        history.helper_tokens_from_usage(
-            "source",
-            false,
-            crate::context_manager::HelperProjection::plain(true)
-        ),
+        history.helper_tokens_from_usage(source, false, projection),
         None
     );
     history.update_token_info(
@@ -372,11 +374,7 @@ fn helper_fit_uses_measured_work_only_for_a_known_unchanged_user_boundary() {
     history.record_items([&tool], policy);
     let work = 800 - 40 + estimate_item_token_count(&tool);
     assert_eq!(
-        history.helper_tokens_from_usage(
-            "source",
-            false,
-            crate::context_manager::HelperProjection::plain(true)
-        ),
+        history.helper_tokens_from_usage(source, false, projection),
         None
     );
     assert_eq!(history.work_usage_without_frames(false), work + reserve);
@@ -385,38 +383,59 @@ fn helper_fit_uses_measured_work_only_for_a_known_unchanged_user_boundary() {
         crate::compact::AUTO_COMPACT_WORK_NOTES_REQUEST_TAG.to_owned(),
     )
     .into();
-    for (source, expected) in [(None, None), (Some("source"), Some(work))] {
+    for (model, expected) in [(None, None), (Some("source"), Some(work))] {
         let mut captured = history.clone();
-        captured.set_measured_context(40, source.map(str::to_owned));
+        captured.set_measured_context(40, model.map(str::to_owned));
+        captured.mark_measured_projection(source.provider, source.endpoint, projection);
         let start = captured.raw_items().len();
         captured.record_session_item(&marker, policy, false);
         assert_eq!(
             captured
-                .work_notes_baseline_at(start, "source")
+                .work_notes_baseline_at(start, source)
                 .map(|b| b.work_tokens(
                     &BaseInstructions::default(),
                     crate::context_manager::HelperProjection::plain(true)
                 )),
             expected
         );
-        assert!(captured.work_notes_baseline_at(start, "other").is_none());
+        for other in [
+            UsageSource {
+                model: "other",
+                ..source
+            },
+            UsageSource {
+                provider: "two",
+                ..source
+            },
+            UsageSource {
+                endpoint: Some("route-b"),
+                ..source
+            },
+            UsageSource {
+                endpoint: None,
+                ..source
+            },
+        ] {
+            assert!(captured.work_notes_baseline_at(start, other).is_none());
+        }
     }
     history.set_measured_context(40, Some("source".into()));
+    assert_eq!(
+        history.helper_tokens_from_usage(source, false, projection),
+        None
+    );
+    history.mark_measured_projection(source.provider, source.endpoint, projection);
     history.record_items([&user_msg("not yet measured")], policy);
     let conservative = history.work_usage_without_frames(false);
     assert_eq!(
-        history.helper_tokens_from_usage(
-            "source",
-            false,
-            crate::context_manager::HelperProjection::plain(true)
-        ),
+        history.helper_tokens_from_usage(source, false, projection),
         Some(conservative)
     );
     let start = history.raw_items().len();
     history.record_session_item(&marker, policy, false);
     assert_eq!(
         history
-            .work_notes_baseline_at(start, "source")
+            .work_notes_baseline_at(start, source)
             .map(|b| b.work_tokens(
                 &BaseInstructions::default(),
                 crate::context_manager::HelperProjection::plain(true)

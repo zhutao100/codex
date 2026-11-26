@@ -110,7 +110,10 @@ use crate::client::ModelClient;
 use crate::client::ModelClientSession;
 use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
+use crate::client_common::ResponseUsage;
+use crate::client_common::SampledControls;
 use crate::client_common::SampledReasoning;
+use crate::client_common::SampledVerbosity;
 use crate::client_common::ToolSurface;
 use crate::codex_thread::ThreadConfigSnapshot;
 use crate::compact::InitialContextInjection;
@@ -180,7 +183,6 @@ use crate::protocol::StreamErrorEvent;
 use crate::protocol::Submission;
 use crate::protocol::ThreadRolledBackEvent;
 use crate::protocol::TokenCountEvent;
-use crate::protocol::TokenUsage;
 use crate::protocol::TokenUsageInfo;
 use crate::protocol::TurnContinuationSource;
 use crate::protocol::TurnContinuedEvent;
@@ -249,6 +251,7 @@ use codex_protocol::user_input::UserInput;
 use tokio::sync::watch;
 
 mod completion_review;
+pub(crate) use completion_review::ReviewFrameProposal;
 mod handlers;
 mod mcp;
 mod read_only_temp;
@@ -649,14 +652,30 @@ impl SessionState {
             .map(|(id, _)| *id)
     }
 
-    fn sampled_settings(
-        &self,
-        context: &TurnContext,
-        base: &BaseInstructions,
-    ) -> RegularTaskSettings {
+    fn task_settings(&self, context: &TurnContext, base: &BaseInstructions) -> RegularTaskSettings {
         let mut settings = RegularTaskSettings::from_turn(context);
         settings.recorded_base = self.recorded_base_id(&base.text);
-        settings.sampled_reasoning = Some(context.sampled_reasoning());
+        settings
+    }
+
+    fn checkpoint_source_settings(&self, context: &TurnContext) -> RegularTaskSettings {
+        let mut settings = self.task_settings(context, &self.base_instructions_for_turn(context));
+        if let Some(last) = &self.completion_review.last_work_settings
+            && last.sampled_controls.is_some()
+        {
+            // Compare all task settings, including the recorded base. A login or catalog
+            // change is not a new sample of this task's generation controls.
+            settings.sampled_controls.clone_from(&last.sampled_controls);
+            if &settings == last {
+                return settings;
+            }
+        }
+        settings.sampled_controls = context.sampled_controls.clone().or_else(|| {
+            context.sampled_controls_at(
+                context.current_endpoint().as_deref(),
+                context.model_info.supports_parallel_tool_calls,
+            )
+        });
         settings
     }
 
@@ -1085,6 +1104,7 @@ impl Session {
             state.history.measured_format_delta = usage.measured_format_delta;
             state.history.measured_base_tokens = usage.measured_base_tokens;
             state.history.measured_tool_tokens = usage.measured_tool_tokens;
+            state.history.measured_surface = usage.measured_surface;
             state.history.work_notes_baseline = usage.work_notes_baseline;
             state.set_server_reasoning_included(usage.server_reasoning_included);
         } else {
@@ -1983,17 +2003,40 @@ impl Session {
             .set_reference_context_item(Some(context.reference));
     }
 
-    pub(crate) async fn seed_initial_context_if_needed(&self, turn_context: &TurnContext) {
-        {
-            let state = self.state.lock().await;
-            if state.initial_context_seeded {
-                return;
-            }
+    /// Without a fresh user admission, commit the messages and reference in one recorder line.
+    pub(crate) async fn seed_initial_context_if_needed(
+        self: &Arc<Self>,
+        context: &Arc<TurnContext>,
+    ) -> CodexResult<()> {
+        if self.state.lock().await.initial_context_seeded {
+            return Ok(());
         }
-
-        self.record_context_updates_and_set_reference_context_item(turn_context)
-            .await;
-        self.flush_rollout().await;
+        let context = Arc::clone(context);
+        self.completion_review_transaction(move |session| async move {
+            if session.state.lock().await.initial_context_seeded {
+                return Ok(());
+            }
+            let items = session.build_initial_context(&context).await;
+            let reference = context.to_turn_context_item();
+            let recorder = session.services.rollout.lock().await.clone();
+            if let Some(recorder) = recorder {
+                recorder
+                    .record_items(&[RolloutItem::ContextSeed {
+                        items: items.clone(),
+                        reference: reference.clone(),
+                    }])
+                    .await?;
+                recorder.flush().await?;
+            }
+            let mut state = session.state.lock().await;
+            state.record_items(items.iter(), context.truncation_policy);
+            state.history.set_reference_context_item(Some(reference));
+            state.initial_context_seeded = true;
+            drop(state);
+            session.send_raw_response_items(&context, &items).await;
+            Ok(())
+        })
+        .await?
     }
 
     async fn persist_rollout_response_items(
@@ -2132,12 +2175,13 @@ impl Session {
     pub(crate) async fn update_token_usage_info_with_request_context(
         &self,
         turn_context: &TurnContext,
-        token_usage: Option<&TokenUsage>,
+        usage: ResponseUsage<'_>,
         request_context_tokens: i64,
         server_reasoning_included: bool,
         input_item_count: usize,
         prompt: &Prompt,
     ) {
+        let token_usage = usage.tokens;
         let record_context = {
             let mut state = self.state.lock().await;
             if let Some(token_usage) = token_usage.filter(|usage| usage.total_tokens > 0) {
@@ -2150,12 +2194,14 @@ impl Session {
                     request_context_tokens,
                     Some(turn_context.model_info.slug.clone()),
                 );
-                state
-                    .history
-                    .mark_measured_projection(crate::context_manager::HelperProjection {
+                state.history.mark_measured_projection(
+                    &turn_context.model_provider_id,
+                    usage.endpoint,
+                    crate::context_manager::HelperProjection {
                         images: turn_context.supports_image_inputs(),
                         structured_outputs: prompt.tools.structured_outputs,
-                    });
+                    },
+                );
                 state.history.measured_base_tokens = Some(crate::truncate::approx_token_count(
                     &prompt.base_instructions.text,
                 ) as i64);
@@ -2201,6 +2247,7 @@ impl Session {
                     measured_format_delta: state.history.measured_format_delta,
                     measured_base_tokens: state.history.measured_base_tokens,
                     measured_tool_tokens: state.history.measured_tool_tokens,
+                    measured_surface: state.history.measured_surface.clone(),
                 })
         };
         if let Some(item) = item {

@@ -2,6 +2,7 @@ use crate::client_common::tools::ToolSpec;
 use crate::config::types::Personality;
 use crate::error::Result;
 pub use codex_api::common::ResponseEvent;
+use codex_protocol::config_types::Verbosity;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::ResponseItem;
@@ -47,9 +48,58 @@ pub struct Prompt {
 
     /// Optionally specify the personality of the model.
     pub personality: Option<Personality>,
+    pub(crate) verbosity: Option<SampledVerbosity>,
+    pub(crate) sampled_controls: Option<SampledControls>,
+    pub(crate) helper_fit: Option<crate::compact::HelperFit>,
+    pub(crate) review_admission: Option<ReviewAdmission>,
 
     /// Optional the output schema for the model's response.
     pub output_schema: Option<Value>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ReviewAdmission {
+    pub(crate) target: i64,
+    pub(crate) proposal: Option<Arc<crate::session::ReviewFrameProposal>>,
+    /// The ordinary estimate is attributable only to this authenticated endpoint.
+    pub(crate) measured: Option<(String, i64)>,
+}
+
+impl ReviewAdmission {
+    pub(crate) async fn admit(
+        &self,
+        prompt: &Prompt,
+        items: &mut [ResponseItem],
+        endpoint: Option<&str>,
+    ) -> Result<()> {
+        let estimated = match &self.measured {
+            Some((owner, tokens)) if Some(owner.as_str()) == endpoint => *tokens,
+            _ => items.iter().fold(
+                (crate::truncate::approx_token_count(&prompt.base_instructions.text) as i64)
+                    .saturating_add(prompt.tools.tokens()),
+                |cost, item| {
+                    cost.saturating_add(crate::context_manager::estimate_item_token_count(item))
+                },
+            ),
+        };
+        if let Some(proposal) = &self.proposal {
+            return proposal
+                .admit(estimated, self.target, items, endpoint)
+                .await;
+        }
+        Self::check_size(estimated, self.target, endpoint)
+    }
+
+    pub(crate) fn check_size(estimated: i64, target: i64, endpoint: Option<&str>) -> Result<()> {
+        if estimated > target {
+            return Err(crate::error::CodexErr::ReviewPayloadExceeded {
+                estimated,
+                target,
+                endpoint: endpoint.map(str::to_owned),
+            });
+        }
+        Ok(())
+    }
 }
 
 /// The same ordered inventory is used for admission, sampling and its usage record.
@@ -99,6 +149,48 @@ pub(crate) enum SampledReasoning {
     Enabled(Option<ReasoningEffort>),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SampledVerbosity {
+    Omitted,
+    Level(Verbosity),
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct SampledControls {
+    pub(crate) route: crate::model_provider_info::CheckpointRoute,
+    pub(crate) reasoning: SampledReasoning,
+    pub(crate) verbosity: SampledVerbosity,
+    /// Older receipts did not record this setting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) parallel_tool_calls: Option<bool>,
+}
+
+impl SampledControls {
+    pub(crate) fn owns_endpoint(&self, endpoint: Option<&str>) -> bool {
+        self.route.owns_endpoint(endpoint)
+    }
+}
+
+impl SampledVerbosity {
+    pub(crate) fn for_request(model: &ModelInfo, configured: Option<Verbosity>) -> Self {
+        if model.support_verbosity {
+            configured
+                .or(model.default_verbosity)
+                .map_or(Self::Omitted, Self::Level)
+        } else {
+            Self::Omitted
+        }
+    }
+
+    pub(crate) fn level(self) -> Option<Verbosity> {
+        match self {
+            Self::Omitted => None,
+            Self::Level(value) => Some(value),
+        }
+    }
+}
+
 impl SampledReasoning {
     pub(crate) fn for_request(model: &ModelInfo, effort: Option<ReasoningEffort>) -> Self {
         if model.supports_reasoning_summaries {
@@ -111,16 +203,19 @@ impl SampledReasoning {
             Self::Disabled
         }
     }
-
-    pub(crate) fn restore(self, model: &mut ModelInfo) {
-        model.supports_reasoning_summaries = matches!(self, Self::Enabled(_));
-        if let Self::Enabled(effort) = self {
-            model.default_reasoning_level = effort;
-        }
-    }
 }
 
 impl Prompt {
+    pub(crate) fn parallel_tool_calls_at(&self, endpoint: Option<&str>) -> bool {
+        self.parallel_tool_calls
+            && self
+                .sampled_controls
+                .as_ref()
+                .filter(|c| c.owns_endpoint(endpoint))
+                .and_then(|c| c.parallel_tool_calls)
+                .unwrap_or(true)
+    }
+
     pub(crate) fn with_tools(mut self, tools: ToolSurface) -> Self {
         self.tools = tools;
         self.format_tool_results();
@@ -313,8 +408,28 @@ pub(crate) mod tools {
 }
 
 pub struct ResponseStream {
+    pub(crate) endpoint_sha256: Option<String>,
+    pub(crate) compact_input: Option<crate::compact::SentCompactInput>,
     pub(crate) rx_event: mpsc::Receiver<Result<ResponseEvent>>,
     pub(crate) consumer_dropped: CancellationToken,
+}
+
+/// Usage belongs to the endpoint that opened this stream, not a newly resolved configuration.
+pub(crate) struct ResponseUsage<'a> {
+    pub(crate) tokens: Option<&'a codex_protocol::protocol::TokenUsage>,
+    pub(crate) endpoint: Option<&'a str>,
+}
+
+impl ResponseStream {
+    pub(crate) fn usage<'a>(
+        &'a self,
+        tokens: Option<&'a codex_protocol::protocol::TokenUsage>,
+    ) -> ResponseUsage<'a> {
+        ResponseUsage {
+            tokens,
+            endpoint: self.endpoint_sha256.as_deref(),
+        }
+    }
 }
 
 impl Stream for ResponseStream {
@@ -333,11 +448,29 @@ impl Drop for ResponseStream {
 
 #[cfg(test)]
 mod tests {
+    use super::SampledControls;
     use codex_api::ResponsesApiRequest;
     use codex_api::common::OpenAiVerbosity;
     use codex_api::common::TextControls;
     use codex_api::create_text_param_for_request;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn legacy_sampled_controls_do_not_override_parallel_calls() -> serde_json::Result<()> {
+        let original = serde_json::json!({"route":{"provider":"sample","endpoint_sha256":"A"}, "reasoning":"disabled", "verbosity":"omitted"});
+        let controls: SampledControls = serde_json::from_value(original.clone())?;
+        assert_eq!(serde_json::to_value(&controls)?, original);
+        assert_eq!(
+            [false, true].map(|allowed| super::Prompt {
+                sampled_controls: Some(controls.clone()),
+                parallel_tool_calls: allowed,
+                ..Default::default()
+            }
+            .parallel_tool_calls_at(Some("A"))),
+            [false, true]
+        );
+        Ok(())
+    }
 
     #[test]
     fn serializes_text_verbosity_when_set() {

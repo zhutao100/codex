@@ -15,7 +15,11 @@ pub fn apply_rollout_item(
 ) {
     match item {
         RolloutItem::SessionMeta(meta_line) => apply_session_meta_from_item(metadata, meta_line),
-        RolloutItem::TurnContext(turn_ctx) => apply_turn_context(metadata, turn_ctx),
+        RolloutItem::TurnContext(turn_ctx)
+        | RolloutItem::ContextSeed {
+            reference: turn_ctx,
+            ..
+        } => apply_turn_context(metadata, turn_ctx),
         RolloutItem::EventMsg(event) => apply_event_msg(metadata, event),
         RolloutItem::ResponseItem(item) => apply_response_item(metadata, item),
         RolloutItem::Compacted(_)

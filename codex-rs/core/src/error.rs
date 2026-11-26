@@ -71,6 +71,17 @@ pub enum CodexErr {
     )]
     ContextWindowExceeded,
 
+    #[error(
+        "Review follow-up needs {estimated} estimated tokens on the sending endpoint, with {target} available. Run /compact or select a larger context window, then /continue. No oversized request was sent."
+    )]
+    ReviewPayloadExceeded {
+        estimated: i64,
+        target: i64,
+        endpoint: Option<String>,
+    },
+    #[error("The pending review was superseded before dispatch.")]
+    ReviewSuperseded,
+
     #[error("no thread with id: {0}")]
     ThreadNotFound(ThreadId),
 
@@ -196,6 +207,8 @@ impl CodexErr {
             | CodexErr::LandlockSandboxExecutableNotProvided
             | CodexErr::RetryLimit(_)
             | CodexErr::ContextWindowExceeded
+            | CodexErr::ReviewPayloadExceeded { .. }
+            | CodexErr::ReviewSuperseded
             | CodexErr::ThreadNotFound(_)
             | CodexErr::AgentLimitReached { .. }
             | CodexErr::Spawn

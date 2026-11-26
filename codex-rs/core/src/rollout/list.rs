@@ -587,6 +587,7 @@ async fn read_head_summary(path: &Path, head_limit: usize) -> io::Result<HeadTai
                     .or_else(|| Some(rollout_line.timestamp.clone()));
             }
             RolloutItem::TurnContext(_)
+            | RolloutItem::ContextSeed { .. }
             | RolloutItem::ToolOutputPolicy { .. }
             | RolloutItem::SampledInstructions { .. }
             | RolloutItem::TokenUsageContext { .. }
@@ -649,6 +650,7 @@ async fn read_head_records(path: &Path, limit: usize) -> io::Result<Vec<serde_js
                     }
                 }
                 RolloutItem::Compacted(_)
+                | RolloutItem::ContextSeed { .. }
                 | RolloutItem::TurnContext(_)
                 | RolloutItem::ToolOutputPolicy { .. }
                 | RolloutItem::SampledInstructions { .. }

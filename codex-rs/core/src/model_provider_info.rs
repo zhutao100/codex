@@ -16,9 +16,32 @@ use http::header::HeaderValue;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
+use sha2::Digest;
+use sha2::Sha256;
 use std::collections::HashMap;
 use std::env::VarError;
 use std::time::Duration;
+use url::Url;
+
+/// Host-only ownership of a sampled request. Never write an endpoint or auth data to the rollout.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CheckpointRoute {
+    pub(crate) provider: String,
+    pub(crate) endpoint_sha256: String,
+}
+
+impl CheckpointRoute {
+    pub(crate) fn owns_endpoint(&self, endpoint: Option<&str>) -> bool {
+        Some(self.endpoint_sha256.as_str()) == endpoint
+    }
+
+    pub(crate) fn new(provider: &str, endpoint: Option<&str>) -> Option<Self> {
+        Some(Self {
+            provider: provider.to_owned(),
+            endpoint_sha256: endpoint?.to_owned(),
+        })
+    }
+}
 
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS: u64 = 300_000;
 const DEFAULT_STREAM_MAX_RETRIES: u64 = 5;
@@ -141,19 +164,60 @@ impl ModelProviderInfo {
         Ok(headers)
     }
 
+    fn resolved_base_url(&self, auth_mode: Option<AuthMode>) -> &str {
+        self.base_url
+            .as_deref()
+            .unwrap_or(if matches!(auth_mode, Some(AuthMode::Chatgpt)) {
+                "https://chatgpt.com/backend-api/codex"
+            } else {
+                "https://api.openai.com/v1"
+            })
+    }
+
+    fn endpoint_fingerprint(&self, auth_mode: Option<AuthMode>) -> Option<String> {
+        self.fingerprint_for_base_url(self.resolved_base_url(auth_mode))
+    }
+
+    pub(crate) fn fingerprint_for_base_url(&self, base_url: &str) -> Option<String> {
+        let mut url = Url::parse(base_url).ok()?;
+        match url.scheme() {
+            "ws" => url.set_scheme("http").ok()?,
+            "wss" => url.set_scheme("https").ok()?,
+            "http" | "https" => (),
+            _ => return None,
+        }
+        // Arbitrary query selectors or URL credentials may identify another deployment.
+        // Do not store or hash secrets to try to reconstruct it.
+        if !url.has_host()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || self.query_params.as_ref().is_some_and(|p| !p.is_empty())
+        {
+            return None;
+        }
+        Some(format!(
+            "{:x}",
+            Sha256::digest(url.as_str().trim_end_matches('/').as_bytes())
+        ))
+    }
+
+    /// Predict the same route as `resolve_request_auth` without reading credentials.
+    pub(crate) fn configured_endpoint(&self, session_auth: Option<AuthMode>) -> Option<String> {
+        let mode = if self.env_key.is_some() || self.experimental_bearer_token.is_some() {
+            Some(AuthMode::ApiKey)
+        } else {
+            session_auth
+        };
+        self.endpoint_fingerprint(mode)
+    }
+
     pub(crate) fn to_api_provider(
         &self,
         auth_mode: Option<AuthMode>,
     ) -> crate::error::Result<ApiProvider> {
-        let default_base_url = if matches!(auth_mode, Some(AuthMode::Chatgpt)) {
-            "https://chatgpt.com/backend-api/codex"
-        } else {
-            "https://api.openai.com/v1"
-        };
-        let base_url = self
-            .base_url
-            .clone()
-            .unwrap_or_else(|| default_base_url.to_string());
+        let base_url = self.resolved_base_url(auth_mode).to_owned();
 
         let headers = self.build_header_map()?;
         let retry = ApiRetryConfig {
@@ -343,6 +407,49 @@ pub fn create_oss_provider_with_base_url(base_url: &str, wire_api: WireApi) -> M
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn checkpoint_owner_uses_the_effective_endpoint_without_persisting_url_data() {
+        let mut provider =
+            create_oss_provider_with_base_url("https://EXAMPLE.com:443/v1/", WireApi::Responses);
+        let owner = provider.endpoint_fingerprint(None).unwrap();
+        assert_eq!(owner.len(), 64);
+        assert!(owner.bytes().all(|b| b.is_ascii_hexdigit()));
+        provider.base_url = Some("https://example.com/v1".into());
+        assert_eq!(
+            provider
+                .endpoint_fingerprint(Some(AuthMode::Chatgpt))
+                .as_ref(),
+            Some(&owner)
+        );
+        provider.base_url = Some("wss://example.com:443/v1".into());
+        assert_eq!(provider.endpoint_fingerprint(None).as_ref(), Some(&owner));
+        for other in [
+            "https://example.com:8443/v1",
+            "https://example.com/v2",
+            "http://example.com/v1",
+            "https://other.example/v1",
+        ] {
+            provider.base_url = Some(other.into());
+            assert_ne!(provider.endpoint_fingerprint(None).unwrap(), owner);
+        }
+        for ambiguous in [
+            "https://user:password@example.com/v1",
+            "https://example.com/v1?token=secret",
+            "not a URL",
+        ] {
+            provider.base_url = Some(ambiguous.into());
+            assert_eq!(provider.endpoint_fingerprint(None), None);
+        }
+        provider.base_url = None;
+        let api = provider.endpoint_fingerprint(Some(AuthMode::ApiKey));
+        let chat = provider.endpoint_fingerprint(Some(AuthMode::Chatgpt));
+        assert!(api.is_some() && chat.is_some() && api != chat);
+        provider.env_key = Some("KEY_NAME".into());
+        assert_eq!(provider.configured_endpoint(Some(AuthMode::Chatgpt)), api);
+        provider.query_params = Some(HashMap::from([("token".into(), "secret".into())]));
+        assert_eq!(provider.configured_endpoint(None), None);
+    }
 
     #[test]
     fn test_deserialize_ollama_model_provider_toml() {

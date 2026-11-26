@@ -214,9 +214,12 @@ impl Session {
 
         let task: Arc<dyn AnySessionTask> = Arc::new(task);
         let task_kind = task.kind();
-        if task_kind != TaskKind::Regular {
-            self.seed_initial_context_if_needed(turn_context.as_ref())
+        if task_kind != TaskKind::Regular
+            && let Err(error) = self.seed_initial_context_if_needed(&turn_context).await
+        {
+            self.send_event(&turn_context, EventMsg::Error(error.to_error_event(None)))
                 .await;
+            return;
         }
         let review_input_revision = if task_kind == TaskKind::Regular && !input.is_empty() {
             self.accept_completion_review_input(&input, true, Some(&turn_context))

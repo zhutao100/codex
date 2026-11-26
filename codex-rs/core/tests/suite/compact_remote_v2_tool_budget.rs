@@ -28,6 +28,233 @@ fn request_cost(request: &ResponsesRequest) -> Result<i64> {
     Ok(count)
 }
 
+#[test_case::test_case(false; "catalog enables parallel tool calls")]
+#[test_case::test_case(true; "catalog withdraws parallel tool calls")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn same_slug_provider_rebind_keeps_the_receipt_without_applying_it(
+    original_parallel: bool,
+) -> Result<()> {
+    skip_if_no_network_unless_localhost!(Ok(()));
+    const MODEL: &str = "gpt-5.1";
+    let cwd = tempfile::tempdir()?;
+    let args = evidence(cwd.path())?;
+    let build = |window, selected: &'static str, first: String, second: String, supports: bool| {
+        builder(cwd.path(), window, TruncationPolicyConfig::bytes(32_000)).with_config(move |cfg| {
+            for (key, url) in [("first", first), ("second", second)] {
+                let mut provider = cfg.model_provider.clone();
+                provider.base_url = Some(url);
+                cfg.model_providers.insert(key.into(), provider);
+            }
+            let overlay = cfg.model_overlay.as_mut().unwrap();
+            overlay.cross_model.effective_context_window_percent = Some(100);
+            overlay.cross_model.supports_reasoning_summaries = Some(supports);
+            overlay.cross_model.default_reasoning_level =
+                Some(Some(codex_protocol::openai_models::ReasoningEffort::Low));
+            overlay.cross_model.support_verbosity = Some(supports);
+            overlay.cross_model.supports_parallel_tool_calls = Some(if supports {
+                original_parallel
+            } else {
+                !original_parallel
+            });
+            cfg.model_verbosity = Some(codex_protocol::config_types::Verbosity::High);
+            overlay.models.push(ModelOverlayEntry {
+                slug: MODEL.into(),
+                model_provider: Some(selected.into()),
+                patch: Default::default(),
+                final_instruction_override: None,
+            });
+        })
+    };
+    let replies = [
+        responses::sse(vec![
+            responses::ev_function_call("doc", "read_file", &args),
+            responses::ev_completed_with_tokens("work", 31_800),
+        ]),
+        text_reply("notes", NOTES, 5_000),
+        compact_response("summary"),
+        text_reply("done", "Done.", 2_000),
+    ];
+    let original = responses::start_mock_server().await;
+    let other = responses::start_mock_server().await;
+    let capture = responses::mount_sse_sequence(&original, replies.to_vec()).await;
+    let live = build(120_000, "first", original.uri(), other.uri(), true)
+        .build(&original)
+        .await?;
+    live.codex
+        .submit(user_input("Inspect the evidence."))
+        .await?;
+    complete(&live.codex).await;
+    shutdown(&live.codex).await?;
+    let captured = capture.requests();
+    assert_eq!(captured.len(), 4);
+    let full = captured[2].function_call_output("doc");
+    assert_eq!(captured[0].body_json()["reasoning"]["effort"], "low");
+    assert_eq!(captured[0].body_json()["text"]["verbosity"], "high");
+    assert_eq!(
+        captured[0].body_json()["parallel_tool_calls"],
+        original_parallel
+    );
+    assert!(full.to_string().contains("sampled evidence"));
+    let path = live.codex.rollout_path().context("rollout")?;
+    let raw = std::fs::read_to_string(&path)?;
+    let before = cut_after_output(&raw, "doc")?;
+    let mut after = 0;
+    let mut sampled_controls = None;
+    for line in raw.split_inclusive('\n') {
+        after += line.len();
+        let v: Value = serde_json::from_str(line)?;
+        let p = &v["payload"];
+        if v["type"] == "token_usage_context" {
+            assert_eq!(p["source_model"], MODEL);
+            assert_eq!(p["measured_surface"]["provider"], "first");
+            if p["info"]["last_token_usage"]["input_tokens"] == 5_000 {
+                break;
+            }
+        }
+        if let Some(decision) = p["pending_compaction"].as_object() {
+            assert_eq!(decision["fit_route"]["provider"], "first");
+            assert_eq!(
+                decision["fit_route"]["endpoint_sha256"]
+                    .as_str()
+                    .map(str::len),
+                Some(64)
+            );
+            assert_eq!(
+                decision["source"]["sampled_controls"]["route"],
+                decision["fit_route"]
+            );
+            assert!(decision["source_fit"]["measured"].is_object());
+            sampled_controls = Some(decision["source"]["sampled_controls"].clone());
+        }
+    }
+    assert!(before < after && after < raw.len());
+    let sampled_controls = sampled_controls.context("initial sampled controls")?;
+    assert_eq!(sampled_controls["parallel_tool_calls"], original_parallel);
+    for (cut, next) in [(before, 1), (after, 2)] {
+        for (new_key, new_endpoint, legacy) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (true, true, false),
+            (false, false, true),
+        ] {
+            let local = new_key || new_endpoint || legacy;
+            if legacy {
+                let mut unowned = String::new();
+                for line in raw[..cut].lines() {
+                    let mut v: Value = serde_json::from_str(line)?;
+                    if let Some(p) = v["payload"].as_object_mut() {
+                        if let Some(surface) =
+                            p.get_mut("measured_surface").and_then(Value::as_object_mut)
+                        {
+                            surface.remove("endpoint_sha256"); // The older record still identifies the key.
+                        }
+                        if let Some(s) = p
+                            .get_mut("last_work_settings")
+                            .and_then(Value::as_object_mut)
+                        {
+                            s.remove("sampled_controls");
+                        }
+                        if let Some(d) = p
+                            .get_mut("pending_compaction")
+                            .and_then(Value::as_object_mut)
+                        {
+                            d.remove("fit_route");
+                            d.insert("fit_provider".into(), json!("first"));
+                            if let Some(s) = d.get_mut("source").and_then(Value::as_object_mut) {
+                                s.remove("sampled_controls");
+                            }
+                        }
+                    }
+                    unowned.push_str(&serde_json::to_string(&v)?);
+                    unowned.push('\n');
+                }
+                std::fs::write(&path, unowned)?;
+            } else {
+                std::fs::write(&path, &raw[..cut])?;
+            }
+            let (route, unused) = if new_endpoint {
+                (&other, &original)
+            } else {
+                (&original, &other)
+            };
+            let unrelated_posts = responses::model_post_count(unused).await?;
+            let wire = responses::mount_sse_sequence(route, replies[next..].to_vec()).await;
+            let active = if new_key {
+                build(32_000, "second", original.uri(), route.uri(), false)
+            } else {
+                build(32_000, "first", route.uri(), other.uri(), false)
+            }
+            .resume(&original, live.home.clone(), path.clone())
+            .await?;
+            active.codex.submit(Op::Continue).await?;
+            complete(&active.codex).await;
+            shutdown(&active.codex).await?;
+            let requests = wire.requests();
+            assert_eq!(requests.len(), 4 - next);
+            assert_eq!(responses::model_post_count(unused).await?, unrelated_posts);
+            for helper in &requests[..requests.len() - 1] {
+                assert_eq!(helper.body_json()["model"], MODEL);
+                assert_eq!(
+                    helper.body_json()["reasoning"],
+                    if local {
+                        Value::Null
+                    } else {
+                        captured[0].body_json()["reasoning"].clone()
+                    }
+                );
+                assert_eq!(
+                    helper.body_json()["text"]["verbosity"],
+                    if local { Value::Null } else { json!("high") }
+                );
+                assert_eq!(
+                    helper.body_json()["parallel_tool_calls"],
+                    local && !original_parallel,
+                    "key={new_key}, endpoint={new_endpoint}, legacy={legacy}, cut={cut}"
+                );
+                assert_eq!(
+                    helper.function_call_output("doc") == full,
+                    local,
+                    "key={new_key}, endpoint={new_endpoint}, legacy={legacy}, cut={cut}"
+                );
+            }
+            let destination = requests.last().context("destination")?.body_json();
+            assert_eq!(destination["parallel_tool_calls"], !original_parallel);
+            assert!(
+                destination["reasoning"].is_null() && destination["text"]["verbosity"].is_null()
+            );
+            let saved = std::fs::read_to_string(&path)?;
+            let decision = saved
+                .lines()
+                .filter_map(|s| serde_json::from_str::<Value>(s).ok())
+                .filter_map(|r| r["payload"]["pending_compaction"].as_object().cloned())
+                .next_back()
+                .context("recovered fit")?;
+            // A different current route uses local sizing, but cannot erase the
+            // original endpoint's qualified correction from the recovery journal.
+            assert_eq!(
+                decision["source_fit"] == json!("local"),
+                legacy,
+                "key={new_key}, endpoint={new_endpoint}, legacy={legacy}, cut={cut}"
+            );
+            assert_eq!(
+                decision
+                    .get("fit_route")
+                    .and_then(|r| r["provider"].as_str()),
+                (!legacy).then_some("first")
+            );
+            if !legacy {
+                assert_eq!(
+                    decision["source"]["sampled_controls"], sampled_controls,
+                    "key={new_key}, endpoint={new_endpoint}, cut={cut}"
+                );
+            }
+        }
+    }
+    assert_eq!(capture.requests().len(), 4);
+    Ok(())
+}
+
 #[test_case::test_case(true, true; "stable large inventory")]
 #[test_case::test_case(false, true; "MCP schemas added")]
 #[test_case::test_case(true, false; "MCP schemas removed")]
@@ -81,10 +308,9 @@ async fn helper_budgets_price_the_current_mcp_inventory(old: bool, new: bool) ->
     let raw = std::fs::read_to_string(&path)?;
     let cut = &raw[..cut_after_output(&raw, "doc")?];
     std::fs::write(&path, cut)?;
-    let probe_server = responses::start_mock_server().await;
-    let probe = responses::mount_sse_sequence(&probe_server, replies[1..].to_vec()).await;
+    let probe = responses::mount_sse_sequence(&server, replies[1..].to_vec()).await;
     let active = build(120_000)
-        .resume(&probe_server, live.home.clone(), path.clone())
+        .resume(&server, live.home.clone(), path.clone())
         .await?;
     active.codex.submit(refresh(new)).await?;
     active.codex.submit(Op::Continue).await?;
@@ -143,7 +369,6 @@ async fn helper_budgets_price_the_current_mcp_inventory(old: bool, new: bool) ->
             };
             for overflow in [0, 1] {
                 std::fs::write(&path, &prefix)?;
-                let server = responses::start_mock_server().await;
                 let wire = responses::mount_sse_sequence(&server, replies[1..].to_vec()).await;
                 let active = build(exact - overflow)
                     .resume(&server, live.home.clone(), path.clone())
@@ -207,7 +432,6 @@ async fn helper_budgets_price_the_current_mcp_inventory(old: bool, new: bool) ->
                     }
                     assert!(saw_receipt);
                     std::fs::write(&path, after_notes)?;
-                    let server = responses::start_mock_server().await;
                     let resumed =
                         responses::mount_sse_sequence(&server, replies[2..].to_vec()).await;
                     let active = build(exact - overflow)

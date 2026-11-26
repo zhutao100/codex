@@ -118,6 +118,10 @@ async fn run_remote_compact_task_inner_impl(
 
     let prompt = Prompt {
         input,
+        verbosity: Some(turn_context.verbosity),
+        sampled_controls: turn_context.sampled_controls.clone(),
+        helper_fit: None,
+        review_admission: None,
         tools: Default::default(),
         parallel_tool_calls: false,
         base_instructions,
@@ -136,15 +140,26 @@ async fn run_remote_compact_task_inner_impl(
         )
         .await?;
 
-    // Unlike V2, the unary endpoint supplies the replacement list and can echo its input.
+    // The unary endpoint can echo context with new IDs. The host owns its
+    // installation, either here or on the first ordinary admission.
+    let canonical = sess.build_initial_context(context.replacement).await;
+    let source_canonical = if Arc::ptr_eq(context.request, context.replacement) {
+        Vec::new()
+    } else {
+        sess.build_initial_context(context.request).await
+    };
     new_history.retain(|item| {
         !is_preserved_work_notes_item(item) && !context.review_frames.matches_message(item)
+            && !canonical.iter().chain(&source_canonical).any(|known| matches!(
+                (item, known),
+                (ResponseItem::Message { role, content, .. }, ResponseItem::Message { role: old_role, content: old_content, .. })
+                if role == old_role && content == old_content
+            ))
     });
     let reference_context_item = match initial_context_injection {
         InitialContextInjection::DoNotInject => None,
         InitialContextInjection::BeforeLastUserMessage => {
-            let initial_context = sess.build_initial_context(context.replacement).await;
-            insert_initial_context_before_last_real_user_message(&mut new_history, initial_context);
+            insert_initial_context_before_last_real_user_message(&mut new_history, canonical);
             Some(context.replacement.to_turn_context_item())
         }
     };

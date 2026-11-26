@@ -256,7 +256,10 @@ async fn live_continuation_discounts_discarded_sampled_calls_only_for_helper_fit
     session
         .update_token_usage_info_with_request_context(
             &context,
-            Some(&receipt),
+            ResponseUsage {
+                tokens: Some(&receipt),
+                endpoint: context.current_endpoint().as_deref(),
+            },
             0,
             true,
             1,
@@ -277,7 +280,7 @@ async fn live_continuation_discounts_discarded_sampled_calls_only_for_helper_fit
     let new_result = crate::context_manager::estimate_item_token_count(&result);
     assert_eq!(
         state.helper_tokens_from_usage(
-            &context.model_info.slug,
+            context.usage_source(context.current_endpoint().as_deref()),
             crate::context_manager::HelperProjection::plain(true)
         ),
         Some(receipt.input_tokens + new_result)
@@ -409,11 +412,14 @@ async fn compaction_usage_counts_preserved_notes_once_after_installation_and_res
     session
         .update_token_usage_info_with_request_context(
             &context,
-            Some(&TokenUsage {
-                input_tokens: 11_200,
-                total_tokens: 11_200,
-                ..Default::default()
-            }),
+            ResponseUsage {
+                tokens: Some(&TokenUsage {
+                    input_tokens: 11_200,
+                    total_tokens: 11_200,
+                    ..Default::default()
+                }),
+                endpoint: context.current_endpoint().as_deref(),
+            },
             5_000,
             false,
             0,
@@ -468,6 +474,7 @@ async fn compaction_usage_counts_preserved_notes_once_after_installation_and_res
                     measured_format_delta: None,
                     measured_base_tokens: None,
                     measured_tool_tokens: None,
+                    measured_surface: None,
                 },
                 RolloutItem::EventMsg(EventMsg::TokenCount(TokenCountEvent {
                     info: Some(info),
@@ -521,6 +528,12 @@ async fn continued_work_measurement_is_not_owned_by_the_previous_user_turn() {
                 measured_format_delta: None,
                 measured_base_tokens: None,
                 measured_tool_tokens: None,
+                measured_surface: owner.map(|_| codex_protocol::protocol::MeasuredInputSurface {
+                    provider: context.model_provider_id.clone(),
+                    endpoint_sha256: context.current_endpoint(),
+                    images: true,
+                    structured_outputs: false,
+                }),
             },
             RolloutItem::ResponseItem(
                 DeveloperInstructions::new(compact::AUTO_COMPACT_WORK_NOTES_REQUEST_TAG).into(),
@@ -535,18 +548,28 @@ async fn continued_work_measurement_is_not_owned_by_the_previous_user_turn() {
             .await;
         let state = session.state.lock().await;
         assert_eq!(state.work_source_model(), Some(owner.unwrap_or(&a.model)));
+        let endpoint = context.current_endpoint();
+        let source_a = crate::context_manager::UsageSource {
+            model: &a.model,
+            provider: &context.model_provider_id,
+            endpoint: endpoint.as_deref(),
+        };
+        let source_b = crate::context_manager::UsageSource {
+            model: &b.model,
+            ..source_a
+        };
         assert_eq!(
             state.helper_tokens_from_usage(
-                &a.model,
+                source_a,
                 crate::context_manager::HelperProjection::plain(true)
             ),
             None
         );
-        assert_eq!(state.history.work_notes_baseline_at(2, &a.model), None);
+        assert_eq!(state.history.work_notes_baseline_at(2, source_a), None);
         assert_eq!(
             state
                 .history
-                .work_notes_baseline_at(2, &b.model)
+                .work_notes_baseline_at(2, source_b)
                 .map(|s| s.work_tokens(
                     &BaseInstructions::default(),
                     crate::context_manager::HelperProjection::plain(true)

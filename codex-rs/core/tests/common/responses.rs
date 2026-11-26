@@ -38,6 +38,22 @@ pub async fn mount_app_catalog(server: &MockServer, names: &[&str]) {
     mount_app_catalog_with_capabilities(server, names, serde_json::json!({"tools":{}})).await;
 }
 
+/// Includes unexpected requests that did not match a mounted response fixture.
+pub async fn model_post_count(server: &MockServer) -> Result<usize> {
+    let received = server
+        .received_requests()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("request recording disabled"))?;
+    Ok(received
+        .iter()
+        .filter(|r| {
+            r.method.as_str() == "POST"
+                && (r.url.path().ends_with("/responses")
+                    || r.url.path().ends_with("/responses/compact"))
+        })
+        .count())
+}
+
 /// Refresh ordinary MCP servers backed by the loopback catalog. An empty list removes them.
 pub fn refresh_catalog_servers(
     server: &MockServer,

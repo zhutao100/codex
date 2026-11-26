@@ -172,7 +172,7 @@ pub(crate) struct RegularTaskSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) recorded_base: Option<ThreadId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(super) sampled_reasoning: Option<SampledReasoning>,
+    pub(super) sampled_controls: Option<SampledControls>,
 }
 
 impl RegularTaskSettings {
@@ -191,7 +191,7 @@ impl RegularTaskSettings {
             service_tier: config.service_tier.clone(),
             schema: None,
             recorded_base: None,
-            sampled_reasoning: None,
+            sampled_controls: None,
         }
     }
 
@@ -211,7 +211,7 @@ impl RegularTaskSettings {
             service_tier: ctx.service_tier.clone(),
             schema: ctx.final_output_json_schema.clone(),
             recorded_base: None,
-            sampled_reasoning: None,
+            sampled_controls: None,
         }
     }
 

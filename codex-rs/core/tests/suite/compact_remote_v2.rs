@@ -407,10 +407,9 @@ async fn measured_second_user_turn_preserves_helper_prefix_without_reasoning_hea
             }
             std::fs::write(path, legacy)?;
         }
-        let restart = responses::start_mock_server().await;
-        let replay = responses::mount_sse_sequence(&restart, helpers().into()).await;
+        let replay = responses::mount_sse_sequence(&server, helpers().into()).await;
         let resumed = builder()
-            .resume(&restart, test.home.clone(), path.clone())
+            .resume(&server, test.home.clone(), path.clone())
             .await?;
         resumed.codex.submit(Op::Continue).await?;
         complete(&resumed.codex).await;
@@ -458,7 +457,19 @@ async fn repeated_auto_compaction_preserves_the_full_work_prefix_and_installs_on
     let arguments = json!({"file_path":path}).to_string();
     let mut streams = Vec::new();
     let mut starts = Vec::new();
+    let extra_candidates = [
+        "Second same-scope candidate.",
+        "Third same-scope candidate.",
+    ];
     for epoch in 1..=5 {
+        if epoch == 3 {
+            for candidate in extra_candidates {
+                streams.extend([
+                    responses::sse(vec![responses::ev_assistant_message("candidate", candidate), responses::ev_completed_with_tokens("candidate", 14_000)]),
+                    responses::sse(vec![responses::ev_assistant_message("review", r#"{"evaluation":"Check the next candidate.","fix_actions_advised":true}"#), responses::ev_completed("review")]),
+                ]);
+            }
+        }
         starts.push(streams.len());
         let mut reasoning = responses::ev_reasoning_item("reasoning", &[], &[]);
         // The opaque wire representation is large; the completed work request reports that it fits.
@@ -471,10 +482,14 @@ async fn repeated_auto_compaction_preserves_the_full_work_prefix_and_installs_on
             ]),
             responses::sse(vec![
                 responses::ev_function_call("last", "read_file", &arguments),
-                // Even cycles hit the review payload guard below the ordinary threshold.
+                // Include a review-budget crossing with three anchored frames, below the automatic threshold.
                 responses::ev_completed_with_tokens(
                     "near-limit",
-                    if epoch % 2 == 0 { 24_000 } else { 28_000 },
+                    if matches!(epoch, 2..=4) {
+                        24_000
+                    } else {
+                        28_000
+                    },
                 ),
             ]),
             responses::sse(vec![
@@ -508,15 +523,15 @@ async fn repeated_auto_compaction_preserves_the_full_work_prefix_and_installs_on
         .submit(user_input("continue the same work"))
         .await?;
     complete(&test.codex).await;
-    test.codex.submit(Op::ReviewCompletedTurn).await?;
-    wait_for_event(&test.codex, |event| match event {
-        EventMsg::Error(error) => panic!("unexpected error: {}", error.message),
-        EventMsg::TurnComplete(turn) => {
-            turn.last_agent_message.as_deref() == Some("Finished all work.")
-        }
-        _ => false,
-    })
-    .await;
+    for expected in extra_candidates.into_iter().chain(["Finished all work."]) {
+        test.codex.submit(Op::ReviewCompletedTurn).await?;
+        wait_for_event(&test.codex, |event| match event {
+            EventMsg::Error(error) => panic!("unexpected error: {}", error.message),
+            EventMsg::TurnComplete(turn) => turn.last_agent_message.as_deref() == Some(expected),
+            _ => false,
+        })
+        .await;
+    }
     test.codex.submit(Op::Shutdown).await?;
     wait_for_event(&test.codex, |event| {
         matches!(event, EventMsg::ShutdownComplete)
@@ -524,7 +539,7 @@ async fn repeated_auto_compaction_preserves_the_full_work_prefix_and_installs_on
     .await;
     let installed = replacement_history(test.session_configured.rollout_path.as_ref().unwrap());
     let requests = mock.requests();
-    assert_eq!(requests.len(), 23);
+    assert_eq!(requests.len(), 27);
     assert_eq!(installed.len(), starts.len());
     let mut previous_wrapper = None;
     for (epoch, start) in starts.into_iter().enumerate() {
@@ -566,8 +581,24 @@ async fn repeated_auto_compaction_preserves_the_full_work_prefix_and_installs_on
         };
         assert_eq!(
             hot.iter().filter(|item| is_review_frame(item)).count(),
-            usize::from(epoch > 0)
+            if epoch == 2 {
+                3
+            } else {
+                usize::from(epoch > 0)
+            }
         );
+        if epoch == 2 {
+            for (n, candidate) in extra_candidates.iter().enumerate() {
+                let previous = requests[start - 4 + 2 * n].input();
+                let next = requests[start - 2 + 2 * n].input();
+                assert!(next.starts_with(&previous));
+                assert_eq!(next[previous.len()]["content"][0]["text"], *candidate);
+                assert_eq!(
+                    next.iter().filter(|item| is_review_frame(item)).count(),
+                    n + 2
+                );
+            }
+        }
         for (request, call) in [(work, "early"), (notes, "last")] {
             let (text, _) = request
                 .function_call_output_content_and_success(call)
@@ -708,12 +739,15 @@ async fn websocket_notes_compact_followup_reuses_socket_with_fresh_history() -> 
         ],
         vec![
             responses::ev_assistant_message("notes", NOTES),
-            responses::ev_completed("notes"),
+            responses::ev_completed_with_tokens("notes", 4_000),
         ],
-        vec![ev_compaction("summary"), responses::ev_completed("compact")],
+        vec![
+            ev_compaction("summary"),
+            responses::ev_completed_with_tokens("compact", 4_001),
+        ],
         vec![
             responses::ev_assistant_message("done", "done"),
-            responses::ev_completed("done"),
+            responses::ev_completed_with_tokens("done", 4_002),
         ],
     ]])
     .await;
@@ -747,6 +781,25 @@ async fn websocket_notes_compact_followup_reuses_socket_with_fresh_history() -> 
     assert!(followup.get("previous_response_id").is_none());
     assert!(followup.to_string().contains("summary"));
     assert!(!followup.to_string().contains("compaction_trigger"));
+    test.codex.submit(Op::Shutdown).await?;
+    wait_for_event(&test.codex, |e| matches!(e, EventMsg::ShutdownComplete)).await;
+    let mut owners = Vec::new();
+    for line in std::fs::read_to_string(test.codex.rollout_path().unwrap())?.lines() {
+        if let RolloutItem::TokenUsageContext {
+            info,
+            measured_surface: Some(surface),
+            ..
+        } = serde_json::from_str::<RolloutLine>(line)?.item
+            && info.last_token_usage.input_tokens > 0
+        {
+            owners.push((info.last_token_usage.input_tokens, surface.endpoint_sha256));
+        }
+    }
+    assert_eq!(
+        owners.iter().map(|v| v.0).collect::<Vec<_>>(),
+        [28_000, 4_000, 4_001, 4_002]
+    );
+    assert!(owners[0].1.is_some() && owners.iter().all(|v| v.1 == owners[0].1));
     server.shutdown().await;
     Ok(())
 }

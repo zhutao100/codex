@@ -74,10 +74,104 @@ impl SourceFit {
     }
 }
 
+/// Freeze the correction and the route that earned it in the same snapshot.
+/// Missing `source_fit` is a legacy decision, distinct from choosing local sizing.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct WorkFit {
+    #[serde(default)]
+    pub(crate) source_fit: Option<SourceFit>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) fit_route: Option<crate::model_provider_info::CheckpointRoute>,
+}
+
+impl WorkFit {
+    pub(crate) fn local() -> Self {
+        Self {
+            source_fit: Some(SourceFit::Local),
+            fit_route: None,
+        }
+    }
+
+    fn adjustment(
+        &self,
+        actual_endpoint: Option<&str>,
+        tools: &crate::client_common::ToolSurface,
+    ) -> i64 {
+        let fit = self
+            .source_fit
+            .filter(|_| {
+                self.fit_route
+                    .as_ref()
+                    .is_some_and(|r| r.owns_endpoint(actual_endpoint))
+            })
+            .unwrap_or(SourceFit::Local);
+        fit.adjustment(tools)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct HelperFit {
+    budget: HelperBudget,
+    work: WorkFit,
+}
+
+#[derive(Debug, Clone)]
+enum HelperBudget {
+    Notes {
+        window: Option<i64>,
+        turn_id: String,
+    },
+    V2 {
+        limit: Option<i64>,
+    },
+}
+
+/// Keep the successful V2 wire input, not an independently refitted copy for installation.
+pub(crate) struct SentCompactInput {
+    pub(crate) items: Vec<ResponseItem>,
+    pub(crate) rewritten_outputs: usize,
+    pub(crate) estimated_deleted_tokens: i64,
+}
+
+impl HelperFit {
+    pub(crate) fn apply(
+        &self,
+        items: &mut Vec<ResponseItem>,
+        prompt: &Prompt,
+        actual_endpoint: Option<&str>,
+    ) -> Option<(usize, i64)> {
+        let adjustment = self.work.adjustment(actual_endpoint, &prompt.tools);
+        match &self.budget {
+            HelperBudget::Notes { window, turn_id } => {
+                crate::session::turn::fit_work_notes_input(
+                    items,
+                    &prompt.base_instructions,
+                    *window,
+                    adjustment,
+                    turn_id,
+                );
+                None
+            }
+            HelperBudget::V2 { limit } => {
+                let trim = crate::compact_remote::trim_function_call_history_to_fit_context_window(
+                    items,
+                    *limit,
+                    &prompt.base_instructions,
+                    adjustment,
+                );
+                items.push(ResponseItem::CompactionTrigger {});
+                Some(trim)
+            }
+        }
+    }
+}
+
 pub(crate) struct CompactionContext<'a> {
     pub(crate) request: &'a Arc<TurnContext>,
     pub(crate) replacement: &'a Arc<TurnContext>,
-    pub(crate) source_fit: SourceFit,
+    /// Ordered declarations from this checkpoint's last completed notes request, if any.
+    pub(crate) notes_tools: Option<crate::client_common::ToolSurface>,
+    pub(crate) source_fit: WorkFit,
     /// Freeze the work frame across capture, retries and the subsequent compact request.
     pub(crate) review_frames: ReviewPromptFrames,
 }
@@ -87,13 +181,43 @@ impl<'a> CompactionContext<'a> {
         Self {
             request: context,
             replacement: context,
-            source_fit: SourceFit::Local,
+            notes_tools: None,
+            source_fit: WorkFit::local(),
             review_frames: ReviewPromptFrames::default(),
         }
     }
 
     pub(crate) fn review_frame_tokens(&self) -> i64 {
         self.review_frames.tokens()
+    }
+
+    pub(crate) fn notes_fit(&self) -> HelperFit {
+        self.helper_fit(HelperBudget::Notes {
+            window: self.request.model_info.resolved_context_window(),
+            turn_id: self.request.sub_id.clone(),
+        })
+    }
+
+    pub(crate) fn v2_fit(&self) -> HelperFit {
+        self.helper_fit(HelperBudget::V2 {
+            limit: crate::compact_remote_v2::source_token_limit(self.request),
+        })
+    }
+
+    fn helper_fit(&self, budget: HelperBudget) -> HelperFit {
+        HelperFit {
+            budget,
+            work: if self
+                .source_fit
+                .fit_route
+                .as_ref()
+                .is_some_and(|r| r.provider == self.request.model_provider_id)
+            {
+                self.source_fit.clone()
+            } else {
+                WorkFit::local()
+            },
+        }
     }
 }
 
@@ -217,6 +341,8 @@ async fn run_compact_task_inner(
         let frame_tokens = context.review_frames.retained_tokens(&turn_input);
         let prompt = Prompt {
             input: turn_input,
+            verbosity: Some(turn_context.verbosity),
+            sampled_controls: turn_context.sampled_controls.clone(),
             base_instructions: sess.get_base_instructions_for_turn(turn_context).await,
             personality: turn_context.personality,
             ..Default::default()
@@ -760,7 +886,7 @@ pub(crate) fn is_preserved_work_notes_item(item: &ResponseItem) -> bool {
     is_preserved_work_notes_message(&text)
 }
 
-fn extract_existing_preserved_work_notes(items: &[ResponseItem]) -> Option<String> {
+pub(crate) fn extract_existing_preserved_work_notes(items: &[ResponseItem]) -> Option<String> {
     items.iter().rev().find_map(|item| {
         let ResponseItem::Message { role, content, .. } = item else {
             return None;
@@ -821,7 +947,7 @@ async fn drain_to_completed(
             Ok(ResponseEvent::Completed { token_usage, .. }) => {
                 sess.update_token_usage_info_with_request_context(
                     turn_context,
-                    token_usage.as_ref(),
+                    stream.usage(token_usage.as_ref()),
                     frame_tokens,
                     server_reasoning_included,
                     0,

@@ -25,6 +25,7 @@ pub(crate) struct ReconstructedTokenUsage {
     pub(crate) measured_format_delta: Option<i64>,
     pub(crate) measured_base_tokens: Option<i64>,
     pub(crate) measured_tool_tokens: Option<i64>,
+    pub(crate) measured_surface: Option<codex_protocol::protocol::MeasuredInputSurface>,
     pub(crate) work_notes_baseline: Option<crate::context_manager::WorkNotesBaseline>,
 }
 
@@ -124,12 +125,20 @@ impl Session {
         let mut latest_compaction_tail_kind = CompactionTailKind::None;
         let mut checkpoint_after_latest_compaction = false;
         let mut completion_review: Option<CompletionReviewState> = None;
+        let mut recorded_advice = None;
         let mut awaiting_compact_followup = false;
 
         for (index, item) in rollout_items.iter().enumerate() {
             match item {
                 RolloutItem::ResponseItem(response_item) => {
                     awaiting_adjacent_post_compaction_context = false;
+                    if matches!(response_item, ResponseItem::Message { role, .. } if role == "developer")
+                        && let Some(handoff) =
+                            completion_review.as_mut().and_then(pending_started_advice)
+                        && response_item == &handoff.advisory_item()
+                    {
+                        recorded_advice = Some((history.raw_items().len(), handoff.ticket.clone()));
+                    }
                     let input_installed = completion_review
                         .as_mut()
                         .is_some_and(|review| review.observe_input_installation(response_item));
@@ -178,6 +187,7 @@ impl Session {
                 }
                 RolloutItem::ToolOutputPolicy { .. } | RolloutItem::SampledInstructions { .. } => {}
                 RolloutItem::Compacted(compacted) => {
+                    recorded_advice = None;
                     // The marker alone commits a fresh history. A steer can still arrive
                     // before its first ordinary continuation, even if none was queued at install.
                     awaiting_compact_followup = true;
@@ -248,6 +258,19 @@ impl Session {
                         };
                     checkpoint_after_latest_compaction = false;
                 }
+                RolloutItem::ContextSeed { items, reference } => {
+                    let policy = reference
+                        .truncation_policy
+                        .map(Into::into)
+                        .unwrap_or(turn_context.truncation_policy);
+                    for item in items {
+                        history.record_session_item(item, policy, server_reasoning_included);
+                    }
+                    current_metadata.reference_context_item = Some(reference.clone());
+                    current_epoch.base_metadata.reference_context_item = Some(reference.clone());
+                    pending_context = None;
+                    awaiting_adjacent_post_compaction_context = false;
+                }
                 RolloutItem::TurnContext(item) => {
                     if awaiting_adjacent_post_compaction_context
                         && current_metadata
@@ -273,6 +296,7 @@ impl Session {
                     awaiting_adjacent_post_compaction_context = false;
                 }
                 RolloutItem::EventMsg(EventMsg::ThreadRolledBack(rollback)) => {
+                    recorded_advice = None;
                     completion_review = None;
                     awaiting_compact_followup = false;
                     awaiting_adjacent_post_compaction_context = false;
@@ -337,6 +361,7 @@ impl Session {
                     measured_format_delta,
                     measured_base_tokens,
                     measured_tool_tokens,
+                    measured_surface,
                 } => {
                     awaiting_adjacent_post_compaction_context = false;
                     if awaiting_compact_followup && info.last_token_usage.input_tokens > 0 {
@@ -362,6 +387,7 @@ impl Session {
                     history.measured_format_delta = *measured_format_delta;
                     history.measured_base_tokens = measured_base_tokens.filter(|&cost| cost >= 0);
                     history.measured_tool_tokens = measured_tool_tokens.filter(|&cost| cost >= 0);
+                    history.measured_surface.clone_from(measured_surface);
                     superseded_usage = None;
                     server_reasoning_included = *included;
                 }
@@ -398,9 +424,20 @@ impl Session {
             measured_format_delta: history.measured_format_delta,
             measured_base_tokens: history.measured_base_tokens,
             measured_tool_tokens: history.measured_tool_tokens,
+            measured_surface: history.measured_surface.clone(),
             work_notes_baseline: history.work_notes_baseline.clone(),
         });
         let history = history.raw_items().to_vec();
+        // Advice and its frame selection are separate writes. Only the handoff active
+        // at the actual append can claim it. An interrupt marker or stale snapshot
+        // can follow that append without undoing it.
+        if let Some(handoff) = completion_review.as_mut().and_then(pending_started_advice)
+            && let Some((index, owner)) = recorded_advice
+            && owner == handoff.ticket
+            && history.get(index) == Some(&handoff.advisory_item())
+        {
+            handoff.advisory_recorded = true;
+        }
         let pending_notes = history
             .iter()
             .rev()
@@ -494,6 +531,22 @@ impl Session {
             pending_continuation,
             completion_review,
         }
+    }
+}
+
+fn pending_started_advice(review: &mut CompletionReviewState) -> Option<&mut ReviewHandoff> {
+    let handoff = review.handoff.as_ref()?;
+    if review.replacement_answer_required
+        && !handoff.advisory_recorded
+        && matches!(
+            handoff.disposition,
+            ReviewHandoffDisposition::Started { .. }
+        )
+        && review.ticket_is_current(&handoff.ticket)
+    {
+        review.handoff.as_mut()
+    } else {
+        None
     }
 }
 

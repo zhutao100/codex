@@ -82,7 +82,7 @@ use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
 use crate::client_common::ResponseStream;
 use crate::client_common::SampledReasoning;
-use crate::client_common::ToolSurface;
+use crate::client_common::SampledVerbosity;
 use crate::client_common::reasoning_effort_for_request;
 use crate::default_client::build_reqwest_client;
 use crate::default_client::default_headers;
@@ -143,6 +143,8 @@ struct ModelClientState {
 pub struct ModelClient {
     restored_history: bool,
     state: Arc<ModelClientState>,
+    #[cfg(test)]
+    pub(crate) loopback_routes: Option<Arc<HashMap<String, String>>>,
 }
 
 /// A turn-scoped streaming session created from a [`ModelClient`].
@@ -168,8 +170,6 @@ pub struct ModelClientSession {
     continuation_reset_reason: Option<&'static str>,
     websocket_last_request: Option<ResponseCreateWsRequest>,
     websocket_last_response_rx: Option<oneshot::Receiver<LastResponse>>,
-    /// Actual sampling tools, captured before opening the stream for inline compaction.
-    pub(crate) sampling_tools: Option<(String, ToolSurface)>,
     /// Turn state for sticky routing.
     ///
     /// This is an `OnceLock` that stores the turn state value received from the server
@@ -187,6 +187,33 @@ pub struct ModelClientSession {
 struct LastResponse {
     response_id: String,
     items_added: Vec<ResponseItem>,
+}
+
+/// The request projection and its owner are chosen together, after auth resolution.
+struct PreparedResponses {
+    prompt: ApiPrompt,
+    endpoint: Option<String>,
+    compact_trim: Option<(usize, i64)>,
+}
+
+impl PreparedResponses {
+    fn attach(self, mut stream: ResponseStream) -> ResponseStream {
+        stream.endpoint_sha256 = self.endpoint;
+        if let Some((rewritten_outputs, estimated_deleted_tokens)) = self.compact_trim {
+            let mut items = self.prompt.input.items;
+            let trigger = items.pop();
+            debug_assert!(matches!(
+                trigger,
+                Some(codex_protocol::models::ResponseItem::CompactionTrigger {})
+            ));
+            stream.compact_input = Some(crate::compact::SentCompactInput {
+                items,
+                rewritten_outputs,
+                estimated_deleted_tokens,
+            });
+        }
+        stream
+    }
 }
 
 struct CachedWebsocketConnection {
@@ -229,6 +256,8 @@ impl ModelClient {
     ) -> Self {
         Self {
             restored_history: false,
+            #[cfg(test)]
+            loopback_routes: None,
             state: Arc::new(ModelClientState {
                 auth_manager,
                 conversation_id,
@@ -275,7 +304,6 @@ impl ModelClient {
             continuation_reset_reason: None,
             websocket_last_request: None,
             websocket_last_response_rx: None,
-            sampling_tools: None,
             turn_state: Arc::new(OnceLock::new()),
         }
     }
@@ -552,7 +580,36 @@ impl ModelClientSession {
             && (*CODEX_RS_SSE_FIXTURE).is_none()
     }
 
-    fn build_responses_request(&self, prompt: &Prompt) -> ApiPrompt {
+    fn resolve_responses_route(
+        &self,
+        mode: Option<crate::auth::AuthMode>,
+    ) -> Result<(codex_api::Provider, Option<String>)> {
+        let provider = self.provider.to_api_provider(mode)?;
+        let endpoint = self.provider.fingerprint_for_base_url(&provider.base_url);
+        // Live-login tests exercise the production default route resolver. Redirect only
+        // the socket destination, and reject any route the fixture did not register.
+        #[cfg(test)]
+        if let Some(routes) = &self.client.loopback_routes {
+            let base_url = routes
+                .get(&provider.base_url)
+                .ok_or_else(|| CodexErr::Fatal("Unmapped test route".into()))?
+                .clone();
+            return Ok((
+                codex_api::Provider {
+                    base_url,
+                    ..provider
+                },
+                endpoint,
+            ));
+        }
+        Ok((provider, endpoint))
+    }
+
+    async fn build_responses_request(
+        &self,
+        prompt: &Prompt,
+        endpoint: Option<String>,
+    ) -> Result<PreparedResponses> {
         let instructions = &prompt.base_instructions.text;
         let base = (!instructions.is_empty()).then(|| {
             // Match upstream's thread- and content-scoped identity, including after resume.
@@ -563,25 +620,36 @@ impl ModelClientSession {
             let id = uuid::Uuid::new_v5(&thread, instructions.as_bytes());
             BaseInstructionsMessage::new(format!("msg_{id}"), instructions)
         });
-        ApiPrompt {
-            input: ResponsesInput {
-                base,
-                items: project_provider_input(
-                    std::borrow::Cow::Borrowed(&prompt.input),
-                    &self.provider,
-                )
-                .into_owned(),
-            },
-            tools: prompt.tools.wire().to_vec(),
-            parallel_tool_calls: prompt.parallel_tool_calls,
-            output_schema: prompt.output_schema.clone(),
+        let mut items =
+            project_provider_input(std::borrow::Cow::Borrowed(&prompt.input), &self.provider)
+                .into_owned();
+        if let Some(admission) = &prompt.review_admission {
+            admission
+                .admit(prompt, &mut items, endpoint.as_deref())
+                .await?;
         }
+        let compact_trim = prompt
+            .helper_fit
+            .as_ref()
+            .and_then(|fit| fit.apply(&mut items, prompt, endpoint.as_deref()));
+        let prompt = ApiPrompt {
+            input: ResponsesInput { base, items },
+            tools: prompt.tools.wire().to_vec(),
+            parallel_tool_calls: prompt.parallel_tool_calls_at(endpoint.as_deref()),
+            output_schema: prompt.output_schema.clone(),
+        };
+        Ok(PreparedResponses {
+            prompt,
+            endpoint,
+            compact_trim,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
     fn build_responses_options(
         &self,
         prompt: &Prompt,
+        endpoint: Option<&str>,
         model_info: &ModelInfo,
         effort: Option<ReasoningEffortConfig>,
         summary: ReasoningSummaryConfig,
@@ -592,7 +660,14 @@ impl ModelClientSession {
         let turn_metadata_header =
             turn_metadata_header.and_then(|value| HeaderValue::from_str(value).ok());
 
-        let reasoning = match SampledReasoning::for_request(model_info, effort) {
+        let sampled = prompt
+            .sampled_controls
+            .as_ref()
+            .filter(|c| c.owns_endpoint(endpoint));
+        let reasoning = match sampled.map_or_else(
+            || SampledReasoning::for_request(model_info, effort),
+            |c| c.reasoning,
+        ) {
             SampledReasoning::Enabled(effort) => Some(Reasoning {
                 effort,
                 summary: if summary == ReasoningSummaryConfig::None {
@@ -613,20 +688,22 @@ impl ModelClientSession {
             include.push("output.encrypted_content".to_string());
         }
 
-        let verbosity = if model_info.support_verbosity {
-            self.client
-                .state
-                .model_verbosity
-                .or(model_info.default_verbosity)
-        } else {
-            if self.client.state.model_verbosity.is_some() {
-                warn!(
-                    "model_verbosity is set but ignored as the model does not support verbosity: {}",
-                    model_info.slug
-                );
-            }
-            None
-        };
+        let verbosity = sampled
+            .map(|c| c.verbosity)
+            .or(prompt.verbosity)
+            .unwrap_or_else(|| {
+                SampledVerbosity::for_request(model_info, self.client.state.model_verbosity)
+            })
+            .level();
+        if verbosity.is_none()
+            && !model_info.support_verbosity
+            && self.client.state.model_verbosity.is_some()
+        {
+            warn!(
+                "model_verbosity is set but ignored as the model does not support verbosity: {}",
+                model_info.slug
+            );
+        }
 
         let text = create_text_param_for_request(verbosity, &prompt.output_schema);
         let conversation_id = self.client.state.conversation_id.to_string();
@@ -856,11 +933,13 @@ impl ModelClientSession {
                 .map_err(map_api_error)?;
             let (stream, _last_response_rx) =
                 map_response_stream(stream, otel_manager.clone(), None);
-            return Ok(stream);
+            return Ok(self
+                .build_responses_request(prompt, None)
+                .await?
+                .attach(stream));
         }
 
         let auth_manager = self.client.state.auth_manager.clone();
-        let api_prompt = self.build_responses_request(prompt);
 
         // One outer stream attempt may have several wire sends, including auth recovery.
         let telemetry = Arc::new(ApiTelemetry::new(otel_manager.clone()));
@@ -876,7 +955,8 @@ impl ModelClientSession {
                     .as_ref()
                     .map(super::auth::AuthManager::unauthorized_recovery);
             }
-            let api_provider = self.provider.to_api_provider(request_auth.auth_mode)?;
+            let (api_provider, endpoint) = self.resolve_responses_route(request_auth.auth_mode)?;
+            let prepared = self.build_responses_request(prompt, endpoint).await?;
             let api_auth = request_auth.provider;
             self.bind_request_auth(api_auth.socket_auth(request_auth.auth_mode));
             let transport = ReqwestTransport::new(build_reqwest_client());
@@ -884,6 +964,7 @@ impl ModelClientSession {
 
             let options = self.build_responses_options(
                 prompt,
+                prepared.endpoint.as_deref(),
                 model_info,
                 effort,
                 summary,
@@ -894,7 +975,7 @@ impl ModelClientSession {
             let mut trace = self.trace_cache_request(
                 &api_provider.base_url,
                 &model_info.slug,
-                &api_prompt,
+                &prepared.prompt,
                 &options,
                 || codex_api::ResponsesStorage::http(&api_provider, options.store_override),
                 "http",
@@ -905,7 +986,7 @@ impl ModelClientSession {
                 .with_telemetry(Some(telemetry.clone()), Some(telemetry.clone()));
 
             let stream_result = client
-                .stream_prompt(&model_info.slug, &api_prompt, options)
+                .stream_prompt(&model_info.slug, &prepared.prompt, options)
                 .await;
 
             match stream_result {
@@ -920,7 +1001,7 @@ impl ModelClientSession {
                     }
                     let (stream, _last_response_rx) =
                         map_response_stream(stream, otel_manager.clone(), trace);
-                    return Ok(stream);
+                    return Ok(prepared.attach(stream));
                 }
                 Err(ApiError::Transport(
                     unauthorized_transport @ TransportError::Http { status, .. },
@@ -946,7 +1027,6 @@ impl ModelClientSession {
         turn_metadata_header: Option<&str>,
     ) -> Result<WebsocketStreamOutcome> {
         let auth_manager = self.client.state.auth_manager.clone();
-        let api_prompt = self.build_responses_request(prompt);
 
         let mut auth_recovery = None;
         loop {
@@ -960,7 +1040,7 @@ impl ModelClientSession {
                     .as_ref()
                     .map(super::auth::AuthManager::unauthorized_recovery);
             }
-            let api_provider = self.provider.to_api_provider(request_auth.auth_mode)?;
+            let (api_provider, endpoint) = self.resolve_responses_route(request_auth.auth_mode)?;
             let api_auth = request_auth.provider;
             let socket_auth = api_auth.socket_auth(request_auth.auth_mode);
             self.bind_request_auth(socket_auth);
@@ -968,6 +1048,7 @@ impl ModelClientSession {
 
             let options = self.build_responses_options(
                 prompt,
+                endpoint.as_deref(),
                 model_info,
                 effort,
                 summary,
@@ -1000,8 +1081,11 @@ impl ModelClientSession {
                 Err(err) => return Err(map_api_error(err)),
             };
 
+            // A refused upgrade sends no model input. Fit only the route that accepted
+            // the socket; an HTTP fallback resolves its own provider and prompt.
+            let prepared = self.build_responses_request(prompt, endpoint).await?;
             let (request, last_request, failure) =
-                self.prepare_websocket_request(&model_info.slug, &api_prompt, &options);
+                self.prepare_websocket_request(&model_info.slug, &prepared.prompt, &options);
             let connection = self.connection.as_ref().ok_or_else(|| {
                 map_api_error(ApiError::Stream(
                     "websocket connection is unavailable".to_string(),
@@ -1028,7 +1112,7 @@ impl ModelClientSession {
             let trace = self.trace_cache_request(
                 &api_provider.base_url,
                 &model_info.slug,
-                &api_prompt,
+                &prepared.prompt,
                 &options,
                 || codex_api::ResponsesStorage::websocket(create.store),
                 mode,
@@ -1044,7 +1128,7 @@ impl ModelClientSession {
                 map_response_stream(stream_result, otel_manager.clone(), trace);
             self.websocket_last_response_rx = Some(last_response_rx);
 
-            return Ok(WebsocketStreamOutcome::Stream(stream));
+            return Ok(WebsocketStreamOutcome::Stream(prepared.attach(stream)));
         }
     }
 
@@ -1481,6 +1565,8 @@ where
 
     (
         ResponseStream {
+            endpoint_sha256: None,
+            compact_input: None,
             rx_event,
             consumer_dropped: consumer_dropped_for_stream,
         },

@@ -22,7 +22,7 @@ pub(crate) struct ReviewPromptFrames(pub(crate) Vec<ReviewPromptFrame>);
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ReviewPromptFrame {
-    item: ResponseItem,
+    pub(crate) item: ResponseItem,
     pub(crate) tokens: i64,
     after_boundaries: usize,
     pub(crate) attempt: Option<String>,
@@ -69,13 +69,15 @@ impl ReviewPromptFrames {
         self.0.iter().map(|frame| frame.tokens).sum()
     }
 
+    /// Return the projected index of the newest frame, so a first send can replace
+    /// only its own optional text without searching for an equal historical message.
     pub(crate) fn insert(
         &self,
         input: &mut Vec<ResponseItem>,
         work_end: Option<usize>,
-    ) -> crate::error::Result<()> {
+    ) -> crate::error::Result<Option<usize>> {
         if self.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         // Raw history may also contain ghost snapshots or unpaired tool items that normalization
         // removes. Boundary ordinals, unlike raw/projected offsets, agree in both representations.
@@ -87,13 +89,15 @@ impl ReviewPromptFrames {
                     .filter_map(|(i, item)| is_frame_boundary(item).then_some(i + 1)),
             )
             .collect();
+        let mut newest = None;
         for frame in self.0.iter().rev() {
             let index = anchors.get(frame.after_boundaries).ok_or_else(|| crate::error::CodexErr::Fatal(
                 "The sampled review frame's history boundary is unavailable. No incomplete request was sent.".into()
             ))?;
             input.insert(*index, frame.item.clone());
+            newest = Some(newest.map_or(*index, |pos| pos + usize::from(*index <= pos)));
         }
-        Ok(())
+        Ok(newest)
     }
 
     pub(crate) fn matches_message(&self, item: &ResponseItem) -> bool {
@@ -111,7 +115,29 @@ impl ReviewPromptFrames {
 
 pub(crate) enum ReviewSampling {
     Ready(ReviewPromptFrames),
-    Compact,
+    /// The last frame has not governed work. Publish it only after authenticated admission.
+    FirstSend {
+        frames: ReviewPromptFrames,
+        mandatory_alternative: Option<Box<ReviewPromptFrame>>,
+    },
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum ReviewAdvice {
+    Recorded,
+    FirstSend(Box<PendingReviewAdvice>),
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) struct PendingReviewAdvice {
+    pub(crate) attempt: String,
+    pub(crate) item: ResponseItem,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ReviewSamplingInput<'a> {
+    pub(crate) items: &'a [ResponseItem],
+    pub(crate) advice: Option<&'a PendingReviewAdvice>,
 }
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -255,8 +281,8 @@ impl AcceptedReviewInput {
 pub(crate) struct AutoCompactionDecision {
     pub(crate) source: RegularTaskSettings,
     pub(crate) placement: InitialContextInjection,
-    #[serde(default)]
-    pub(crate) source_fit: Option<crate::compact::SourceFit>,
+    #[serde(flatten)]
+    pub(crate) fit: crate::compact::WorkFit,
     #[serde(flatten)]
     pub(crate) capture: CaptureJournal,
 }
