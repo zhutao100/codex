@@ -439,7 +439,7 @@ jobs:
           tar -xOzf "$dest/codex-${{ matrix.target }}.tar.gz" codex-resources/bwrap | sha256sum --check <(echo "$CODEX_BWRAP_SHA256  -")
           zstd -dc "$dest/codex-bwrap-${{ matrix.target }}.zst" | sha256sum --check <(echo "$CODEX_BWRAP_SHA256  -")
 
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}
           # Upload the per-binary .zst files as well as the new .tar.gz
