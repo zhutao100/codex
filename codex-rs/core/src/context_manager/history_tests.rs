@@ -386,7 +386,7 @@ fn helper_fit_uses_measured_work_only_for_a_known_unchanged_user_boundary() {
     for (model, expected) in [(None, None), (Some("source"), Some(work))] {
         let mut captured = history.clone();
         captured.set_measured_context(40, model.map(str::to_owned));
-        captured.mark_measured_projection(source.provider, source.endpoint, projection);
+        captured.mark_measured_projection(source.provider, source.endpoint, projection, 0);
         let start = captured.raw_items().len();
         captured.record_session_item(&marker, policy, false);
         assert_eq!(
@@ -424,7 +424,7 @@ fn helper_fit_uses_measured_work_only_for_a_known_unchanged_user_boundary() {
         history.helper_tokens_from_usage(source, false, projection),
         None
     );
-    history.mark_measured_projection(source.provider, source.endpoint, projection);
+    history.mark_measured_projection(source.provider, source.endpoint, projection, 0);
     history.record_items([&user_msg("not yet measured")], policy);
     let conservative = history.work_usage_without_frames(false);
     assert_eq!(

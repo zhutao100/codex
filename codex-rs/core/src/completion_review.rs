@@ -103,14 +103,6 @@ impl ReviewPromptFrames {
     pub(crate) fn matches_message(&self, item: &ResponseItem) -> bool {
         self.0.iter().any(|frame| frame.matches_message(item))
     }
-
-    pub(crate) fn retained_tokens(&self, input: &[ResponseItem]) -> i64 {
-        input
-            .iter()
-            .filter_map(|item| self.0.iter().find(|frame| frame.matches_message(item)))
-            .map(|frame| frame.tokens)
-            .sum()
-    }
 }
 
 pub(crate) enum ReviewSampling {
@@ -430,6 +422,12 @@ impl Default for CompletionReviewState {
 }
 
 impl CompletionReviewState {
+    pub(crate) fn outgoing_work_settings(&self) -> Option<&RegularTaskSettings> {
+        self.completed_owed_source
+            .as_ref()
+            .or(self.last_work_settings.as_ref())
+    }
+
     pub(crate) fn release_owed_response(&mut self, sampled: Option<&RegularTaskSettings>) {
         if let Some(admitted) = self.owed_settings.take() {
             self.completed_owed_source = Some(sampled.cloned().unwrap_or(admitted));
@@ -438,6 +436,14 @@ impl CompletionReviewState {
 
     pub(crate) fn notes_remaining(&self) -> Option<u8> {
         self.capture_journal()?.notes_remaining
+    }
+
+    pub(crate) fn owed_steered_settings(&self) -> Option<&RegularTaskSettings> {
+        self.owed_settings.as_ref().filter(|_| {
+            self.pending_inputs
+                .iter()
+                .any(AcceptedReviewInput::is_uninstalled_steering)
+        })
     }
 
     pub(crate) fn capture_journal(&self) -> Option<&CaptureJournal> {

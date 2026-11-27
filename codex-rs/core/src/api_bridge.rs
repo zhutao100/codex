@@ -46,15 +46,7 @@ pub(crate) fn map_api_error(err: ApiError) -> CodexErr {
                 let body_text = body.unwrap_or_default();
 
                 if status == http::StatusCode::BAD_REQUEST {
-                    if let Some(message) = cyber_policy_message_from_body(&body_text) {
-                        CodexErr::CyberPolicy { message }
-                    } else if body_text
-                        .contains("The image data you provided does not represent a valid image")
-                    {
-                        CodexErr::InvalidImageRequest()
-                    } else {
-                        CodexErr::InvalidRequest(body_text)
-                    }
+                    bad_request_error(body_text)
                 } else if status == http::StatusCode::INTERNAL_SERVER_ERROR {
                     CodexErr::InternalServerError
                 } else if status == http::StatusCode::TOO_MANY_REQUESTS {
@@ -130,21 +122,24 @@ const CYBER_POLICY_ERROR_CODE: &str = "cyber_policy";
 const CYBER_POLICY_FALLBACK_MESSAGE: &str =
     "This request has been flagged for possible cybersecurity risk.";
 
-fn cyber_policy_message_from_body(body_text: &str) -> Option<String> {
-    let parsed = serde_json::from_str::<Value>(body_text).ok()?;
-    let error = parsed.get("error")?;
-    if error.get("code").and_then(Value::as_str) != Some(CYBER_POLICY_ERROR_CODE) {
-        return None;
+fn bad_request_error(body: String) -> CodexErr {
+    let parsed = serde_json::from_str::<Value>(&body).ok();
+    let error = parsed.as_ref().and_then(|v| v.get("error"));
+    match error.and_then(|e| e.get("code")).and_then(Value::as_str) {
+        Some("context_length_exceeded") => CodexErr::ContextWindowExceeded,
+        Some(CYBER_POLICY_ERROR_CODE) => CodexErr::CyberPolicy {
+            message: error
+                .and_then(|e| e.get("message"))
+                .and_then(Value::as_str)
+                .filter(|m| !m.trim().is_empty())
+                .unwrap_or(CYBER_POLICY_FALLBACK_MESSAGE)
+                .to_owned(),
+        },
+        _ if body.contains("The image data you provided does not represent a valid image") => {
+            CodexErr::InvalidImageRequest()
+        }
+        _ => CodexErr::InvalidRequest(body),
     }
-
-    Some(
-        error
-            .get("message")
-            .and_then(Value::as_str)
-            .filter(|message| !message.trim().is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| CYBER_POLICY_FALLBACK_MESSAGE.to_string()),
-    )
 }
 
 #[cfg(test)]

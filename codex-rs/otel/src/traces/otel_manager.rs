@@ -96,14 +96,7 @@ impl OtelManager {
         } = event
         {
             use codex_api::ReasoningRemovalReason;
-            let report = match reasoning_removals {
-                None => "unavailable",
-                Some(counts) if counts.is_empty() => "no_removals_reported",
-                Some(counts) if counts.contains_key(&ReasoningRemovalReason::PrefixMismatch) => {
-                    "prefix_mismatch_reported"
-                }
-                Some(_) => "removals_reported",
-            };
+            let report = ReasoningRemovalReason::report_label(reasoning_removals.as_ref());
             tracing::debug!(target: "codex_core::cache_trace", parent: handle_responses_span, response_id, report, ?reasoning_removals, "reasoning replay report");
             self.counter(
                 crate::metrics::names::REASONING_REPLAY_COUNT_METRIC,

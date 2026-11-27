@@ -1626,11 +1626,9 @@ async fn usage_limit_error_emits_rate_limit_event() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn context_window_error_sets_total_tokens_to_model_window() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+async fn context_window_error_does_not_publish_a_synthetic_bill() -> anyhow::Result<()> {
+    core_test_support::skip_if_no_network_unless_localhost!(Ok(()));
     let server = MockServer::start().await;
-
-    const EFFECTIVE_CONTEXT_WINDOW: i64 = (272_000 * 95) / 100;
 
     mount_sse_once_match(
         &server,
@@ -1683,33 +1681,18 @@ async fn context_window_error_sets_total_tokens_to_model_window() -> anyhow::Res
         })
         .await?;
 
-    let token_event = wait_for_event(&codex, |event| {
-        matches!(
-            event,
-            EventMsg::TokenCount(payload)
-                if payload.info.as_ref().is_some_and(|info| {
-                    info.model_context_window == Some(info.total_token_usage.total_tokens)
-                        && info.total_token_usage.total_tokens > 0
-                })
-        )
+    let error_event = wait_for_event(&codex, |ev| {
+        if let EventMsg::TokenCount(payload) = ev {
+            assert!(
+                payload
+                    .info
+                    .as_ref()
+                    .is_none_or(|i| i.total_token_usage.total_tokens == 0)
+            );
+        }
+        matches!(ev, EventMsg::Error(_))
     })
     .await;
-
-    let EventMsg::TokenCount(token_payload) = token_event else {
-        unreachable!("wait_for_event returned unexpected event");
-    };
-
-    let info = token_payload
-        .info
-        .expect("token usage info present when context window is exceeded");
-
-    assert_eq!(info.model_context_window, Some(EFFECTIVE_CONTEXT_WINDOW));
-    assert_eq!(
-        info.total_token_usage.total_tokens,
-        EFFECTIVE_CONTEXT_WINDOW
-    );
-
-    let error_event = wait_for_event(&codex, |ev| matches!(ev, EventMsg::Error(_))).await;
     let expected_context_window_message = CodexErr::ContextWindowExceeded.to_string();
     assert!(
         matches!(

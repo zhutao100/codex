@@ -292,6 +292,138 @@ async fn mid_turn_notes_are_carried_exactly_and_transient_suffix_is_excluded() -
     Ok(())
 }
 
+#[test_case::test_case(false; "stream failure")]
+#[test_case::test_case(true; "HTTP 400 before the notes stream")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rejected_notes_preserve_work_and_billed_usage_through_install_and_replay(
+    http: bool,
+) -> Result<()> {
+    skip_if_no_network_unless_localhost!(Ok(()));
+    let server = responses::start_mock_server().await;
+    let receipt = |id, tokens, cached| {
+        let mut event = responses::ev_completed_with_tokens(id, tokens);
+        event["response"]["usage"]["input_tokens_details"] = json!({"cached_tokens":cached});
+        event
+    };
+    let followup = || {
+        responses::sse(vec![
+            responses::ev_assistant_message("done", "Done."),
+            receipt("done", 3000, 128),
+        ])
+    };
+    let refusal = if http {
+        ResponseTemplate::new(400).set_body_json(
+            json!({"error":{"code":"context_length_exceeded","message":"notes do not fit"}}),
+        )
+    } else {
+        responses::sse_response(responses::sse_failed(
+            "notes",
+            "context_length_exceeded",
+            "notes do not fit",
+        ))
+    };
+    let wire = responses::mount_response_sequence(
+        &server,
+        vec![
+            responses::sse_response(responses::sse(vec![
+                responses::ev_shell_command_call("work", "printf evidence"),
+                receipt("work", 28_000, 25_600),
+            ])),
+            refusal,
+            responses::sse_response(responses::sse(vec![
+                ev_compaction("summary"),
+                receipt("compact", 1000, 512),
+            ])),
+            responses::sse_response(followup()),
+            responses::sse_response(followup()),
+        ],
+    )
+    .await;
+    let build = || {
+        test_codex().with_config(|cfg| {
+            cfg.model_context_window = Some(32_000);
+            cfg.model_auto_compact_token_limit = Some(27_000);
+        })
+    };
+    let original = build().build(&server).await?;
+    original.codex.submit(user_input("Read evidence.")).await?;
+    complete(&original.codex).await;
+    let path = original.codex.rollout_path().unwrap();
+    original.codex.submit(Op::Shutdown).await?;
+    wait_for_event(&original.codex, |e| matches!(e, EventMsg::ShutdownComplete)).await;
+    let raw = std::fs::read_to_string(&path)?;
+    let mut cut = 0;
+    let mut bills = Vec::new();
+    for line in raw.split_inclusive('\n') {
+        cut += line.len();
+        match serde_json::from_str::<RolloutLine>(line)?.item {
+            RolloutItem::TokenUsageContext {
+                info,
+                helper,
+                measured_surface,
+                rejected_context,
+                ..
+            } => {
+                assert_eq!(rejected_context, None);
+                bills.push((
+                    info.total_token_usage.input_tokens,
+                    info.total_token_usage.cached_input_tokens,
+                ));
+                if info.last_token_usage.input_tokens == 1000 {
+                    assert_eq!(helper.unwrap().work_usage.input_tokens, 28_000);
+                    assert!(measured_surface.unwrap().endpoint_sha256.is_some());
+                }
+            }
+            RolloutItem::Compacted(c) => {
+                let billed = c.checkpoint.unwrap().usage.total_token_usage;
+                assert_eq!(
+                    (billed.input_tokens, billed.cached_input_tokens),
+                    (29_000, 26_112)
+                );
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(bills, [(28_000, 25_600), (29_000, 26_112)]);
+    std::fs::write(&path, &raw[..cut])?;
+    let resumed = build()
+        .resume(&server, original.home.clone(), path.clone())
+        .await?;
+    resumed.codex.submit(Op::Continue).await?;
+    complete(&resumed.codex).await;
+    resumed.codex.submit(Op::Shutdown).await?;
+    wait_for_event(&resumed.codex, |e| matches!(e, EventMsg::ShutdownComplete)).await;
+    let total = std::fs::read_to_string(&path)?
+        .lines()
+        .map(serde_json::from_str::<RolloutLine>)
+        .collect::<serde_json::Result<Vec<_>>>()?
+        .into_iter()
+        .rev()
+        .find_map(|l| match l.item {
+            RolloutItem::TokenUsageContext { info, .. } => Some(info.total_token_usage),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        (total.input_tokens, total.cached_input_tokens),
+        (32_000, 26_240)
+    );
+    let sent = wire.requests();
+    assert_eq!(sent.len(), 5);
+    let capture = sent[1].input();
+    let (marker, notes_prefix) = capture.split_last().unwrap();
+    assert!(
+        marker
+            .to_string()
+            .contains("AUTO_COMPACT_WORK_NOTES_REQUEST")
+    );
+    assert_compact_request(&sent[2].body_json());
+    assert_eq!(notes_prefix, sent[2].input().split_last().unwrap().1);
+    assert_eq!(sent[3].input(), sent[4].input());
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn measured_second_user_turn_preserves_helper_prefix_without_reasoning_header() -> Result<()>
 {

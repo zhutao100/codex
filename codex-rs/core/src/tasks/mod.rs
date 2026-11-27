@@ -209,12 +209,24 @@ impl Session {
     ) {
         let work =
             crate::runtime_work::WorkGuard::new(self.conversation_id, &turn_context.sub_id, "task");
-        self.abort_all_tasks(TurnAbortReason::Replaced).await;
         let _lifecycle = self.task_lifecycle.lock().await;
+        self.stop_all_tasks_locked(TaskStopReason::Abort(TurnAbortReason::Replaced))
+            .await;
+        self.spawn_task_locked(turn_context, input, task, work)
+            .await;
+    }
 
+    /// Caller owns `task_lifecycle` from idle/replacement selection through registration.
+    pub(crate) async fn spawn_task_locked<T: SessionTask>(
+        self: &Arc<Self>,
+        turn_context: Arc<TurnContext>,
+        input: Vec<UserInput>,
+        task: T,
+        work: crate::runtime_work::WorkGuard,
+    ) {
         let task: Arc<dyn AnySessionTask> = Arc::new(task);
         let task_kind = task.kind();
-        if task_kind != TaskKind::Regular
+        if !matches!(task_kind, TaskKind::Regular | TaskKind::Compact)
             && let Err(error) = self.seed_initial_context_if_needed(&turn_context).await
         {
             self.send_event(&turn_context, EventMsg::Error(error.to_error_event(None)))
@@ -324,6 +336,10 @@ impl Session {
         // Completion removes its active entry before persistence. Join that
         // finalizer before observing idle state or shutting down the recorder.
         let _lifecycle = self.task_lifecycle.lock().await;
+        self.stop_all_tasks_locked(reason).await;
+    }
+
+    async fn stop_all_tasks_locked(self: &Arc<Self>, reason: TaskStopReason) {
         if matches!(reason, TaskStopReason::Pause(_)) {
             let unsupported = self.active_turn.lock().await.as_ref().and_then(|active| {
                 active.tasks.first().and_then(|(id, task)| match task.kind {
@@ -689,6 +705,18 @@ impl Session {
             .abort(session_ctx, Arc::clone(&task.turn_context), reason.clone())
             .await;
 
+        // A maintenance command owns its lifecycle event, not the ordinary continuation
+        // or its history. This also applies if installation just finished under the guard.
+        if task.kind == TaskKind::Compact
+            && let TaskStopReason::Abort(reason) = reason
+        {
+            self.send_event(
+                task.turn_context.as_ref(),
+                EventMsg::TurnAborted(TurnAbortedEvent { reason }),
+            )
+            .await;
+            return;
+        }
         if !matches!(reason, TaskStopReason::Pause(_)) {
             self.stop_completion_review_operations().await;
         } else {

@@ -17,6 +17,7 @@ pub(crate) struct ReconstructedRollout {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ReconstructedTokenUsage {
     pub(crate) info: TokenUsageInfo,
+    pub(crate) helper: Option<Box<crate::protocol::HelperUsageContext>>,
     pub(crate) source_model: Option<String>,
     pub(crate) request_context_tokens: i64,
     pub(crate) server_reasoning_included: bool,
@@ -26,6 +27,7 @@ pub(crate) struct ReconstructedTokenUsage {
     pub(crate) measured_base_tokens: Option<i64>,
     pub(crate) measured_tool_tokens: Option<i64>,
     pub(crate) measured_surface: Option<codex_protocol::protocol::MeasuredInputSurface>,
+    pub(crate) rejected_context: Option<codex_protocol::protocol::RejectedContext>,
     pub(crate) work_notes_baseline: Option<crate::context_manager::WorkNotesBaseline>,
 }
 
@@ -353,6 +355,7 @@ impl Session {
                 }
                 RolloutItem::TokenUsageContext {
                     info,
+                    helper,
                     source_model,
                     request_context_tokens,
                     server_reasoning_included: included,
@@ -362,9 +365,14 @@ impl Session {
                     measured_base_tokens,
                     measured_tool_tokens,
                     measured_surface,
+                    rejected_context,
                 } => {
                     awaiting_adjacent_post_compaction_context = false;
-                    if awaiting_compact_followup && info.last_token_usage.input_tokens > 0 {
+                    if awaiting_compact_followup
+                        && helper.is_none()
+                        && rejected_context.is_none()
+                        && info.last_token_usage.input_tokens > 0
+                    {
                         awaiting_compact_followup = false;
                         if let Some(review) = &mut completion_review {
                             review.release_owed_response(None);
@@ -388,6 +396,8 @@ impl Session {
                     history.measured_base_tokens = measured_base_tokens.filter(|&cost| cost >= 0);
                     history.measured_tool_tokens = measured_tool_tokens.filter(|&cost| cost >= 0);
                     history.measured_surface.clone_from(measured_surface);
+                    history.rejected_context.clone_from(rejected_context);
+                    history.helper_receipt.clone_from(helper);
                     superseded_usage = None;
                     server_reasoning_included = *included;
                 }
@@ -416,6 +426,7 @@ impl Session {
         }
         let token_usage = history.token_info().map(|info| ReconstructedTokenUsage {
             info,
+            helper: history.helper_receipt.clone(),
             source_model: history.usage_source_model().map(str::to_owned),
             request_context_tokens: history.request_context_tokens(),
             server_reasoning_included,
@@ -425,6 +436,7 @@ impl Session {
             measured_base_tokens: history.measured_base_tokens,
             measured_tool_tokens: history.measured_tool_tokens,
             measured_surface: history.measured_surface.clone(),
+            rejected_context: history.rejected_context.clone(),
             work_notes_baseline: history.work_notes_baseline.clone(),
         });
         let history = history.raw_items().to_vec();

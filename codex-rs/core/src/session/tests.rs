@@ -108,8 +108,10 @@ async fn request_context_usage_replays_atomic_prefixes_and_duplicate_token_event
             measured_item_tokens: None,
             measured_format_delta: None,
             measured_base_tokens: None,
+            helper: None,
             measured_tool_tokens: None,
             measured_surface: None,
+            rejected_context: None,
             work_notes_baseline: None,
         })
     };
@@ -138,8 +140,10 @@ async fn request_context_usage_replays_atomic_prefixes_and_duplicate_token_event
             measured_item_tokens: None,
             measured_format_delta: None,
             measured_base_tokens: None,
+            helper: None,
             measured_tool_tokens: None,
             measured_surface: None,
+            rejected_context: None,
         },
         event.clone(),
         event.clone(),
@@ -152,8 +156,10 @@ async fn request_context_usage_replays_atomic_prefixes_and_duplicate_token_event
             measured_item_tokens: None,
             measured_format_delta: None,
             measured_base_tokens: None,
+            helper: None,
             measured_tool_tokens: None,
             measured_surface: None,
+            rejected_context: None,
         },
         event,
     ];
@@ -223,8 +229,10 @@ async fn request_context_usage_replays_atomic_prefixes_and_duplicate_token_event
             measured_item_tokens: None,
             measured_format_delta: None,
             measured_base_tokens: None,
+            helper: None,
             measured_tool_tokens: None,
             measured_surface: None,
+            rejected_context: None,
         },
         RolloutItem::EventMsg(EventMsg::TokenCount(TokenCountEvent {
             info: Some(changed.clone()),
@@ -330,8 +338,10 @@ async fn usage_boundary_replays_unreported_output(context_record: bool, explicit
             measured_item_tokens: None,
             measured_format_delta: None,
             measured_base_tokens: None,
+            helper: None,
             measured_tool_tokens: None,
             measured_surface: None,
+            rejected_context: None,
         });
     }
     records.push(event.clone());
@@ -352,8 +362,10 @@ async fn usage_boundary_replays_unreported_output(context_record: bool, explicit
             measured_item_tokens: None,
             measured_format_delta: None,
             measured_base_tokens: None,
+            helper: None,
             measured_tool_tokens: None,
             measured_surface: None,
+            rejected_context: None,
             work_notes_baseline: None,
         })
     );

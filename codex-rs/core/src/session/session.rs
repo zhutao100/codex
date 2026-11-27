@@ -5,7 +5,7 @@ use super::*;
 /// A session has at most 1 running task at a time, and can be interrupted by user input.
 pub(crate) struct Session {
     pub(crate) conversation_id: ThreadId,
-    pub(super) tx_sub: Sender<Submission>,
+    pub(super) tx_sub: Sender<QueuedSubmission>,
     pub(super) tx_event: Sender<Event>,
     pub(super) agent_status: watch::Sender<AgentStatus>,
     pub(super) state: Mutex<SessionState>,
@@ -176,6 +176,17 @@ pub(crate) struct RegularTaskSettings {
 }
 
 impl RegularTaskSettings {
+    pub(super) fn matches_work_receipt(
+        &self,
+        source: crate::context_manager::UsageSource<'_>,
+    ) -> bool {
+        self.mode.model() == source.model
+            && self.sampled_controls.as_ref().is_none_or(|controls| {
+                controls.route.provider == source.provider
+                    && controls.owns_endpoint(source.endpoint)
+            })
+    }
+
     pub(super) fn for_review_handoff(
         config: &SessionConfiguration,
         mode: CollaborationMode,
@@ -258,7 +269,7 @@ impl Session {
         auth_manager: Arc<AuthManager>,
         models_manager: Arc<ModelsManager>,
         exec_policy: ExecPolicyManager,
-        tx_sub: Sender<Submission>,
+        tx_sub: Sender<QueuedSubmission>,
         tx_event: Sender<Event>,
         agent_status: watch::Sender<AgentStatus>,
         initial_history: InitialHistory,

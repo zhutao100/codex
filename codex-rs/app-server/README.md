@@ -96,7 +96,7 @@ Raw Responses items in resume payloads and raw item notifications can include op
 - `thread/archive` — move a thread’s rollout file into the archived directory; returns `{}` on success.
 - `thread/name/set` — set or update a thread’s user-facing name; returns `{}` on success. Thread names are not required to be unique; name lookups resolve to the most recently updated thread.
 - `thread/unarchive` — move an archived rollout file back into the sessions directory; returns the restored `thread` on success.
-- `thread/compact/start` — trigger conversation history compaction for a thread; returns `{}` immediately while progress streams through standard turn/item notifications. Eligible OpenAI providers default to streaming remote compaction through Responses; see [selection, fallback and history guarantees](../docs/features/remote_compaction_v2/README.md).
+- `thread/compact/start` — start history compaction on an idle thread; returns `{}` on admission, before inference completes. Progress streams through standard turn/item notifications. See [selection, recovery and history guarantees](../docs/features/remote_compaction_v2/README.md).
 - `thread/rollback` — drop the last N turns from the agent’s in-memory context and persist a rollback marker in the rollout so future resumes see the pruned history; returns the updated `thread` (with `turns` populated) on success.
 - `turn/start` — add user input to a thread and begin Codex generation; responds with the initial `turn` object and streams `turn/started`, `item/*`, and `turn/completed` notifications.
 - `turn/interrupt` — request cancellation of an in-flight turn by `(thread_id, turn_id)`; success is an empty `{}` response and the turn finishes with `status: "interrupted"`.
@@ -263,7 +263,9 @@ Use `thread/unarchive` to move an archived rollout back into the sessions direct
 
 ### Example: Trigger thread compaction
 
-Use `thread/compact/start` to trigger manual history compaction for a thread. The request returns immediately with `{}`.
+Use `thread/compact/start` to trigger manual history compaction. The response is `{}` once core has admitted the command in submission order; it is not an installation receipt. A running task or a runnable queued review/continuation makes the thread busy, including just after `turn/completed`. The command returns an invalid-request error rather than superseding that work. Unfinished review work must be in its original directory even when compaction already installed a replacement.
+
+A standalone command preserves available notes without starting a capture. If an automatic checkpoint is unfinished, the command may request the notes attempts still owed and then retry compaction on the original source. It leaves the pending ordinary turn for continuation, including if the client interrupts the retry.
 
 Progress is emitted as standard `turn/*` and `item/*` notifications on the same `threadId`. Clients should expect a single compaction item:
 
@@ -474,6 +476,8 @@ Event notifications are the server-initiated event stream for thread lifecycles,
 ### Turn events
 
 The app-server streams JSON-RPC notifications while a turn is running. Each turn starts with `turn/started` (initial `turn`) and ends with `turn/completed` (final `turn` status). Token usage events stream separately via `thread/tokenUsage/updated`. Clients subscribe to the events they care about, rendering each item incrementally as updates arrive. The per-item lifecycle is always: `item/started` → zero or more item-specific deltas → `item/completed`.
+
+An ordinary context-window rejection is an error, not a token-usage receipt, whether the provider refuses the POST before a stream opens or reports the failure on the stream. It does not replace the last reported usage or reset the thread's lifetime input and cached input. Use the error to display the refusal; do not infer it from the usage meter.
 
 - `turn/started` — `{ turn }` with the turn id, optional `model`, empty `items`, and `status: "inProgress"`.
 - `turn/completed` — `{ turn }` where `turn.status` is `completed`, `interrupted`, `paused`, or `failed`; failures carry `{ error: { message, codexErrorInfo?, additionalDetails? } }`. `turn.model` is included when known.

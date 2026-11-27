@@ -473,8 +473,10 @@ async fn compaction_usage_counts_preserved_notes_once_after_installation_and_res
                     measured_item_tokens: None,
                     measured_format_delta: None,
                     measured_base_tokens: None,
+                    helper: None,
                     measured_tool_tokens: None,
                     measured_surface: None,
+                    rejected_context: None,
                 },
                 RolloutItem::EventMsg(EventMsg::TokenCount(TokenCountEvent {
                     info: Some(info),
@@ -521,15 +523,18 @@ async fn continued_work_measurement_is_not_owned_by_the_previous_user_turn() {
             RolloutItem::TokenUsageContext {
                 info: TokenUsageInfo::new_or_append(&None, &Some(usage), None).unwrap(),
                 source_model: owner.map(str::to_owned),
+                rejected_context: None,
                 request_context_tokens: 50,
                 server_reasoning_included: false,
                 last_usage_item_count: Some(2),
                 measured_item_tokens: None,
                 measured_format_delta: None,
                 measured_base_tokens: None,
+                helper: None,
                 measured_tool_tokens: None,
                 measured_surface: owner.map(|_| codex_protocol::protocol::MeasuredInputSurface {
                     provider: context.model_provider_id.clone(),
+                    response_format_tokens: None,
                     endpoint_sha256: context.current_endpoint(),
                     images: true,
                     structured_outputs: false,
@@ -961,7 +966,15 @@ async fn previous_model_compaction_reports_a_missing_provider() {
             }],
             ..Default::default()
         });
-        state.set_token_usage_full(1_000);
+        // The old task exceeded pre-admission capacity. A refusal of the *new*
+        // prompt would instead belong to the new provider.
+        state.history.record_items(
+            &[
+                user_message(&"outgoing evidence ".repeat(100)),
+                assistant_message("Done."),
+            ],
+            context.truncation_policy,
+        );
     }
     session
         .set_previous_turn_settings(Some(PreviousTurnSettings {

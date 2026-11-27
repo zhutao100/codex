@@ -555,6 +555,8 @@ async fn remote_compact_trim_estimate_uses_session_base_instructions() -> Result
                 move |config| {
                     config.compaction_mode = codex_core::config::types::CompactionMode::Unary;
                     config.model_context_window = Some(override_context_window);
+                    // Exercise the manual fitter, not ordinary capacity before the second call.
+                    config.model_auto_compact_token_limit = Some(i64::MAX);
                     config.base_instructions = Some(override_base_instructions);
                 }
             }),

@@ -338,7 +338,6 @@ async fn run_compact_task_inner(
             .clone()
             .for_prompt_with_modalities(&turn_context.model_info.input_modalities);
         let turn_input_len = turn_input.len();
-        let frame_tokens = context.review_frames.retained_tokens(&turn_input);
         let prompt = Prompt {
             input: turn_input,
             verbosity: Some(turn_context.verbosity),
@@ -353,7 +352,6 @@ async fn run_compact_task_inner(
             &mut client_session,
             turn_metadata_header.as_deref(),
             &prompt,
-            frame_tokens,
         )
         .await;
 
@@ -384,7 +382,6 @@ async fn run_compact_task_inner(
                     retries = 0;
                     continue;
                 }
-                sess.set_total_tokens_full(turn_context.as_ref()).await;
                 let event = EventMsg::Error(e.to_error_event(None));
                 sess.send_event(turn_context, event).await;
                 return Err(e);
@@ -909,7 +906,6 @@ async fn drain_to_completed(
     client_session: &mut ModelClientSession,
     turn_metadata_header: Option<&str>,
     prompt: &Prompt,
-    frame_tokens: i64,
 ) -> CodexResult<Vec<ResponseItem>> {
     let mut stream = client_session
         .stream(
@@ -925,7 +921,6 @@ async fn drain_to_completed(
     // Keep uncommitted summarizer output out of the live notes capture. Each
     // retry gets a fresh buffer; only a completed attempt supplies the summary.
     let mut output = Vec::new();
-    let mut server_reasoning_included = false;
     loop {
         let maybe_event = stream.next().await;
         let Some(event) = maybe_event else {
@@ -938,22 +933,12 @@ async fn drain_to_completed(
             Ok(ResponseEvent::OutputItemDone(item)) => {
                 output.push(item);
             }
-            Ok(ResponseEvent::ServerReasoningIncluded(included)) => {
-                server_reasoning_included = included;
-            }
             Ok(ResponseEvent::RateLimits(snapshot)) => {
                 sess.update_rate_limits(turn_context, snapshot).await;
             }
             Ok(ResponseEvent::Completed { token_usage, .. }) => {
-                sess.update_token_usage_info_with_request_context(
-                    turn_context,
-                    stream.usage(token_usage.as_ref()),
-                    frame_tokens,
-                    server_reasoning_included,
-                    0,
-                    prompt,
-                )
-                .await;
+                sess.record_helper_usage(turn_context, stream.usage(token_usage.as_ref()))
+                    .await;
                 return Ok(output);
             }
             Ok(_) => continue,

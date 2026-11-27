@@ -830,6 +830,10 @@ impl McpConnectionManager {
             .with_context(|| format!("resources/read failed for `{server}` ({uri})"))
     }
 
+    pub(crate) async fn selected_sandbox(&self) -> Option<SandboxState> {
+        self.selected_sandbox.lock().await.clone()
+    }
+
     pub async fn activate_sandbox(&self, sandbox_state: SandboxState) {
         {
             let mut selected = self.selected_sandbox.lock().await;

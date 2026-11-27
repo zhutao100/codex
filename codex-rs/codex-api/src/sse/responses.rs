@@ -142,14 +142,17 @@ struct ResponseCompletedUsage {
     total_tokens: i64,
 }
 
+impl ResponseCompletedUsage {
+    fn reported_cached_tokens(&self) -> Option<i64> {
+        self.input_tokens_details.as_ref()?.cached_tokens
+    }
+}
+
 impl From<ResponseCompletedUsage> for TokenUsage {
     fn from(val: ResponseCompletedUsage) -> Self {
         TokenUsage {
             input_tokens: val.input_tokens,
-            cached_input_tokens: val
-                .input_tokens_details
-                .and_then(|d| d.cached_tokens)
-                .unwrap_or(0),
+            cached_input_tokens: val.reported_cached_tokens().unwrap_or(0),
             output_tokens: val.output_tokens,
             reasoning_output_tokens: val
                 .output_tokens_details
@@ -456,6 +459,10 @@ pub fn process_responses_event(
                     Ok(resp) => {
                         return Ok(Some(ResponseEvent::Completed {
                             response_id: resp.id,
+                            reported_cached_tokens: resp
+                                .usage
+                                .as_ref()
+                                .and_then(ResponseCompletedUsage::reported_cached_tokens),
                             token_usage: resp.usage.map(Into::into),
                             end_turn: resp.end_turn,
                             reasoning_removals,
@@ -476,6 +483,10 @@ pub fn process_responses_event(
                     Ok(resp) => {
                         return Ok(Some(ResponseEvent::Completed {
                             response_id: resp.id.unwrap_or_default(),
+                            reported_cached_tokens: resp
+                                .usage
+                                .as_ref()
+                                .and_then(ResponseCompletedUsage::reported_cached_tokens),
                             token_usage: resp.usage.map(Into::into),
                             end_turn: None,
                             reasoning_removals,
@@ -492,6 +503,7 @@ pub fn process_responses_event(
             debug!("response.done missing response payload");
             return Ok(Some(ResponseEvent::Completed {
                 response_id: String::new(),
+                reported_cached_tokens: None,
                 reasoning_removals: None,
                 token_usage: None,
                 end_turn: None,

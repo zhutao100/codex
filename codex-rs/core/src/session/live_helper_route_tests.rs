@@ -61,6 +61,62 @@ pub(super) async fn sample_work(
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn opening_refusal_keeps_the_attempted_endpoint_across_login_change() -> anyhow::Result<()> {
+    core_test_support::skip_if_no_network_unless_localhost!(Ok(()));
+    let chat = responses::start_mock_server().await;
+    let api = responses::start_mock_server().await;
+    let home = tempfile::tempdir()?;
+    let auth = AuthManager::from_auth_for_testing_with_home(
+        CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+        home.path().into(),
+    );
+    crate::auth::login_with_api_key(home.path(), "test-api-key", AuthCredentialsStoreMode::File)?;
+    let (mut session, mut context) = make_session_and_context().await;
+    context.provider = crate::ModelProviderInfo::create_openai_provider();
+    context.provider.base_url = None;
+    context.provider.supports_websockets = false;
+    context.auth_manager = Some(auth.clone());
+    context.model_info.context_window = Some(32_000);
+    let attempted = context.current_endpoint();
+    assert!(attempted.is_some());
+    session.services.auth_manager = auth.clone();
+    session.services.model_client =
+        routed_client(&session, &context, auth.clone(), chat.uri(), api.uri())?;
+    Mock::given(method("POST"))
+        .and(path_regex("/responses$"))
+        .respond_with(move |_: &wiremock::Request| {
+            assert!(auth.reload());
+            wiremock::ResponseTemplate::new(400)
+                .set_body_json(json!({"error":{"code":"context_length_exceeded"}}))
+        })
+        .expect(1)
+        .mount(&chat)
+        .await;
+    let (session, context) = (Arc::new(session), Arc::new(context));
+    let mut client = session.services.model_client.new_session();
+    let error = sample_work(&session, &context, &mut client)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("expected context refusal"))?;
+    assert!(matches!(
+        error.downcast_ref::<CodexErr>(),
+        Some(CodexErr::ContextWindowExceeded)
+    ));
+    let current = context.current_endpoint();
+    assert_ne!(current, attempted);
+    assert_eq!(responses::model_post_count(&api).await?, 0);
+    let state = session.state.lock().await;
+    let refused = |route| {
+        state
+            .history
+            .rejected_on(context.usage_source(route), context.model_context_window())
+    };
+    assert!(refused(attempted.as_deref()));
+    assert!(!refused(current.as_deref()));
+    Ok(())
+}
+
 #[test_case::test_case(false, true; "unchanged endpoint uses the measured review size")]
 #[test_case::test_case(true, false; "new endpoint admits locally fitting review directly")]
 #[test_case::test_case(true, true; "new endpoint checkpoints instead of sending oversized review")]
@@ -284,6 +340,89 @@ pub(super) fn routed_client(
         ),
     ])));
     Ok(client)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_recovery_counts_the_compaction_attempt_once() -> anyhow::Result<()> {
+    core_test_support::skip_if_no_network_unless_localhost!(Ok(()));
+    use codex_otel::metrics::MetricsConfig;
+    use opentelemetry_sdk::metrics::InMemoryMetricExporter;
+    use opentelemetry_sdk::metrics::data::AggregatedMetrics;
+    use opentelemetry_sdk::metrics::data::MetricData;
+    let server = responses::start_mock_server().await;
+    Mock::given(method("GET"))
+        .and(path_regex("/responses$"))
+        .respond_with(wiremock::ResponseTemplate::new(426))
+        .mount(&server)
+        .await;
+    let request = responses::mount_sse_once(&server, responses::sse(vec![
+        json!({"type":"response.output_item.done","item":{"type":"compaction","encrypted_content":"summary"}}),
+        responses::ev_completed("compact"),
+    ])).await;
+    let (mut session, mut context) = make_session_and_context().await;
+    let (tx, events) = async_channel::unbounded();
+    session.tx_event = tx;
+    let meter = context.otel_manager.clone().with_metrics_config(
+        MetricsConfig::in_memory(
+            "test",
+            "codex-core",
+            crate::CODEX_VERSION,
+            InMemoryMetricExporter::default(),
+        )
+        .with_runtime_reader(),
+    )?;
+    context.otel_manager = meter.clone();
+    session.services.otel_manager = meter.clone();
+    session.services.model_client = routed_client(
+        &session,
+        &context,
+        session.services.auth_manager.clone(),
+        server.uri(),
+        server.uri(),
+    )?;
+    let session = Arc::new(session);
+    session
+        .checkpoint_auto_compaction(
+            &context,
+            crate::compact::InitialContextInjection::DoNotInject,
+            &crate::compact::WorkFit::local(),
+            0,
+            false,
+        )
+        .await?;
+    crate::tasks::SessionTask::run(
+        Arc::new(crate::tasks::CompactTask),
+        Arc::new(crate::tasks::SessionTaskContext::new(session)),
+        Arc::new(context),
+        vec![],
+        CancellationToken::new(),
+    )
+    .await;
+    while let Ok(event) = events.try_recv() {
+        if let EventMsg::Error(error) = event.msg {
+            anyhow::bail!("{}", error.message);
+        }
+    }
+    assert_eq!(
+        request.single_request().input().last().unwrap()["type"],
+        "compaction_trigger"
+    );
+    let snapshot = meter.snapshot_metrics()?;
+    let counter = snapshot
+        .scope_metrics()
+        .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
+        .find(|m| m.name() == "codex.task.compact")
+        .ok_or_else(|| anyhow::anyhow!("missing compaction counter"))?;
+    let AggregatedMetrics::U64(MetricData::Sum(sum)) = counter.data() else {
+        anyhow::bail!("expected an unsigned counter")
+    };
+    assert_eq!(
+        sum.data_points()
+            .map(opentelemetry_sdk::metrics::data::SumDataPoint::value)
+            .sum::<u64>(),
+        1
+    );
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

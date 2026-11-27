@@ -66,6 +66,7 @@ impl Stream for AggregatedStream {
                 Poll::Ready(Some(Ok(ResponseEvent::Completed {
                     response_id,
                     token_usage,
+                    reported_cached_tokens,
                     end_turn,
                     reasoning_removals,
                 }))) => {
@@ -108,6 +109,7 @@ impl Stream for AggregatedStream {
                         this.pending.push_back(ResponseEvent::Completed {
                             response_id: response_id.clone(),
                             token_usage: token_usage.clone(),
+                            reported_cached_tokens,
                             end_turn,
                             reasoning_removals: reasoning_removals.clone(),
                         });
@@ -119,6 +121,7 @@ impl Stream for AggregatedStream {
                     return Poll::Ready(Some(Ok(ResponseEvent::Completed {
                         response_id,
                         token_usage,
+                        reported_cached_tokens,
                         end_turn,
                         reasoning_removals,
                     })));

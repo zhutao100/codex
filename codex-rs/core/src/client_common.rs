@@ -57,6 +57,16 @@ pub struct Prompt {
     pub output_schema: Option<Value>,
 }
 
+pub(crate) fn response_format_tokens(schema: &Option<Value>) -> i64 {
+    codex_api::create_text_param_for_request(None, schema)
+        .and_then(|text| text.format)
+        .map_or(0, |format| {
+            serde_json::to_string(&format).map_or(i64::MAX, |json| {
+                crate::truncate::approx_token_count(&json) as i64
+            })
+        })
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ReviewAdmission {
     pub(crate) target: i64,
@@ -76,7 +86,7 @@ impl ReviewAdmission {
             Some((owner, tokens)) if Some(owner.as_str()) == endpoint => *tokens,
             _ => items.iter().fold(
                 (crate::truncate::approx_token_count(&prompt.base_instructions.text) as i64)
-                    .saturating_add(prompt.tools.tokens()),
+                    .saturating_add(prompt.request_overhead_tokens()),
                 |cost, item| {
                     cost.saturating_add(crate::context_manager::estimate_item_token_count(item))
                 },
@@ -206,6 +216,12 @@ impl SampledReasoning {
 }
 
 impl Prompt {
+    pub(crate) fn request_overhead_tokens(&self) -> i64 {
+        self.tools
+            .tokens()
+            .saturating_add(response_format_tokens(&self.output_schema))
+    }
+
     pub(crate) fn parallel_tool_calls_at(&self, endpoint: Option<&str>) -> bool {
         self.parallel_tool_calls
             && self
@@ -547,6 +563,11 @@ mod tests {
         );
         assert_eq!(format.get("strict"), Some(&serde_json::Value::Bool(true)));
         assert_eq!(format.get("schema"), Some(&schema));
+        assert_eq!(
+            super::response_format_tokens(&Some(schema)),
+            crate::truncate::approx_token_count(&format.to_string()) as i64
+        );
+        assert_eq!(super::response_format_tokens(&None), 0);
     }
 
     #[test]

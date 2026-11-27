@@ -1,5 +1,6 @@
 //! Opt-in comparisons of completed, provider-projected logical requests. Never used to select a request.
 use super::*;
+use codex_api::ReasoningRemovalReason;
 use codex_api::ResponsesStorage;
 use codex_protocol::protocol::TokenUsage;
 use serde::Serialize;
@@ -250,7 +251,14 @@ fn compare(
 }
 
 impl Pending {
-    pub(super) fn complete(self, id: &str, usage: Option<&TokenUsage>, output: &[ResponseItem]) {
+    pub(super) fn complete(
+        self,
+        id: &str,
+        usage: Option<&TokenUsage>,
+        reported_cached_tokens: Option<i64>,
+        reasoning_removals: Option<&std::collections::BTreeMap<ReasoningRemovalReason, i64>>,
+        output: &[ResponseItem],
+    ) {
         let Some(stamps) = output
             .iter()
             .map(|item| self.trace.stamp(item, self.storage))
@@ -299,7 +307,10 @@ impl Pending {
                 shape = comparison.as_ref().map_or("no_baseline", |c| c.shape),
                 shared_items = comparison.as_ref().map(|c| c.shared), previous_type = comparison.as_ref().and_then(|c| c.previous_type),
                 current_type = comparison.as_ref().and_then(|c| c.current_type), changed_surface = comparison.as_ref().and_then(|c| c.changed_surface),
-                input_tokens = usage.map(|u| u.input_tokens), accounted_cached_tokens = usage.map(|u| u.cached_input_tokens),
+                input_tokens = usage.map(|u| u.input_tokens), cached_tokens_reported = reported_cached_tokens.is_some(), cached_tokens = reported_cached_tokens,
+                reasoning_replay_report = ReasoningRemovalReason::report_label(reasoning_removals), ?reasoning_removals,
+                reasoning_prefix_mismatch_removed = reasoning_removals.map(|counts| counts.get(&ReasoningRemovalReason::PrefixMismatch).copied().unwrap_or_default()),
+                accounted_cached_tokens = usage.map(|u| u.cached_input_tokens),
                 accounted_uncached_tokens = usage.map(|u| u.input_tokens.saturating_sub(u.cached_input_tokens)),
                 sampled_outputs = sampled, outputs_with_replay = returned,
                 "completed logical cache comparison");

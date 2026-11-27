@@ -427,12 +427,14 @@ enum SteeringCut {
     OverLimitReceipt,
     BelowLimitReceipt,
     OwedResponseCrossesLimit,
+    OwedResponseDownshift,
 }
 
 #[test_case::test_case(SteeringCut::Installed; "installed replacement")]
 #[test_case::test_case(SteeringCut::OverLimitReceipt; "over-limit receipt before decision")]
 #[test_case::test_case(SteeringCut::BelowLimitReceipt; "below-limit receipt without a barrier")]
 #[test_case::test_case(SteeringCut::OwedResponseCrossesLimit; "same model with new directory policy and schema")]
+#[test_case::test_case(SteeringCut::OwedResponseDownshift; "owed tool crosses only the smaller destination threshold")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn schema_checkpoint_defers_steering_and_keeps_jointly_admitted_apps(
     cut: SteeringCut,
@@ -446,8 +448,10 @@ async fn schema_checkpoint_defers_steering_and_keeps_jointly_admitted_apps(
         SteeringCut::OverLimitReceipt | SteeringCut::BelowLimitReceipt
     );
     let below_limit = matches!(cut, SteeringCut::BelowLimitReceipt);
-    let recompact = matches!(cut, SteeringCut::OwedResponseCrossesLimit);
-    let target = if recompact { "gpt-5.1" } else { "gpt-5.2" };
+    let downshift = matches!(cut, SteeringCut::OwedResponseDownshift);
+    let same_model = matches!(cut, SteeringCut::OwedResponseCrossesLimit);
+    let recompact = same_model || downshift;
+    let target = if same_model { "gpt-5.1" } else { "gpt-5.2" };
     const STEER: &str = "Earlier amendment.";
     const FRESH: &str = "New prompt.";
     let apps = responses::start_mock_server().await;
@@ -467,6 +471,30 @@ async fn schema_checkpoint_defers_steering_and_keeps_jointly_admitted_apps(
             .with_config(move |cfg| {
                 cfg.model_context_window = Some(200_000);
                 cfg.model_auto_compact_token_limit = Some(limit);
+                if downshift {
+                    use codex_core::models_manager::overlay::ModelInfoPatch;
+                    use codex_core::models_manager::overlay::ModelOverlayEntry;
+                    cfg.model_context_window = None;
+                    cfg.model_auto_compact_token_limit = None;
+                    let models = &mut cfg
+                        .model_overlay
+                        .get_or_insert_with(Default::default)
+                        .models;
+                    for (slug, window, threshold) in
+                        [("gpt-5.1", 200_000, limit), (target, 100_000, 40_000)]
+                    {
+                        models.push(ModelOverlayEntry {
+                            slug: slug.into(),
+                            model_provider: None,
+                            final_instruction_override: None,
+                            patch: ModelInfoPatch {
+                                context_window: Some(Some(window)),
+                                auto_compact_token_limit: Some(Some(threshold)),
+                                ..Default::default()
+                            },
+                        });
+                    }
+                }
                 cfg.cwd = cwd;
                 cfg.sandbox_policy = codex_core::config::Constrained::allow_any(
                     codex_protocol::protocol::SandboxPolicy::new_read_only_policy(),
@@ -613,7 +641,16 @@ async fn schema_checkpoint_defers_steering_and_keeps_jointly_admitted_apps(
             .context("the original task's app probe")?;
         replies.push(responses::sse(vec![
             responses::ev_function_call("old-probe", old_tool, "{}"),
-            ev_completed_with_tokens("before", if recompact { 100_000 } else { 0 }),
+            ev_completed_with_tokens(
+                "before",
+                if downshift {
+                    50_000
+                } else if same_model {
+                    100_000
+                } else {
+                    0
+                },
+            ),
         ]));
     }
     if recompact {
@@ -629,6 +666,12 @@ async fn schema_checkpoint_defers_steering_and_keeps_jointly_admitted_apps(
     let resume = builder(limit)
         .resume(&apps, test.home.clone(), path.clone())
         .await?;
+    if downshift {
+        resume
+            .codex
+            .submit(responses::refresh_catalog_servers(&apps, &[]))
+            .await?;
+    }
     let Op::UserInput { items, .. } = prompt(FRESH, "Calendar", None) else {
         unreachable!()
     };
@@ -674,7 +717,11 @@ async fn schema_checkpoint_defers_steering_and_keeps_jointly_admitted_apps(
                     body["params"]["sandboxCwd"],
                     serde_json::to_value(expected_cwd)?
                 );
-                order.push(policy.to_owned());
+                // Rebuilding an MCP connection can republish the same policy.
+                // It cannot publish the deferred policy before the outgoing work.
+                if !downshift || order.last().is_none_or(|last| last != policy) {
+                    order.push(policy.to_owned());
+                }
             } else if body["method"] == "tools/call" {
                 order.push(
                     body["params"]["name"]
@@ -751,7 +798,7 @@ async fn schema_checkpoint_defers_steering_and_keeps_jointly_admitted_apps(
         let order = wire_order(&apps.received_requests().await.context("recording")?[start..])?;
         assert!(
             order.ends_with(
-                &["read-only", target, "workspace-write", target, target].map(str::to_owned)
+                &["read-only", "gpt-5.1", "workspace-write", target, target].map(str::to_owned)
             ),
             "recovery wire order: {order:?}"
         );

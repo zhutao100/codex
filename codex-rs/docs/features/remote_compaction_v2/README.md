@@ -31,7 +31,7 @@ Set the mode at the top level or in the active profile. Eligibility uses the sel
 
 ## Lifecycle constraints
 
-Manual compaction preserves existing notes without requesting fresh notes. Automatic/pre-turn and model-downshift paths recover a bounded notes transaction before ordinary work. Notes are never a completed answer to the user's task; failed compaction retains continuation and acknowledged later input.
+Standalone `/compact` preserves available notes without requesting fresh ones. If an automatic checkpoint is already pending, `/compact` finishes only its remaining helpers; `/continue` still owns the ordinary answer. Neither `/compact` nor `thread/compact/start` replaces a running task or a reserved, runnable reviewer or continuation. A canceled reservation does not block maintenance. Interrupting a manual retry stops the helper, not the saved ordinary continuation. Review-derived work requires the original directory even after installation if its replacement answer is still owed.
 
 Check outgoing work before admitting a fresh prompt, including on `/continue` after acceptance but before the first capture marker. A previous final answer does not exempt the new task from this check. On a downshift at or above the destination's threshold, both helpers use the larger model that measured the work, with its provider and instructions. A review that needs compaction below that threshold uses the same source until the destination samples ordinary work.
 

@@ -8,10 +8,14 @@ use super::*;
 pub(super) async fn submission_loop(
     sess: Arc<Session>,
     config: Arc<Config>,
-    rx_sub: Receiver<Submission>,
+    rx_sub: Receiver<QueuedSubmission>,
 ) {
     // To break out of this loop, send Op::Shutdown.
-    while let Ok(sub) = rx_sub.recv().await {
+    while let Ok(QueuedSubmission {
+        submission: sub,
+        compact_admission,
+    }) = rx_sub.recv().await
+    {
         debug!(?sub, "Submission");
         if let Some((operation, queued_work)) = sess.take_completion_review_operation(&sub.id).await
         {
@@ -175,7 +179,16 @@ pub(super) async fn submission_loop(
                 .await;
             }
             Op::Compact => {
-                compact(&sess, sub.id.clone()).await;
+                let result = compact(&sess, sub.id.clone()).await;
+                if let Some(reply) = compact_admission {
+                    let _ = reply.send(result);
+                } else if let Err(error) = result {
+                    sess.send_event_raw(Event {
+                        id: sub.id,
+                        msg: EventMsg::Error(error.to_error_event(None)),
+                    })
+                    .await;
+                }
             }
             Op::ThreadRollback { num_turns } => {
                 thread_rollback(&sess, sub.id.clone(), num_turns).await;
@@ -398,43 +411,34 @@ async fn continue_with(sess: &Arc<Session>, sub_id: String, request: ContinueReq
         return;
     }
 
-    let turn_context = if checkpoint.target == PendingContinuationTarget::Regular
-        || checkpoint.model.is_some()
-    {
-        let updates = {
-            let state = sess.state.lock().await;
-            if checkpoint.target == PendingContinuationTarget::Regular
-                && let Some(settings) = &state.completion_review.recovery_settings
-            {
-                settings.updates(checkpoint.model.clone())
-            } else {
-                let (mode, schema) = if checkpoint.target == PendingContinuationTarget::Regular {
-                    (
-                        state.mode_for_continuation(),
-                        state.completion_review.recovery_output_schema.clone(),
-                    )
+    let turn_context =
+        if checkpoint.target == PendingContinuationTarget::Regular || checkpoint.model.is_some() {
+            let updates = {
+                let state = sess.state.lock().await;
+                if checkpoint.target == PendingContinuationTarget::Regular {
+                    state.regular_continuation_updates(checkpoint.model.clone())
                 } else {
-                    (state.session_configuration.collaboration_mode.clone(), None)
-                };
-                SessionSettingsUpdate {
-                    collaboration_mode: Some(mode.with_updates(
-                        checkpoint.model.clone(),
-                        None,
-                        None,
-                    )),
-                    final_output_json_schema: Some(schema),
-                    ..Default::default()
+                    SessionSettingsUpdate {
+                        collaboration_mode: Some(
+                            state.session_configuration.collaboration_mode.with_updates(
+                                checkpoint.model.clone(),
+                                None,
+                                None,
+                            ),
+                        ),
+                        final_output_json_schema: Some(None),
+                        ..Default::default()
+                    }
                 }
-            }
+            };
+            let Ok(turn_context) = sess.new_turn_with_sub_id(sub_id, updates).await else {
+                sess.set_pending_continuation(Some(checkpoint)).await;
+                return;
+            };
+            turn_context
+        } else {
+            sess.new_default_turn_with_sub_id(sub_id).await
         };
-        let Ok(turn_context) = sess.new_turn_with_sub_id(sub_id, updates).await else {
-            sess.set_pending_continuation(Some(checkpoint)).await;
-            return;
-        };
-        turn_context
-    } else {
-        sess.new_default_turn_with_sub_id(sub_id).await
-    };
     match checkpoint.target {
         PendingContinuationTarget::Regular => {
             sess.spawn_task(
@@ -944,10 +948,26 @@ pub async fn download_remote_skill(
     }
 }
 
-pub async fn compact(sess: &Arc<Session>, sub_id: String) {
+async fn compact(sess: &Arc<Session>, sub_id: String) -> CodexResult<()> {
+    let _lifecycle = sess.task_lifecycle.lock().await;
+    if sess.active_turn.lock().await.is_some() {
+        return Err(CodexErr::UnsupportedOperation(
+            "Cannot compact while a task is already running.".into(),
+        ));
+    }
+    {
+        let state = sess.state.lock().await;
+        if state.has_runnable_review_successor() {
+            return Err(CodexErr::UnsupportedOperation(
+                "Cannot compact while completion review work is queued.".into(),
+            ));
+        }
+        state.check_regular_continuation_directory()?;
+    }
+    let work = crate::runtime_work::WorkGuard::new(sess.conversation_id, &sub_id, "task");
     let turn_context = sess.new_default_turn_with_sub_id(sub_id).await;
 
-    sess.spawn_task(
+    sess.spawn_task_locked(
         Arc::clone(&turn_context),
         vec![UserInput::Text {
             text: turn_context.compact_prompt().to_string(),
@@ -955,8 +975,10 @@ pub async fn compact(sess: &Arc<Session>, sub_id: String) {
             text_elements: Vec::new(),
         }],
         CompactTask,
+        work,
     )
     .await;
+    Ok(())
 }
 
 pub async fn thread_rollback(sess: &Arc<Session>, sub_id: String, num_turns: u32) {

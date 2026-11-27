@@ -35,6 +35,17 @@ enum SamplingPurpose<'a> {
 }
 
 impl SamplingPurpose<'_> {
+    async fn context_refused(
+        self,
+        session: &Session,
+        context: &TurnContext,
+        endpoint: Option<&str>,
+    ) {
+        if !matches!(self, Self::WorkNotes(_)) {
+            session.record_context_rejection(context, endpoint).await;
+        }
+    }
+
     fn tool_execution(self) -> ToolCallExecutionMode {
         match self {
             Self::Work => ToolCallExecutionMode::Normal,
@@ -233,18 +244,18 @@ pub(super) fn measured_helper_work(
         return Some((
             frozen
                 .work_tokens(base, projection)
-                .saturating_sub(frozen.measured_tool_tokens?),
+                .saturating_sub(frozen.measured_request_overhead?),
             frozen.projected_tokens(base, projection),
         ));
     }
-    if state.token_info()?.last_token_usage.input_tokens <= 0 {
+    if state.history.work_usage()?.input_tokens <= 0 {
         return None;
     }
     let work = state
         .helper_tokens_from_usage(source, projection)?
         .saturating_add(state.history.base_delta(base))
         .max(0)
-        .saturating_sub(state.history.measured_tool_tokens?);
+        .saturating_sub(state.history.measured_request_overhead()?);
     Some((work, state.history.projected_tokens(base, projection)))
 }
 
@@ -472,13 +483,7 @@ async fn run_turn_inner(
         .unwrap_or(i64::MAX);
     let owed = {
         let state = sess.state.lock().await;
-        state.completion_review.owed_settings.clone().filter(|_| {
-            state
-                .completion_review
-                .pending_inputs
-                .iter()
-                .any(AcceptedReviewInput::is_uninstalled_steering)
-        })
+        state.completion_review.owed_steered_settings().cloned()
     };
     let owed_context = if let Some(settings) = owed {
         match sess
@@ -486,23 +491,23 @@ async fn run_turn_inner(
             .await
         {
             Ok(context) => {
-                let state = sess.state.lock().await;
-                let review = &state.completion_review;
                 let limit = context
                     .model_info
                     .auto_compact_token_limit()
-                    .unwrap_or(i64::MAX)
-                    .min(incoming_limit);
-                (review.awaiting_compact_followup
-                    || review.pending_compaction.is_some()
-                    || review.defer_new_prompt_frame
-                    || state.get_total_token_usage(state.server_reasoning_included()) >= limit
-                    || state
-                        .history
-                        .raw_items()
-                        .iter()
-                        .rev()
-                        .any(compact::is_work_notes_request_item))
+                    .unwrap_or(i64::MAX);
+                let checkpoint = {
+                    let state = sess.state.lock().await;
+                    state.completion_review.awaiting_compact_followup
+                        || state.has_pending_auto_checkpoint()
+                        || interrupted_source_was_full(&state, &context, limit)
+                };
+                (checkpoint
+                    || ordinary_pressure(&sess, &context, None, &cancellation_token)
+                        .await?
+                        .at_limit(limit)
+                    || ordinary_pressure(&sess, &incoming, None, &cancellation_token)
+                        .await?
+                        .needs_checkpoint(&context, &incoming, incoming_limit))
                 .then_some(context)
             }
             Err(error) => {
@@ -543,21 +548,11 @@ async fn run_turn_inner(
         .await;
     }
     let mut compacted_on_entry = false;
-    let pending = sess.state.lock().await.pending_work_notes();
-    let pending_notes = match pending {
-        Ok(pending) => pending,
-        Err(error) => {
-            sess.send_event(turn_context, EventMsg::Error(error.to_error_event(None)))
-                .await;
-            return None;
-        }
-    };
-    let (saved_source, only_deferred, queued_steering, fresh_before_admission) = {
+    let (pending, queued_steering, fresh_before_admission) = {
         let state = sess.state.lock().await;
         let review = &state.completion_review;
         (
-            review.recovery_capture_source(&turn_context.model_info.slug),
-            review.defer_new_prompt_frame && review.pending_compaction.is_none(),
+            PendingCheckpoint::read(&state, &turn_context.model_info.slug),
             review
                 .pending_inputs
                 .iter()
@@ -573,23 +568,19 @@ async fn run_turn_inner(
     } else {
         InitialContextInjection::DoNotInject
     };
-    if pending_notes.is_some() || saved_source.is_some() {
-        // Selection is durable before the capture marker. Finish either checkpoint before
-        // admitting pending input or re-evaluating the candidate against a wider window.
-        let marker_model = pending_notes
-            .as_ref()
-            .and_then(|p| p.source_model.as_deref());
-        let source = match &saved_source {
-            Some(DeferredCaptureSource::Settings(source)) => {
-                sess.turn_context_for_task_settings(turn_context, source)
-                    .await
-            }
-            Some(DeferredCaptureSource::LegacyModel(model)) => {
-                work_notes_request_context(&sess, turn_context, marker_model.or(Some(model))).await
-            }
-            None => work_notes_request_context(&sess, turn_context, marker_model).await,
-        };
-        let request_context = match source {
+    let pending = match pending {
+        Ok(pending) => pending,
+        Err(error) => {
+            sess.send_event(turn_context, EventMsg::Error(error.to_error_event(None)))
+                .await;
+            return None;
+        }
+    };
+    if let Some(pending) = pending {
+        let request_context = match pending
+            .source(&sess, turn_context, input.is_empty(), &cancellation_token)
+            .await
+        {
             Ok(context) => context,
             Err(error) => {
                 sess.send_event(turn_context, EventMsg::Error(error.to_error_event(None)))
@@ -597,20 +588,6 @@ async fn run_turn_inner(
                 return None;
             }
         };
-        // A frame-only deferral can predate the installation preflight, or the
-        // destination may have shrunk. Preserve its source, but do not start an
-        // impossible capture. Actual capture journals and markers still finish first.
-        if only_deferred
-            && pending_notes.is_none()
-            && input.is_empty()
-            && let Err(error) = sess
-                .check_review_handoff_floor(turn_context, &request_context, &cancellation_token)
-                .await
-        {
-            sess.send_event(turn_context, EventMsg::Error(error.to_error_event(None)))
-                .await;
-            return None;
-        }
         if let Err(error) = run_pre_turn_compact(
             &sess,
             &request_context,
@@ -639,41 +616,62 @@ async fn run_turn_inner(
     } else {
         false
     };
-    let total_usage_tokens = sess.get_total_token_usage().await;
     // An older steer may be waiting even before any compaction decision was journaled.
     // Check both the outgoing work and incoming capacity before choosing the first sampler.
-    let at_limit = total_usage_tokens >= auto_compact_limit
-        || (owed_context.is_some() && total_usage_tokens >= incoming_limit);
-    let (over_limit_work, review_active, installed, admission_checked) = {
+    let pressure = ordinary_pressure(&sess, turn_context, None, &cancellation_token).await?;
+    let at_limit = pressure.at_limit(auto_compact_limit)
+        || (owed_context.is_some()
+            && ordinary_pressure(&sess, &incoming, None, &cancellation_token)
+                .await?
+                .needs_checkpoint(turn_context, &incoming, incoming_limit));
+    let (
+        over_limit_work,
+        review_active,
+        installed,
+        admission_checked,
+        completed_source_owns_history,
+    ) = {
         let state = sess.state.lock().await;
+        let unfinished = continuation.is_some()
+            && !fresh_before_admission
+            && !queued_steering
+            && history_needs_continuation(state.history.raw_items());
+        let source_was_full = (owed_context.is_some() || unfinished)
+            && interrupted_source_was_full(&state, turn_context, auto_compact_limit);
         (
-            at_limit
-                && !state.completion_review.awaiting_compact_followup
-                && (continuation.is_none()
-                    || fresh_before_admission
-                    || queued_steering
-                    || resumed_job
-                    || history_needs_continuation(state.history.raw_items())),
+            pressure.rejected
+                || ((at_limit || source_was_full)
+                    && !state.completion_review.awaiting_compact_followup
+                    && (continuation.is_none()
+                        || fresh_before_admission
+                        || queued_steering
+                        || resumed_job
+                        || unfinished)),
             state.completion_review.replacement_answer_required,
             state.completion_review.awaiting_compact_followup,
             continuation.is_some()
                 && !fresh_before_admission
                 && state.completion_review.unsampled_fresh_model.as_deref()
                     == Some(turn_context.model_info.slug.as_str()),
+            state.completed_source_owns_history(),
         )
     };
     // A checkpoint before any new sampling belongs to the outgoing ordinary request,
     // including a plain continuation interrupted after its tool result.
-    let check_outgoing = !compacted_on_entry && !installed && !admission_checked;
-    let mut source_context = if check_outgoing && (at_limit || review_active) {
+    // An admitted but unsampled prompt may have actually been refused by the service.
+    // On explicit recovery that refusal supersedes the earlier successful preflight.
+    let check_outgoing =
+        !compacted_on_entry && (pressure.rejected || (!installed && !admission_checked));
+    let mut source_context = if check_outgoing
+        && completed_source_owns_history
+        && (at_limit
+            || over_limit_work
+            || review_active
+            || pressure.source_work >= auto_compact_limit)
+    {
         let outgoing = {
             let state = sess.state.lock().await;
-            let review = &state.completion_review;
-            review
-                .completed_owed_source
-                .as_ref()
-                .or(review.last_work_settings.as_ref())
-                .cloned()
+            state.completion_review.outgoing_work_settings().cloned()
         };
         let source = match outgoing {
             Some(source) => {
@@ -693,14 +691,7 @@ async fn run_turn_inner(
     } else {
         Arc::clone(turn_context)
     };
-    let downshift = should_compact_with_previous_model(
-        &source_context.model_info.slug,
-        &turn_context.model_info.slug,
-        total_usage_tokens,
-        auto_compact_limit,
-        source_context.model_context_window(),
-        turn_context.model_context_window(),
-    );
+    let downshift = pressure.downshift(&source_context, turn_context, auto_compact_limit);
     if check_outgoing && (downshift || over_limit_work) {
         // Do not start a new capacity checkpoint for a review that cannot run even on
         // empty history. A checkpoint already in flight or input changing the owner wins.
@@ -1102,7 +1093,7 @@ async fn run_turn_inner(
                 let SamplingRequestResult {
                     needs_follow_up,
                     last_agent_message: sampling_request_last_agent_message,
-                    notes_tools,
+                    reusable_tools,
                 } = sampling_request_output;
                 let needs_follow_up =
                     needs_follow_up || !after_compaction.is_empty() || initial_input.is_some();
@@ -1130,24 +1121,8 @@ async fn run_turn_inner(
                         break;
                     }
                 }
-                let total_usage_tokens = sess.get_total_token_usage().await;
-                let token_limit_reached = total_usage_tokens >= auto_compact_limit;
-
-                let estimated_token_count =
-                    sess.get_estimated_token_count(turn_context.as_ref()).await;
-
-                info!(
-                    turn_id = %turn_context.sub_id,
-                    total_usage_tokens,
-                    estimated_token_count = ?estimated_token_count,
-                    auto_compact_limit,
-                    token_limit_reached,
-                    needs_follow_up,
-                    "post sampling token usage"
-                );
-
                 if capturing_notes {
-                    compact_context.notes_tools = notes_tools;
+                    compact_context.notes_tools = reusable_tools;
                     let (notes, remaining) =
                         match captured_pre_compact_work_notes(&sess, turn_context).await {
                             Ok(notes) => notes,
@@ -1183,7 +1158,8 @@ async fn run_turn_inner(
 
                 // A successful ordinary round can add fresh tool work to compact.
                 compaction = FollowUpCompaction::Idle;
-                if !Arc::ptr_eq(turn_context, &incoming) {
+                let same_task = Arc::ptr_eq(turn_context, &incoming);
+                if !same_task {
                     // The old request completed before the deferred prompt or its settings
                     // could take effect. Keep its measured model as the outgoing source.
                     source_context = Arc::clone(turn_context);
@@ -1202,11 +1178,6 @@ async fn run_turn_inner(
                         .auto_compact_token_limit()
                         .unwrap_or(i64::MAX);
                 }
-                if needs_follow_up && total_usage_tokens >= auto_compact_limit {
-                    compaction = FollowUpCompaction::Pending;
-                    continue;
-                }
-
                 if !needs_follow_up {
                     last_agent_message = sampling_request_last_agent_message;
                     sess.hooks()
@@ -1225,6 +1196,25 @@ async fn run_turn_inner(
                         })
                         .await;
                     break;
+                }
+                let pressure = ordinary_pressure(
+                    &sess,
+                    turn_context,
+                    reusable_tools.as_ref().filter(|_| same_task),
+                    &cancellation_token,
+                )
+                .await?;
+                let token_limit_reached =
+                    pressure.needs_checkpoint(&source_context, turn_context, auto_compact_limit);
+                let total_usage_tokens = pressure.destination;
+                let estimated_token_count =
+                    sess.get_estimated_token_count(turn_context.as_ref()).await;
+                info!(
+                    turn_id = %turn_context.sub_id, total_usage_tokens, ?estimated_token_count,
+                    auto_compact_limit, token_limit_reached, needs_follow_up, "post sampling token usage"
+                );
+                if token_limit_reached {
+                    compaction = FollowUpCompaction::Pending;
                 }
                 continue;
             }
@@ -1491,7 +1481,7 @@ async fn begin_follow_up_compaction(
 }
 
 async fn work_notes_request_context(
-    sess: &Arc<Session>,
+    sess: &Session,
     current: &Arc<TurnContext>,
     source_model: Option<&str>,
 ) -> CodexResult<Arc<TurnContext>> {
@@ -1609,7 +1599,119 @@ async fn run_auto_compact(
     result
 }
 
-async fn run_pre_turn_compact(
+struct PendingCheckpoint {
+    saved: Option<DeferredCaptureSource>,
+    marker_model: Option<String>,
+    frame_only: bool,
+}
+
+impl PendingCheckpoint {
+    fn read(state: &SessionState, model: &str) -> CodexResult<Option<Self>> {
+        let review = &state.completion_review;
+        let marker = state.pending_work_notes()?;
+        let saved = review.recovery_capture_source(model);
+        if marker.is_none() && saved.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            frame_only: marker.is_none() && review.pending_compaction.is_none(),
+            marker_model: marker.and_then(|p| p.source_model),
+            saved,
+        }))
+    }
+
+    async fn source(
+        self,
+        sess: &Session,
+        destination: &Arc<TurnContext>,
+        check_floor: bool,
+        cancel: &CancellationToken,
+    ) -> CodexResult<Arc<TurnContext>> {
+        let source = match self.saved {
+            Some(DeferredCaptureSource::Settings(settings)) => {
+                sess.turn_context_for_task_settings(destination, &settings)
+                    .await?
+            }
+            Some(DeferredCaptureSource::LegacyModel(model)) => {
+                work_notes_request_context(
+                    sess,
+                    destination,
+                    self.marker_model.as_deref().or(Some(&model)),
+                )
+                .await?
+            }
+            None => {
+                work_notes_request_context(sess, destination, self.marker_model.as_deref()).await?
+            }
+        };
+        // A frame-only selection can predate a destination budget change. An
+        // actual capture journal or marker is already committed and finishes first.
+        if self.frame_only && check_floor {
+            sess.check_review_handoff_floor(destination, &source, cancel)
+                .await?;
+        }
+        Ok(source)
+    }
+}
+
+/// Return the optional selected checkpoint source and the actual destination.
+/// Standalone maintenance after a refusal shares `/continue`'s owner, not its notes workflow.
+pub(crate) async fn manual_checkpoint_contexts(
+    sess: &Arc<Session>,
+    default: &Arc<TurnContext>,
+    cancel: &CancellationToken,
+) -> CodexResult<(Option<Arc<TurnContext>>, Arc<TurnContext>)> {
+    let (selected, updates, owed, cleanup) = {
+        let state = sess.state.lock().await;
+        let selected = state.has_pending_auto_checkpoint();
+        if !selected && state.completed_source_owns_history() {
+            return Ok((None, Arc::clone(default)));
+        }
+        let regular = state
+            .pending_continuation
+            .as_ref()
+            .filter(|p| p.target == PendingContinuationTarget::Regular);
+        let model = regular
+            .map_or_else(
+                || state.completion_review.recovery_model.clone(),
+                |p| p.model.clone(),
+            )
+            .or_else(|| state.completion_review.unsampled_fresh_model.clone())
+            .or_else(|| {
+                state
+                    .history
+                    .rejected_context
+                    .as_ref()
+                    .map(|r| r.model.clone())
+            });
+        (
+            selected,
+            state.regular_continuation_updates(model),
+            state.completion_review.owed_steered_settings().cloned(),
+            regular.map(|p| p.source == TurnContinuationSource::Interrupted),
+        )
+    };
+    if selected && let Some(remove_abort) = cleanup {
+        sess.prepare_history_for_continuation(remove_abort).await;
+        sess.clean_rollout_for_continuation(remove_abort).await;
+    }
+    let destination = match owed {
+        Some(settings) => {
+            sess.turn_context_for_task_settings(default, &settings)
+                .await?
+        }
+        None => sess.project_turn_context(default, updates, None).await?,
+    };
+    if !selected {
+        return Ok((None, destination));
+    }
+    let pending = PendingCheckpoint::read(&*sess.state.lock().await, &destination.model_info.slug)?
+        .ok_or(CodexErr::TurnAborted)?;
+    let source = pending.source(sess, &destination, true, cancel).await?;
+    Ok((Some(source), destination))
+}
+
+pub(crate) async fn run_pre_turn_compact(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
     destination: &Arc<TurnContext>,
@@ -1708,7 +1810,7 @@ async fn run_pre_turn_compact(
             .await;
             match output {
                 Ok(completed) => {
-                    context.notes_tools = completed.notes_tools;
+                    context.notes_tools = completed.reusable_tools;
                     (notes, remaining) =
                         captured_pre_compact_work_notes(sess, turn_context).await?;
                     if notes.is_some() {
@@ -1979,13 +2081,14 @@ async fn run_sampling_request(
     let SamplingTools {
         router,
         surface: tools,
+        static_catalog,
     } = match selected_tools {
         Some(tools) => tools,
         None => {
             sampling_tools(
                 &sess,
                 &turn_context,
-                &input,
+                Some(&input),
                 skill_names,
                 &cancellation_token,
             )
@@ -2050,12 +2153,11 @@ async fn run_sampling_request(
         )
         .await
         {
-            Ok(output) => {
+            Ok(mut output) => {
+                if matches!(purpose, SamplingPurpose::WorkNotes(_)) || static_catalog {
+                    output.reusable_tools = Some(prompt.tools.clone());
+                }
                 return Ok(output);
-            }
-            Err(CodexErr::ContextWindowExceeded) => {
-                sess.set_total_tokens_full(&turn_context).await;
-                return Err(CodexErr::ContextWindowExceeded);
             }
             Err(CodexErr::UsageLimitReached(e)) => {
                 let rate_limits = e.rate_limits.clone();
@@ -2174,6 +2276,7 @@ async fn connector_skill_names(sess: &Session, context: &TurnContext) -> HashMap
 struct SamplingTools {
     router: Arc<ToolRouter>,
     surface: ToolSurface,
+    static_catalog: bool,
 }
 
 async fn prepare_review_sampling(
@@ -2193,15 +2296,154 @@ async fn prepare_review_sampling(
     {
         return Ok((ReviewSampling::Ready(Default::default()), None));
     }
-    let tools = sampling_tools(sess, context, input.items, skill_names, cancel).await?;
+    let tools = sampling_tools(sess, context, Some(input.items), skill_names, cancel).await?;
     let decision = sess.review_sampling(input).await?;
     Ok((decision, Some(tools)))
+}
+
+/// A cut after an over-limit response can precede the checkpoint decision. If the
+/// caller still owes that task a response, a rebind cannot erase the obligation.
+/// This is evidence about the finished sampling request, not a destination estimate.
+fn interrupted_source_was_full(state: &SessionState, context: &TurnContext, limit: i64) -> bool {
+    state.completed_source_owns_history()
+        && state.work_source_model() == Some(&context.model_info.slug)
+        && !state.history.work_receipt_source(None).is_some_and(|s| {
+            state
+                .completion_review
+                .outgoing_work_settings()
+                .is_some_and(|work| !work.matches_work_receipt(s))
+                || (s.provider == context.model_provider_id
+                    && s.endpoint == context.current_endpoint().as_deref())
+        })
+        && !state.history.raw_items()[state.history.last_usage_item_count()..]
+            .iter()
+            .any(is_user_turn_boundary_response_item)
+        && state.history.work_usage().is_some_and(|usage| {
+            usage.input_tokens > 0
+                && state
+                    .history
+                    .projected_source_work(state.server_reasoning_included())
+                    .map_or(usage.total_tokens, |work| {
+                        work.saturating_add(state.completion_review.prompt_frames.tokens())
+                    })
+                    >= limit
+        })
+}
+
+#[derive(Default)]
+struct OrdinaryPressure {
+    destination: i64,
+    rejected: bool,
+    /// Work on a different measured model, excluding its old response format.
+    source_work: i64,
+}
+
+impl OrdinaryPressure {
+    fn at_limit(&self, limit: i64) -> bool {
+        self.rejected || self.destination >= limit
+    }
+    fn downshift(&self, source: &TurnContext, dest: &TurnContext, limit: i64) -> bool {
+        should_compact_with_previous_model(
+            &source.model_info.slug,
+            &dest.model_info.slug,
+            self.destination.max(self.source_work),
+            limit,
+            source.model_context_window(),
+            dest.model_context_window(),
+        )
+    }
+
+    fn needs_checkpoint(&self, source: &TurnContext, dest: &TurnContext, limit: i64) -> bool {
+        self.at_limit(limit) || self.downshift(source, dest, limit)
+    }
+}
+
+/// Price the next ordinary request. A work receipt can calibrate its own route;
+/// an installation or a different destination uses the locally projected items.
+async fn ordinary_pressure(
+    sess: &Session,
+    context: &TurnContext,
+    previous_static: Option<&ToolSurface>,
+    cancel: &CancellationToken,
+) -> Option<OrdinaryPressure> {
+    {
+        let state = sess.state.lock().await;
+        if state.history.raw_items().is_empty() {
+            return Some(OrdinaryPressure {
+                rejected: state.history.rejected_on(
+                    context.usage_source(context.current_endpoint().as_deref()),
+                    context.model_context_window(),
+                ),
+                ..Default::default()
+            });
+        }
+    }
+    sess.refresh_mcp_inventory_for_quote(context).await;
+    let tools = if let Some(surface) = previous_static
+        && !sess.current_mcp_manager().await.has_servers()
+    {
+        surface.clone()
+    } else {
+        let skills = connector_skill_names(sess, context).await;
+        match sampling_tools(sess, context, None, &skills, cancel).await {
+            Ok(tools) => tools.surface,
+            Err(error) => {
+                sess.send_event(context, EventMsg::Error(error.to_error_event(None)))
+                    .await;
+                return None;
+            }
+        }
+    };
+    let state = sess.state.lock().await;
+    let history = &state.history;
+    let base = state.base_instructions_for_turn(context);
+    let projection = crate::context_manager::HelperProjection {
+        structured_outputs: tools.structured_outputs,
+        ..context.helper_projection()
+    };
+    let endpoint = context.current_endpoint();
+    let transcript = history
+        .ordinary_transcript_tokens(
+            context.usage_source(endpoint.as_deref()),
+            &base,
+            state.server_reasoning_included(),
+            projection,
+        )
+        .unwrap_or_else(|| history.projected_tokens(&base, projection));
+    let frames = state.completion_review.prompt_frames.tokens();
+    Some(OrdinaryPressure {
+        rejected: history.rejected_on(
+            context.usage_source(endpoint.as_deref()),
+            context.model_context_window(),
+        ),
+        source_work: history
+            .work_receipt_source(None)
+            .filter(|source| {
+                state.completed_source_owns_history()
+                    && source.model != context.model_info.slug
+                    && state
+                        .completion_review
+                        .outgoing_work_settings()
+                        .is_none_or(|work| work.matches_work_receipt(*source))
+            })
+            .and_then(|_| history.projected_source_work(state.server_reasoning_included()))
+            .map_or(0, |work| {
+                work.saturating_sub(history.measured_response_format_tokens())
+                    .saturating_add(frames)
+            }),
+        destination: transcript
+            .saturating_add(frames)
+            .saturating_add(tools.tokens())
+            .saturating_add(crate::client_common::response_format_tokens(
+                &context.final_output_json_schema,
+            )),
+    })
 }
 
 async fn sampling_tools(
     sess: &Session,
     turn_context: &TurnContext,
-    input: &[ResponseItem],
+    input: Option<&[ResponseItem]>,
     skill_names: &HashMap<String, usize>,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<SamplingTools> {
@@ -2214,13 +2456,17 @@ async fn sampling_tools(
     let hosted_binding = mcp_connection_manager.hosted_binding();
     let connectors_for_tools = if turn_context.config.features.enabled(Feature::Apps) {
         let connectors = connectors::accessible_connectors_from_mcp_tools(&mcp_tools);
-        let state = sess.state.lock().await;
-        Some(filter_connectors_for_input(
-            connectors,
-            input,
-            &state.completion_review.explicit_app_paths,
-            skill_names,
-        ))
+        if connectors.is_empty() {
+            Some(Vec::new())
+        } else {
+            let state = sess.state.lock().await;
+            Some(filter_connectors_for_input(
+                connectors,
+                input.unwrap_or_else(|| state.history.raw_items()),
+                &state.completion_review.explicit_app_paths,
+                skill_names,
+            ))
+        }
     } else {
         None
     };
@@ -2235,6 +2481,7 @@ async fn sampling_tools(
     ));
     Ok(SamplingTools {
         surface: ToolSurface::new(&router.specs())?,
+        static_catalog: !has_mcp_servers,
         router,
     })
 }
@@ -2247,18 +2494,22 @@ pub(crate) async fn compaction_tool_specs(
 ) -> CodexResult<ToolSurface> {
     sess.activate_mcp_context(turn_context).await;
     let skill_names = connector_skill_names(sess, turn_context).await;
-    Ok(
-        sampling_tools(sess, turn_context, input, &skill_names, cancellation_token)
-            .await?
-            .surface,
+    Ok(sampling_tools(
+        sess,
+        turn_context,
+        Some(input),
+        &skill_names,
+        cancellation_token,
     )
+    .await?
+    .surface)
 }
 
 #[derive(Debug)]
 struct SamplingRequestResult {
     needs_follow_up: bool,
     last_agent_message: Option<String>,
-    notes_tools: Option<ToolSurface>,
+    reusable_tools: Option<ToolSurface>,
 }
 
 /// Ephemeral per-response state for streaming a single proposed plan.
@@ -2822,8 +3073,8 @@ async fn try_run_sampling_request(
         features = sess.features.enabled_features(),
     );
 
-    let mut stream = client_session
-        .stream(
+    let opening = client_session
+        .open_stream(
             prompt,
             &turn_context.model_info,
             &turn_context.otel_manager,
@@ -2834,7 +3085,17 @@ async fn try_run_sampling_request(
         )
         .instrument(trace_span!("stream_request"))
         .or_cancel(&cancellation_token)
-        .await??;
+        .await?;
+    let mut stream = match opening {
+        Ok(stream) => stream,
+        Err(crate::client::OpenStreamError::ContextRefused { endpoint }) => {
+            purpose
+                .context_refused(&sess, &turn_context, endpoint.as_deref())
+                .await;
+            return Err(CodexErr::ContextWindowExceeded);
+        }
+        Err(crate::client::OpenStreamError::Other(err)) => return Err(err),
+    };
 
     let tool_execution_mode = purpose.tool_execution();
     let request_context_tokens = prompt
@@ -3066,15 +3327,20 @@ async fn try_run_sampling_request(
                 if let Some(state) = plan_mode_state.as_mut() {
                     flush_proposed_plan_segments_all(&sess, &turn_context, state).await;
                 }
-                sess.update_token_usage_info_with_request_context(
-                    &turn_context,
-                    stream.usage(token_usage.as_ref()),
-                    request_context_tokens,
-                    server_reasoning_included,
-                    input_item_count,
-                    prompt,
-                )
-                .await;
+                if matches!(purpose, SamplingPurpose::WorkNotes(_)) {
+                    sess.record_helper_usage(&turn_context, stream.usage(token_usage.as_ref()))
+                        .await;
+                } else {
+                    sess.update_token_usage_info_with_request_context(
+                        &turn_context,
+                        stream.usage(token_usage.as_ref()),
+                        request_context_tokens,
+                        server_reasoning_included,
+                        input_item_count,
+                        prompt,
+                    )
+                    .await;
+                }
                 should_emit_turn_diff = true;
 
                 if let Some(false) = end_turn {
@@ -3087,8 +3353,7 @@ async fn try_run_sampling_request(
                 break Ok(SamplingRequestResult {
                     needs_follow_up,
                     last_agent_message,
-                    notes_tools: matches!(purpose, SamplingPurpose::WorkNotes(_))
-                        .then(|| prompt.tools.clone()),
+                    reusable_tools: None,
                 });
             }
             ResponseEvent::OutputTextDelta(delta) => {
@@ -3223,6 +3488,11 @@ async fn try_run_sampling_request(
         }
     }
 
+    if matches!(outcome, Err(CodexErr::ContextWindowExceeded)) {
+        purpose
+            .context_refused(&sess, &turn_context, stream.endpoint_sha256.as_deref())
+            .await;
+    }
     outcome
 }
 

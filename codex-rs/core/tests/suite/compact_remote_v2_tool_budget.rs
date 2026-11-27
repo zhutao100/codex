@@ -6,13 +6,375 @@ fn json_tokens(value: &Value) -> Result<i64> {
     Ok(serde_json::to_vec(value)?.len().div_ceil(4) as i64)
 }
 
-// All fixture items are text, without images, ciphertext or provider-side tools.
+#[path = "compact_remote_v2_ordinary_pressure.rs"]
+mod ordinary_pressure;
+
+#[path = "compact_remote_v2_capacity_transitions.rs"]
+mod capacity_transitions;
+
+#[test_case::test_case(false; "small result fits with the retained schema")]
+#[test_case::test_case(true; "result fits only without the retained schema")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn installed_structured_pressure_after_an_unmeasured_tool(large: bool) -> Result<()> {
+    skip_if_no_network_unless_localhost!(Ok(()));
+    let cwd = tempfile::tempdir()?;
+    let path = cwd.path().join("evidence");
+    std::fs::write(&path, "abcdefghij\n".repeat(if large { 1500 } else { 1 }))?;
+    let args = json!({"file_path":path,"limit":2000}).to_string();
+    let schema = json!({"type":"object","description":"Evidence. ".repeat(2800)});
+    let server = responses::start_mock_server().await;
+    let done = text_reply("done", "{}", 1_000);
+    let mut replies = vec![
+        text_reply("source", "Done.", 28_000),
+        compact_response("summary"),
+        responses::sse(vec![
+            responses::ev_function_call("unmeasured", "read_file", &args),
+            json!({"type":"response.completed","response":{"id":"no-usage"}}),
+        ]),
+    ];
+    if large {
+        replies.push(compact_response("summary"));
+    }
+    replies.push(done);
+    let traffic = responses::mount_sse_sequence(&server, replies.clone()).await;
+    let build = || builder(cwd.path(), 48_000, TruncationPolicyConfig::bytes(32_000));
+    let original = build().build(&server).await?;
+    original
+        .codex
+        .submit(user_input(&"Customer evidence.\n".repeat(1900)))
+        .await?;
+    complete(&original.codex).await;
+    original
+        .codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "Read the file.".into(),
+                text_elements: vec![],
+            }],
+            final_output_json_schema: Some(schema.clone()),
+        })
+        .await?;
+    complete(&original.codex).await;
+    shutdown(&original.codex).await?;
+    let sent = traffic.requests();
+    assert_eq!(sent.len(), replies.len(), "unexpected compaction decision");
+    assert_compact_request(&sent[1].body_json());
+    assert_eq!(sent[2].body_json()["text"]["format"]["schema"], schema);
+    let next = &sent[3];
+    let tools = json_tokens(&sent[2].body_json()["tools"])?;
+    let format = json_tokens(&sent[2].body_json()["text"]["format"])?;
+    let cost = request_cost(next)? + tools
+        - if large {
+            json_tokens(&json!({"type":"compaction_trigger"}))?
+        } else {
+            0
+        };
+    assert!(cost < 27_000, "the tool round alone costs {cost}");
+    assert_eq!(
+        cost + format >= 27_000,
+        large,
+        "work {cost} + format {format}"
+    );
+    if large {
+        assert_compact_request(&next.body_json());
+    }
+    assert_eq!(
+        sent.last().unwrap().body_json()["text"]["format"]["schema"],
+        schema
+    );
+
+    let rollout = original.codex.rollout_path().unwrap();
+    let raw = std::fs::read_to_string(&rollout)?;
+    std::fs::write(&rollout, &raw[..cut_after_output(&raw, "unmeasured")?])?;
+    let replay = responses::mount_sse_sequence(&server, replies[3..].to_vec()).await;
+    let resumed = build()
+        .resume(&server, original.home.clone(), rollout)
+        .await?;
+    resumed.codex.submit(Op::Continue).await?;
+    complete(&resumed.codex).await;
+    shutdown(&resumed.codex).await?;
+    let replayed = replay.requests();
+    assert_eq!(replayed.len(), sent.len() - 3);
+    for (a, b) in replayed.iter().zip(&sent[3..]) {
+        assert_eq!(a.input(), b.input());
+        assert_eq!(a.body_json()["text"], b.body_json()["text"]);
+    }
+    Ok(())
+}
+
+#[test_case::test_case(false, false; "dropping a schema avoids a checkpoint through a usage-less tool round")]
+#[test_case::test_case(false, true; "a large uncovered tool result still requires a checkpoint")]
+#[test_case::test_case(true, false; "adding a schema reserves its input before work")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ordinary_capacity_tracks_the_next_response_format(
+    grow: bool,
+    large_tail: bool,
+) -> Result<()> {
+    skip_if_no_network_unless_localhost!(Ok(()));
+    let server = responses::start_mock_server().await;
+    let cwd = tempfile::tempdir()?;
+    let file = cwd.path().join("next.txt");
+    std::fs::write(
+        &file,
+        "Unreported tool evidence.\n".repeat(if large_tail { 1150 } else { 1 }),
+    )?;
+    let mut streams = vec![responses::sse(vec![
+        responses::ev_assistant_message("old", "Done."),
+        responses::ev_completed_with_tokens("old", if grow { 24_000 } else { 28_000 }),
+    ])];
+    if grow {
+        streams.push(compact_response("summary"));
+    }
+    streams.push(responses::sse(vec![
+        responses::ev_function_call(
+            "tool",
+            "read_file",
+            &json!({"file_path":file,"limit":1500}).to_string(),
+        ),
+        json!({"type":"response.completed","response":{"id":"unmeasured"}}),
+    ]));
+    if large_tail {
+        streams.push(responses::sse(vec![
+            responses::ev_assistant_message("notes", NOTES),
+            responses::ev_completed("notes"),
+        ]));
+        streams.push(compact_response("tail summary"));
+    }
+    streams.push(responses::sse(vec![
+        responses::ev_assistant_message("new", "Finished."),
+        responses::ev_completed("new"),
+    ]));
+    let wire = responses::mount_sse_sequence(&server, streams).await;
+    let active = builder(cwd.path(), 48_000, TruncationPolicyConfig::bytes(32_000))
+        .build(&server)
+        .await?;
+    let schema = json!({"type":"object","description":"Evidence. ".repeat(2000)});
+    for (text, structured) in [("First.", !grow), ("Next.", grow)] {
+        active
+            .codex
+            .submit(Op::UserInput {
+                items: vec![UserInput::Text {
+                    text: text.into(),
+                    text_elements: vec![],
+                }],
+                final_output_json_schema: structured.then(|| schema.clone()),
+            })
+            .await?;
+        complete(&active.codex).await;
+    }
+    let sent = wire.requests();
+    assert_eq!(
+        sent.len(),
+        3 + usize::from(grow) + 2 * usize::from(large_tail)
+    );
+    assert_eq!(
+        sent.first()
+            .unwrap()
+            .body_json()
+            .pointer("/text/format/schema"),
+        (!grow).then_some(&schema)
+    );
+    assert_eq!(
+        sent.last()
+            .unwrap()
+            .body_json()
+            .pointer("/text/format/schema"),
+        grow.then_some(&schema)
+    );
+    if grow {
+        assert_compact_request(&sent[1].body_json());
+    }
+    if large_tail {
+        assert_compact_request(&sent[3].body_json());
+    } else {
+        assert!(
+            sent.last().unwrap().function_call_output("tool")["output"]
+                .as_str()
+                .unwrap()
+                .contains("Unreported tool evidence.")
+        );
+    }
+    Ok(())
+}
+
+#[test_case::test_case(false, false, false; "live retry after invalid summary")]
+#[test_case::test_case(false, true, false; "restored retry after invalid summary")]
+#[test_case::test_case(true, true, false; "restored structured work fits without its response format")]
+#[test_case::test_case(false, true, true; "paid summary that cannot be installed")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_retry_keeps_the_ordinary_measurement(
+    large_format: bool,
+    restart: bool,
+    oversized_summary: bool,
+) -> Result<()> {
+    skip_if_no_network_unless_localhost!(Ok(()));
+    let cwd = tempfile::tempdir()?;
+    let args = evidence(cwd.path())?;
+    let server = responses::start_mock_server().await;
+    let work = if large_format { 32_600 } else { 28_000 };
+    let schema = json!({"type":"object","description":"Evidence. ".repeat(if large_format { 3000 } else { 1 })});
+    let mut failed: Vec<_> = oversized_summary
+        .then(|| ev_compaction(&"Q".repeat(260_000)))
+        .into_iter()
+        .collect();
+    failed.push(responses::ev_completed_with_tokens("invalid", 33_000));
+    let mock = responses::mount_sse_sequence(
+        &server,
+        vec![
+            responses::sse(vec![
+                responses::ev_function_call("read", "read_file", &args),
+                responses::ev_completed_with_tokens("call", 5000),
+            ]),
+            responses::sse(vec![
+                responses::ev_function_call("tail", "read_file", &args),
+                responses::ev_completed_with_tokens("work", work),
+            ]),
+            responses::sse(failed),
+            responses::sse(vec![
+                ev_compaction("summary"),
+                responses::ev_completed_with_tokens("valid", 1000),
+            ]),
+            responses::sse(vec![
+                responses::ev_assistant_message("after", r#"{"answer":"Done."}"#),
+                responses::ev_completed("after"),
+            ]),
+        ],
+    )
+    .await;
+    let build = || {
+        builder(cwd.path(), 32_000, TruncationPolicyConfig::bytes(32_000)).with_config(|c| {
+            c.model_overlay
+                .as_mut()
+                .unwrap()
+                .cross_model
+                .effective_context_window_percent = Some(100);
+        })
+    };
+    let mut active = build().build(&server).await?;
+    active
+        .codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "Inspect the evidence. ".repeat(if large_format { 5000 } else { 1 }),
+                text_elements: vec![],
+            }],
+            final_output_json_schema: Some(schema.clone()),
+        })
+        .await?;
+    let path = active.codex.rollout_path().context("rollout")?;
+    let reason = if oversized_summary {
+        "context target"
+    } else {
+        "exactly one"
+    };
+    wait_for_event(
+        &active.codex,
+        |e| matches!(e, EventMsg::Error(err) if err.message.contains(reason)),
+    )
+    .await;
+    complete(&active.codex).await;
+    assert!(replacement_history(&path).is_empty());
+    if restart {
+        active.codex.submit(Op::Shutdown).await?;
+        wait_for_event(&active.codex, |e| matches!(e, EventMsg::ShutdownComplete)).await;
+        active = build()
+            .resume(&server, active.home.clone(), path.clone())
+            .await?;
+    }
+    active.codex.submit(Op::Compact).await?;
+    complete(&active.codex).await;
+    assert_eq!(mock.requests().len(), 4);
+    active.codex.submit(Op::Continue).await?;
+    complete(&active.codex).await;
+    active.codex.submit(Op::Shutdown).await?;
+    wait_for_event(&active.codex, |e| matches!(e, EventMsg::ShutdownComplete)).await;
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 5);
+    assert_eq!(requests[1].body_json()["text"]["format"]["schema"], schema);
+    let ordinary = requests[1].function_call_output("read");
+    for helper in &requests[2..4] {
+        assert_compact_request(&helper.body_json());
+        assert_eq!(helper.function_call_output("read"), ordinary);
+        assert!(
+            helper.function_call_output("tail")["output"] == ordinary["output"],
+            "V2 shortened the fitting trailing tool result"
+        );
+    }
+    assert_eq!(requests[2].input(), requests[3].input());
+    let first = &requests[4];
+    assert_eq!(first.body_json()["text"]["format"]["schema"], schema);
+    let installed_cost = request_cost(first)?
+        + json_tokens(&first.body_json()["tools"])?
+        + json_tokens(&first.body_json()["text"]["format"])?;
+    assert!(
+        installed_cost < 27_000,
+        "ordinary replacement costs {installed_cost} with its schema"
+    );
+    let records = std::fs::read_to_string(&path)?
+        .lines()
+        .map(serde_json::from_str::<RolloutLine>)
+        .collect::<serde_json::Result<Vec<_>>>()?;
+    let receipts: Vec<_> = records
+        .iter()
+        .filter_map(|line| match &line.item {
+            RolloutItem::TokenUsageContext {
+                info,
+                helper,
+                last_usage_item_count,
+                measured_surface: Some(surface),
+                ..
+            } => Some((
+                info.last_token_usage.input_tokens,
+                helper.as_ref().map(|h| h.work_usage.input_tokens),
+                *last_usage_item_count,
+                surface,
+            )),
+            _ => None,
+        })
+        .collect();
+    let prior = receipts
+        .iter()
+        .find(|r| r.0 == work)
+        .context("ordinary receipt")?;
+    let failed = receipts
+        .iter()
+        .find(|r| r.0 == 33_000)
+        .context("failed helper receipt")?;
+    assert_eq!(
+        prior.3.response_format_tokens,
+        Some(json_tokens(&requests[1].body_json()["text"]["format"])?)
+    );
+    assert_eq!((prior.1, failed.1), (None, Some(work)));
+    assert_eq!((prior.2, prior.3), (failed.2, failed.3));
+    let installed = records
+        .into_iter()
+        .find_map(|line| match line.item {
+            RolloutItem::Compacted(c) => c.checkpoint,
+            _ => None,
+        })
+        .context("installation")?;
+    assert_eq!(
+        installed.usage.total_token_usage.input_tokens,
+        5000 + work + 33_000 + 1000
+    );
+    Ok(())
+}
+
+// Price the captured fixture's model-visible input, not the transport envelope.
 fn request_cost(request: &ResponsesRequest) -> Result<i64> {
     let mut count = request.instructions_text().len().div_ceil(4) as i64;
     for item in request.input().iter().skip(1) {
         count += match item["type"].as_str() {
+            Some("compaction") => {
+                // This stub is shorter than the encryption envelope; it has no estimated payload.
+                assert_eq!(item["encrypted_content"], "summary");
+                0
+            }
             Some("function_call") => (item["name"].as_str().context("name")?.len()
                 + item["arguments"].as_str().context("args")?.len())
+            .div_ceil(4) as i64,
+            Some("custom_tool_call") => (item["name"].as_str().context("name")?.len()
+                + item["input"].as_str().context("custom input")?.len())
             .div_ceil(4) as i64,
             Some("message") if item["role"] == "assistant" => item["content"]
                 .as_array()
@@ -331,6 +693,7 @@ async fn helper_budgets_price_the_current_mcp_inventory(old: bool, new: bool) ->
         let mut prefix = String::new();
         for line in cut.lines() {
             let mut v: Value = serde_json::from_str(line)?;
+            let ledger = v["type"] == "token_usage_context";
             let p = &mut v["payload"];
             if p["info"]["last_token_usage"]["input_tokens"] == 45_000 {
                 if p.get("measured_tool_tokens").is_some() {
@@ -345,13 +708,22 @@ async fn helper_budgets_price_the_current_mcp_inventory(old: bool, new: bool) ->
                             .context("total")?;
                         p["info"]["total_token_usage"][field] = json!(before + covered - 45_000);
                     }
-                } else {
-                    // An older record may know the model but not the original tools.
-                    p.as_object_mut().context("record")?.remove(if old == new {
-                        "source_model"
+                } else if ledger {
+                    let record = p.as_object_mut().context("record")?;
+                    if old == new {
+                        // Historical ledgers recorded coverage without a measured source.
+                        record.retain(|key, _| {
+                            matches!(
+                                key.as_str(),
+                                "info"
+                                    | "last_usage_item_count"
+                                    | "request_context_tokens"
+                                    | "server_reasoning_included"
+                            )
+                        });
                     } else {
-                        "measured_tool_tokens"
-                    });
+                        record.remove("measured_tool_tokens");
+                    }
                 }
             }
             prefix.push_str(&serde_json::to_string(&v)?);
