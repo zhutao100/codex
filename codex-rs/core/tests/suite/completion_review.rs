@@ -1239,8 +1239,31 @@ async fn compaction_replays_the_sampled_optional_reference_choice(
         let path = codex.rollout_path().context("rollout before restart")?;
         codex.submit(Op::Shutdown).await?;
         wait_for_event(&codex, |event| matches!(event, EventMsg::ShutdownComplete)).await;
-        let resumed =
-            resume_conversation_for_server(&server, home, path, configure_recovery_models).await;
+        let original_cwd = home.path().join("workspace");
+        let other = TempDir::new()?;
+        let before = completion_state(&path)?;
+        let request_count = requests.requests().len();
+        let resumed = resume_conversation_for_server(
+            &server,
+            home.clone(),
+            path.clone(),
+            configure_recovery_models,
+        )
+        .await;
+        resumed
+            .submit(context_override(Some(other.path().into()), None))
+            .await?;
+        resumed.submit(Op::Compact).await?;
+        let refused = wait_for_event(&resumed, |e| {
+            matches!(e, EventMsg::Error(_) | EventMsg::TurnStarted(_))
+        })
+        .await;
+        assert!(matches!(refused, EventMsg::Error(e) if e.message.contains("working directory")));
+        assert_eq!(completion_state(&path)?, before);
+        assert_eq!(requests.requests().len(), request_count);
+        resumed
+            .submit(context_override(Some(original_cwd), None))
+            .await?;
         resumed.submit(Op::Continue).await?;
         resumed
     };
@@ -2385,6 +2408,32 @@ async fn review_followup_budget_recovery_preserves_scope(
             .submit(context_override(None, Some("completion-recovery-large")))
             .await?;
     } else {
+        let path = codex
+            .rollout_path()
+            .context("installed review checkpoint")?;
+        let before = completion_state(&path)?;
+        assert_eq!(
+            read_rollout_lines(&path)
+                .iter()
+                .filter(|l| matches!(l.item, RolloutItem::Compacted(_)))
+                .count(),
+            1
+        );
+        let other = TempDir::new()?;
+        codex
+            .submit(context_override(Some(other.path().into()), None))
+            .await?;
+        let refused = codex
+            .start_compaction()
+            .await
+            .err()
+            .context("manual compact was admitted outside the review's directory")?;
+        assert!(refused.to_string().contains("working directory"));
+        assert_eq!(requests.requests().len(), 4);
+        assert_eq!(completion_state(&path)?, before);
+        codex
+            .submit(context_override(Some(home.path().join("workspace")), None))
+            .await?;
         codex.submit(Op::Compact).await?;
         wait_for_event(&codex, |event| match event {
             EventMsg::Error(event) => panic!("compaction failed: {}", event.message),

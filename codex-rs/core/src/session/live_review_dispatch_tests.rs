@@ -553,6 +553,42 @@ async fn review_loop_keeps_outgoing_controls_when_compact_returns_to_the_work_ro
     assert_ne!(sent[1].body_json()["text"]["verbosity"], *work_controls);
     assert_eq!(responses::model_post_count(&f.api).await?, 1);
     assert_eq!(responses::model_post_count(&f.chat).await?, 4);
+    f.session.flush_rollout().await;
+    let (items, _, errors) = RolloutRecorder::load_rollout_items(&f.rollout).await?;
+    assert_eq!(errors, 0);
+    let billed: Vec<_> = items
+        .into_iter()
+        .filter_map(|item| match item {
+            RolloutItem::TokenUsageContext {
+                info,
+                helper: Some(helper),
+                measured_surface: Some(work),
+                ..
+            } => Some((
+                info.last_token_usage.input_tokens,
+                helper.endpoint_sha256,
+                helper.work_usage.input_tokens,
+                work.endpoint_sha256,
+            )),
+            _ => None,
+        })
+        .collect();
+    let chat = f
+        .context
+        .provider
+        .configured_endpoint(Some(AuthMode::Chatgpt));
+    let api = f
+        .context
+        .provider
+        .configured_endpoint(Some(AuthMode::ApiKey));
+    assert_ne!(chat, api);
+    assert_eq!(
+        billed,
+        vec![
+            (5000, api, 5000, chat.clone()),
+            (2000, chat.clone(), 5000, chat)
+        ]
+    );
     Ok(())
 }
 

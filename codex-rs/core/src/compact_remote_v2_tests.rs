@@ -43,6 +43,7 @@ fn stream(events: Vec<CodexResult<ResponseEvent>>) -> ResponseStream {
 
 fn completed() -> CodexResult<ResponseEvent> {
     Ok(ResponseEvent::Completed {
+        reported_cached_tokens: None,
         reasoning_removals: None,
         response_id: "complete".into(),
         token_usage: Some(TokenUsage {
@@ -74,8 +75,6 @@ async fn collector_accepts_only_completed_compaction_and_never_records_extra_out
             Ok(ResponseEvent::OutputItemDone(compaction("summary"))),
             completed(),
         ]),
-        17,
-        &Prompt::default(),
     )
     .await
     .unwrap();
@@ -87,7 +86,10 @@ async fn collector_accepts_only_completed_compaction_and_never_records_extra_out
         }
     );
     assert_eq!(session.clone_history().await.raw_items(), &[]);
-    assert_eq!(session.clone_history().await.request_context_tokens(), 17);
+    assert_eq!(
+        session.clone_history().await.work_usage(),
+        Some(&TokenUsage::default())
+    );
     assert_eq!(
         session
             .clone_history()
@@ -109,8 +111,7 @@ async fn collector_rejects_invalid_completed_cardinality_but_accounts_for_usage(
             .collect();
         events.push(completed());
         assert!(matches!(
-            collect_compaction_output(&session, &context, stream(events), 0, &Prompt::default())
-                .await,
+            collect_compaction_output(&session, &context, stream(events)).await,
             Err(CodexErr::Fatal(_))
         ));
         assert_eq!(session.clone_history().await.raw_items(), &[]);
@@ -136,8 +137,7 @@ async fn collector_discards_partial_summary_on_eof_or_failure() {
             events.push(Err(error));
         }
         assert!(matches!(
-            collect_compaction_output(&session, &context, stream(events), 0, &Prompt::default())
-                .await,
+            collect_compaction_output(&session, &context, stream(events)).await,
             Err(CodexErr::Stream(..))
         ));
         assert_eq!(session.clone_history().await.raw_items(), &[]);
@@ -149,8 +149,6 @@ async fn collector_discards_partial_summary_on_eof_or_failure() {
             Ok(ResponseEvent::OutputItemDone(compaction("fresh"))),
             completed(),
         ]),
-        0,
-        &Prompt::default(),
     )
     .await
     .unwrap();

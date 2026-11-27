@@ -153,7 +153,7 @@ impl Session {
 
     async fn refresh_mcp_servers_inner(
         &self,
-        turn_context: &TurnContext,
+        sandbox: SandboxState,
         mcp_servers: HashMap<String, McpServerConfig>,
         store_mode: OAuthCredentialsStoreMode,
     ) {
@@ -191,7 +191,7 @@ impl Session {
                 auth_statuses,
                 self.get_tx_event(),
                 cancel_token,
-                turn_context.into(),
+                sandbox,
             )
             .await;
 
@@ -201,6 +201,16 @@ impl Session {
     }
 
     pub(super) async fn refresh_mcp_servers_if_requested(&self, turn_context: &TurnContext) {
+        self.apply_pending_mcp_refresh(turn_context, false).await;
+    }
+
+    /// A quote may be for a deferred task. Update inventory without transferring
+    /// sandbox ownership to that task before its first admitted request.
+    pub(super) async fn refresh_mcp_inventory_for_quote(&self, turn_context: &TurnContext) {
+        self.apply_pending_mcp_refresh(turn_context, true).await;
+    }
+
+    async fn apply_pending_mcp_refresh(&self, turn_context: &TurnContext, preserve_owner: bool) {
         let refresh_config = { self.pending_mcp_server_refresh_config.lock().await.take() };
         let Some(refresh_config) = refresh_config else {
             return;
@@ -229,8 +239,17 @@ impl Session {
             }
         };
 
-        self.refresh_mcp_servers_inner(turn_context, mcp_servers, store_mode)
-            .await;
+        let sandbox = if preserve_owner {
+            self.current_mcp_manager().await.selected_sandbox().await
+        } else {
+            None
+        };
+        self.refresh_mcp_servers_inner(
+            sandbox.unwrap_or_else(|| turn_context.into()),
+            mcp_servers,
+            store_mode,
+        )
+        .await;
     }
 
     pub(crate) async fn refresh_mcp_servers_after_install(
@@ -255,7 +274,7 @@ impl Session {
             next.mcp_servers = merged;
         }
         drop(pending);
-        self.refresh_mcp_servers_inner(turn_context, servers, store_mode)
+        self.refresh_mcp_servers_inner(turn_context.into(), servers, store_mode)
             .await;
     }
 

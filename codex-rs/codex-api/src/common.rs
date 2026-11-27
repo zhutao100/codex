@@ -122,6 +122,18 @@ pub enum ReasoningRemovalReason {
 }
 
 impl ReasoningRemovalReason {
+    /// Classify the provider's report without interpreting an absent report as zero removals.
+    pub fn report_label(counts: Option<&std::collections::BTreeMap<Self, i64>>) -> &'static str {
+        match counts {
+            None => "unavailable",
+            Some(counts) if counts.is_empty() => "no_removals_reported",
+            Some(counts) if counts.contains_key(&Self::PrefixMismatch) => {
+                "prefix_mismatch_reported"
+            }
+            Some(_) => "removals_reported",
+        }
+    }
+
     /// Every metric category, including unrecognized API reasons.
     pub const ALL: [Self; 6] = [
         Self::OrganizationMismatch,
@@ -160,6 +172,8 @@ pub enum ResponseEvent {
     Completed {
         response_id: String,
         token_usage: Option<TokenUsage>,
+        /// Provider value before the accounting default for missing cache detail.
+        reported_cached_tokens: Option<i64>,
         /// Did the model affirmatively end its turn? Some providers do not set this,
         /// so callers rely on fallback logic when this is `None`.
         end_turn: Option<bool>,

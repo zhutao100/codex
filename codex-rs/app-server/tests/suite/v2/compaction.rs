@@ -33,6 +33,9 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use core_test_support::responses;
 use core_test_support::skip_if_no_network;
+use core_test_support::skip_if_no_network_unless_localhost;
+use core_test_support::streaming_sse::StreamingSseChunk;
+use core_test_support::streaming_sse::start_streaming_sse_server;
 use pretty_assertions::assert_eq;
 use std::collections::BTreeMap;
 use tempfile::TempDir;
@@ -206,19 +209,23 @@ async fn auto_compaction_remote_emits_started_and_completed_items() -> Result<()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn thread_compact_start_triggers_compaction_and_returns_empty_response() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+    skip_if_no_network_unless_localhost!(Ok(()));
 
-    let server = responses::start_mock_server().await;
+    let (finish, gate) = tokio::sync::oneshot::channel();
     let sse = responses::sse(vec![
         responses::ev_assistant_message("m1", "MANUAL_COMPACT_SUMMARY"),
         responses::ev_completed_with_tokens("r1", 200),
     ]);
-    responses::mount_sse_sequence(&server, vec![sse]).await;
+    let (server, _) = start_streaming_sse_server(vec![vec![StreamingSseChunk {
+        gate: Some(gate),
+        body: sse,
+    }]])
+    .await;
 
     let codex_home = TempDir::new()?;
     write_mock_responses_config_toml(
         codex_home.path(),
-        &server.uri(),
+        server.uri(),
         &BTreeMap::default(),
         AUTO_COMPACT_LIMIT,
         None,
@@ -244,6 +251,19 @@ async fn thread_compact_start_triggers_compaction_and_returns_empty_response() -
         to_response::<ThreadCompactStartResponse>(compact_resp)?;
 
     let started = wait_for_context_compaction_started(&mut mcp).await?;
+    let busy = mcp
+        .send_thread_compact_start_request(ThreadCompactStartParams {
+            thread_id: thread_id.clone(),
+        })
+        .await?;
+    let error = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(busy)),
+    )
+    .await??;
+    assert_eq!(error.error.code, INVALID_REQUEST_ERROR_CODE);
+    assert!(error.error.message.contains("already running"));
+    finish.send(()).expect("release compact response");
     let completed = wait_for_context_compaction_completed(&mut mcp).await?;
 
     let ThreadItem::ContextCompaction { id: started_id } = started.item else {
@@ -256,7 +276,8 @@ async fn thread_compact_start_triggers_compaction_and_returns_empty_response() -
     assert_eq!(started.thread_id, thread_id);
     assert_eq!(completed.thread_id, thread_id);
     assert_eq!(started_id, completed_id);
-
+    assert_eq!(server.requests().await.len(), 1);
+    server.shutdown().await;
     Ok(())
 }
 

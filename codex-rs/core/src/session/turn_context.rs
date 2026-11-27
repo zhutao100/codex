@@ -404,10 +404,19 @@ impl Session {
         source: &TurnContext,
         settings: &RegularTaskSettings,
     ) -> CodexResult<Arc<TurnContext>> {
-        let updates = settings.updates(None);
+        self.project_turn_context(source, settings.updates(None), Some(settings))
+            .await
+    }
+
+    pub(super) async fn project_turn_context(
+        &self,
+        source: &TurnContext,
+        updates: SessionSettingsUpdate,
+        sampled: Option<&RegularTaskSettings>,
+    ) -> CodexResult<Arc<TurnContext>> {
         let (mut configuration, base) = {
             let state = self.state.lock().await;
-            let base = if let Some(owner) = settings.recorded_base {
+            let base = if let Some(owner) = sampled.and_then(|s| s.recorded_base) {
                 let Some((_, text)) = state.recorded_bases.iter().find(|(id, _)| *id == owner)
                 else {
                     return Err(CodexErr::Fatal(
@@ -428,14 +437,14 @@ impl Session {
         };
         (configuration.provider_id, configuration.provider) = configuration
             .original_config_do_not_use
-            .resolve_model_provider_for_model(settings.mode.model())?;
+            .resolve_model_provider_for_model(configuration.collaboration_mode.model())?;
         Ok(self
             .new_turn_from_configuration(
                 source.sub_id.clone(),
                 configuration,
                 updates.final_output_json_schema,
                 base,
-                Some(settings),
+                sampled,
             )
             .await)
     }

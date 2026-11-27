@@ -2253,11 +2253,14 @@ impl CodexMessageProcessor {
             }
         };
 
-        match thread.submit(Op::Compact).await {
-            Ok(_) => {
+        match thread.start_compaction().await {
+            Ok(()) => {
                 self.outgoing
                     .send_response(request_id, ThreadCompactStartResponse {})
                     .await;
+            }
+            Err(CodexErr::UnsupportedOperation(message)) => {
+                self.send_invalid_request_error(request_id, message).await;
             }
             Err(err) => {
                 self.send_internal_error(request_id, format!("failed to start compaction: {err}"))

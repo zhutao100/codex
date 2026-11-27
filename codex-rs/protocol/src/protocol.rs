@@ -1366,6 +1366,8 @@ impl TokenUsageInfo {
         self.last_token_usage = last.clone();
     }
 
+    /// Legacy synthetic display value. Do not apply this to a usage ledger: a
+    /// rejected ordinary request has a separate `RejectedContext` and no bill.
     pub fn fill_to_context_window(&mut self, context_window: i64) {
         let previous_total = self.total_token_usage.total_tokens;
         let delta = (context_window - previous_total).max(0);
@@ -1381,6 +1383,7 @@ impl TokenUsageInfo {
         };
     }
 
+    /// Constructs the legacy synthetic display value, not provider usage.
     pub fn full_context_window(context_window: i64) -> Self {
         let mut info = Self {
             total_token_usage: TokenUsage::default(),
@@ -2017,7 +2020,11 @@ pub enum RolloutItem {
     /// Host-owned usage baseline accounting, not conversation input or a UI event.
     TokenUsageContext {
         info: TokenUsageInfo,
-        /// Request model that produced the measured usage; absent for estimates and legacy records.
+        /// Present when the latest billed response was a helper, not the work measurement.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        helper: Option<Box<HelperUsageContext>>,
+        /// Model that measured the ordinary work; absent for estimates and legacy records.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         source_model: Option<String>,
@@ -2049,13 +2056,41 @@ pub enum RolloutItem {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         measured_surface: Option<MeasuredInputSurface>,
+        /// An ordinary request was refused on this surface; not another usage receipt.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        rejected_context: Option<RejectedContext>,
     },
     EventMsg(EventMsg),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
+pub struct RejectedContext {
+    pub model: String,
+    pub provider: String,
+    pub endpoint_sha256: Option<String>,
+    #[ts(type = "number")]
+    pub window: i64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
+pub struct HelperUsageContext {
+    /// Previously measured work; the enclosing `info` contains the billed response.
+    pub work_usage: TokenUsage,
+    pub model: String,
+    pub provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub endpoint_sha256: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
 pub struct MeasuredInputSurface {
     pub provider: String,
+    /// Estimated cost of the sampled `text.format`, not the formatted tool outputs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "number")]
+    pub response_format_tokens: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub endpoint_sha256: Option<String>,

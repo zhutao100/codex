@@ -20,6 +20,37 @@ use crate::completion_review::ReviewTicket;
 use crate::completion_review::TaggedCaptureCall;
 use crate::completion_review::WorkNotesCheckpoint;
 
+impl SessionState {
+    fn available_review_handoff(
+        &self,
+        disposition: ReviewHandoffDisposition,
+    ) -> Option<&ReviewHandoff> {
+        self.completion_review.unstarted_handoff().filter(|h| {
+            self.pending_continuation.is_none()
+                && h.disposition == disposition
+                && self
+                    .completion_review
+                    .episode
+                    .as_ref()
+                    .is_some_and(|e| e.cwd == self.session_configuration.cwd)
+        })
+    }
+
+    pub(super) fn has_runnable_review_successor(&self) -> bool {
+        self.internal_review_operations.values().any(|(op, owner)| {
+            owner.is_some()
+                && match op {
+                    InternalReviewOperation::Review(ticket) => {
+                        self.completion_review.ticket_is_current(ticket)
+                    }
+                    InternalReviewOperation::Continue(ticket) => self
+                        .available_review_handoff(ReviewHandoffDisposition::Prepared)
+                        .is_some_and(|h| &h.ticket == ticket),
+                }
+        })
+    }
+}
+
 /// A new ordinary handoff, not yet part of the outgoing work. The authenticated
 /// send publishes it before any possible transmission, including the first retry.
 #[derive(Debug)]
@@ -356,7 +387,7 @@ impl Session {
             .and_then(|s| s.endpoint);
         let measured = state
             .history
-            .review_transcript_tokens(
+            .ordinary_transcript_tokens(
                 context.usage_source(endpoint),
                 &prompt.base_instructions,
                 state.server_reasoning_included(),
@@ -367,7 +398,7 @@ impl Session {
             )
             .map(|tokens| {
                 tokens
-                    .saturating_add(prompt.tools.tokens())
+                    .saturating_add(prompt.request_overhead_tokens())
                     .max(0)
                     .saturating_add(request_only_tokens)
                     .saturating_add(
@@ -799,7 +830,7 @@ impl Session {
     ) {
         let _guard = self.completion_review_installation.lock().await;
         let mut state = self.state.lock().await;
-        if !state.regular_continuation_directory_matches() {
+        if state.check_regular_continuation_directory().is_err() {
             return;
         }
         let Some(checkpoint) = state
@@ -1217,23 +1248,13 @@ impl Session {
     ) -> Option<PendingContinuation> {
         let _guard = self.completion_review_installation.lock().await;
         let mut state = self.state.lock().await;
-        if state.pending_continuation.is_some() {
-            return None;
-        }
-        let cwd_matches = state
-            .completion_review
-            .eligible_episode()
-            .is_some_and(|episode| episode.cwd == state.session_configuration.cwd);
-        let handoff = state.completion_review.unstarted_handoff()?;
         let expected = if confirmed {
             ReviewHandoffDisposition::Deferred
         } else {
             ReviewHandoffDisposition::Prepared
         };
-        if !cwd_matches
-            || handoff.ticket.attempt_id != attempt_id
-            || handoff.disposition != expected
-        {
+        let handoff = state.available_review_handoff(expected)?;
+        if handoff.ticket.attempt_id != attempt_id {
             return None;
         }
         let mode =
@@ -1295,7 +1316,7 @@ impl Session {
             .insert(id.clone(), (reservation.0, Some(reservation.1)));
         if self
             .tx_sub
-            .try_send(Submission { id: id.clone(), op })
+            .try_send(Submission { id: id.clone(), op }.into())
             .is_err()
         {
             let operation = self
@@ -1362,13 +1383,8 @@ impl Session {
         &self,
     ) -> Option<InternalReviewOperation> {
         let state = self.state.lock().await;
-        if state.pending_continuation.is_some() {
-            return None;
-        }
         state
-            .completion_review
-            .unstarted_handoff()
-            .filter(|handoff| handoff.disposition == ReviewHandoffDisposition::Prepared)
+            .available_review_handoff(ReviewHandoffDisposition::Prepared)
             .map(|handoff| InternalReviewOperation::Continue(handoff.ticket.clone()))
     }
 
@@ -1752,6 +1768,9 @@ impl Session {
             super::turn::compaction_tool_specs(self, context, &initial_context, cancel).await?;
         let base = self.get_base_instructions_for_turn(context).await;
         let fixed = crate::compact_remote_v2::fixed_context_tokens(&initial_context, &base.text)
+            .saturating_add(crate::client_common::response_format_tokens(
+                &context.final_output_json_schema,
+            ) as usize)
             .saturating_add(tools.tokens() as usize)
             .saturating_add(notes.as_ref().map_or(0, |item| {
                 crate::context_manager::estimate_item_token_count(item) as usize

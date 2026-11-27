@@ -148,7 +148,7 @@ async fn run_compact(
     );
     let (output, sent) = request_compaction(
         sess,
-        context,
+        turn_context,
         client_session,
         &prompt,
         &metadata,
@@ -174,6 +174,9 @@ async fn run_compact(
         .get_base_instructions_for_turn(replacement_context)
         .await;
     let fixed = fixed_context_tokens(&initial_context, &replacement_instructions.text)
+        .saturating_add(crate::client_common::response_format_tokens(
+            &replacement_context.final_output_json_schema,
+        ) as usize)
         .saturating_add(history::retained_tokens(&output.item))
         .saturating_add(notes_item.as_ref().map_or(0, history::retained_tokens));
     let review_limit = sess.replacement_review_limit(replacement_context).await?;
@@ -332,7 +335,7 @@ fn retention_budget(
     if let Some(target) = installation_target(window, auto_limit) {
         if fixed_tokens > target {
             return Err(CodexErr::Fatal(format!(
-                "Compaction summary, notes, instructions and tools need about {fixed_tokens} tokens, exceeding the {target}-token context target; increase the limiting context window or automatic compaction threshold"
+                "Compaction summary, notes and fixed request surface need about {fixed_tokens} tokens, exceeding the {target}-token context target; increase the limiting context window or automatic compaction threshold"
             )));
         }
         return Ok(history::RETAINED_MESSAGE_TOKEN_BUDGET.min(target - fixed_tokens));
@@ -391,13 +394,12 @@ fn retryable(error: &CodexErr) -> bool {
 
 async fn request_compaction(
     sess: &Session,
-    source: &CompactionContext<'_>,
+    context: &TurnContext,
     client: &mut ModelClientSession,
     prompt: &Prompt,
     metadata: &str,
     token: &CancellationToken,
 ) -> CodexResult<(CompactionOutput, SentCompactInput)> {
-    let context = source.request;
     client.cache_operation = crate::client::CacheOperation::Compact;
     client.cache_attempt = 0;
     let max_retries = context.provider.stream_max_retries().min(2);
@@ -420,14 +422,7 @@ async fn request_compaction(
                 .compact_input
                 .take()
                 .ok_or_else(|| CodexErr::Fatal("Missing fitted compact input".into()))?;
-            let output = collect_compaction_output(
-                sess,
-                context,
-                stream,
-                source.review_frame_tokens(),
-                prompt,
-            )
-            .await?;
+            let output = collect_compaction_output(sess, context, stream).await?;
             Ok((output, sent))
         };
         let error = tokio::select! {
@@ -480,12 +475,9 @@ async fn collect_compaction_output(
     sess: &Session,
     context: &TurnContext,
     mut stream: ResponseStream,
-    frame_tokens: i64,
-    prompt: &Prompt,
 ) -> CodexResult<CompactionOutput> {
     let mut candidate = None;
     let mut count = 0;
-    let mut server_reasoning_included = false;
     while let Some(event) = stream.next().await {
         let event = event?;
         if matches!(&event, ResponseEvent::Completed { .. }) {
@@ -504,15 +496,8 @@ async fn collect_compaction_output(
                 token_usage,
                 ..
             } => {
-                sess.update_token_usage_info_with_request_context(
-                    context,
-                    stream.usage(token_usage.as_ref()),
-                    frame_tokens,
-                    server_reasoning_included,
-                    0,
-                    prompt,
-                )
-                .await;
+                sess.record_helper_usage(context, stream.usage(token_usage.as_ref()))
+                    .await;
                 if count != 1 {
                     return Err(CodexErr::Fatal(format!(
                         "Remote compaction v2 expected exactly one compaction output, got {count}"
@@ -524,9 +509,6 @@ async fn collect_compaction_output(
                 return Ok(CompactionOutput { item, response_id });
             }
             ResponseEvent::RateLimits(snapshot) => sess.update_rate_limits(context, snapshot).await,
-            ResponseEvent::ServerReasoningIncluded(included) => {
-                server_reasoning_included = included;
-            }
             _ => {}
         }
     }

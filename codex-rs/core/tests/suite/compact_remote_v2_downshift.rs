@@ -586,7 +586,8 @@ async fn fresh_preturn_replays_the_same_requests_at_every_installation_cut(
     let schema = structured.then(|| {
         json!({
             "type": "object", "properties": {"answer": {"type":"string"}},
-            "required": ["answer"], "additionalProperties": false
+            "required": ["answer"], "additionalProperties": false,
+            "description":"Response contract. ".repeat(1200),
         })
     });
     let cwd = tempfile::tempdir()?;
@@ -646,7 +647,11 @@ async fn fresh_preturn_replays_the_same_requests_at_every_installation_cut(
     let original = builder(&server).build(&server).await?;
     original
         .codex
-        .submit(user_input("Use $calendar to complete the original task."))
+        .submit(user_input(&if structured {
+            "Historical evidence to retain. ".repeat(6700)
+        } else {
+            "Use $calendar to complete the original task.".into()
+        }))
         .await?;
     complete(&original.codex).await;
     let Op::UserInput { items, .. } = user_input(FRESH) else {
@@ -743,14 +748,62 @@ async fn fresh_preturn_replays_the_same_requests_at_every_installation_cut(
     let path = original.codex.rollout_path().unwrap();
     let raw = std::fs::read_to_string(&path)?;
     let cuts = preturn_replay_cuts(&raw, FRESH, dest, last)?;
-    for &(label, cut, start) in &cuts {
+    if !downshift {
+        // This cut precedes selection. The old answer is complete; on a new
+        // endpoint its 185k bill cannot force the small destination to compact.
+        let cut = cuts
+            .iter()
+            .find(|c| c.0 == "accepted before capture")
+            .unwrap()
+            .1;
         std::fs::write(&path, &raw[..cut])?;
-        let server = responses::start_mock_server().await;
-        if !downshift {
-            responses::mount_app_catalog(&server, &["Calendar"]).await;
+        let rebound = responses::start_mock_server().await;
+        responses::mount_app_catalog(&rebound, &["Calendar"]).await;
+        let posts = responses::mount_sse_once(&rebound, replies[last].clone()).await;
+        let replay = builder(&rebound)
+            .resume(&rebound, original.home.clone(), path.clone())
+            .await?;
+        replay.codex.submit(Op::Continue).await?;
+        complete(&replay.codex).await;
+        shutdown(&replay.codex).await?;
+        let request = posts.single_request();
+        assert_eq!(request.body_json()["model"], dest);
+        assert!(
+            request
+                .input()
+                .iter()
+                .any(|item| item["content"][0]["text"] == FRESH)
+        );
+        assert!(
+            !request
+                .input()
+                .iter()
+                .any(|item| item["type"] == "compaction")
+        );
+    }
+    for (label, cut, start, manual) in cuts.iter().flat_map(|&(label, cut, start)| {
+        std::iter::once((label, cut, start, false)).chain(
+            matches!(
+                label,
+                "selected before first helper" | "notes answer" | "compact receipt before install"
+            )
+            .then_some((label, cut, start, true)),
+        )
+    }) {
+        std::fs::write(&path, &raw[..cut])?;
+        // Before selection, a completed task's bill calibrates only its original
+        // endpoint. After selection the checkpoint also survives a real rebind.
+        let rebound = if !downshift && label == "accepted before capture" {
+            None
+        } else {
+            Some(responses::start_mock_server().await)
+        };
+        let server = rebound.as_ref().unwrap_or(&server);
+        if !downshift && rebound.is_some() {
+            responses::mount_app_catalog(server, &["Calendar"]).await;
         }
-        let posts = responses::mount_sse_sequence(&server, replies[start..].to_vec()).await;
-        let mut replay = builder(&server);
+        let posts = responses::mount_sse_sequence(server, replies[start..].to_vec()).await;
+        let mut replay = builder(server);
         if !downshift && matches!(label, "accepted before capture" | "notes answer") {
             // The archived outgoing text must not be re-rendered from a refreshed template.
             // The destination opted out of that section and is unaffected.
@@ -760,8 +813,17 @@ async fn fresh_preturn_replays_the_same_requests_at_every_installation_cut(
             });
         }
         let resumed = replay
-            .resume(&server, original.home.clone(), path.clone())
+            .resume(server, original.home.clone(), path.clone())
             .await?;
+        if manual {
+            resumed.codex.submit(Op::Compact).await?;
+            complete(&resumed.codex).await;
+            assert_eq!(
+                posts.requests().len(),
+                last - start,
+                "{label}: manual retry finishes only the remaining checkpoint requests"
+            );
+        }
         resumed.codex.submit(Op::Continue).await?;
         complete(&resumed.codex).await;
         shutdown(&resumed.codex).await?;
@@ -1086,21 +1148,177 @@ async fn legacy_capture_recovers_inline_and_installs_prepared_skills_once() -> R
     Ok(())
 }
 
-#[test_case::test_case(false, false, false, false, false; "failed continue")]
-#[test_case::test_case(false, true, false, false, false; "failed new input")]
-#[test_case::test_case(true, false, false, false, false; "paused continue")]
-#[test_case::test_case(true, true, false, false, false; "paused new input")]
-#[test_case::test_case(false, false, true, false, false; "failed restart continue")]
-#[test_case::test_case(false, true, true, false, false; "failed restart new input")]
-#[test_case::test_case(true, false, true, false, false; "paused restart continue")]
-#[test_case::test_case(true, true, true, false, false; "paused restart new input")]
-#[test_case::test_case(false, false, true, true, false; "legacy capture restart continue")]
-#[test_case::test_case(false, false, false, false, true; "failed continue with model override")]
-#[test_case::test_case(true, false, true, false, true; "paused restart with model override")]
+enum RecoveryCommand {
+    Continue,
+    NewInput,
+    CompactThenContinue,
+}
+
+#[test_case::test_case(false; "interrupt then continue on the saved destination")]
+#[test_case::test_case(true; "competing commands and restart preserve the owner")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_checkpoint_stop_keeps_ordinary_owner(compete_and_restart: bool) -> Result<()> {
+    skip_if_no_network_unless_localhost!(Ok(()));
+    let (fail, pending) = oneshot::channel();
+    let (_hold, retry) = oneshot::channel();
+    let gated = |gate, end| {
+        vec![
+            chunk(vec![responses::ev_response_created("pending")]),
+            StreamingSseChunk {
+                gate: Some(gate),
+                body: end,
+            },
+        ]
+    };
+    let (source, _) = start_streaming_sse_server(vec![
+        vec![chunk(vec![
+            responses::ev_assistant_message("old", "Old work."),
+            responses::ev_completed_with_tokens("old", 160_000),
+        ])],
+        gated(
+            pending,
+            responses::sse(vec![responses::ev_completed("invalid")]),
+        ),
+        gated(retry, compact_response("not installed")),
+        vec![chunk(vec![
+            ev_compaction("installed"),
+            responses::ev_completed("valid"),
+        ])],
+    ])
+    .await;
+    let dest = responses::start_mock_server().await;
+    let post = responses::mount_sse_once(&dest, text_reply("after", "{}", 1200)).await;
+    let src_url = format!("{}/v1", source.uri());
+    let dest_url = format!("{}/v1", dest.uri());
+    let build = |model: &'static str| {
+        let (s, d) = (src_url.clone(), dest_url.clone());
+        test_codex()
+            .with_model(model)
+            .with_config(move |cfg| configure_providers(cfg, s, d, true))
+    };
+    let original = build("previous-provider-model")
+        .build_with_streaming_server(&source)
+        .await?;
+    original.codex.submit(user_input("Source work.")).await?;
+    complete(&original.codex).await;
+    original
+        .codex
+        .submit(model_override("destination-provider-model"))
+        .await?;
+    let schema = json!({"type":"object","description":"Destination format."});
+    let owner = original
+        .codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "Finish the saved request.".into(),
+                text_elements: vec![],
+            }],
+            final_output_json_schema: Some(schema.clone()),
+        })
+        .await?;
+    wait_for_requests(&source, 2).await;
+    if compete_and_restart {
+        assert_compact_is_busy(&original.codex).await?;
+        assert_eq!(source.requests().await.len(), 2);
+    }
+    fail.send(()).unwrap();
+    wait_for_event(&original.codex, |e| matches!(e, EventMsg::Error(_))).await;
+    complete(&original.codex).await;
+    let path = original.codex.rollout_path().unwrap();
+    shutdown(&original.codex).await?;
+    let resume = || build("recovery-provider-model");
+    let mut active = resume()
+        .resume(&dest, original.home.clone(), path.clone())
+        .await?;
+    assert_eq!(active.session_configured.model, "recovery-provider-model");
+    let retry_id = active.codex.submit(Op::Compact).await?;
+    wait_for_requests(&source, 3).await;
+    if compete_and_restart {
+        assert_compact_is_busy(&active.codex).await?;
+        assert_eq!(source.requests().await.len(), 3);
+    }
+    active.codex.submit(Op::Interrupt).await?;
+    wait_for_event(&active.codex, |e| matches!(e, EventMsg::TurnAborted(_))).await;
+    assert!(post.requests().is_empty());
+    assert!(replacement_history(&path).is_empty());
+    if compete_and_restart {
+        shutdown(&active.codex).await?;
+        active = resume()
+            .resume(&dest, original.home.clone(), path.clone())
+            .await?;
+    }
+    active.codex.submit(Op::Continue).await?;
+    let event = wait_for_event(&active.codex, |e| {
+        matches!(e, EventMsg::TurnContinued(_) | EventMsg::Error(_))
+    })
+    .await;
+    let EventMsg::TurnContinued(event) = event else {
+        anyhow::bail!("lost ordinary continuation: {event:?}")
+    };
+    assert_ne!(
+        event.continued_from_turn_id.as_deref(),
+        Some(retry_id.as_str())
+    );
+    assert_eq!(
+        event.continued_from_turn_id.as_deref(),
+        Some(owner.as_str())
+    );
+    complete(&active.codex).await;
+    shutdown(&active.codex).await?;
+    let helpers = source.requests().await;
+    assert_eq!(helpers.len(), 4);
+    let inputs = helpers[1..]
+        .iter()
+        .map(|raw| serde_json::from_slice::<Value>(raw))
+        .collect::<serde_json::Result<Vec<_>>>()?;
+    for body in &inputs {
+        assert_compact_request(body);
+        assert_eq!(body["model"], "previous-provider-model");
+        assert_eq!(body["input"], inputs[0]["input"]);
+    }
+    let ordinary = post.single_request().body_json();
+    assert_eq!(ordinary["model"], "destination-provider-model");
+    assert_eq!(ordinary["text"]["format"]["schema"], schema);
+    for line in std::fs::read_to_string(path)?.lines() {
+        if let RolloutItem::ResponseItem(ResponseItem::Message { role, content, .. }) =
+            serde_json::from_str::<RolloutLine>(line)?.item
+            && role == "user"
+        {
+            assert!(!content.iter().any(
+                |p| matches!(p, ContentItem::InputText {text} if text.starts_with("<turn_aborted>"))
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn assert_compact_is_busy(codex: &codex_core::CodexThread) -> Result<()> {
+    codex.submit(Op::Compact).await?;
+    let event = wait_for_event(codex, |e| {
+        matches!(e, EventMsg::Error(_) | EventMsg::TurnAborted(_))
+    })
+    .await;
+    assert!(matches!(event, EventMsg::Error(e) if e.message.contains("already running")));
+    Ok(())
+}
+
+#[test_case::test_case(false, RecoveryCommand::Continue, false, false, false; "failed continue")]
+#[test_case::test_case(false, RecoveryCommand::NewInput, false, false, false; "failed new input")]
+#[test_case::test_case(true, RecoveryCommand::Continue, false, false, false; "paused continue")]
+#[test_case::test_case(true, RecoveryCommand::NewInput, false, false, false; "paused new input")]
+#[test_case::test_case(false, RecoveryCommand::Continue, true, false, false; "failed restart continue")]
+#[test_case::test_case(false, RecoveryCommand::NewInput, true, false, false; "failed restart new input")]
+#[test_case::test_case(true, RecoveryCommand::Continue, true, false, false; "paused restart continue")]
+#[test_case::test_case(true, RecoveryCommand::NewInput, true, false, false; "paused restart new input")]
+#[test_case::test_case(false, RecoveryCommand::Continue, true, true, false; "legacy capture restart continue")]
+#[test_case::test_case(false, RecoveryCommand::Continue, false, false, true; "failed continue with model override")]
+#[test_case::test_case(true, RecoveryCommand::Continue, true, false, true; "paused restart with model override")]
+#[test_case::test_case(false, RecoveryCommand::CompactThenContinue, false, false, false; "manual retry after failed downshift")]
+#[test_case::test_case(true, RecoveryCommand::CompactThenContinue, true, false, true; "manual retry after pause restart and model override")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn model_downshift_recovery_preserves_source_and_destination(
     pause: bool,
-    new_input: bool,
+    command: RecoveryCommand,
     restart: bool,
     legacy_capture: bool,
     recovery_override: bool,
@@ -1218,14 +1436,19 @@ async fn model_downshift_recovery_preserves_source_and_destination(
             40_000,
         )
     };
-    active
-        .codex
-        .submit(if new_input {
-            user_input("fresh destination input")
-        } else {
+    let new_input = matches!(command, RecoveryCommand::NewInput);
+    let next = match command {
+        RecoveryCommand::NewInput => user_input("fresh destination input"),
+        RecoveryCommand::Continue => Op::Continue,
+        RecoveryCommand::CompactThenContinue => {
+            active.codex.submit(Op::Compact).await?;
+            complete(&active.codex).await;
+            assert_eq!(old_server.requests().await.len(), 4);
+            assert!(followup.requests().is_empty());
             Op::Continue
-        })
-        .await?;
+        }
+    };
+    active.codex.submit(next).await?;
     complete(&active.codex).await;
 
     let requests = old_server.requests().await;

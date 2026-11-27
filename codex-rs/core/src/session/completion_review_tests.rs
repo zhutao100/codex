@@ -913,20 +913,26 @@ async fn review_admission_charges_resolved_tool_schemas(
     assert!(state.completion_review.defer_new_prompt_frame);
 }
 
-#[test_case::test_case(true; "growing base cannot use pinned fast path")]
-#[test_case::test_case(false; "shrinking base avoids compaction")]
+#[test_case::test_case(true, false; "growing base cannot use pinned fast path")]
+#[test_case::test_case(false, false; "shrinking base avoids compaction")]
+#[test_case::test_case(true, true; "adding a response format charges its wire cost")]
+#[test_case::test_case(false, true; "dropping a response format credits its wire cost")]
 #[tokio::test]
-async fn pinned_review_accounts_for_only_the_instruction_delta(grow: bool) {
+async fn pinned_review_accounts_for_request_surface_changes(grow: bool, change_format: bool) {
     let (session, mut context) = completed_session().await;
     let ctx = Arc::get_mut(&mut context).unwrap();
     ctx.model_info.context_window = Some(40_000);
     ctx.model_info.effective_context_window_percent = 100;
     let base = |long| {
-        if long {
+        if long && !change_format {
             "Sampled style. ".repeat(300)
         } else {
             "Default.".into()
         }
+    };
+    let schema = |long| {
+        (change_format && long)
+            .then(|| serde_json::json!({"type":"object","description":"Evidence. ".repeat(500)}))
     };
     Arc::make_mut(&mut ctx.config).base_instructions = Some(base(!grow));
     let ticket = session.begin_completion_review(false).await.unwrap();
@@ -948,6 +954,7 @@ async fn pinned_review_accounts_for_only_the_instruction_delta(grow: bool) {
     let prompt = Prompt {
         base_instructions: session.get_base_instructions_for_turn(&context).await,
         tools: tools.clone(),
+        output_schema: schema(!grow),
         ..Default::default()
     };
     session
@@ -986,6 +993,7 @@ async fn pinned_review_accounts_for_only_the_instruction_delta(grow: bool) {
         input: items.clone(),
         tools,
         base_instructions: session.get_base_instructions_for_turn(&context).await,
+        output_schema: schema(grow),
         ..Default::default()
     };
     let admit = session
@@ -998,6 +1006,29 @@ async fn pinned_review_accounts_for_only_the_instruction_delta(grow: bool) {
             .is_ok(),
         !grow
     );
+    if change_format {
+        // Without a recorded format cost, keep the work correction but grant
+        // no credit for a schema the old writer might not have sent.
+        session
+            .state
+            .lock()
+            .await
+            .history
+            .measured_surface
+            .as_mut()
+            .unwrap()
+            .response_format_tokens = None;
+        let legacy = session
+            .ordinary_review_admission(&context, &prompt, frames.tokens(), None)
+            .await;
+        assert!(legacy.measured.is_some());
+        assert!(
+            legacy
+                .admit(&prompt, &mut items, context.current_endpoint().as_deref())
+                .await
+                .is_err()
+        );
+    }
 }
 
 #[tokio::test]

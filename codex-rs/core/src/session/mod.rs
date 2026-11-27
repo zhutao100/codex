@@ -336,11 +336,26 @@ fn server_model_mismatch_warning(requested_model: &str, server_model: &str) -> S
 /// It operates as a queue pair where you send submissions and receive events.
 pub struct Codex {
     pub(crate) next_id: AtomicU64,
-    pub(crate) tx_sub: Sender<Submission>,
+    pub(crate) tx_sub: Sender<QueuedSubmission>,
     pub(crate) rx_event: Receiver<Event>,
     // Last known status of the agent.
     pub(crate) agent_status: watch::Receiver<AgentStatus>,
     pub(crate) session: Arc<Session>,
+}
+
+/// Admission is a host reply, not part of a protocol submission or the rollout.
+pub(crate) struct QueuedSubmission {
+    pub(crate) submission: Submission,
+    compact_admission: Option<tokio::sync::oneshot::Sender<CodexResult<()>>>,
+}
+
+impl From<Submission> for QueuedSubmission {
+    fn from(submission: Submission) -> Self {
+        Self {
+            submission,
+            compact_admission: None,
+        }
+    }
 }
 
 /// The spawned [`Codex`] and its thread ID.
@@ -528,22 +543,43 @@ impl Codex {
         Ok(CodexSpawnOk { codex, thread_id })
     }
 
-    /// Submit the `op` wrapped in a `Submission` with a unique ID.
-    pub async fn submit(&self, op: Op) -> CodexResult<String> {
+    fn submission(&self, op: Op) -> Submission {
         let id = self
             .next_id
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
             .to_string();
-        let sub = Submission { id: id.clone(), op };
+        Submission { id, op }
+    }
+
+    /// Submit the `op` wrapped in a `Submission` with a unique ID.
+    pub async fn submit(&self, op: Op) -> CodexResult<String> {
+        let sub = self.submission(op);
+        let id = sub.id.clone();
         self.submit_with_id(sub).await?;
         Ok(id)
+    }
+
+    pub(crate) async fn start_compaction(&self) -> CodexResult<()> {
+        let (reply, result) = tokio::sync::oneshot::channel();
+        self.tx_sub
+            .send(QueuedSubmission {
+                submission: self.submission(Op::Compact),
+                compact_admission: Some(reply),
+            })
+            .await
+            .map_err(|_| CodexErr::InternalAgentDied)?;
+        tokio::select! {
+            biased;
+            result = result => result.map_err(|_| CodexErr::InternalAgentDied)?,
+            _ = self.tx_sub.closed() => Err(CodexErr::InternalAgentDied),
+        }
     }
 
     /// Use sparingly: prefer `submit()` so Codex is responsible for generating
     /// unique IDs for each submission.
     pub async fn submit_with_id(&self, sub: Submission) -> CodexResult<()> {
         self.tx_sub
-            .send(sub)
+            .send(sub.into())
             .await
             .map_err(|_| CodexErr::InternalAgentDied)?;
         Ok(())
@@ -645,6 +681,29 @@ pub(crate) enum ThreadNameSource {
 }
 
 impl SessionState {
+    fn has_pending_auto_checkpoint(&self) -> bool {
+        let review = &self.completion_review;
+        review.pending_compaction.is_some()
+            || review.defer_new_prompt_frame
+            || self
+                .history
+                .raw_items()
+                .iter()
+                .rev()
+                .any(compact::is_work_notes_request_item)
+    }
+
+    fn regular_continuation_updates(&self, model: Option<String>) -> SessionSettingsUpdate {
+        if let Some(settings) = &self.completion_review.recovery_settings {
+            return settings.updates(model);
+        }
+        SessionSettingsUpdate {
+            collaboration_mode: Some(self.mode_for_continuation().with_updates(model, None, None)),
+            final_output_json_schema: Some(self.completion_review.recovery_output_schema.clone()),
+            ..Default::default()
+        }
+    }
+
     fn recorded_base_id(&self, text: &str) -> Option<ThreadId> {
         self.recorded_bases
             .iter()
@@ -658,9 +717,17 @@ impl SessionState {
         settings
     }
 
+    /// A pre-admission checkpoint can use the last sampler. Once another task's
+    /// input is admitted, that sampler no longer owns the whole work prefix.
+    fn completed_source_owns_history(&self) -> bool {
+        self.completion_review.unsampled_fresh_model.is_none()
+            && self.history.rejected_context.is_none()
+    }
+
     fn checkpoint_source_settings(&self, context: &TurnContext) -> RegularTaskSettings {
         let mut settings = self.task_settings(context, &self.base_instructions_for_turn(context));
-        if let Some(last) = &self.completion_review.last_work_settings
+        if self.completed_source_owns_history()
+            && let Some(last) = &self.completion_review.last_work_settings
             && last.sampled_controls.is_some()
         {
             // Compare all task settings, including the recorded base. A login or catalog
@@ -679,13 +746,19 @@ impl SessionState {
         settings
     }
 
-    fn regular_continuation_directory_matches(&self) -> bool {
-        !self.completion_review.replacement_answer_required
-            || self
-                .completion_review
+    fn check_regular_continuation_directory(&self) -> CodexResult<()> {
+        let review = &self.completion_review;
+        if !review.replacement_answer_required
+            || review
                 .episode
                 .as_ref()
                 .is_some_and(|episode| episode.cwd == self.session_configuration.cwd)
+        {
+            return Ok(());
+        }
+        Err(CodexErr::UnsupportedOperation(
+            "Cannot continue review-derived main work in a different working directory. Return to the completed task's directory and use /continue, or start a new request for the current directory.".into(),
+        ))
     }
 
     fn base_instructions_for_turn(&self, turn_context: &TurnContext) -> BaseInstructions {
@@ -953,6 +1026,7 @@ impl Session {
         format!("{prefix}-{id}")
     }
 
+    #[cfg(test)]
     async fn get_total_token_usage(&self) -> i64 {
         let state = self.state.lock().await;
         state.get_total_token_usage(state.server_reasoning_included())
@@ -1105,6 +1179,8 @@ impl Session {
             state.history.measured_base_tokens = usage.measured_base_tokens;
             state.history.measured_tool_tokens = usage.measured_tool_tokens;
             state.history.measured_surface = usage.measured_surface;
+            state.history.rejected_context = usage.rejected_context;
+            state.history.helper_receipt = usage.helper;
             state.history.work_notes_baseline = usage.work_notes_baseline;
             state.set_server_reasoning_included(usage.server_reasoning_included);
         } else {
@@ -2172,6 +2248,28 @@ impl Session {
         )
     }
 
+    pub(crate) async fn record_helper_usage(
+        &self,
+        context: &TurnContext,
+        receipt: ResponseUsage<'_>,
+    ) {
+        if let Some(usage) = receipt.tokens {
+            let mut state = self.state.lock().await;
+            if usage.total_tokens > 0 || state.token_info().is_none() {
+                state.history.bill_helper(
+                    usage,
+                    context.model_context_window(),
+                    context.usage_source(receipt.endpoint),
+                );
+            }
+            drop(state);
+            if usage.total_tokens > 0 {
+                self.persist_token_usage_context().await;
+            }
+        }
+        self.send_token_count_event(context).await;
+    }
+
     pub(crate) async fn update_token_usage_info_with_request_context(
         &self,
         turn_context: &TurnContext,
@@ -2201,6 +2299,7 @@ impl Session {
                         images: turn_context.supports_image_inputs(),
                         structured_outputs: prompt.tools.structured_outputs,
                     },
+                    crate::client_common::response_format_tokens(&prompt.output_schema),
                 );
                 state.history.measured_base_tokens = Some(crate::truncate::approx_token_count(
                     &prompt.base_instructions.text,
@@ -2223,7 +2322,7 @@ impl Session {
                         0,
                     );
                 }
-                false
+                state.history.rejected_context.take().is_some()
             }
         };
         if record_context {
@@ -2239,6 +2338,7 @@ impl Session {
                 .token_info()
                 .map(|info| RolloutItem::TokenUsageContext {
                     info,
+                    helper: state.history.helper_receipt.clone(),
                     source_model: state.history.usage_source_model().map(str::to_owned),
                     request_context_tokens: state.history.request_context_tokens(),
                     server_reasoning_included: state.server_reasoning_included(),
@@ -2248,6 +2348,7 @@ impl Session {
                     measured_base_tokens: state.history.measured_base_tokens,
                     measured_tool_tokens: state.history.measured_tool_tokens,
                     measured_surface: state.history.measured_surface.clone(),
+                    rejected_context: state.history.rejected_context.clone(),
                 })
         };
         if let Some(item) = item {
@@ -2302,18 +2403,19 @@ impl Session {
         self.send_event(turn_context, event).await;
     }
 
-    pub(crate) async fn set_total_tokens_full(&self, turn_context: &TurnContext) {
-        let mut record_context = false;
+    pub(crate) async fn record_context_rejection(
+        &self,
+        turn_context: &TurnContext,
+        endpoint: Option<&str>,
+    ) {
         if let Some(context_window) = turn_context.model_context_window() {
-            let mut state = self.state.lock().await;
-            record_context = true;
-            state.set_token_usage_full(context_window);
-            state.set_server_reasoning_included(true);
-        }
-        if record_context {
+            self.state
+                .lock()
+                .await
+                .history
+                .mark_rejected(turn_context.usage_source(endpoint), context_window);
             self.persist_token_usage_context().await;
         }
-        self.send_token_count_event(turn_context).await;
     }
 
     pub(crate) async fn record_response_item_and_emit_turn_item(
@@ -2560,12 +2662,8 @@ impl Session {
             .pending_continuation
             .as_ref()
             .is_some_and(|checkpoint| checkpoint.target == PendingContinuationTarget::Regular)
-            && !state.regular_continuation_directory_matches()
         {
-            return Err(CodexErr::UnsupportedOperation(
-                "Cannot continue review-derived main work in a different working directory. Return to the completed task's directory and use /continue, or start a new request for the current directory."
-                    .into(),
-            ));
+            state.check_regular_continuation_directory()?;
         }
         Ok(state.pending_continuation.take())
     }

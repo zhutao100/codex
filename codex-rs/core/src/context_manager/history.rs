@@ -15,7 +15,9 @@ use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::InputModality;
+use codex_protocol::protocol::HelperUsageContext;
 use codex_protocol::protocol::MeasuredInputSurface;
+use codex_protocol::protocol::RejectedContext;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TokenUsageInfo;
 use codex_protocol::protocol::TurnContextItem;
@@ -43,10 +45,19 @@ impl HelperProjection {
     }
 }
 
+impl From<&MeasuredInputSurface> for HelperProjection {
+    fn from(surface: &MeasuredInputSurface) -> Self {
+        Self {
+            images: surface.images,
+            structured_outputs: surface.structured_outputs,
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum WorkBudget {
     Helper,
-    Review,
+    Ordinary,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -131,7 +142,7 @@ pub(crate) struct WorkNotesBaseline {
     work: [[i64; 2]; 2],
     items: ProjectionCost,
     measured_base_tokens: Option<i64>,
-    pub(crate) measured_tool_tokens: Option<i64>,
+    pub(crate) measured_request_overhead: Option<i64>,
 }
 
 impl WorkNotesBaseline {
@@ -174,7 +185,9 @@ pub(crate) struct ContextManager {
     pub(crate) measured_base_tokens: Option<i64>,
     pub(crate) measured_tool_tokens: Option<i64>,
     token_info: Option<TokenUsageInfo>,
+    pub(crate) helper_receipt: Option<Box<HelperUsageContext>>,
     pub(crate) measured_surface: Option<MeasuredInputSurface>,
+    pub(crate) rejected_context: Option<RejectedContext>,
     source_model: Option<String>,
     /// Items at this index and later are not covered by the stored usage baseline.
     last_usage_item_count: usize,
@@ -196,7 +209,9 @@ impl ContextManager {
             measured_base_tokens: None,
             measured_tool_tokens: None,
             token_info: TokenUsageInfo::new_or_append(&None, &None, None),
+            helper_receipt: None,
             measured_surface: None,
+            rejected_context: None,
             source_model: None,
             last_usage_item_count: 0,
             request_context_tokens: 0,
@@ -207,6 +222,29 @@ impl ContextManager {
 
     pub(crate) fn token_info(&self) -> Option<TokenUsageInfo> {
         self.token_info.clone()
+    }
+
+    pub(crate) fn work_usage(&self) -> Option<&TokenUsage> {
+        self.helper_receipt
+            .as_ref()
+            .map(|helper| &helper.work_usage)
+            .or_else(|| self.token_info.as_ref().map(|i| &i.last_token_usage))
+    }
+
+    pub(crate) fn bill_helper(
+        &mut self,
+        usage: &TokenUsage,
+        window: Option<i64>,
+        source: UsageSource<'_>,
+    ) {
+        self.helper_receipt = Some(Box::new(HelperUsageContext {
+            work_usage: self.work_usage().cloned().unwrap_or_default(),
+            model: source.model.to_owned(),
+            provider: source.provider.to_owned(),
+            endpoint_sha256: source.endpoint.map(str::to_owned),
+        }));
+        self.token_info =
+            TokenUsageInfo::new_or_append(&self.token_info, &Some(usage.clone()), window);
     }
 
     pub(crate) fn set_token_info(&mut self, info: Option<TokenUsageInfo>) {
@@ -227,6 +265,8 @@ impl ContextManager {
         covered_item_count: usize,
     ) {
         self.token_info = info;
+        self.helper_receipt = None;
+        self.rejected_context = None;
         self.source_model = None;
         self.measured_surface = None;
         self.last_usage_item_count = covered_item_count.min(self.items.len());
@@ -255,6 +295,7 @@ impl ContextManager {
         provider: &str,
         endpoint: Option<&str>,
         projection: HelperProjection,
+        response_format_tokens: i64,
     ) {
         let plain = self
             .original_covered_cost
@@ -263,6 +304,7 @@ impl ContextManager {
         self.measured_format_delta = Some(self.original_covered_cost.get(projection) - plain);
         self.measured_surface = Some(MeasuredInputSurface {
             provider: provider.to_owned(),
+            response_format_tokens: Some(response_format_tokens),
             endpoint_sha256: endpoint.map(str::to_owned),
             images: projection.images,
             structured_outputs: projection.structured_outputs,
@@ -271,6 +313,32 @@ impl ContextManager {
 
     pub(crate) fn base_delta(&self, base: &BaseInstructions) -> i64 {
         instruction_delta(base, self.measured_base_tokens)
+    }
+
+    pub(crate) fn measured_response_format_tokens(&self) -> i64 {
+        // Older ordinary receipts still price work and tools; grant no credit for
+        // an unmeasured response format instead of falling back to ciphertext size.
+        self.measured_surface
+            .as_ref()
+            .and_then(|s| s.response_format_tokens)
+            .unwrap_or(0)
+            .max(0)
+    }
+
+    pub(crate) fn rejected_on(&self, source: UsageSource<'_>, window: Option<i64>) -> bool {
+        self.rejected_context.as_ref().is_some_and(|r| {
+            r.model == source.model
+                && r.provider == source.provider
+                && r.endpoint_sha256.as_deref() == source.endpoint
+                && window.is_some_and(|w| w <= r.window)
+        })
+    }
+
+    pub(crate) fn measured_request_overhead(&self) -> Option<i64> {
+        Some(
+            self.measured_tool_tokens?
+                .saturating_add(self.measured_response_format_tokens()),
+        )
     }
 
     pub(crate) fn usage_source_model(&self) -> Option<&str> {
@@ -321,7 +389,7 @@ impl ContextManager {
         self.projected_work_usage(source, reasoning_included, projection, WorkBudget::Helper)
     }
 
-    pub(crate) fn review_transcript_tokens(
+    pub(crate) fn ordinary_transcript_tokens(
         &self,
         source: UsageSource<'_>,
         base: &BaseInstructions,
@@ -329,11 +397,27 @@ impl ContextManager {
         projection: HelperProjection,
     ) -> Option<i64> {
         self.measured_base_tokens?;
-        let tools = self.measured_tool_tokens?;
+        let overhead = self.measured_request_overhead()?;
         Some(
-            self.projected_work_usage(source, reasoning_included, projection, WorkBudget::Review)?
-                .saturating_add(self.base_delta(base))
-                .saturating_sub(tools),
+            self.projected_work_usage(
+                source,
+                reasoning_included,
+                projection,
+                WorkBudget::Ordinary,
+            )?
+            .saturating_add(self.base_delta(base))
+            .saturating_sub(overhead),
+        )
+    }
+
+    /// The outgoing model's capacity signal, not a measurement of the next model.
+    pub(crate) fn projected_source_work(&self, reasoning_included: bool) -> Option<i64> {
+        let projection = self.measured_surface.as_ref()?.into();
+        self.projected_work_usage(
+            self.work_receipt_source(None)?,
+            reasoning_included,
+            projection,
+            WorkBudget::Ordinary,
         )
     }
 
@@ -344,7 +428,7 @@ impl ContextManager {
         projection: HelperProjection,
         budget: WorkBudget,
     ) -> Option<i64> {
-        let usage = &self.token_info.as_ref()?.last_token_usage;
+        let usage = self.work_usage()?;
         if usage.total_tokens <= 0 {
             return None;
         }
@@ -365,10 +449,7 @@ impl ContextManager {
         {
             return None;
         }
-        let previous_projection = HelperProjection {
-            images: surface.images,
-            structured_outputs: surface.structured_outputs,
-        };
+        let previous_projection = HelperProjection::from(surface);
         let uncovered = self.uncovered_cost();
         let tail = uncovered.get(projection);
         let retained = self.total_item_tokens.sub(uncovered);
@@ -393,7 +474,7 @@ impl ContextManager {
             .max(-usage.output_tokens.max(0))
             .saturating_add(projection_change);
         let reserve = if !reasoning_included
-            && (budget == WorkBudget::Review
+            && (budget == WorkBudget::Ordinary
                 || self.items[self.last_usage_item_count..]
                     .iter()
                     .any(is_user_turn_boundary))
@@ -456,7 +537,7 @@ impl ContextManager {
                     ],
                     items: self.total_item_tokens,
                     measured_base_tokens: self.measured_base_tokens,
-                    measured_tool_tokens: self.measured_tool_tokens,
+                    measured_request_overhead: self.measured_request_overhead(),
                 })
             });
         }
@@ -471,21 +552,20 @@ impl ContextManager {
         self.reference_context_item = item;
     }
 
-    pub(crate) fn set_token_usage_full(&mut self, context_window: i64) {
-        self.source_model = None;
-        self.measured_surface = None;
-        self.measured_item_tokens = None;
-        self.measured_format_delta = None;
-        self.measured_base_tokens = None;
-        self.measured_tool_tokens = None;
-        self.last_usage_item_count = self.items.len();
-        self.request_context_tokens = 0;
-        match &mut self.token_info {
-            Some(info) => info.fill_to_context_window(context_window),
-            None => {
-                self.token_info = Some(TokenUsageInfo::full_context_window(context_window));
-            }
-        }
+    pub(crate) fn mark_rejected(&mut self, source: UsageSource<'_>, window: i64) {
+        self.rejected_context = Some(RejectedContext {
+            model: source.model.into(),
+            provider: source.provider.into(),
+            endpoint_sha256: source.endpoint.map(str::to_owned),
+            window,
+        });
+        // Even the first refused request needs a recoverable host ledger. Zero
+        // initial totals are not a sampled input or a newly covered history item.
+        self.token_info.get_or_insert_with(|| TokenUsageInfo {
+            total_token_usage: TokenUsage::default(),
+            last_token_usage: TokenUsage::default(),
+            model_context_window: Some(window),
+        });
     }
 
     /// `items` is ordered from oldest to newest.
@@ -711,6 +791,7 @@ impl ContextManager {
 
         let cut_idx = self.trim_pre_turn_context_updates(first_user_idx, cut_idx);
         self.truncate_items(cut_idx);
+        self.rejected_context = None;
     }
 
     pub(crate) fn update_token_info(
@@ -764,11 +845,7 @@ impl ContextManager {
     /// When true, the server already accounted for past reasoning tokens and
     /// the client should not re-estimate them.
     pub(crate) fn get_total_token_usage(&self, server_reasoning_included: bool) -> i64 {
-        let last_tokens = self
-            .token_info
-            .as_ref()
-            .map(|info| info.last_token_usage.total_tokens)
-            .unwrap_or(0);
+        let last_tokens = self.work_usage().map_or(0, |usage| usage.total_tokens);
         last_tokens.saturating_add(self.get_unreported_token_usage(server_reasoning_included))
     }
 

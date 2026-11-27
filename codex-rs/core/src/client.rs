@@ -196,6 +196,39 @@ struct PreparedResponses {
     compact_trim: Option<(usize, i64)>,
 }
 
+/// Opening a transport is not necessarily a model request (e.g. a refused WS
+/// upgrade). Only an error from a submitted prompt can establish a capacity barrier.
+pub(crate) enum OpenStreamError {
+    ContextRefused { endpoint: Option<String> },
+    Other(CodexErr),
+}
+
+impl OpenStreamError {
+    fn after_send(error: ApiError, request: &PreparedResponses) -> Self {
+        match map_api_error(error) {
+            CodexErr::ContextWindowExceeded => Self::ContextRefused {
+                endpoint: request.endpoint.clone(),
+            },
+            error => Self::Other(error),
+        }
+    }
+}
+
+impl From<CodexErr> for OpenStreamError {
+    fn from(error: CodexErr) -> Self {
+        Self::Other(error)
+    }
+}
+
+impl From<OpenStreamError> for CodexErr {
+    fn from(error: OpenStreamError) -> Self {
+        match error {
+            OpenStreamError::ContextRefused { .. } => Self::ContextWindowExceeded,
+            OpenStreamError::Other(error) => error,
+        }
+    }
+}
+
 impl PreparedResponses {
     fn attach(self, mut stream: ResponseStream) -> ResponseStream {
         stream.endpoint_sha256 = self.endpoint;
@@ -926,7 +959,7 @@ impl ModelClientSession {
         service_tier: Option<String>,
         turn_metadata_header: Option<&str>,
         http_reason: &'static str,
-    ) -> Result<ResponseStream> {
+    ) -> std::result::Result<ResponseStream, OpenStreamError> {
         if let Some(path) = &*CODEX_RS_SSE_FIXTURE {
             warn!(path, "Streaming from fixture");
             let stream = codex_api::stream_from_fixture(path, self.provider.stream_idle_timeout())
@@ -1009,7 +1042,7 @@ impl ModelClientSession {
                     handle_unauthorized(unauthorized_transport, &mut auth_recovery).await?;
                     continue;
                 }
-                Err(err) => return Err(map_api_error(err)),
+                Err(err) => return Err(OpenStreamError::after_send(err, &prepared)),
             }
         }
     }
@@ -1025,7 +1058,7 @@ impl ModelClientSession {
         summary: ReasoningSummaryConfig,
         service_tier: Option<String>,
         turn_metadata_header: Option<&str>,
-    ) -> Result<WebsocketStreamOutcome> {
+    ) -> std::result::Result<WebsocketStreamOutcome, OpenStreamError> {
         let auth_manager = self.client.state.auth_manager.clone();
 
         let mut auth_recovery = None;
@@ -1078,7 +1111,7 @@ impl ModelClientSession {
                 {
                     return Ok(WebsocketStreamOutcome::FallbackToHttp);
                 }
-                Err(err) => return Err(map_api_error(err)),
+                Err(err) => return Err(map_api_error(err).into()),
             };
 
             // A refused upgrade sends no model input. Fit only the route that accepted
@@ -1122,7 +1155,7 @@ impl ModelClientSession {
             let stream_result = connection
                 .stream_request(request, Some(Arc::clone(&self.turn_state)))
                 .await
-                .map_err(map_api_error)?;
+                .map_err(|err| OpenStreamError::after_send(err, &prepared))?;
             self.websocket_last_request = Some(last_request);
             let (stream, last_response_rx) =
                 map_response_stream(stream_result, otel_manager.clone(), trace);
@@ -1156,6 +1189,30 @@ impl ModelClientSession {
         service_tier: Option<String>,
         turn_metadata_header: Option<&str>,
     ) -> Result<ResponseStream> {
+        self.open_stream(
+            prompt,
+            model_info,
+            otel_manager,
+            effort,
+            summary,
+            service_tier,
+            turn_metadata_header,
+        )
+        .await
+        .map_err(Into::into)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn open_stream(
+        &mut self,
+        prompt: &Prompt,
+        model_info: &ModelInfo,
+        otel_manager: &OtelManager,
+        effort: Option<ReasoningEffortConfig>,
+        summary: ReasoningSummaryConfig,
+        service_tier: Option<String>,
+        turn_metadata_header: Option<&str>,
+    ) -> std::result::Result<ResponseStream, OpenStreamError> {
         let wire_api = self.provider.wire_api;
         match wire_api {
             WireApi::Responses => {
@@ -1510,17 +1567,24 @@ where
                 Ok(ResponseEvent::Completed {
                     response_id,
                     token_usage,
+                    reported_cached_tokens,
                     end_turn,
                     reasoning_removals,
                 }) => {
                     if let Some(trace) = cache_trace.take() {
-                        trace.complete(&response_id, token_usage.as_ref(), &items_added);
+                        trace.complete(
+                            &response_id,
+                            token_usage.as_ref(),
+                            reported_cached_tokens,
+                            reasoning_removals.as_ref(),
+                            &items_added,
+                        );
                     }
                     if let Some(usage) = &token_usage {
                         otel_manager.sse_event_completed(
                             usage.input_tokens,
                             usage.output_tokens,
-                            Some(usage.cached_input_tokens),
+                            reported_cached_tokens,
                             Some(usage.reasoning_output_tokens),
                             usage.total_tokens,
                         );
@@ -1535,6 +1599,7 @@ where
                         .send(Ok(ResponseEvent::Completed {
                             response_id,
                             token_usage,
+                            reported_cached_tokens,
                             end_turn,
                             reasoning_removals,
                         }))
@@ -1763,6 +1828,7 @@ mod tests {
                 reasoning_removals: None,
                 response_id: "resp-1".to_string(),
                 token_usage: None,
+                reported_cached_tokens: None,
                 end_turn: Some(true),
             }),
         ]);

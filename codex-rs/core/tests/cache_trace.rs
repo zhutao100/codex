@@ -200,7 +200,10 @@ async fn compare_completed_work_and_sibling_compact_on_http_and_websocket() -> R
             assert!(lines.lines().any(|l| l.contains("provider cache receipt")
                 && l.contains(&format!("response_id=\"{id}\""))
                 && l.contains("cached_tokens_reported=false")));
-            assert!(comparison(id, "previous")?.contains(&format!("input_tokens={input}")));
+            let row = comparison(id, "previous")?;
+            assert!(row.contains(&format!("input_tokens={input}")));
+            assert!(row.contains("reasoning_replay_report=\"unavailable\""));
+            assert!(!row.contains("reasoning_prefix_mismatch_removed="));
         }
         assert!(lines.lines().any(|l| l.contains("reasoning replay report")
             && l.contains("response_id=\"compact\"")
@@ -214,8 +217,56 @@ async fn compare_completed_work_and_sibling_compact_on_http_and_websocket() -> R
                 && !lines.contains("codex.tool_result")
         );
     }
+    verify_idless_receipts(log.path()).await?;
     verify_explorer_report_is_ordinary(log.path(), &private_path).await?;
     verify_azure_storage_transition(log.path()).await?;
+    Ok(())
+}
+
+async fn verify_idless_receipts(log: &std::path::Path) -> Result<()> {
+    let events = |details, transformations| {
+        let done = json!({"type":"response.done", "response":{"input_transformations":transformations, "usage":{
+            "input_tokens":4000, "input_tokens_details":details, "output_tokens":0, "total_tokens":4000
+        }}});
+        vec![responses::ev_assistant_message("answer", "Done."), done]
+    };
+    let http = responses::start_mock_server().await;
+    responses::mount_sse_once(&http, responses::sse(events(json!({}), json!([])))).await;
+    let removed = json!({"type":"reasoning","action":"removed","reason":"prefix_mismatch"});
+    let ws = responses::start_websocket_server(vec![vec![events(
+        json!({"cached_tokens":0}),
+        json!([removed, removed]),
+    )]])
+    .await;
+    let a = test_codex().build(&http).await?;
+    let b = test_codex().build_with_websocket_server(&ws).await?;
+    let offset = std::fs::metadata(log)?.len() as usize;
+    tokio::try_join!(a.submit_turn("Check."), b.submit_turn("Check."))?;
+    let text = std::fs::read_to_string(log)?;
+    for (test, present) in [(&a, false), (&b, true)] {
+        let thread = test.session_configured.session_id;
+        let rows: Vec<_> = text[offset..]
+            .lines()
+            .filter(|line| {
+                line.contains("completed logical cache comparison")
+                    && line.contains(&format!("thread_id={thread}"))
+            })
+            .collect();
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            assert!(row.contains("response_id=\"\"") && row.contains("input_tokens=4000"));
+            assert!(row.contains(&format!("cached_tokens_reported={present}")));
+            assert_eq!(row.contains(" cached_tokens=0"), present);
+            let (report, mismatches) = if present {
+                ("prefix_mismatch_reported", 2)
+            } else {
+                ("no_removals_reported", 0)
+            };
+            assert!(row.contains(&format!("reasoning_replay_report=\"{report}\"")));
+            assert!(row.contains(&format!("reasoning_prefix_mismatch_removed={mismatches}")));
+        }
+    }
+    ws.shutdown().await;
     Ok(())
 }
 

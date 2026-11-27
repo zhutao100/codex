@@ -38,6 +38,7 @@ use crate::error::CodexErr;
 use crate::models_manager::manager::ModelsManager;
 use crate::session::Codex;
 use crate::session::CodexSpawnOk;
+use crate::session::QueuedSubmission;
 use crate::session::SUBMISSION_CHANNEL_CAPACITY;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
@@ -188,10 +189,13 @@ pub(crate) async fn run_codex_thread_one_shot(
             let _ = tx_bridge.send(event).await;
             if should_shutdown {
                 let _ = ops_tx
-                    .send(Submission {
-                        id: "shutdown".to_string(),
-                        op: Op::Shutdown {},
-                    })
+                    .send(
+                        Submission {
+                            id: "shutdown".to_string(),
+                            op: Op::Shutdown {},
+                        }
+                        .into(),
+                    )
                     .await;
                 child_cancel.cancel();
                 break;
@@ -583,7 +587,7 @@ async fn shutdown_delegate(codex: &Codex) {
 /// Forward ops from a caller to a sub-agent, respecting cancellation.
 async fn forward_ops(
     codex: Arc<Codex>,
-    rx_ops: Receiver<Submission>,
+    rx_ops: Receiver<QueuedSubmission>,
     cancel_token_ops: CancellationToken,
 ) {
     loop {
@@ -591,7 +595,9 @@ async fn forward_ops(
             Ok(Ok(submission)) => submission,
             Ok(Err(_)) | Err(_) => break,
         };
-        let _ = codex.submit_with_id(submission).await;
+        if codex.tx_sub.send(submission).await.is_err() {
+            break;
+        }
     }
 }
 
@@ -766,10 +772,13 @@ mod tests {
         let forward = tokio::spawn(forward_ops(codex, rx_ops, cancel));
 
         tx_ops
-            .send(Submission {
-                id: "caller-submission".to_string(),
-                op: Op::Interrupt,
-            })
+            .send(
+                Submission {
+                    id: "caller-submission".to_string(),
+                    op: Op::Interrupt,
+                }
+                .into(),
+            )
             .await
             .unwrap();
         drop(tx_ops);
@@ -781,8 +790,8 @@ mod tests {
             .expect("forward_ops join error");
 
         let forwarded = rx_child.recv().await.expect("forwarded submission");
-        assert_eq!("caller-submission", forwarded.id);
-        assert_eq!(Op::Interrupt, forwarded.op);
+        assert_eq!("caller-submission", forwarded.submission.id);
+        assert_eq!(Op::Interrupt, forwarded.submission.op);
     }
 
     #[tokio::test]
@@ -849,7 +858,7 @@ mod tests {
         assert_eq!("full", received.id);
         let mut ops = Vec::new();
         while let Ok(sub) = rx_sub.try_recv() {
-            ops.push(sub.op);
+            ops.push(sub.submission.op);
         }
         assert!(
             ops.iter().any(|op| matches!(op, Op::Interrupt)),
