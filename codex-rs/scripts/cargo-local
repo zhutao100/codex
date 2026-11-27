@@ -2,13 +2,45 @@
 set -euo pipefail
 
 wrapper="${CARGO_LOCAL_BIN:-${HOME}/.local/share/codex-rust-wrappers/cargo-local}"
-script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-workspace_dir="$(cd -- "${script_dir}/.." && pwd -P)"
 
-if [ ! -x "${wrapper}" ]; then
-    printf 'scripts/cargo-local: shared cargo-local wrapper is not executable: %s\n' "${wrapper}" >&2
-    exit 127
+install_wrappers() (
+    install_dir="${1}"
+    parent="${install_dir%/*}"
+    mkdir -p -- "${parent}" || exit
+    stage="$(mktemp -d "${parent}/.codex-rust-wrappers.XXXXXX")" || exit
+    trap 'rm -rf -- "${stage}"' EXIT
+    checkout="${stage}/${install_dir##*/}"
+
+    if ! GIT_TERMINAL_PROMPT=0 git clone --quiet --depth 1 --branch main \
+        --config 'credential.https://github.com.helper=!command -v gh >/dev/null 2>&1 && gh auth git-credential' \
+        -- https://github.com/zhutao100/codex-rust-wrappers.git "${checkout}"; then
+        printf 'scripts/cargo-local: cannot clone the private wrappers repository; use gh auth login or configure GitHub HTTPS credentials\n' >&2
+        exit 1
+    fi
+    if [ ! -f "${checkout}/cargo-local" ] || [ ! -x "${checkout}/cargo-local" ]; then
+        printf 'scripts/cargo-local: the cloned repository has no executable cargo-local\n' >&2
+        exit 1
+    fi
+
+    # Move into the parent (not the install path), so a concurrent install cannot nest the checkout.
+    mv -n -- "${checkout}" "${parent}/"
+)
+
+if [ ! -f "${wrapper}" ] || [ ! -x "${wrapper}" ]; then
+    if [ -z "${CARGO_LOCAL_BIN:-}" ]; then
+        install_dir="${wrapper%/*}"
+        if [ ! -e "${install_dir}" ] && [ ! -L "${install_dir}" ]; then
+            install_wrappers "${install_dir}" || [ -x "${wrapper}" ] || exit 127
+        fi
+    fi
+    if [ ! -f "${wrapper}" ] || [ ! -x "${wrapper}" ]; then
+        printf 'scripts/cargo-local: shared cargo-local wrapper is not executable: %s\n' "${wrapper}" >&2
+        exit 127
+    fi
 fi
 
-export CARGO_LOCAL_WORKSPACE_DIR="${CARGO_LOCAL_WORKSPACE_DIR:-${workspace_dir}}"
+if [ -z "${CARGO_LOCAL_WORKSPACE_DIR:-}" ]; then
+    CARGO_LOCAL_WORKSPACE_DIR="$(CDPATH='' cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+fi
+export CARGO_LOCAL_WORKSPACE_DIR
 exec "${wrapper}" "$@"

@@ -14,7 +14,7 @@ Read [project principles](docs/principles.md) before changing the agent loop, co
 
 ## Development
 
-Use `cargo-local` for local Cargo build/check/test/run commands and `just-local` for recipes that invoke Cargo. The repository shim requires a separately installed shared wrapper; see [build and test guidance](docs/development.md) for setup, profiles and scoped checks.
+Use `cargo-local` for local Cargo build/check/test/run commands and `just-local` for recipes that invoke Cargo. Use the repository's `scripts/cargo-local` for first-use installation; see [build and test guidance](docs/development.md) for setup, profiles and scoped checks.
 
 Set `CODEX_SANDBOX_NETWORK_DISABLED=1` for tests. Use the existing localhost-aware guard for mock transport tests and let the wrapper declare that capability. Do not count a skipped network test as transport coverage. Capture noisy output outside the repository and report the relevant result and limitations.
 

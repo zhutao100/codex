@@ -2,9 +2,11 @@
 
 ## Local build commands
 
-Use `cargo-local` for Cargo work. The checked-in [shim](../scripts/cargo-local) delegates to `CARGO_LOCAL_BIN`, or to `$HOME/.local/share/codex-rust-wrappers/cargo-local`, and sets `CARGO_LOCAL_WORKSPACE_DIR`. It exits if that executable is absent; the shared wrapper is an environment prerequisite, not vendored code. Install/configure the wrapper before running commands. Use `just-local` when an available recipe calls Cargo directly.
+Use `cargo-local` for Cargo work. The checked-in [shim](../scripts/cargo-local) installs the shared wrappers from the private `zhutao100/codex-rust-wrappers` repository if `$HOME/.local/share/codex-rust-wrappers` is absent. The first run requires access through `gh auth login` or GitHub HTTPS credentials. Subsequent runs use the local executable without checking the remote; update explicitly with `git -C "$HOME/.local/share/codex-rust-wrappers" pull --ff-only`. The shim never overwrites an existing directory or fetches for a `CARGO_LOCAL_BIN` override. Use `just-local` when a recipe calls Cargo directly.
 
 The shared wrapper owns target-directory selection, test-output filtering and platform sandboxing. Keep separate targets for independent worktrees. Confirm its selected target with `cargo-local --print-target-dir`; do not assume artifacts are in `target/`. Keep cache configuration and output captures outside the repository.
+
+Run `scripts/cargo-local --prepare-deps` with network access to cache locked host dependencies before offline tests. Use `scripts/cargo-local --prune-artifacts` to preview stale intermediates in the selected target, then add `--apply` to prune between builds. This operation requires `cargo-reclaim` and does not run automatically.
 
 |Purpose|Command|
 |---|---|
