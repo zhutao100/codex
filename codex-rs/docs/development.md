@@ -6,7 +6,9 @@ Use `cargo-local` for Cargo work. The checked-in [shim](../scripts/cargo-local) 
 
 The shared wrapper owns target-directory selection, test-output filtering and platform sandboxing. Keep separate targets for independent worktrees. Confirm its selected target with `cargo-local --print-target-dir`; do not assume artifacts are in `target/`. Keep cache configuration and output captures outside the repository.
 
-Run `scripts/cargo-local --prepare-deps` with network access to cache locked host dependencies before offline tests. Use `scripts/cargo-local --prune-artifacts` to preview stale intermediates in the selected target, then add `--apply` to prune between builds. This operation requires `cargo-reclaim` and does not run automatically.
+Default `cargo-local test` output mode prepares missing locked Cargo sources once on a recognized build-time cache miss, then retries under the same test sandbox. Use `CARGO_LOCAL_PREPARE_DEPS=0` or `--offline` to disable preparation, or run `scripts/cargo-local --prepare-deps` with network access to prewarm the cache explicitly.
+
+Use `scripts/cargo-local --prune-artifacts` to preview stale intermediates in the selected target, then add `--apply` to prune between builds. This operation requires `cargo-reclaim` and does not run automatically.
 
 |Purpose|Command|
 |---|---|
