@@ -27,13 +27,13 @@ class FetchCodexV8ArtifactsTest(unittest.TestCase):
         self,
         target: str,
         *,
+        profile: str = v8.V8_ARTIFACT_PROFILE,
         line_ending: bytes = b"\n",
         trusted_digest: str | None = None,
         trusted_name: str | None = None,
         create_pins: bool = True,
     ) -> Iterator[tuple[TargetSpec, MagicMock, str]]:
         spec = TARGET_SPECS[target]
-        profile = v8.V8_ARTIFACT_PROFILE
         archive_name = (
             f"rusty_v8_{profile}_{target}.lib.gz"
             if spec.is_windows
@@ -76,6 +76,22 @@ class FetchCodexV8ArtifactsTest(unittest.TestCase):
             patch.object(v8, "download_file", side_effect=download) as download_file,
         ):
             yield spec, download_file, manifest_name
+
+    def test_fetches_the_requested_release_profile(self) -> None:
+        target = "aarch64-apple-darwin"
+        with self.release(target, profile="release") as (spec, download, manifest):
+            artifacts = v8.fetch_codex_v8_artifacts(
+                spec, version=self.version, cache_root=self.root, profile="release"
+            )
+
+        self.assertEqual(
+            [Path(call.args[1]).name for call in download.call_args_list],
+            [manifest, artifacts.archive.name, artifacts.binding.name],
+        )
+        self.assertEqual(
+            (artifacts.archive.name, artifacts.binding.name),
+            (f"librusty_v8_release_{target}.a.gz", f"src_binding_release_{target}.rs"),
+        )
 
     def test_fetches_artifacts_after_authenticating_manifest(self) -> None:
         with self.release("x86_64-unknown-linux-gnu") as (

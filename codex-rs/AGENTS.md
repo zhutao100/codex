@@ -16,10 +16,7 @@ Thus, the design of the changes target to minimize the potentials of future reba
 - The shared wrapper prefers Rustup's Cargo and rustc so both honor `rust-toolchain.toml`.
 - always use `CODEX_SANDBOX_NETWORK_DISABLED=1` for test runs to avoid tampering the host.
 - With `CODEX_SANDBOX_NETWORK_DISABLED=1` on macOS, `cargo-local` uses localhost-only Seatbelt and applies `scripts/cargo-local-network-sandbox-skips.txt` for nested sandbox and shell tests. It reuses cached WebRTC artifacts when available and defaults to an 8 MiB test stack for deeply nested app-server tests.
-- `cargo-local test` defaults to agent output: it filters passing libtest
-  progress into a compact summary while preserving warnings and failures. Use
-  `CODEX_RS_CARGO_LOCAL_TEST_OUTPUT=raw` only when exact Cargo/libtest output is
-  needed.
+- `cargo-local test` defaults to compact output and automatic dependency recovery. Use `CODEX_RS_CARGO_LOCAL_TEST_OUTPUT=raw` only for exact output; it does not recover missing dependencies.
 - The `cargo build` commands can produce giant console output, even with
   `--quiet`. Redirect broad/noisy build output to tmp files and parse only
   necessary information.

@@ -38,7 +38,8 @@
 ## Local verification
 
 - `scripts/cargo-local` installs the private `zhutao100/codex-rust-wrappers` repository into `$HOME/.local/share/codex-rust-wrappers` only when the directory is absent. First use requires GitHub HTTPS credentials or `gh auth login`. Normal runs and `CARGO_LOCAL_BIN` overrides do not check the remote; update with `git -C "$HOME/.local/share/codex-rust-wrappers" pull --ff-only`.
-- Run `scripts/cargo-local --prepare-deps` with network access before offline tests on a fresh checkout or after dependency updates. It fetches the locked Cargo dependencies and uses the checkout's checksum-verifying package helper to cache the matching V8 archive and bindings. Tests use the local mirror without borrowing native artifacts from another worktree.
+- Default `scripts/cargo-local test` runs retry recognized build-time misses after quietly preparing locked Cargo sources, the pinned V8 archive and bindings, or the GStreamer SDK via Homebrew for native macOS voice-host builds. Warm runs do not prepare dependencies. `CARGO_LOCAL_PREPARE_DEPS=0` or `--offline` disables recovery. Use `scripts/cargo-local --prepare-deps` to prewarm Cargo and sandboxed V8 explicitly; `nextest` does not use automatic recovery.
+- Keep the release and sandbox release manifest pins current when updating V8. Cargo selects the exact archive and bindings from the verified local mirror; do not reuse native artifacts from another worktree. The local Homebrew SDK does not replace the packaged runtime required by the installed voice-client test.
 - `scripts/cargo-local --prune-artifacts` previews stale target intermediates; add `--apply` to remove them between builds. Install `cargo-reclaim` once with `cargo-local install --locked cargo-reclaim --version 0.6.0`.
 - Use `CODEX_SANDBOX_NETWORK_DISABLED=1` and the shared Cargo wrappers for tests.
 - Keep package-scoped `just-local test -p <crate>` runs separate from workspace benchmark smoke tests.
