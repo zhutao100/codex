@@ -37,12 +37,14 @@
 
 ## Local verification
 
+- `scripts/cargo-local` installs the private `zhutao100/codex-rust-wrappers` repository into `$HOME/.local/share/codex-rust-wrappers` only when the directory is absent. First use requires GitHub HTTPS credentials or `gh auth login`. Normal runs and `CARGO_LOCAL_BIN` overrides do not check the remote; update with `git -C "$HOME/.local/share/codex-rust-wrappers" pull --ff-only`.
+- Run `scripts/cargo-local --prepare-deps` with network access before offline tests on a fresh checkout or after dependency updates. It fetches the locked Cargo dependencies and uses the checkout's checksum-verifying package helper to cache the matching V8 archive and bindings. Tests use the local mirror without borrowing native artifacts from another worktree.
+- `scripts/cargo-local --prune-artifacts` previews stale target intermediates; add `--apply` to remove them between builds. Install `cargo-reclaim` once with `cargo-local install --locked cargo-reclaim --version 0.6.0`.
 - Use `CODEX_SANDBOX_NETWORK_DISABLED=1` and the shared Cargo wrappers for tests.
 - Keep package-scoped `just-local test -p <crate>` runs separate from workspace benchmark smoke tests.
 - Use Cargo/nextest quiet flags and capture logs; `just --quiet` suppresses failure diagnostics as well as successful output.
 - Nextest uses `--cargo-quiet --status-level fail --final-status-level fail`, not `--quiet`. Select insta snapshot operations with `--manifest-path tui/Cargo.toml`.
 - Before scoped core/app-server integration runs, build the `codex`, `codex-code-mode-host`, and `test_stdio_server` binaries from their owning packages. Scoped nextest builds do not automatically produce these cross-package fixtures.
-- Match both V8 archive and bindings to the locked version and sandbox features; use the checksum-verifying package artifact helper instead of reusing an arbitrary cached archive.
 - For deterministic TUI checks, unset `NO_COLOR`, `TERM_PROGRAM`, `TERM_PROGRAM_VERSION`, and `TERM_SESSION_ID`. Use a temporary Git config without global ignore rules so worktree fixtures include their `.codex/config.toml`.
 - Limit build jobs and test workers on the developer host. Run tests that can interfere with the host in a disposable VM.
 - Core suites using `skip_if_no_network!` return early under the required network-disabled flag. Distinguish those guards from executed localhost regressions and public app-server RPC tests when reporting coverage.
